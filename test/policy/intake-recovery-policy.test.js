@@ -1346,13 +1346,22 @@ const boundaryWriterStateArgumentAt = (tokens, index, aliases) => {
   return name === null ? undefined : aliases.get(name);
 };
 
-const boundBoundaryWriterStateArgument = (tokens, start, end, pairs) => {
+const boundBoundaryWriterStateArgument = (tokens, start, end, pairs, aliases = new Set()) => {
   for (let index = start; index < end; index += 1) {
     const descriptor = boundaryWriterDescriptorAt(tokens, index);
     if (!descriptor || tokens[index + 1]?.value !== '.'
       || tokens[index + 2]?.value !== 'bind' || tokens[index + 3]?.value !== '(') continue;
     const closing = pairs.get(index + 3);
-    if (closing !== undefined && closing < end) return descriptor.stateArgument;
+    if (closing === undefined || closing >= end) continue;
+    const boundArguments = topLevelSegments(tokens, index + 4, closing).slice(1);
+    const preboundState = boundArguments[descriptor.stateArgument];
+    const stateWasPrebound = preboundState !== undefined;
+    return {
+      stateArgument: Math.max(0, descriptor.stateArgument - boundArguments.length),
+      stateWasPrebound,
+      preboundGap: stateWasPrebound
+        && valueHasGapOutcome(tokens, preboundState[0], preboundState[1], pairs, aliases)
+    };
   }
   return undefined;
 };
@@ -1431,6 +1440,36 @@ const staticMemberExpressionName = (tokens, start, end, pairs) => {
   return parts.length === 1 ? parts[0] : JSON.stringify(parts);
 };
 
+const parenthesizedObjectMemberValueRangeAt = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (tokens[expression.start]?.value !== '(') return null;
+  const wrapperClosing = pairs.get(expression.start);
+  if (wrapperClosing === undefined || wrapperClosing + 3 !== expression.end
+    || !['.', '?.'].includes(tokens[wrapperClosing + 1]?.value)
+    || tokens[wrapperClosing + 2]?.type !== 'identifier') return null;
+
+  const objectOpening = expression.start + 1;
+  const objectClosing = pairs.get(objectOpening);
+  if (tokens[objectOpening]?.value !== '{' || objectClosing !== wrapperClosing - 1) return null;
+
+  const projectedProperty = tokens[wrapperClosing + 2].value;
+  for (const [propertyStart, propertyEnd] of topLevelSegments(
+    tokens,
+    objectOpening + 1,
+    objectClosing
+  )) {
+    const colonIndex = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+    if (colonIndex < 0) continue;
+    const propertyName = tokens[propertyStart]?.value === '['
+      ? (pairs.get(propertyStart) === colonIndex - 1
+        ? staticPropertyName(tokens[propertyStart + 1])
+        : null)
+      : staticPropertyName(tokens[propertyStart]);
+    if (propertyName === projectedProperty) return [colonIndex + 1, propertyEnd];
+  }
+  return null;
+};
+
 const assignmentTargetAt = (tokens, index, end, pairs) => {
   if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.') return null;
   let equalsIndex = index + 1;
@@ -1456,6 +1495,13 @@ const assignmentTargetAt = (tokens, index, end, pairs) => {
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
+  const projectedValue = parenthesizedObjectMemberValueRangeAt(
+    tokens,
+    expression.start,
+    expression.end,
+    pairs
+  );
+  if (projectedValue) return valueHasGapOutcome(tokens, projectedValue[0], projectedValue[1], pairs, aliases);
   const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
   if (commaSegments.length > 1) {
     const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
@@ -1573,16 +1619,51 @@ const outcomeAssignmentValueStart = (tokens, index) => {
   return null;
 };
 
+const staticApplyArrayArgumentsAt = (tokens, start, end, useIndex, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return null;
+  if (tokens[expression.start]?.value === '['
+    && pairs.get(expression.start) === expression.end - 1) {
+    return topLevelSegments(tokens, expression.start + 1, expression.end - 1);
+  }
+  if (expression.end - expression.start !== 1
+    || tokens[expression.start]?.type !== 'identifier') return null;
+
+  const name = tokens[expression.start].value;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const functionRanges = findFunctionRanges(tokens, pairs);
+  const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  const binding = resolveVisibleBinding(lexicalBindings, name, useIndex, lexicalScopes, useScope);
+  if (!binding || binding.index >= useIndex || tokens[binding.index - 1]?.value !== 'const'
+    || tokens[binding.index + 1]?.value !== '=') return null;
+
+  const arrayStart = binding.index + 2;
+  const arrayEnd = trimExpressionRange(
+    tokens,
+    arrayStart,
+    findAssignmentValueEnd(tokens, arrayStart, tokens.length),
+    pairs
+  ).end;
+  if (tokens[arrayStart]?.value !== '[' || pairs.get(arrayStart) !== arrayEnd - 1) return null;
+  return topLevelSegments(tokens, arrayStart + 1, arrayEnd - 1);
+};
+
 const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, aliases = new Set()) => {
   if (stateArgument === undefined) return false;
   const isApplyCall = tokens[opening - 2]?.value === '.' && tokens[opening - 1]?.value === 'apply';
   if (isApplyCall) {
     const applyArguments = topLevelSegments(tokens, opening + 1, closing);
     const argumentArray = applyArguments[1];
-    const arrayStart = argumentArray?.[0];
-    const arrayEnd = argumentArray?.[1];
-    if (tokens[arrayStart]?.value !== '[' || pairs.get(arrayStart) !== arrayEnd - 1) return false;
-    const functionArguments = topLevelSegments(tokens, arrayStart + 1, arrayEnd - 1);
+    if (!argumentArray) return false;
+    const functionArguments = staticApplyArrayArgumentsAt(
+      tokens,
+      argumentArray[0],
+      argumentArray[1],
+      opening,
+      pairs
+    );
+    if (!functionArguments) return false;
     const gapArgument = functionArguments[stateArgument];
     return gapArgument !== undefined
       && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases);
@@ -1599,6 +1680,28 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, alia
   const gapArgument = argumentsList[stateArgument];
   return gapArgument !== undefined
     && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases);
+};
+
+const boundaryWriterCallHasGapAt = (tokens, index, end, pairs, aliases, writerAliases) => {
+  const writerName = boundaryWriterNameAt(tokens, index);
+  const writer = boundaryWriterStateArgumentAt(tokens, index, writerAliases);
+  const stateArgument = typeof writer === 'number' ? writer : writer?.stateArgument;
+  if (writerName === null || stateArgument === undefined || tokens[index - 1]?.value === 'function') {
+    return false;
+  }
+
+  const opening = boundaryWriterCallOpeningAt(tokens, index);
+  const closing = opening === null ? undefined : pairs.get(opening);
+  if (closing === undefined || closing >= end) return false;
+  if (typeof writer === 'object' && writer.stateWasPrebound) return writer.preboundGap;
+  return callHasGapArgument(
+    tokens,
+    opening,
+    closing,
+    pairs,
+    stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
+    aliases
+  );
 };
 
 const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases, writerAliases = new Map()) => {
@@ -1634,28 +1737,18 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
       && tokens[index + 1]?.value === '=') {
       const expressionStart = index + 2;
       const expressionEnd = findAssignmentValueEnd(tokens, expressionStart, end);
-      const stateArgument = boundBoundaryWriterStateArgument(tokens, expressionStart, expressionEnd, pairs);
+      const stateArgument = boundBoundaryWriterStateArgument(
+        tokens,
+        expressionStart,
+        expressionEnd,
+        pairs,
+        aliases
+      );
       if (stateArgument === undefined) knownWriterAliases.delete(token.value);
       else knownWriterAliases.set(token.value, stateArgument);
     }
     if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, aliases, functionRanges)) return true;
-    const writerName = boundaryWriterNameAt(tokens, index);
-    const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
-    if (writerName === null || stateArgument === undefined) continue;
-    if (tokens[index - 1]?.value === 'function') continue;
-    const opening = boundaryWriterCallOpeningAt(tokens, index);
-    const closing = opening === null ? undefined : pairs.get(opening);
-    if (closing !== undefined && closing < end
-      && callHasGapArgument(
-        tokens,
-        opening,
-        closing,
-        pairs,
-        stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
-        aliases
-      )) {
-      return true;
-    }
+    if (boundaryWriterCallHasGapAt(tokens, index, end, pairs, aliases, knownWriterAliases)) return true;
   }
   return false;
 };
@@ -2020,7 +2113,13 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       const assignedGap = valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases);
       if (assignedGap) knownAliases.add(assignmentTarget.name);
       else knownAliases.delete(assignmentTarget.name);
-      const stateArgument = boundBoundaryWriterStateArgument(tokens, assignmentValueStart, statementEnd, pairs);
+      const stateArgument = boundBoundaryWriterStateArgument(
+        tokens,
+        assignmentValueStart,
+        statementEnd,
+        pairs,
+        knownAliases
+      );
       if (stateArgument === undefined) knownWriterAliases.delete(assignmentTarget.name);
       else knownWriterAliases.set(assignmentTarget.name, stateArgument);
       if (assignedGap && OUTCOME_NAMES.has(assignmentTarget.name)) return true;
@@ -2028,21 +2127,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       continue;
     }
     if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, knownAliases, functionRanges)) return true;
-    const writerName = boundaryWriterNameAt(tokens, index);
-    const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
-    if (writerName !== null && stateArgument !== undefined
-      && tokens[index - 1]?.value !== 'function') {
-      const opening = boundaryWriterCallOpeningAt(tokens, index);
-      const closing = opening === null ? undefined : pairs.get(opening);
-      if (closing !== undefined && closing < end && callHasGapArgument(
-        tokens,
-        opening,
-        closing,
-        pairs,
-        stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
-        knownAliases
-      )) return true;
-    }
+    if (boundaryWriterCallHasGapAt(tokens, index, end, pairs, knownAliases, knownWriterAliases)) return true;
   }
   return opening === null && valueHasGapOutsideNestedFunctions(
     tokens,
@@ -2553,7 +2638,8 @@ const visibleBoundaryWriterAliasesAt = (
       tokens,
       assignment.expressionStart,
       assignment.expressionEnd,
-      pairs
+      pairs,
+      aliases
     );
     if (stateArgument !== undefined) aliases.set(name, stateArgument);
   }
@@ -2963,6 +3049,77 @@ test('deadline policy inventory recognizes boundary writers invoked through call
     source: 'if (deadlineReached) state.markIntakeBoundary.call(state, id, READINESS.GAP, detail);'
   }]);
   assert.deepEqual(offenders, ['discord/deadline-call-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory resolves named arrays passed to boundary writer apply', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-apply-named-array-gap.js',
+      source: [
+        'const args = [id, READINESS.GAP, detail];',
+        'if (deadlineReached) state.markIntakeBoundary.apply(state, args);'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/deadline-apply-named-array-safe.js',
+      source: [
+        'const args = [id, READINESS.UNAVAILABLE, detail];',
+        'if (deadlineReached) state.markIntakeBoundary.apply(state, args);'
+      ].join('\n')
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-apply-named-array-gap.js:2']);
+});
+
+test('deadline policy inventory resolves pre-bound and partially applied boundary writers', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-bound-writer-gap.js',
+      source: [
+        'const persist = state.markIntakeBoundary.bind(state, id, READINESS.GAP, detail);',
+        'if (deadlineReached) persist();'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/deadline-partially-bound-writer-gap.js',
+      source: [
+        'const persist = state.markIntakeBoundary.bind(state, id);',
+        'if (deadlineReached) persist(READINESS.GAP, detail);'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/deadline-bound-writer-safe.js',
+      source: [
+        'const persist = state.markIntakeBoundary.bind(state, id, READINESS.UNAVAILABLE, detail);',
+        'if (deadlineReached) persist();'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/deadline-partially-bound-writer-safe.js',
+      source: [
+        'const persist = state.markIntakeBoundary.bind(state, id);',
+        'if (deadlineReached) persist(READINESS.UNAVAILABLE, READINESS.GAP);'
+      ].join('\n')
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-bound-writer-gap.js:2',
+    'discord/deadline-partially-bound-writer-gap.js:2'
+  ]);
+});
+
+test('deadline policy inventory resolves parenthesized object-member outcomes', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-parenthesized-object-gap.js',
+      source: 'if (deadlineReached) return ({ state: READINESS.GAP }).state;'
+    },
+    {
+      relative: 'discord/deadline-parenthesized-object-safe.js',
+      source: 'if (deadlineReached) return ({ state: READINESS.UNAVAILABLE }).state;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-parenthesized-object-gap.js:1']);
 });
 
 test('deadline policy inventory recognizes boundary writers invoked through apply', () => {
