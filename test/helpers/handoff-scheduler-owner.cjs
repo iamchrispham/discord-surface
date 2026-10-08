@@ -326,7 +326,8 @@ function classStateInventory(sourceText) {
   }
 
   function isNodeTimersModuleSpecifier(specifier) {
-    return Boolean(specifier && ts.isStringLiteralLike(specifier) && specifier.text === 'node:timers');
+    return Boolean(specifier && ts.isStringLiteralLike(specifier) &&
+      (specifier.text === 'node:timers' || specifier.text === 'timers'));
   }
 
   function isNodeTimersRequire(expression) {
@@ -334,7 +335,8 @@ function classStateInventory(sourceText) {
     if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) ||
       call.expression.text !== 'require' || lexicalBinding(call.expression) || call.arguments.length !== 1) return false;
     const specifier = unwrapParentheses(call.arguments[0]);
-    return ts.isStringLiteralLike(specifier) && specifier.text === 'node:timers';
+    return ts.isStringLiteralLike(specifier) &&
+      (specifier.text === 'node:timers' || specifier.text === 'timers');
   }
 
   function nodeTimersNamespaceBinding(binding, seen = new Set()) {
@@ -377,6 +379,32 @@ function classStateInventory(sourceText) {
     return null;
   }
 
+  function isKnownConstructorStateInitializer(node, member) {
+    if (!ts.isConstructorDeclaration(member) || !ts.isPropertyAccessExpression(node) ||
+      !ts.isThis(node.expression)) return false;
+    const assignment = node.parent;
+    if (!ts.isBinaryExpression(assignment) || assignment.left !== node ||
+      assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+    const initializer = unwrapParentheses(assignment.right);
+    const initializers = {
+      deferredHandoffRecoveryTimer: 'null',
+      deferredHandoffRecoveryTimerDeadline: 'null',
+      pendingHandoffRecoveryPollTimer: 'null',
+      deferredHandoffRecoveryChannels: 'set',
+      pendingHandoffRecoveryChannels: 'set',
+      deferredHandoffRecoveryDelayMs: 'delay'
+    };
+    const expected = initializers[node.name.text];
+    if (expected === 'null') return initializer.kind === ts.SyntaxKind.NullKeyword;
+    if (expected === 'delay') {
+      return ts.isIdentifier(initializer) &&
+        initializer.text === 'DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS';
+    }
+    return expected === 'set' && ts.isNewExpression(initializer) &&
+      ts.isIdentifier(initializer.expression) && initializer.expression.text === 'Set' &&
+      (!initializer.arguments || initializer.arguments.length === 0);
+  }
+
   function receiverAliasEvents(member) {
     const events = new Map();
     function statusAt(binding, position) {
@@ -389,6 +417,24 @@ function classStateInventory(sourceText) {
       }
       return status;
     }
+    function isConditionallyExecuted(node) {
+      let current = node;
+      while (current && current !== member.body && current !== member.initializer) {
+        const parent = current.parent;
+        if (ts.isIfStatement(parent) && current !== parent.expression) return true;
+        if (ts.isConditionalExpression(parent) && current !== parent.condition) return true;
+        if (ts.isBinaryExpression(parent) && current === parent.right &&
+          [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken,
+            ts.SyntaxKind.QuestionQuestionToken].includes(parent.operatorToken.kind)) return true;
+        if (ts.isIterationStatement(parent, false) && !ts.isDoStatement(parent) &&
+          current === parent.statement) return true;
+        if ((ts.isCaseClause(parent) || ts.isDefaultClause(parent)) &&
+          parent.statements.includes(current)) return true;
+        if (ts.isCatchClause(parent) && current === parent.block) return true;
+        current = parent;
+      }
+      return false;
+    }
     function receiverIsGatewayThis(expression, tracksGatewayThis) {
       expression = unwrapParentheses(expression);
       if (!expression) return false;
@@ -396,8 +442,9 @@ function classStateInventory(sourceText) {
       if (ts.isIdentifier(expression)) return statusAt(lexicalBinding(expression), expression.pos);
       return false;
     }
-    function record(binding, position, isGatewayThis) {
+    function record(binding, position, isGatewayThis, conditional = false) {
       if (!binding) return;
+      if (conditional) isGatewayThis = isGatewayThis || statusAt(binding, position - 1);
       const changes = events.get(binding) || [];
       changes.push({ position, isGatewayThis });
       events.set(binding, changes);
@@ -410,13 +457,13 @@ function classStateInventory(sourceText) {
       const tracksGatewayThisHere = tracksGatewayThis && !startsDynamicThisScope;
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
         const value = receiverIsGatewayThis(node.initializer, tracksGatewayThisHere);
-        record(node.name, node.end, value);
+        record(node.name, node.end, value, isConditionallyExecuted(node));
       }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
         ts.isIdentifier(unwrapParentheses(node.left))) {
         const left = unwrapParentheses(node.left);
         const value = receiverIsGatewayThis(node.right, tracksGatewayThisHere);
-        record(lexicalBinding(left), node.end, value);
+        record(lexicalBinding(left), node.end, value, isConditionallyExecuted(node));
       }
       ts.forEachChild(node, child => collect(child, tracksGatewayThisHere));
     }
@@ -464,7 +511,9 @@ function classStateInventory(sourceText) {
     if (ts.isClassDeclaration(node) && node.name?.text === 'DiscordGateway') {
       for (const member of node.members) {
 
-        const memberName = member.name?.getText(source) || 'unnamed class member';
+        const memberName = ts.isConstructorDeclaration(member)
+          ? 'constructor'
+          : member.name?.getText(source) || 'unnamed class member';
         const receiverAliases = receiverAliasEvents(member);
         let accessesSchedulerState = false;
         function scan(bodyNode, tracksGatewayThis = true) {
@@ -478,7 +527,8 @@ function classStateInventory(sourceText) {
           }
           if (ts.isPropertyAccessExpression(bodyNode) &&
             receiverAliases.receiverIsGatewayThis(bodyNode.expression, tracksGatewayThisHere) &&
-            HANDOFF_STATE_FIELDS.has(bodyNode.name.text)) accessesSchedulerState = true;
+            HANDOFF_STATE_FIELDS.has(bodyNode.name.text) &&
+            !isKnownConstructorStateInitializer(bodyNode, member)) accessesSchedulerState = true;
           if (ts.isElementAccessExpression(bodyNode) &&
             receiverAliases.receiverIsGatewayThis(bodyNode.expression, tracksGatewayThisHere)) {
             const key = unwrapParentheses(bodyNode.argumentExpression);
@@ -509,8 +559,8 @@ function classStateInventory(sourceText) {
           }
           scan(parameter);
         }
-        if (accessesSchedulerState && !(ts.isConstructorDeclaration(member) ||
-          ['scheduleDeferredHandoffRecovery', 'schedulePendingHandoffRecoveryPoll'].includes(memberName))) {
+        if (accessesSchedulerState &&
+          !['scheduleDeferredHandoffRecovery', 'schedulePendingHandoffRecoveryPoll'].includes(memberName)) {
           violations.push(memberName);
         }
         if (timerOwners.includes(memberName)) violations.push(`${memberName}: timer API`);

@@ -148,7 +148,23 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     '    const { deferredHandoffRecoveryTimer } = this;\n    let timer; ({ deferredHandoffRecoveryTimer: timer } = this);\n    this.deferredHandoffRecoveryTimer = null;'
   );
   assert.notEqual(constructorDestructure, gateway);
-  assert.deepEqual(classStateInventory(constructorDestructure), [], 'constructor state initialization lost its owner exception');
+  assert.deepEqual(classStateInventory(constructorDestructure), ['constructor'],
+    'constructor scheduler state reads were hidden by the initializer exception');
+  for (const mutation of [
+    'this.deferredHandoffRecoveryChannels.add(channelId);',
+    'this.deferredHandoffRecoveryChannels.clear();'
+  ]) {
+    const constructorMutation = gateway.replace(
+      '    this.deferredHandoffRecoveryTimer = null;',
+      [
+        '    this.deferredHandoffRecoveryTimer = null;',
+        `    ${mutation}`
+      ].join('\n')
+    );
+    assert.notEqual(constructorMutation, gateway);
+    assert.ok(classStateInventory(constructorMutation).includes('constructor'),
+      `constructor scheduler mutation escaped inventory: ${mutation}`);
+  }
   const extraOwnerSite = gateway.replace(
     '  scheduleDeferredHandoffRecovery(channelId) {',
     '  privateHandoffSchedulerTick() { return handoffSchedulerHandlers.scheduleDeferredHandoffRecovery.apply(this, arguments); }\n\n  scheduleDeferredHandoffRecovery(channelId) {'
@@ -202,6 +218,11 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
   ]) {
     assert.deepEqual(classStateInventory(withMember(member)), [name], `${name}: Gateway receiver alias escaped inventory`);
   }
+  const conditionalReceiverAlias = withMember(
+    'privateConditionalReceiverAlias(other, useOther) { let gateway = this; if (useOther) gateway = other; return gateway.deferredHandoffRecoveryChannels; }'
+  );
+  assert.deepEqual(classStateInventory(conditionalReceiverAlias), ['privateConditionalReceiverAlias'],
+    'conditional receiver reassignment erased a possible Gateway alias');
   for (const [name, member] of [
     ['privateGlobalThisTimerOwner', 'privateGlobalThisTimerOwner() { globalThis.setTimeout(() => {}, 1); }'],
     ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }'],
@@ -214,12 +235,18 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
   for (const [name, member] of [
     ['privateRequiredTimerNamespace', "privateRequiredTimerNamespace() { const timers = require('node:timers'); timers.setTimeout(() => {}, 1); }"],
     ['privateRequiredTimerAlias', "privateRequiredTimerAlias() { const { setTimeout: schedule } = require('node:timers'); schedule(() => {}, 1); }"],
+    ['privateRequiredLegacyTimerNamespace', "privateRequiredLegacyTimerNamespace() { const timers = require('timers'); timers.setTimeout(() => {}, 1); }"],
+    ['privateRequiredLegacyTimerAlias', "privateRequiredLegacyTimerAlias() { const { setTimeout: schedule } = require('timers'); schedule(() => {}, 1); }"],
     ['privateImportedTimerNamespace', 'privateImportedTimerNamespace() { timers.setTimeout(() => {}, 1); }'],
-    ['privateImportedTimerAlias', 'privateImportedTimerAlias() { schedule(() => {}, 1); }']
+    ['privateImportedTimerAlias', 'privateImportedTimerAlias() { schedule(() => {}, 1); }'],
+    ['privateImportedLegacyTimerNamespace', 'privateImportedLegacyTimerNamespace() { timers.setTimeout(() => {}, 1); }'],
+    ['privateImportedLegacyTimerAlias', 'privateImportedLegacyTimerAlias() { schedule(() => {}, 1); }']
   ]) {
     let prelude = '';
     if (name === 'privateImportedTimerNamespace') prelude = "import * as timers from 'node:timers';\n";
     if (name === 'privateImportedTimerAlias') prelude = "import { setTimeout as schedule } from 'node:timers';\n";
+    if (name === 'privateImportedLegacyTimerNamespace') prelude = "import * as timers from 'timers';\n";
+    if (name === 'privateImportedLegacyTimerAlias') prelude = "import { setTimeout as schedule } from 'timers';\n";
     const inventory = classStateInventory(`${prelude}${withMember(member)}`);
     assert.ok(inventory.includes(`${name}: timer API`), `${name}: imported Node timer escaped inventory`);
   }
