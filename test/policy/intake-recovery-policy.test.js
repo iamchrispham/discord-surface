@@ -268,12 +268,15 @@ const findTokenPairs = tokens => {
 
 const isGapEnumElementAt = (tokens, index) => {
   const object = tokens[index]?.value;
-  const property = tokens[index + 2];
+  const bracketIndex = tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '['
+    ? index + 2
+    : index + 1;
+  const property = tokens[bracketIndex + 1];
   return (object === 'READINESS' || object === 'THREAD_STATES')
-    && tokens[index + 1]?.value === '['
+    && tokens[bracketIndex]?.value === '['
     && (property?.type === 'string' || property?.type === 'template')
     && property.value === 'GAP'
-    && tokens[index + 3]?.value === ']';
+    && tokens[bracketIndex + 2]?.value === ']';
 };
 
 const isGapValueAt = (tokens, index) => {
@@ -309,7 +312,7 @@ const gapValueEnd = (tokens, index) => {
   if ((tokens[index]?.type === 'string' || tokens[index]?.type === 'template')) return index + 1;
   if ((tokens[index]?.value === 'READINESS' || tokens[index]?.value === 'THREAD_STATES')
     && tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'GAP') return index + 3;
-  if (isGapEnumElementAt(tokens, index)) return index + 4;
+  if (isGapEnumElementAt(tokens, index)) return index + (tokens[index + 1]?.value === '?.' ? 5 : 4);
   return index + 1;
 };
 
@@ -322,7 +325,7 @@ const isComparisonOperand = (tokens, index, start, end) => {
   return right < end && COMPARISON_OPERATORS.has(tokens[right]?.value);
 };
 
-const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => {
+const scanExpressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => {
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
@@ -360,6 +363,118 @@ const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCa
   }
   return false;
 };
+
+const topLevelLogicalOperatorAt = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let selected = null;
+  const precedence = new Map([['??', 1], ['||', 2], ['&&', 3]]);
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index]?.value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && precedence.has(value)) {
+      const candidate = precedence.get(value);
+      if (!selected || candidate < selected.precedence) selected = { index, value, precedence: candidate };
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return selected;
+};
+
+const knownOutcomeMemberAt = (tokens, start, end) => {
+  if (!['READINESS', 'THREAD_STATES'].includes(tokens[start]?.value)) return null;
+  let propertyIndex;
+  let memberEnd;
+  if (tokens[start + 1]?.value === '.'
+    || (tokens[start + 1]?.value === '?.' && tokens[start + 2]?.value !== '[')) {
+    propertyIndex = start + 2;
+    memberEnd = propertyIndex + 1;
+  } else {
+    const bracketIndex = tokens[start + 1]?.value === '?.' && tokens[start + 2]?.value === '['
+      ? start + 2
+      : start + 1;
+    if (tokens[bracketIndex]?.value !== '[' || tokens[bracketIndex + 2]?.value !== ']') return null;
+    propertyIndex = bracketIndex + 1;
+    memberEnd = bracketIndex + 3;
+  }
+  const property = tokens[propertyIndex];
+  if (!property || memberEnd !== end || !['identifier', 'string', 'template'].includes(property.type)) return null;
+  return { isGap: property.value === 'GAP', truthy: true, nullish: false };
+};
+
+const staticExpressionOutcomeAt = (tokens, start, end, aliases, allowNestedCalls) => {
+  while (tokens[end - 1]?.value === ';') end -= 1;
+  while (tokens[start]?.value === '(' && tokens[end - 1]?.value === ')') {
+    start += 1;
+    end -= 1;
+  }
+  if (start >= end) return { isGap: false, truthy: null, nullish: null };
+
+  const logical = topLevelLogicalOperatorAt(tokens, start, end);
+  if (logical) {
+    const left = staticExpressionOutcomeAt(tokens, start, logical.index, aliases, allowNestedCalls);
+    const right = staticExpressionOutcomeAt(tokens, logical.index + 1, end, aliases, allowNestedCalls);
+    const merge = () => ({
+      isGap: left.isGap || right.isGap,
+      truthy: left.truthy === right.truthy ? left.truthy : null,
+      nullish: left.nullish === right.nullish ? left.nullish : null
+    });
+    if (logical.value === '&&') {
+      if (left.truthy === true) return right;
+      if (left.truthy === false) return left;
+      return merge();
+    }
+    if (logical.value === '||') {
+      if (left.truthy === true) return left;
+      if (left.truthy === false) return right;
+      return merge();
+    }
+    if (left.nullish === true) return right;
+    if (left.nullish === false) return left;
+    return merge();
+  }
+
+  const outcomeMember = knownOutcomeMemberAt(tokens, start, end);
+  if (outcomeMember) return outcomeMember;
+  if (isGapValueAt(tokens, start) && gapValueEnd(tokens, start) === end
+    && !isComparisonOperand(tokens, start, start, end)) {
+    return { isGap: true, truthy: true, nullish: false };
+  }
+  if (end - start === 1) {
+    const token = tokens[start];
+    if (token.type === 'identifier' && aliases.has(token.value)) {
+      return { isGap: true, truthy: true, nullish: false };
+    }
+    if (token.value === 'true') return { isGap: false, truthy: true, nullish: false };
+    if (token.value === 'false') return { isGap: false, truthy: false, nullish: false };
+    if (token.value === 'null' || token.value === 'undefined') {
+      return { isGap: false, truthy: false, nullish: true };
+    }
+    if (token.type === 'string' || token.type === 'template') {
+      return { isGap: token.value === 'gap', truthy: Boolean(token.value), nullish: false };
+    }
+    if (token.type === 'number' && Number.isFinite(Number(token.value))) {
+      const value = Number(token.value);
+      return { isGap: false, truthy: Boolean(value), nullish: false };
+    }
+  }
+  if ((tokens[start]?.value === '[' || tokens[start]?.value === '{')
+    && end - start > 1) return { isGap: scanExpressionHasGap(tokens, start, end, aliases, allowNestedCalls), truthy: true, nullish: false };
+  return {
+    isGap: scanExpressionHasGap(tokens, start, end, aliases, allowNestedCalls),
+    truthy: null,
+    nullish: null
+  };
+};
+
+const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => (
+  staticExpressionOutcomeAt(tokens, start, end, aliases, allowNestedCalls).isGap
+);
 
 const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set(), allowNestedCalls = false) => {
   return Array.from(objectOutcomeGapProperties(
@@ -451,6 +566,9 @@ const valueHasGap = (tokens, start, end, pairs, aliases = new Set(), allowNested
     valueEnd = closingIndex;
   }
   if (valueStart >= valueEnd) return false;
+  if (topLevelLogicalOperatorAt(tokens, valueStart, valueEnd)) {
+    return staticExpressionOutcomeAt(tokens, valueStart, valueEnd, aliases, allowNestedCalls).isGap;
+  }
   if (isGapValueAt(tokens, valueStart)
     && !isComparisonOperand(tokens, valueStart, valueStart, valueEnd)) return true;
   if (tokens[valueStart].type === 'identifier' && aliases.has(tokens[valueStart].value)
@@ -2022,7 +2140,7 @@ const localFunctionWasReassigned = (tokens, name, start, end) => {
   return false;
 };
 
-const functionParameterNamesAt = (tokens, range, pairs) => {
+const functionParameterRangesAt = (tokens, range, pairs) => {
   let syntaxStart = range.start;
   if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
   let parameterOpening;
@@ -2036,15 +2154,35 @@ const functionParameterNamesAt = (tokens, range, pairs) => {
   } else if (tokens[range.start]?.value === '=>') {
     parameterClosing = range.start - 1;
     if (tokens[parameterClosing]?.value === ')') parameterOpening = pairs.get(parameterClosing);
-    else return tokens[parameterClosing]?.type === 'identifier' ? [tokens[parameterClosing].value] : [];
+    else return tokens[parameterClosing]?.type === 'identifier'
+      ? [[parameterClosing, parameterClosing + 1]]
+      : [];
   } else {
     return [];
   }
   if (parameterOpening === undefined || parameterClosing === undefined) return [];
-  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing).map(([start, end]) => (
-    end - start === 1 && tokens[start]?.type === 'identifier' ? tokens[start].value : null
-  ));
+  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing);
 };
+
+const functionParameterDescriptorsAt = (tokens, range, pairs) => functionParameterRangesAt(
+  tokens,
+  range,
+  pairs
+).map(([start, end]) => {
+  const defaultIndex = topLevelToken(tokens, start, end, '=');
+  const bindingEnd = defaultIndex < 0 ? end : defaultIndex;
+  return {
+    name: bindingEnd - start === 1 && tokens[start]?.type === 'identifier' ? tokens[start].value : null,
+    defaultStart: defaultIndex < 0 ? null : defaultIndex + 1,
+    defaultEnd: defaultIndex < 0 ? null : end
+  };
+});
+
+const functionParameterNamesAt = (tokens, range, pairs) => functionParameterDescriptorsAt(
+  tokens,
+  range,
+  pairs
+).map(parameter => parameter.name);
 
 const callbackParameterNameAt = (tokens, range, pairs) => functionParameterNamesAt(tokens, range, pairs)[0] ?? null;
 
@@ -2076,7 +2214,7 @@ const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) 
     if (callClosing === undefined || callClosing >= expressionEnd) return null;
     const handlerArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
     const fulfillmentHandler = handlerArguments[0];
-    if (fulfillmentHandler) {
+    if (fulfillmentHandler && fulfillmentHandler[0] < fulfillmentHandler[1]) {
       const handlerExpression = trimExpressionRange(
         tokens,
         fulfillmentHandler[0],
@@ -2164,7 +2302,6 @@ const localFunctionCallHasGapOutcome = (
     const name = tokens[index].value;
     const localFunction = knownLocalFunctions.get(name);
     if (!localFunction || localFunction.closing >= index
-      || tokens[localFunction.start - 1]?.value === 'async'
       || resolvingFunctions.has(localFunction)
       || localFunctionWasReassigned(tokens, name, localFunction.closing + 1, index)) continue;
 
@@ -2174,13 +2311,24 @@ const localFunctionCallHasGapOutcome = (
     const callClosing = pairs.get(callOpening);
     if (callClosing === undefined) continue;
     const callAliases = new Set(aliases);
-    const parameterNames = functionParameterNamesAt(tokens, localFunction, pairs);
+    const parameters = functionParameterDescriptorsAt(tokens, localFunction, pairs);
     const callArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
-    parameterNames.forEach((parameterName, parameterIndex) => {
+    parameters.forEach((parameter, parameterIndex) => {
+      const parameterName = parameter.name;
       if (parameterName === null) return;
       const argument = callArguments[parameterIndex];
-      if (argument !== undefined
+      const argumentWasProvided = argument !== undefined && argument[0] < argument[1];
+      if (argumentWasProvided
         && valueHasGapOutcome(tokens, argument[0], argument[1], pairs, aliases)) {
+        callAliases.add(parameterName);
+      } else if (!argumentWasProvided && parameter.defaultStart !== null
+        && valueHasGapOutcome(
+          tokens,
+          parameter.defaultStart,
+          parameter.defaultEnd,
+          pairs,
+          aliases
+        )) {
         callAliases.add(parameterName);
       } else {
         callAliases.delete(parameterName);
@@ -2486,9 +2634,10 @@ const hasGapOutcome = (
     if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, knownAliases, functionRanges)) return true;
     if (boundaryWriterCallHasGapAt(tokens, index, end, pairs, knownAliases, knownWriterAliases)) return true;
   }
+  const fallbackStart = tokens[start]?.value === 'return' ? start + 1 : start;
   return opening === null && valueHasGapOutsideNestedFunctions(
     tokens,
-    start,
+    fallbackStart,
     end,
     pairs,
     functionRanges,
@@ -2510,13 +2659,23 @@ const isDeadlineTriggerAt = (tokens, index, isDeadlineTimestampAlias = () => fal
     }
     let memberEnd = isComputedMember ? index + 2 : index + 1;
     while (tokens[memberEnd]?.value === '.' && tokens[memberEnd + 1]?.type === 'identifier') memberEnd += 2;
+    const isSetHasMembership = tokens[memberStart - 4]?.value === 'new'
+      && tokens[memberStart - 3]?.value === 'Set'
+      && tokens[memberStart - 2]?.value === '('
+      && tokens[memberStart - 1]?.value === '['
+      && tokens[memberEnd]?.value === ']'
+      && tokens[memberEnd + 1]?.value === ')'
+      && tokens[memberEnd + 2]?.value === '.'
+      && tokens[memberEnd + 3]?.value === 'has'
+      && tokens[memberEnd + 4]?.value === '(';
     return COMPARISON_OPERATORS.has(tokens[memberStart - 1]?.value)
       || COMPARISON_OPERATORS.has(tokens[memberEnd]?.value)
       || tokens[memberStart - 1]?.value === 'case'
       || (tokens[memberEnd]?.value === ']'
         && tokens[memberEnd + 1]?.value === '.'
         && tokens[memberEnd + 2]?.value === 'includes'
-        && tokens[memberEnd + 3]?.value === '(');
+        && tokens[memberEnd + 3]?.value === '(')
+      || isSetHasMembership;
   }
   const deadlineOperandEnd = start => {
     let operandStart = start;
@@ -2608,13 +2767,15 @@ const findAssignedAlias = (tokens, triggerIndex) => {
 const findIdentifierAssignments = (tokens, lexicalScopes) => tokens.flatMap((token, index) => {
   const annotationColon = tokens[index - 2]?.value === ':' ? index - 2 : null;
   const nameIndex = annotationColon === null ? index - 1 : annotationColon - 1;
-  if (token.value !== '=' || tokens[nameIndex]?.type !== 'identifier' || tokens[nameIndex - 1]?.value === '.') {
+  if (!['=', '||=', '&&=', '??='].includes(token.value)
+    || tokens[nameIndex]?.type !== 'identifier' || tokens[nameIndex - 1]?.value === '.') {
     return [];
   }
   return [{
     name: tokens[nameIndex].value,
     index: nameIndex,
     equalsIndex: index,
+    operator: token.value,
     scope: lexicalScopePath(lexicalScopes, nameIndex)
   }];
 });
@@ -2659,11 +2820,34 @@ const isConditionalAssignment = (tokens, pairs, assignment) => {
     || followsConditionalHeader(opening - 1));
 };
 
+const logicalAssignmentRhsSelection = (tokens, pairs, assignments, assignment) => {
+  if (assignment.operator === '=') return true;
+  if (!['||=', '&&=', '??='].includes(assignment.operator)) return null;
+  const priorWrites = assignments
+    .filter(candidate => candidate.name === assignment.name
+      && candidate.bindingIndex === assignment.bindingIndex
+      && candidate.index < assignment.index)
+    .sort((left, right) => left.index - right.index);
+  const prior = priorWrites[priorWrites.length - 1];
+  if (!prior || prior.operator !== '=' || isConditionalAssignment(tokens, pairs, prior)) return null;
+  const priorValue = staticExpressionOutcomeAt(
+    tokens,
+    prior.expressionStart,
+    prior.expressionEnd,
+    new Set(),
+    false
+  );
+  if (assignment.operator === '||=') return priorValue.truthy === null ? null : !priorValue.truthy;
+  if (assignment.operator === '&&=') return priorValue.truthy;
+  return priorValue.nullish;
+};
+
 const resolveVisibleAssignments = (assignments, name, index, lexicalScopes, bindingIndex, tokens, pairs) => {
   const visible = assignments
     .filter(assignment => assignment.name === name
       && assignment.index < index
       && assignment.bindingIndex === bindingIndex
+      && logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== false
       && (isLexicallyVisible(assignment.scope, lexicalScopePath(lexicalScopes, index))
         || isConditionalAssignment(tokens, pairs, assignment)))
     .sort((left, right) => left.index - right.index);
@@ -2948,6 +3132,12 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
     else knownAliases.delete(declaration.name);
   }
   for (const assignment of assignments) {
+    const rhsSelected = logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment);
+    if (rhsSelected === false) continue;
+    if (rhsSelected === null) {
+      knownAliases.delete(assignment.name);
+      continue;
+    }
     const assignedGap = valueHasGapOutcome(
       tokens,
       assignment.expressionStart,
@@ -3111,6 +3301,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     timestampAliasesAdded = false;
     for (const assignment of assignments) {
       if (assignment.bindingIndex === undefined
+        || logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== true
         || deadlineTimestampAliases.some(alias => alias.index === assignment.index
           && alias.bindingIndex === assignment.bindingIndex)) continue;
       const valueRange = trimExpressionRange(
@@ -3252,6 +3443,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     aliasesAdded = false;
     for (const assignment of assignments) {
       if (assignment.bindingIndex === undefined
+        || logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== true
         || deadlineAliases.some(alias => alias.index === assignment.index
           && alias.bindingIndex === assignment.bindingIndex)) continue;
       const valueEnd = findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length);
@@ -3271,25 +3463,27 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         sourceStart,
         lexicalScopes
       );
-      if (!sourceBinding) continue;
       const sourceAlias = deadlineAliases.find(alias => alias.name === sourceToken.value
-        && alias.bindingIndex === sourceBinding.index
+        && alias.bindingIndex === sourceBinding?.index
         && alias.index < sourceStart);
-      if (!sourceAlias) continue;
-      const sourceAssignments = resolveVisibleAssignments(
-        assignments,
-        sourceAlias.name,
-        sourceStart,
-        lexicalScopes,
-        sourceBinding.index,
-        tokens,
-        pairs
-      );
-      if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
+      const sourceIsDeadline = isDeadlineTriggerAt(tokens, sourceStart, isDeadlineTimestampAliasAt);
+      if (!sourceAlias && !sourceIsDeadline) continue;
+      if (sourceAlias) {
+        const sourceAssignments = resolveVisibleAssignments(
+          assignments,
+          sourceAlias.name,
+          sourceStart,
+          lexicalScopes,
+          sourceBinding.index,
+          tokens,
+          pairs
+        );
+        if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
+      }
       deadlineAliases.push({
         name: assignment.name,
         index: assignment.index,
-        negated: sourceNegated ? !sourceAlias.negated : sourceAlias.negated,
+        negated: sourceNegated ? !Boolean(sourceAlias?.negated) : Boolean(sourceAlias?.negated),
         bindingIndex: assignment.bindingIndex,
         scope: assignment.scope
       });
@@ -5084,6 +5278,81 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     regressionAssert.equal(offendersFor(threadHandler).length, 1);
     regressionAssert.equal(offendersFor(intakeChannelGap).length, 0);
     regressionAssert.equal(offendersFor(threadChannelGap).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows logical expression result semantics', () => {
+    const gapAndSafe = `if (deadlineReached) return READINESS.GAP && READINESS.UNAVAILABLE;`;
+    const safeAndGap = `if (deadlineReached) return READINESS.UNAVAILABLE && READINESS.GAP;`;
+    const gapOrSafe = `if (deadlineReached) return READINESS.GAP || READINESS.UNAVAILABLE;`;
+    const safeOrGap = `if (deadlineReached) return READINESS.UNAVAILABLE || READINESS.GAP;`;
+    const gapNullishSafe = `if (deadlineReached) return READINESS.GAP ?? READINESS.UNAVAILABLE;`;
+    const safeNullishGap = `if (deadlineReached) return READINESS.UNAVAILABLE ?? READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(gapAndSafe).length, 0);
+    regressionAssert.equal(offendersFor(safeAndGap).length, 1);
+    regressionAssert.equal(offendersFor(gapOrSafe).length, 1);
+    regressionAssert.equal(offendersFor(safeOrGap).length, 0);
+    regressionAssert.equal(offendersFor(gapNullishSafe).length, 1);
+    regressionAssert.equal(offendersFor(safeNullishGap).length, 0);
+  });
+
+  regressionTest('deadline policy inventory recognizes optional computed gap members', () => {
+    const readinessGap = `if (deadlineReached) return READINESS?.['GAP'];`;
+    const threadGap = `if (deadlineReached) return THREAD_STATES?.['GAP'];`;
+    const unavailable = `if (deadlineReached) return READINESS?.['UNAVAILABLE'];`;
+    const unrelatedGap = `if (deadlineReached) return LAYOUT?.['GAP'];`;
+    regressionAssert.equal(offendersFor(readinessGap).length, 1);
+    regressionAssert.equal(offendersFor(threadGap).length, 1);
+    regressionAssert.equal(offendersFor(unavailable).length, 0);
+    regressionAssert.equal(offendersFor(unrelatedGap).length, 0);
+  });
+
+  regressionTest('deadline policy inventory preserves outcomes through empty then handlers', () => {
+    const passThrough = `if (deadlineReached) return Promise.resolve(READINESS.GAP).then();`;
+    const replacement = `if (deadlineReached) return Promise.resolve(READINESS.GAP).then(() => READINESS.UNAVAILABLE);`;
+    regressionAssert.equal(offendersFor(passThrough).length, 1);
+    regressionAssert.equal(offendersFor(replacement).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows invoked async declarations only', () => {
+    const invokedGap = `async function gap() { return READINESS.GAP; } if (deadlineReached) return gap();`;
+    const invokedSafe = `async function ready() { return READINESS.UNAVAILABLE; } if (deadlineReached) return ready();`;
+    const uninvoked = `if (deadlineReached) { async function gap() { return READINESS.GAP; } return READINESS.UNAVAILABLE; }`;
+    regressionAssert.equal(offendersFor(invokedGap).length, 1);
+    regressionAssert.equal(offendersFor(invokedSafe).length, 0);
+    regressionAssert.equal(offendersFor(uninvoked).length, 0);
+  });
+
+  regressionTest('deadline policy inventory applies defaults only to omitted helper arguments', () => {
+    const omittedGap = `function outcome(value = READINESS.GAP) { return value; } if (deadlineReached) return outcome();`;
+    const explicitSafe = `function outcome(value = READINESS.GAP) { return value; } if (deadlineReached) return outcome(READINESS.UNAVAILABLE);`;
+    const omittedSafe = `function outcome(value = READINESS.UNAVAILABLE) { return value; } if (deadlineReached) return outcome();`;
+    regressionAssert.equal(offendersFor(omittedGap).length, 1);
+    regressionAssert.equal(offendersFor(explicitSafe).length, 0);
+    regressionAssert.equal(offendersFor(omittedSafe).length, 0);
+  });
+
+  regressionTest('deadline policy inventory recognizes Set membership triggers', () => {
+    const deadline = `if (new Set([CODEX_VALIDATION_KINDS.DEADLINE]).has(kind)) return READINESS.GAP;`;
+    const nonDeadline = `if (new Set([CODEX_VALIDATION_KINDS.RETRY]).has(kind)) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(deadline).length, 1);
+    regressionAssert.equal(offendersFor(nonDeadline).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows statically selected logical assignments', () => {
+    const orAssigned = `let expired = false; expired ||= deadlineReached; if (expired) return READINESS.GAP;`;
+    const andAssigned = `let expired = true; expired &&= deadlineReached; if (expired) return READINESS.GAP;`;
+    const nullishAssigned = `let expired = null; expired ??= deadlineReached; if (expired) return READINESS.GAP;`;
+    const negatedSafe = `let within = false; within ||= !deadlineReached; if (within) return READINESS.GAP;`;
+    const orShortCircuits = `let expired = true; expired ||= deadlineReached; if (expired) return READINESS.GAP;`;
+    const andShortCircuits = `let active = false; active &&= deadlineReached; if (!active) return READINESS.GAP;`;
+    const nullishShortCircuits = `let ready = 'ready'; ready ??= deadlineReached; if (ready) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(orAssigned).length, 1);
+    regressionAssert.equal(offendersFor(andAssigned).length, 1);
+    regressionAssert.equal(offendersFor(nullishAssigned).length, 1);
+    regressionAssert.equal(offendersFor(negatedSafe).length, 0);
+    regressionAssert.equal(offendersFor(orShortCircuits).length, 0);
+    regressionAssert.equal(offendersFor(andShortCircuits).length, 0);
+    regressionAssert.equal(offendersFor(nullishShortCircuits).length, 0);
   });
 })();
 
