@@ -92,8 +92,10 @@ function classStateInventory(sourceText) {
     if (!name) return false;
     if (ts.isComputedPropertyName(name)) {
       const expression = unwrapParentheses(name.expression);
-      return (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) &&
-        HANDOFF_STATE_FIELDS.has(expression.text);
+      if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+        return HANDOFF_STATE_FIELDS.has(expression.text);
+      }
+      return !isKnownNonSchedulerElementKey(expression);
     }
     return (ts.isIdentifier(name) || ts.isStringLiteral(name)) && HANDOFF_STATE_FIELDS.has(name.text);
   }
@@ -209,10 +211,16 @@ function classStateInventory(sourceText) {
     if (ts.isIdentifier(callee)) {
       timerName = callee.text;
       shadowedName = timerName;
-    } else if (ts.isPropertyAccessExpression(callee)) {
+    } else if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
       const receiver = unwrapParentheses(callee.expression);
       if (!ts.isIdentifier(receiver) || !['global', 'globalThis'].includes(receiver.text)) return false;
-      timerName = callee.name.text;
+      if (ts.isPropertyAccessExpression(callee)) {
+        timerName = callee.name.text;
+      } else {
+        const property = unwrapParentheses(callee.argumentExpression);
+        if (!property || (!ts.isStringLiteral(property) && !ts.isNoSubstitutionTemplateLiteral(property))) return false;
+        timerName = property.text;
+      }
       shadowedName = receiver.text;
     } else {
       return false;
@@ -352,7 +360,7 @@ function exactOwnerContract(sourceOverrides = {}) {
     if (declaration.modifiers?.length || declaration.asteriskToken) return false;
     const hash = crypto.createHash('sha256').update(declaration.body.getText(ownerSource)).digest('hex');
     if (hash !== METHOD_HASHES[methodName]) return false;
-    if (!hasExactFacade(fs.readFileSync(GATEWAY_PATH, 'utf8'), methodName)) return false;
+    if (!hasExactFacade(gatewayText, methodName)) return false;
     if (!methodOf(gatewaySource, methodName)) return false;
   }
   return ownerText.startsWith("'use strict';\n");

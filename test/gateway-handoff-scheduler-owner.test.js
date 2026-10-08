@@ -61,6 +61,8 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     assert.equal(hasExactFacade(gateway.replace(needle,
       `handoffSchedulerHandlers?.${methodName}.apply(this, arguments)`), methodName), false,
     `${methodName}: optional-chain facade mutant accepted`);
+    assert.equal(exactOwnerContract({ gatewayText: gateway.replace(needle, 'null') }), false,
+      `${methodName}: altered supplied Gateway facade accepted`);
     assert.equal(hasExactFacade(gateway.replace(needle,
       `handoffSchedulerHandlers["${methodName}"].apply(this, arguments)`), methodName), false,
     `${methodName}: constant-bracket facade mutant accepted`);
@@ -76,7 +78,9 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   const destructuredStateMembers = [
     ['deferred shorthand', 'privateDeferredStateReader() { const { deferredHandoffRecoveryChannels } = this; return deferredHandoffRecoveryChannels; }'],
     ['deferred alias', 'privateDeferredStateAliasReader() { const { deferredHandoffRecoveryChannels: channels } = this; return channels; }'],
+    ['computed literal scheduler field', "privateComputedLiteralStateReader() { const { ['deferredHandoffRecoveryChannels']: channels } = this; return channels; }"],
     ['parenthesized this initializer', 'privateParenthesizedStateReader() { const { deferredHandoffRecoveryChannels } = (this); return deferredHandoffRecoveryChannels; }'],
+    ['dynamic computed state binding', 'privateDynamicComputedStateReader(field) { const { [field]: channels } = this; return channels; }'],
     ['pending shorthand', 'privatePendingStateReader() { const { pendingHandoffRecoveryPollTimer } = this; return pendingHandoffRecoveryPollTimer; }'],
     ['direct state property', 'privateDirectStateReader() { return this.deferredHandoffRecoveryChannels; }']
   ];
@@ -92,6 +96,8 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   for (const [label, member] of [
     ['deferred assignment alias', 'privateDeferredAssignmentStateAliasReader() { let channels; ({ deferredHandoffRecoveryChannels: channels } = this); return channels; }'],
     ['pending assignment alias', 'privatePendingAssignmentStateAliasReader() { let timer; ({ pendingHandoffRecoveryPollTimer: timer } = this); return timer; }'],
+    ['computed literal scheduler assignment', "privateComputedLiteralAssignmentReader() { let channels; ({ ['deferredHandoffRecoveryChannels']: channels } = this); return channels; }"],
+    ['dynamic computed assignment alias', 'privateDynamicComputedAssignmentReader(field) { let channels; ({ [field]: channels } = this); return channels; }'],
     ['parameter default alias', 'privateDeferredParameterStateAliasReader({ deferredHandoffRecoveryChannels: channels } = this) { return channels; }'],
     ['literal scheduler element key', "privateLiteralStateReader() { return this['deferredHandoffRecoveryChannels']; }"]
   ]) {
@@ -106,6 +112,9 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   for (const [label, member] of [
     ['ordinary this field', 'privateOrdinaryStateReader() { const { gatewayName } = this; return gatewayName; }'],
     ['other-object scheduler field', 'privateOtherObjectStateReader(other) { const { deferredHandoffRecoveryChannels } = other; return deferredHandoffRecoveryChannels; }'],
+    ['dynamic other-object scheduler field', 'privateOtherObjectDynamicStateReader(other, field) { const { [field]: channels } = other; return channels; }'],
+    ['numeric computed binding key', 'privateNumericComputedStateReader() { const { [0]: first } = this; return first; }'],
+    ['numeric computed assignment key', 'privateNumericComputedAssignmentReader() { let first; ({ [0]: first } = this); return first; }'],
     ['other-source parameter', 'privateOtherSourceParameterReader({ deferredHandoffRecoveryChannels: channels } = other) { return channels; }'],
     ['ordinary literal element key', "privateOrdinaryElementReader() { return this['client']; }"],
     ['timer property read', 'privateTimerPropertyReader(options) { return options.setTimeout; }'],
@@ -179,7 +188,9 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
   }
   for (const [name, member] of [
     ['privateGlobalThisTimerOwner', 'privateGlobalThisTimerOwner() { globalThis.setTimeout(() => {}, 1); }'],
-    ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }']
+    ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }'],
+    ['privateGlobalThisBracketTimerOwner', "privateGlobalThisBracketTimerOwner() { globalThis['setTimeout'](() => {}, 1); }"],
+    ['privateGlobalBracketTimerOwner', "privateGlobalBracketTimerOwner() { global['clearTimeout'](1); }"]
   ]) {
     const inventory = classStateInventory(withMember(member));
     assert.ok(inventory.includes(`${name}: timer API`), `${name}: qualified global timer escaped inventory`);
@@ -188,7 +199,9 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
     ['privateNestedFunctionThisReader', 'privateNestedFunctionThisReader() { function inspect() { return this.deferredHandoffRecoveryChannels; } return inspect.call({}); }'],
     ['privateNestedClassThisReader', 'privateNestedClassThisReader() { class Inspect { read() { return this.pendingHandoffRecoveryPollTimer; } } return Inspect; }'],
     ['privateShadowedGlobalThisTimer', 'privateShadowedGlobalThisTimer(globalThis) { globalThis.setTimeout(() => {}, 1); }'],
-    ['privateShadowedGlobalTimer', 'privateShadowedGlobalTimer(global) { global.clearTimeout(1); }']
+    ['privateShadowedGlobalTimer', 'privateShadowedGlobalTimer(global) { global.clearTimeout(1); }'],
+    ['privateShadowedBracketGlobalTimer', "privateShadowedBracketGlobalTimer(global) { global['clearTimeout'](1); }"],
+    ['privateDynamicBracketTimerName', 'privateDynamicBracketTimerName(timerName) { globalThis[timerName](() => {}, 1); }']
   ]) {
     assert.deepEqual(classStateInventory(withMember(member)), [], `${name}: unrelated scope was treated as Gateway ownership`);
   }
