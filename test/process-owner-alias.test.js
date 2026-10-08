@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runFixture, runFilesFixture, inventoryProcessOwnerSites, SRC_ROOT } =
+const { runFixture, runFilesFixture, inventoryFiles, inventoryProcessOwnerSites, SRC_ROOT } =
   require('./process-owner-evidence-scenarios/public-inventory-fixtures.cjs');
 
 test("let function alias", () => {
@@ -86,6 +86,49 @@ test("static element assignment retains process kill", () => {
 
 test("comma aliases resolve their final operand", () => {
   runFixture("const probe = (sideEffect(), process.kill); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("finite reducer callbacks preserve process probe inventory", () => {
+  const reduced = inventoryFiles({
+    "private-alias.js": "function newProbe(pid) { [pid, 0].reduce(process.kill); }"
+  });
+  assert.equal(reduced.kills.length, 1);
+
+  const reversed = inventoryFiles({
+    "private-alias.js": "function newProbe(pid) { [0, pid].reduceRight(process.kill); }"
+  });
+  assert.equal(reversed.kills.length, 1);
+
+  const noCallback = inventoryFiles({
+    "private-alias.js": "function newProbe(pid) { [pid].reduce(process.kill); }"
+  });
+  assert.deepEqual(noCallback.kills, []);
+});
+
+test("computed timer method aliases preserve forwarded probe inventory", () => {
+  const result = inventoryFiles({
+    "private-alias.js": "const timers = require('node:timers'); const method = 'setImmediate'; function newProbe(pid) { timers[method](process.kill, pid, 0); }"
+  });
+  assert.equal(result.kills.length, 1);
+});
+
+test("super constructor arguments bind to base probe parameters", () => {
+  const result = inventoryFiles({
+    "private-alias.js": "class Base { constructor(probe, pid) { probe(pid, 0); } } class Child extends Base { constructor() { super(process.kill, 1); } } new Child();"
+  });
+  assert.equal(result.kills.length, 1);
+});
+
+test("TypeScript parameter properties retain defaults and constructor arguments", () => {
+  const withDefault = inventoryFiles({
+    "private-alias.ts": "class Check { constructor(private probe = process.kill) {} run(pid: number) { this.probe(pid, 0); } }"
+  });
+  assert.equal(withDefault.kills.length, 1);
+
+  const withArgument = inventoryFiles({
+    "private-alias.ts": "class Check { constructor(private probe: any) {} run(pid: number) { this.probe(pid, 0); } } new Check(process.kill);"
+  });
+  assert.equal(withArgument.kills.length, 1);
 });
 
 test("declared production probe inventory remains valid", () => {
