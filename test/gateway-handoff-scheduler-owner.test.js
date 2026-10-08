@@ -62,8 +62,24 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     assert.deepEqual(classStateInventory(source), [memberName], `${label}: new class member escaped state ownership inventory`);
   }
   for (const [label, member] of [
+    ['deferred assignment alias', 'privateDeferredAssignmentStateAliasReader() { let channels; ({ deferredHandoffRecoveryChannels: channels } = this); return channels; }'],
+    ['pending assignment alias', 'privatePendingAssignmentStateAliasReader() { let timer; ({ pendingHandoffRecoveryPollTimer: timer } = this); return timer; }'],
+    ['parameter default alias', 'privateDeferredParameterStateAliasReader({ deferredHandoffRecoveryChannels: channels } = this) { return channels; }'],
+    ['literal scheduler element key', "privateLiteralStateReader() { return this['deferredHandoffRecoveryChannels']; }"]
+  ]) {
+    const memberName = member.slice(0, member.indexOf('('));
+    const source = gateway.replace(
+      '  scheduleDeferredHandoffRecovery(channelId) {',
+      `  ${member}\n\n  scheduleDeferredHandoffRecovery(channelId) {`
+    );
+    assert.notEqual(source, gateway);
+    assert.deepEqual(classStateInventory(source), [memberName], `${label}: new class member escaped state ownership inventory`);
+  }
+  for (const [label, member] of [
     ['ordinary this field', 'privateOrdinaryStateReader() { const { gatewayName } = this; return gatewayName; }'],
-    ['other-object scheduler field', 'privateOtherObjectStateReader(other) { const { deferredHandoffRecoveryChannels } = other; return deferredHandoffRecoveryChannels; }']
+    ['other-object scheduler field', 'privateOtherObjectStateReader(other) { const { deferredHandoffRecoveryChannels } = other; return deferredHandoffRecoveryChannels; }'],
+    ['other-source parameter', 'privateOtherSourceParameterReader({ deferredHandoffRecoveryChannels: channels } = other) { return channels; }'],
+    ['ordinary literal element key', "privateOrdinaryElementReader() { return this['client']; }"]
   ]) {
     const source = gateway.replace(
       '  scheduleDeferredHandoffRecovery(channelId) {',
@@ -72,9 +88,16 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     assert.notEqual(source, gateway);
     assert.deepEqual(classStateInventory(source), [], `${label}: unrelated read was treated as Gateway scheduler state`);
   }
+  const dynamicElementKey = gateway.replace(
+    '  scheduleDeferredHandoffRecovery(channelId) {',
+    '  privateDynamicElementReader(field) { return this[field]; }\n\n  scheduleDeferredHandoffRecovery(channelId) {'
+  );
+  assert.notEqual(dynamicElementKey, gateway);
+  assert.deepEqual(classStateInventory(dynamicElementKey), ['privateDynamicElementReader'],
+    'dynamic element access stopped conservatively protecting scheduler state');
   const constructorDestructure = gateway.replace(
     '    this.deferredHandoffRecoveryTimer = null;',
-    '    const { deferredHandoffRecoveryTimer } = this;\n    this.deferredHandoffRecoveryTimer = null;'
+    '    const { deferredHandoffRecoveryTimer } = this;\n    let timer; ({ deferredHandoffRecoveryTimer: timer } = this);\n    this.deferredHandoffRecoveryTimer = null;'
   );
   assert.notEqual(constructorDestructure, gateway);
   assert.deepEqual(classStateInventory(constructorDestructure), [], 'constructor state initialization lost its owner exception');

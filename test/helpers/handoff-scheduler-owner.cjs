@@ -83,6 +83,42 @@ function classStateInventory(sourceText) {
   const violations = [];
   const timerOwners = [];
 
+  function unwrapParentheses(expression) {
+    while (expression && ts.isParenthesizedExpression(expression)) expression = expression.expression;
+    return expression;
+  }
+
+  function isSchedulerFieldName(name) {
+    if (!name) return false;
+    if (ts.isComputedPropertyName(name)) {
+      const expression = unwrapParentheses(name.expression);
+      return (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) &&
+        HANDOFF_STATE_FIELDS.has(expression.text);
+    }
+    return (ts.isIdentifier(name) || ts.isStringLiteral(name)) && HANDOFF_STATE_FIELDS.has(name.text);
+  }
+
+  function bindingPatternHasSchedulerField(pattern) {
+    return ts.isObjectBindingPattern(pattern) && pattern.elements.some(element =>
+      isSchedulerFieldName(element.propertyName || element.name));
+  }
+
+  function assignmentPatternHasSchedulerField(pattern) {
+    return ts.isObjectLiteralExpression(pattern) && pattern.properties.some(property => {
+      if (ts.isPropertyAssignment(property)) return isSchedulerFieldName(property.name);
+      return ts.isShorthandPropertyAssignment(property) && HANDOFF_STATE_FIELDS.has(property.name.text);
+    });
+  }
+
+  function isKnownNonSchedulerElementKey(expression) {
+    return ts.isNumericLiteral(expression) || ts.isRegularExpressionLiteral(expression) || [
+      ts.SyntaxKind.BigIntLiteral,
+      ts.SyntaxKind.TrueKeyword,
+      ts.SyntaxKind.FalseKeyword,
+      ts.SyntaxKind.NullKeyword
+    ].includes(expression.kind);
+  }
+
   function visit(node) {
     if (ts.isClassDeclaration(node) && node.name?.text === 'DiscordGateway') {
       for (const member of node.members) {
@@ -92,19 +128,19 @@ function classStateInventory(sourceText) {
         function scan(bodyNode) {
           if (ts.isPropertyAccessExpression(bodyNode) && ts.isThis(bodyNode.expression) &&
             HANDOFF_STATE_FIELDS.has(bodyNode.name.text)) accessesSchedulerState = true;
-          if (ts.isElementAccessExpression(bodyNode) && ts.isThis(bodyNode.expression)) accessesSchedulerState = true;
-          if (ts.isVariableDeclaration(bodyNode) && ts.isObjectBindingPattern(bodyNode.name) &&
-            ts.isThis(bodyNode.initializer) && bodyNode.name.elements.some(element => {
-              const propertyName = element.propertyName;
-              if (propertyName && ts.isComputedPropertyName(propertyName)) {
-                const expression = propertyName.expression;
-                return (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) &&
-                  HANDOFF_STATE_FIELDS.has(expression.text);
-              }
-              const fieldName = propertyName || element.name;
-              return (ts.isIdentifier(fieldName) || ts.isStringLiteral(fieldName)) &&
-                HANDOFF_STATE_FIELDS.has(fieldName.text);
-            })) accessesSchedulerState = true;
+          if (ts.isElementAccessExpression(bodyNode) && ts.isThis(bodyNode.expression)) {
+            const key = unwrapParentheses(bodyNode.argumentExpression);
+            if (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) {
+              if (HANDOFF_STATE_FIELDS.has(key.text)) accessesSchedulerState = true;
+            } else if (!isKnownNonSchedulerElementKey(key)) {
+              accessesSchedulerState = true;
+            }
+          }
+          if (ts.isVariableDeclaration(bodyNode) && bindingPatternHasSchedulerField(bodyNode.name) &&
+            bodyNode.initializer && ts.isThis(bodyNode.initializer)) accessesSchedulerState = true;
+          if (ts.isBinaryExpression(bodyNode) && bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isThis(unwrapParentheses(bodyNode.right)) &&
+            assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
           if (ts.isIdentifier(bodyNode) && ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].includes(bodyNode.text)) {
             timerOwners.push(memberName);
           }
@@ -113,7 +149,13 @@ function classStateInventory(sourceText) {
         }
         if (member.body) scan(member.body);
         if (member.initializer) scan(member.initializer);
-        for (const parameter of member.parameters || []) scan(parameter);
+        for (const parameter of member.parameters || []) {
+          if (parameter.initializer && ts.isThis(unwrapParentheses(parameter.initializer)) &&
+            bindingPatternHasSchedulerField(parameter.name)) {
+            accessesSchedulerState = true;
+          }
+          scan(parameter);
+        }
         if (accessesSchedulerState && !(ts.isConstructorDeclaration(member) ||
           ['scheduleDeferredHandoffRecovery', 'schedulePendingHandoffRecoveryPoll'].includes(memberName))) {
           violations.push(memberName);
