@@ -672,8 +672,6 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   ).statements[0].expression;
   assert.equal(targetsSurfaceState(parenthesizedFacadeOverride.left), true);
   assert.equal(staticAssignmentPropertyName(parenthesizedFacadeOverride.left), 'directPostOwnerIdentity');
-  const isCallableFacadeProperty = property => ts.isMethodDeclaration(property)
-    || (ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer));
   const definePropertyName = (node, targetClass = surfaceStateDeclaration) => {
     if (!ts.isCallExpression(node)
       || !ts.isPropertyAccessExpression(node.expression)
@@ -685,8 +683,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     const descriptor = unwrapExpression(node.arguments[2]);
     if (!ts.isObjectLiteralExpression(descriptor)
       || !descriptor.properties.some(property => property.name
-        && propertyNameText(property.name) === 'value'
-        && isCallableFacadeProperty(property))) return null;
+        && ['value', 'get', 'set'].includes(propertyNameText(property.name)))) return null;
     return staticStringText(node.arguments[1]);
   };
   const concatenatedDefineProperty = parse(
@@ -705,8 +702,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       const source = unwrapExpression(argument);
       if (!ts.isObjectLiteralExpression(source)) return [];
       return source.properties.filter(property => property.name
-        && propertyNameText(property.name) === 'directPostOwnerIdentity'
-        && isCallableFacadeProperty(property));
+        && propertyNameText(property.name) === 'directPostOwnerIdentity');
     });
   };
   const collectSurfaceStateFacades = ast => {
@@ -725,8 +721,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       if (ts.isBinaryExpression(node)
         && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         && targetsSurfaceState(node.left, targetClass)
-        && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity'
-        && isImplementationExpression(node.right)) installations.push(node);
+        && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') installations.push(node);
       if (definePropertyName(node, targetClass) === 'directPostOwnerIdentity') installations.push(node);
       installations.push(...objectAssignProperties(node, targetClass));
     });
@@ -758,11 +753,19 @@ test('17. process capture has one owner and State delegates raw arguments', () =
 
   const facadeRecognitionCases = [
     ['A1 grouped prototype assignment', "class SurfaceState { directPostOwnerIdentity() {} } (SurfaceState.prototype).directPostOwnerIdentity = function () {};", 2],
+    ['prototype assignment null value', 'class SurfaceState { directPostOwnerIdentity() {} } SurfaceState.prototype.directPostOwnerIdentity = null;', 2],
+    ['grouped prototype assignment null value', 'class SurfaceState { directPostOwnerIdentity() {} } (SurfaceState.prototype).directPostOwnerIdentity = null;', 2],
+    ['prototype assignment imported value', 'class SurfaceState { directPostOwnerIdentity() {} } SurfaceState.prototype.directPostOwnerIdentity = importedCapture;', 2],
     ['A2 grouped defineProperty receiver', "class SurfaceState { directPostOwnerIdentity() {} } Object.defineProperty((SurfaceState.prototype), 'directPostOwnerIdentity', { value: function () {} });", 2],
+    ['defineProperty null value', "class SurfaceState { directPostOwnerIdentity() {} } Object.defineProperty(SurfaceState.prototype, 'directPostOwnerIdentity', { value: null });", 2],
+    ['defineProperty imported value', "class SurfaceState { directPostOwnerIdentity() {} } Object.defineProperty(SurfaceState.prototype, 'directPostOwnerIdentity', { value: importedCapture });", 2],
     ['A3 grouped Object.assign receiver', "class SurfaceState { directPostOwnerIdentity() {} } Object.assign((SurfaceState.prototype), { directPostOwnerIdentity() {} });", 2],
+    ['Object.assign null value', 'class SurfaceState { directPostOwnerIdentity() {} } Object.assign(SurfaceState.prototype, { directPostOwnerIdentity: null });', 2],
+    ['Object.assign imported value', 'class SurfaceState { directPostOwnerIdentity() {} } Object.assign(SurfaceState.prototype, { directPostOwnerIdentity: importedCapture });', 2],
     ['A4 other prototype receiver', "class SurfaceState { directPostOwnerIdentity() {} } class OtherState {} (OtherState.prototype).directPostOwnerIdentity = function () {};", 1],
     ['A5 constructor object receiver', "class SurfaceState { directPostOwnerIdentity() {} } (SurfaceState).directPostOwnerIdentity = function () {};", 1],
     ['A6 constructor dot assignment', "class SurfaceState { constructor() { this.directPostOwnerIdentity = function () {}; } directPostOwnerIdentity() {} }", 2],
+    ['constructor null assignment', 'class SurfaceState { constructor() { this.directPostOwnerIdentity = null; } directPostOwnerIdentity() {} }', 2],
     ['A7 constructor element assignment', "class SurfaceState { constructor() { this['directPostOwnerIdentity'] = function () {}; } directPostOwnerIdentity() {} }", 2],
     ['constructor defineProperty receiver', "class SurfaceState { constructor() { Object.defineProperty(this, 'directPostOwnerIdentity', { value: function () {} }); } directPostOwnerIdentity() {} }", 2],
     ['constructor Object.assign receiver', "class SurfaceState { constructor() { Object.assign(this, { directPostOwnerIdentity() {} }); } directPostOwnerIdentity() {} }", 2],
@@ -771,9 +774,9 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['A9 unrelated constructor property', "class SurfaceState { constructor() { this.otherMethod = function () {}; } directPostOwnerIdentity() {} }", 1],
     ['A10 static method', "class SurfaceState { static directPostOwnerIdentity() {} directPostOwnerIdentity() {} }", 1],
     ['nested function this', "class SurfaceState { constructor() { function install() { this.directPostOwnerIdentity = function () {}; } } directPostOwnerIdentity() {} }", 1],
-    ['prototype assignment alias', "class SurfaceState { directPostOwnerIdentity() {} } (SurfaceState.prototype).directPostOwnerIdentity = importedCapture;", 1],
-    ['defineProperty alias value', "class SurfaceState { directPostOwnerIdentity() {} } Object.defineProperty((SurfaceState.prototype), 'directPostOwnerIdentity', { value: importedCapture });", 1],
-    ['Object.assign alias value', "class SurfaceState { directPostOwnerIdentity() {} } Object.assign((SurfaceState.prototype), { directPostOwnerIdentity: importedCapture });", 1],
+    ['prototype assignment alias', "class SurfaceState { directPostOwnerIdentity() {} } (SurfaceState.prototype).directPostOwnerIdentity = importedCapture;", 2],
+    ['defineProperty alias value', "class SurfaceState { directPostOwnerIdentity() {} } Object.defineProperty((SurfaceState.prototype), 'directPostOwnerIdentity', { value: importedCapture });", 2],
+    ['Object.assign alias value', "class SurfaceState { directPostOwnerIdentity() {} } Object.assign((SurfaceState.prototype), { directPostOwnerIdentity: importedCapture });", 2],
   ];
   for (const [label, source, expected] of facadeRecognitionCases) {
     assert.equal(collectSurfaceStateFacades(parse(source, ts.ScriptKind.TS)).length, expected, label);
