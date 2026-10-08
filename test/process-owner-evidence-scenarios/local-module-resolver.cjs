@@ -450,17 +450,22 @@ function createLocalModuleResolver(files) {
         addExport(name, assignmentValue(expression.right), exportObjectIdentity(receiver));
       }
       const nestedPath = exportObjectPath(receiver);
-      if (nestedPath) {
-        for (const object of exportedObjectLiterals(nestedPath)) {
-          let properties = module.nestedObjectProperties.get(object);
-          if (!properties) {
-            properties = new Map();
-            module.nestedObjectProperties.set(object, properties);
-          }
-          const existing = properties.get(String(name));
-          if (existing) existing.push(assignmentValue(expression.right));
-          else properties.set(String(name), [assignmentValue(expression.right)]);
+      const nestedObjects = new Set(nestedPath ? exportedObjectLiterals(nestedPath) : []);
+      if (ts.isIdentifier(receiver) && module.imports.has(receiver.text)) {
+        for (const atom of evaluate(receiver, resolvedPath, new Set())) {
+          if (atom?.objectLiteral) nestedObjects.add(atom.objectLiteral);
         }
+      }
+      for (const object of nestedObjects) {
+        const objectOwner = scanModule(object.getSourceFile().fileName) || module;
+        let properties = objectOwner.nestedObjectProperties.get(object);
+        if (!properties) {
+          properties = new Map();
+          objectOwner.nestedObjectProperties.set(object, properties);
+        }
+        const existing = properties.get(String(name));
+        if (existing) existing.push(assignmentValue(expression.right));
+        else properties.set(String(name), [assignmentValue(expression.right)]);
       }
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module' &&

@@ -63,6 +63,44 @@ test("native Promise result aliases retain callback probe identity", () => {
 runFixture("function newProbe(pid) { const pending = Promise.resolve(pid); pending.then(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
 runFixture("function newProbe(pid) { let pending; pending = Promise.resolve(pid); const alias = pending; alias.then(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
 runFixture("function newProbe(pid) { const Promise = {resolve: value => ({then: callback => callback(value)})}; const pending = Promise.resolve(pid); pending.then(process.kill); }", [], []);
+runFixture("function newProbe(pid) { const pending = new Promise(resolve => resolve(pid)); const alias = pending; alias.then(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+runFixture("function newProbe(pid) { class Promise { constructor(executor) {} } const pending = new Promise(resolve => resolve(pid)); pending.then(process.kill); }", [], []);
+});
+
+test("defineProperty getter returns preserve finite probe identity", () => {
+  runFixture("const api = {}; Object.defineProperty(api, 'probe', {get() { return process.kill; }}); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const api = {}; Object.defineProperty(api, 'probe', {get() { return () => true; }}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+  runFixture("const api = {}; Object.defineProperty(api, 'probe', {value: function probe() { return true; }}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("Reflect.get aliases preserve only builtin probe identity", () => {
+  runFixture("const get = Reflect.get; const probe = get(process, 'kill'); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const get = Reflect.get; const probe = get({ready: true}, 'ready'); function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("const Reflect = {get(target, key) { return target[key]; }}; const get = Reflect.get; const probe = get({ready: true}, 'ready'); function newProbe(pid) { probe(pid, 0); }", [], []);
+});
+
+test("global timer callbacks preserve native forwarding and respect shadows", () => {
+  runFixture("function newProbe(pid) { globalThis.setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { global.setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const globalThis = {setImmediate(callback) {}}; function newProbe(pid) { globalThis.setImmediate(process.kill, pid, 0); }", [], []);
+});
+
+test("writes through imported objects attach probes to the exported identity", () => {
+  const importedProbe = inventoryFiles({
+    "producer.mjs": "export const api = {};",
+    "writer.mjs": "import {api} from './producer.mjs'; api.probe = process.kill;",
+    "consumer.mjs": "import {api} from './producer.mjs'; function newProbe(pid) { api.probe(pid, 0); }"
+  });
+  assert.equal(importedProbe.kills.length, 1);
+  assert.deepEqual(importedProbe.violations, ["unclassified process probe consumer.mjs:newProbe"]);
+
+  const ordinaryWrite = inventoryFiles({
+    "producer.mjs": "export const api = {};",
+    "writer.mjs": "import {api} from './producer.mjs'; api.probe = () => true;",
+    "consumer.mjs": "import {api} from './producer.mjs'; function newProbe(pid) { api.probe(pid, 0); }"
+  });
+  assert.deepEqual(ordinaryWrite.kills, []);
+  assert.deepEqual(ordinaryWrite.violations, []);
 });
 
 test("logical AND excludes statically unreachable probes and keeps unknowns", () => {

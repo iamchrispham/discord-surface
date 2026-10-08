@@ -310,9 +310,23 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
     return null;
   };
+  const localImportAtomCache = new WeakMap();
+  // The resolver has indexed the full module graph; cache export identities, not member snapshots.
+  const localImportResolutionCache = new Map();
+  const resolveLocalImport = (specifier, name, options = {}) => {
+    const key = `${virtualPath}\u0000${specifier}\u0000${name}\u0000${options.importEquals === true}`;
+    const cached = localImportResolutionCache.get(key);
+    if (cached) return new Set(cached);
+    const atoms = moduleResolver.resolveImport(virtualPath, specifier, name, options);
+    localImportResolutionCache.set(key, new Set(atoms));
+    return atoms;
+  };
   const localImportAtoms = symbol => {
-    if (!moduleResolver) return new Set();
+    if (!moduleResolver || !symbol) return new Set();
+    const cached = localImportAtomCache.get(symbol);
+    if (cached) return new Set(cached);
     const atoms = new Set();
+    let sawImport = false;
     for (const declaration of symbol?.declarations || []) {
       let importDeclaration = declaration;
       while (importDeclaration && !ts.isImportDeclaration(importDeclaration)) {
@@ -325,8 +339,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (ts.isNamespaceImport(declaration)) name = '*';
         if (ts.isImportSpecifier(declaration)) name = (declaration.propertyName || declaration.name).text;
         if (name) {
-          for (const atom of moduleResolver.resolveImport(
-            virtualPath, importDeclaration.moduleSpecifier.text, name)) atoms.add(atom);
+          sawImport = true;
+          for (const atom of resolveLocalImport(importDeclaration.moduleSpecifier.text, name)) atoms.add(atom);
         }
       }
       if (ts.isImportEqualsDeclaration(declaration)) {
@@ -334,11 +348,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const moduleName = reference && ts.isExternalModuleReference(reference)
           ? reference.expression : null;
         if (ts.isStringLiteral(moduleName)) {
-          for (const atom of moduleResolver.resolveImport(
-            virtualPath, moduleName.text, '*', { importEquals: true })) atoms.add(atom);
+          sawImport = true;
+          for (const atom of resolveLocalImport(moduleName.text, '*', { importEquals: true })) atoms.add(atom);
         }
       }
     }
+    if (sawImport) localImportAtomCache.set(symbol, new Set(atoms));
     return atoms;
   };
   const staticPropertyNames = (access, resolveAliases = true) => {
@@ -614,11 +629,32 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const names = [...staticValue(key)].filter(value => typeof value === 'string' || typeof value === 'number')
           .map(value => value.toString());
         for (const property of descriptor.properties) {
-          if (!ts.isPropertyAssignment(property) || !property.name) continue;
+          if ((!ts.isPropertyAssignment(property) && !ts.isMethodDeclaration(property)) || !property.name) continue;
           const descriptorName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
             ? property.name.text : null;
-          if (descriptorName !== 'value') continue;
-          indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
+          if (descriptorName === 'value' && ts.isPropertyAssignment(property)) {
+            indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
+            continue;
+          }
+          if (descriptorName !== 'get') continue;
+          const getter = ts.isPropertyAssignment(property) ? property.initializer : property;
+          const body = ts.isMethodDeclaration(getter) || ts.isFunctionExpression(getter) ||
+            ts.isArrowFunction(getter) ? getter.body : null;
+          if (!body) continue;
+          if (!ts.isBlock(body)) {
+            indexMemberAssignmentsForTarget(target, names, { source: body });
+            continue;
+          }
+          const returnedValues = [];
+          const collectReturns = node => {
+            if (node !== body && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
+              ts.isArrowFunction(node) || ts.isMethodDeclaration(node) || ts.isGetAccessor(node) ||
+              ts.isSetAccessor(node))) return;
+            if (ts.isReturnStatement(node) && node.expression) returnedValues.push(node.expression);
+            ts.forEachChild(node, collectReturns);
+          };
+          collectReturns(body);
+          for (const value of returnedValues) indexMemberAssignmentsForTarget(target, names, { source: value });
         }
       }
     }
@@ -1077,6 +1113,65 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return false;
   }
 
+  const lexicalBindingCache = new WeakMap();
+  const bindingMatches = (binding, name) => {
+    if (ts.isIdentifier(binding)) return binding.text === name;
+    if (ts.isObjectBindingPattern(binding) || ts.isArrayBindingPattern(binding)) {
+      return binding.elements.some(element => !ts.isOmittedExpression(element) &&
+        bindingMatches(ts.isBindingElement(element) ? element.name : element, name));
+    }
+    return false;
+  };
+  const statementDeclares = (statement, name) => {
+    if (ts.isVariableStatement(statement)) {
+      return statement.declarationList.declarations.some(declaration => bindingMatches(declaration.name, name));
+    }
+    if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+      ts.isEnumDeclaration(statement)) && statement.name) return bindingMatches(statement.name, name);
+    if (ts.isImportDeclaration(statement)) {
+      const clause = statement.importClause;
+      if (clause?.name && bindingMatches(clause.name, name)) return true;
+      const bindings = clause?.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings) && bindingMatches(bindings.name, name)) return true;
+      if (bindings && ts.isNamedImports(bindings) &&
+        bindings.elements.some(element => bindingMatches(element.name, name))) return true;
+    }
+    return ts.isImportEqualsDeclaration(statement) && bindingMatches(statement.name, name);
+  };
+  function hasLexicalBindingInScope(scope, name) {
+    let cachedByName = lexicalBindingCache.get(scope);
+    if (!cachedByName) {
+      cachedByName = new Map();
+      lexicalBindingCache.set(scope, cachedByName);
+    }
+    if (cachedByName.has(name)) return cachedByName.get(name);
+    let found = false;
+    if (ts.isBlock(scope) || ts.isModuleBlock(scope) || ts.isSourceFile(scope)) {
+      found = scope.statements.some(statement => statementDeclares(statement, name));
+    } else if (ts.isFunctionLike(scope)) {
+      found = scope.parameters.some(parameter => bindingMatches(parameter.name, name)) ||
+        Boolean(scope.name && bindingMatches(scope.name, name));
+    } else if (ts.isCatchClause(scope)) {
+      found = Boolean(scope.variableDeclaration && bindingMatches(scope.variableDeclaration.name, name));
+    } else if ((ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+      scope.initializer && ts.isVariableDeclarationList(scope.initializer)) {
+      found = scope.initializer.declarations.some(declaration => bindingMatches(declaration.name, name));
+    }
+    cachedByName.set(name, found);
+    return found;
+  }
+  function hasLexicalBindingAt(node, name) {
+    const isRuntimeDeclaration = declaration => !declaration.getSourceFile().isDeclarationFile &&
+      !(declaration.modifiers || []).some(modifier => modifier.kind === ts.SyntaxKind.DeclareKeyword);
+    if ((checker.getSymbolAtLocation(node)?.declarations || []).some(isRuntimeDeclaration)) return true;
+    let current = node.parent;
+    while (current) {
+      if (hasLexicalBindingInScope(current, name)) return true;
+      current = current.parent;
+    }
+    return false;
+  }
+
   function bindingSourceExpression(node) {
     let current = node;
     while (current && (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) ||
@@ -1305,6 +1400,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return expressions;
   }
 
+  const REFLECT_GET = { builtin: 'Reflect.get' };
+
   function resolveSet(node, visited) {
     const empty = new Set();
     if (!node || visited.has(node)) return empty;
@@ -1388,6 +1485,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       for (const name of names) {
         if (name === 'default' && hasAtom(receiver, PROCESS_NAMESPACE)) result.add(PROCESS_OBJECT);
         if (name === 'process' && hasAtom(receiver, GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
+        if (name === 'get' && hasAtom(receiver, REFLECT_OBJECT) &&
+          !hasLexicalBindingAt(node.expression, 'Reflect')) result.add(REFLECT_GET);
         for (const atom of receiver) {
           if (moduleResolver?.resolveProperty) {
             for (const resolved of moduleResolver.resolveProperty([atom], String(name), virtualPath, seen)) {
@@ -1524,6 +1623,24 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
 
     if (ts.isCallExpression(node)) {
+      if (node.arguments.length >= 2 && hasAtom(resolveSet(node.expression, seen), REFLECT_GET)) {
+        const receiverAtoms = resolveSet(node.arguments[0], seen);
+        const propertyNames = [...resolveSet(node.arguments[1], seen)].filter(value =>
+          typeof value === 'string' || typeof value === 'number');
+        const result = new Set();
+        for (const atom of receiverAtoms) {
+          for (const name of propertyNames) {
+            if (atom === GLOBAL_OBJECT && String(name) === 'process') result.add(PROCESS_OBJECT);
+            if (atom === PROCESS_OBJECT && String(name) === 'kill') result.add(PID_PROBE);
+            if (moduleResolver?.resolveProperty) {
+              for (const resolved of moduleResolver.resolveProperty([atom], String(name), virtualPath, seen)) {
+                result.add(resolved);
+              }
+            }
+          }
+        }
+        return result;
+      }
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
         const moduleNames = resolveSet(node.arguments[0], seen);
         const result = new Set();
@@ -1636,9 +1753,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
                 for (const atom of resolveSet(element, seen)) result.add(atom);
               }
             }
-            return result;
-          }
+          return result;
         }
+      }
         if (node.expression.name.text === 'assign' &&
           ts.isIdentifier(receiver) && receiver.text === 'Object' && methodIsBuiltin) {
           const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(receiver));
@@ -1724,6 +1841,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     const declaration = symbolDeclaration(symbol);
     if (declaration && isAmbientDeclaration(declaration)) {
       if (node.text === 'process') return new Set([PROCESS_OBJECT]);
+      if (node.text === 'Reflect') return new Set([REFLECT_OBJECT]);
       if (node.text === 'globalThis' || node.text === 'global') return new Set([GLOBAL_OBJECT]);
       if (node.text === 'undefined') return new Set([UNDEFINED_VALUE]);
     }
@@ -2326,6 +2444,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (typeof member !== 'string' || !FORWARDED_CALLBACK_APIS.has(member)) return null;
       if (member === 'nextTick' && hasAtom(staticValue(callee.expression), PROCESS_OBJECT)) return member;
       if (isTimerRequire(callee.expression)) return member;
+      if (ts.isIdentifier(callee.expression) && ['global', 'globalThis'].includes(callee.expression.text)) {
+        const receiverIsShadowed = hasLexicalBindingAt(callee.expression, callee.expression.text);
+        if (!receiverIsShadowed && hasAtom(resolveSet(callee.expression, new Set()), GLOBAL_OBJECT)) return member;
+      }
       const receiverSymbol = checker.getSymbolAtLocation(callee.expression);
       for (const declaration of receiverSymbol?.declarations || []) {
         if (ts.isNamespaceImport(declaration)) {
@@ -2391,6 +2513,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   function isUnshadowedNativePromiseFactory(expression) {
+    if (ts.isNewExpression(expression)) {
+      const promise = expression.expression;
+      if (!ts.isIdentifier(promise) || promise.text !== 'Promise') return false;
+      return !checker.getSymbolAtLocation(promise)?.declarations?.some(declaration =>
+        declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration));
+    }
     if (!ts.isCallExpression(expression) ||
       !ts.isPropertyAccessExpression(expression.expression) ||
       !['resolve', 'reject'].includes(expression.expression.name.text)) return false;
