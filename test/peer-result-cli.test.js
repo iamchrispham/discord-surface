@@ -39,7 +39,9 @@ function prepared(t, provider = 'codex') {
 }
 
 function runCli(f, argv, environment = {}) {
-  const deadline = path.join(path.dirname(f.db), 'cli-deadline.cjs');
+  const deadlineDir = path.join(path.dirname(f.db), 'trap-path');
+  fs.mkdirSync(deadlineDir, { recursive: true });
+  const deadline = path.join(deadlineDir, 'cli-deadline.cjs');
   fs.writeFileSync(deadline, 'setTimeout(() => process.exit(124), 4000).unref();\n');
   return spawnSync(process.execPath, ['--require', deadline, CLI, ...argv], {
     env: { ...process.env, ...environment },
@@ -54,7 +56,7 @@ function invoke(f, flags = [], identity = NATIVE) {
 
 function createNetworkTrap(f) {
   const dir = path.dirname(f.db);
-  const preload = path.join(dir, 'cli-network-trap.cjs');
+  const preload = path.join(dir, 'cli-network-guard.cjs');
   const marker = path.join(dir, 'network-trap-hit');
   fs.writeFileSync(preload, `
     const fs = require('node:fs');
@@ -281,7 +283,8 @@ function createNetworkTrap(f) {
           "const {workerData}=require('node:worker_threads');",
           "const stageWait=new Int32Array(new SharedArrayBuffer(4));",
           "const workerDeadline=Date.now()+1200;",
-          "const trapLoaded=Boolean(/(?:--require|--import).*trap/i.test(process.env.NODE_OPTIONS||'')||process.execArgv.some(arg=>/--(?:require|import).*trap/i.test(arg))||Object.keys(require.cache).some(path=>/trap/i.test(path)));",
+          "const inspectorTargets=globalThis.__peerResultInspectorTargets;",
+          "const trapLoaded=Boolean(inspectorTargets&&typeof inspectorTargets==='object'&&typeof inspectorTargets.worker==='function'&&typeof inspectorTargets.spawn==='function'&&typeof inspectorTargets.spawnSync==='function');",
           "const attempt={transport:workerData.transport,operation:'connect',port:9,host:'127.0.0.1',trapLoaded};",
           "let terminal=false;",
           "const finish=(state,details={})=>{if(terminal)return false;terminal=true;fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state,...details}));return true};",
