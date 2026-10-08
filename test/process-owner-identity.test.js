@@ -397,7 +397,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       && statement.expression
       && isImplementationExpression(statement.expression));
   }
-  function isImplementationDescriptor(expression) {
+  function isImplementationDescriptor(expression, isLocalImplementationAlias) {
     const descriptor = unwrapExpression(expression);
     if (!ts.isObjectLiteralExpression(descriptor)) return false;
     return descriptor.properties.some(property => {
@@ -405,7 +405,9 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       const name = propertyNameText(property.name);
       if (name === 'value') {
         if (ts.isMethodDeclaration(property)) return true;
-        return ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer);
+        return ts.isPropertyAssignment(property)
+          && (isImplementationExpression(property.initializer)
+            || isLocalImplementationAlias(property.initializer));
       }
       if (name !== 'get') return false;
       if (ts.isMethodDeclaration(property)) return hasDirectImplementationReturn(property.body);
@@ -419,16 +421,16 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       return ts.isFunctionExpression(getter) && hasDirectImplementationReturn(getter.body);
     });
   }
-  function isDefinePropertyImplementation(node) {
+  function isDefinePropertyImplementation(node, isLocalImplementationAlias) {
     return ts.isCallExpression(node)
       && ts.isPropertyAccessExpression(node.expression)
       && ts.isIdentifier(node.expression.expression)
       && node.expression.expression.text === 'Object'
       && node.expression.name.text === 'defineProperty'
       && node.arguments.length >= 3
-      && isImplementationDescriptor(node.arguments[2]);
+      && isImplementationDescriptor(node.arguments[2], isLocalImplementationAlias);
   }
-  function definePropertiesImplementationNames(node) {
+  function definePropertiesImplementationNames(node, isLocalImplementationAlias) {
     if (!ts.isCallExpression(node)
       || !ts.isPropertyAccessExpression(node.expression)
       || !ts.isIdentifier(node.expression.expression)
@@ -440,7 +442,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     return descriptors.properties.flatMap(property => {
       if (!ts.isPropertyAssignment(property) || !property.name) return [];
       const name = propertyNameText(property.name);
-      if (!name || !isImplementationDescriptor(property.initializer)) return [];
+      if (!name || !isImplementationDescriptor(property.initializer, isLocalImplementationAlias)) return [];
       return [name];
     });
   }
@@ -487,21 +489,44 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     }
     return false;
   }
+  function sourceChecker(ast) {
+    const options = { allowJs: true, noLib: true, noResolve: true };
+    const fileName = path.resolve(ast.fileName);
+    const matchesSource = candidate => path.resolve(candidate) === fileName;
+    const host = ts.createCompilerHost(options);
+    host.getSourceFile = candidate => matchesSource(candidate) ? ast : undefined;
+    host.fileExists = candidate => matchesSource(candidate);
+    host.readFile = candidate => matchesSource(candidate) ? ast.text : undefined;
+    return ts.createProgram([fileName], options, host).getTypeChecker();
+  }
   function declaredNames(ast) {
     const names = [];
+    const checker = sourceChecker(ast);
     const localImplementations = new Set();
+    function recordLocalImplementation(identifier) {
+      const symbol = checker.getSymbolAtLocation(identifier);
+      if (symbol && (symbol.flags & ts.SymbolFlags.Alias) === 0) localImplementations.add(symbol);
+    }
+    function isLocalImplementationAlias(expression) {
+      const identifier = unwrapExpression(expression);
+      if (!ts.isIdentifier(identifier)) return false;
+      const symbol = checker.getSymbolAtLocation(identifier);
+      return Boolean(symbol
+        && (symbol.flags & ts.SymbolFlags.Alias) === 0
+        && localImplementations.has(symbol));
+    }
     walk(ast, node => {
       if (ts.isFunctionDeclaration(node)
         && node.name
         && node.body
         && !hasDeclareModifier(node)) {
-        localImplementations.add(node.name.text);
+        recordLocalImplementation(node.name);
       }
       if ((ts.isClassDeclaration(node) || ts.isClassExpression(node))
         && node.name
         && !hasDeclareModifier(node)
         && !hasAmbientAncestor(node)) {
-        localImplementations.add(node.name.text);
+        recordLocalImplementation(node.name);
       }
       if (ts.isVariableDeclaration(node)
         && ts.isIdentifier(node.name)
@@ -510,7 +535,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         if (ts.isFunctionExpression(initializer)
           || ts.isArrowFunction(initializer)
           || ts.isClassExpression(initializer)) {
-          localImplementations.add(node.name.text);
+          recordLocalImplementation(node.name);
         }
       }
       if (ts.isBinaryExpression(node)
@@ -520,7 +545,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         if (ts.isFunctionExpression(implementation)
           || ts.isArrowFunction(implementation)
           || ts.isClassExpression(implementation)) {
-          localImplementations.add(node.left.text);
+          recordLocalImplementation(node.left);
         }
       }
     });
@@ -545,14 +570,16 @@ test('17. process capture has one owner and State delegates raw arguments', () =
           names.push(node.name.text);
         }
       }
-      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      if (ts.isBinaryExpression(node)
+        && (node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+          || node.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken
+          || node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken)) {
         const name = assignmentPropertyNameText(node.left);
         const implementation = unwrapExpression(node.right);
         if (name && (ts.isFunctionExpression(implementation)
           || ts.isArrowFunction(implementation)
           || ts.isClassExpression(implementation)
-          || (ts.isIdentifier(implementation)
-            && localImplementations.has(implementation.text)))) {
+          || isLocalImplementationAlias(implementation))) {
           names.push(name);
         }
       }
@@ -563,10 +590,10 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         && node.expression.name.text === 'defineProperty'
         && node.arguments.length >= 2) {
         const name = staticStringText(node.arguments[1]);
-        if (name && isDefinePropertyImplementation(node)) names.push(name);
+        if (name && isDefinePropertyImplementation(node, isLocalImplementationAlias)) names.push(name);
       }
       if (ts.isCallExpression(node)) {
-        names.push(...definePropertiesImplementationNames(node));
+        names.push(...definePropertiesImplementationNames(node, isLocalImplementationAlias));
       }
       if (isRuntimeMemberImplementation(node) && node.name) {
         const name = propertyNameText(node.name);
@@ -581,9 +608,23 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const localClassAliasAst = parse(`class LocalCapture {}
     exports.captureProcessOwnerIdentity = LocalCapture;`);
   assert.ok(declaredNames(localClassAliasAst).includes('captureProcessOwnerIdentity'));
+  const localDescriptorAliasAst = parse(`function localCapture() {}
+    Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value: localCapture });`);
+  assert.ok(declaredNames(localDescriptorAliasAst).includes('captureProcessOwnerIdentity'));
+  const localDefinePropertiesAliasAst = parse(`const localCapture = () => {};
+    Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: localCapture } });`);
+  assert.ok(declaredNames(localDefinePropertiesAliasAst).includes('captureProcessOwnerIdentity'));
   const importedAliasAst = parse(`import { localCapture } from './capture.js';
     exports.captureProcessOwnerIdentity = localCapture;`);
   assert.equal(declaredNames(importedAliasAst).includes('captureProcessOwnerIdentity'), false);
+  const shadowedImportedAliasAst = parse(`import { handler } from './capture.js';
+    { const handler = function () {}; }
+    exports.captureProcessOwnerIdentity = handler;`);
+  assert.equal(declaredNames(shadowedImportedAliasAst).includes('captureProcessOwnerIdentity'), false);
+  const logicalOwnerAssignmentAst = parse(`exports.captureProcessOwnerIdentity ||= function () {};`);
+  assert.ok(declaredNames(logicalOwnerAssignmentAst).includes('captureProcessOwnerIdentity'));
+  const nullishOwnerAssignmentAst = parse(`exports.captureProcessOwnerIdentity ??= () => null;`);
+  assert.ok(declaredNames(nullishOwnerAssignmentAst).includes('captureProcessOwnerIdentity'));
   const nonCallableGetterAst = parse(`const unrelated = {
     get captureProcessOwnerIdentity() { return null; }
   };`);
@@ -863,6 +904,9 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         && isFacadeAssignmentOperator(node.operatorToken.kind)
         && targetsSurfaceState(node.left, targetClass)
         && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') installations.push(node);
+      if (ts.isDeleteExpression(node)
+        && targetsSurfaceState(node.expression, targetClass)
+        && staticAssignmentPropertyName(node.expression) === 'directPostOwnerIdentity') installations.push(node);
       if (definePropertyName(node, targetClass) === 'directPostOwnerIdentity') installations.push(node);
       installations.push(...definePropertiesMembers(node, targetClass));
       installations.push(...objectAssignProperties(node, targetClass));
@@ -877,6 +921,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     constructor() { this.directPostOwnerIdentity ||= replacement; }
   }`);
   assert.equal(collectSurfaceStateFacades(nonWritingFacadeAst).length, 0);
+  const deletedFacadeAst = parse(`class SurfaceState {
+    directPostOwnerIdentity() {}
+  }
+  delete SurfaceState.prototype.directPostOwnerIdentity;`);
+  assert.equal(collectSurfaceStateFacades(deletedFacadeAst).length, 2);
   const facade = collectSurfaceStateFacades(stateAst);
   assert.equal(facade.length, 1);
   assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
