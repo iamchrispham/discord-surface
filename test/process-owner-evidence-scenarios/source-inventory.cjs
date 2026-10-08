@@ -591,19 +591,21 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (objectMethodCall === 'assign' && !shadowedObject) {
       const target = expression.arguments[0];
       if (target) {
+        const properties = new Map();
         for (const source of expression.arguments.slice(1)) {
-          const object = ts.isParenthesizedExpression(source) ? source.expression : source;
-          if (!ts.isObjectLiteralExpression(object)) continue;
-          for (const property of object.properties) {
+          const object = objectLiteralValue(source);
+          if (!object) continue;
+          for (const property of object.objectLiteral.properties) {
             if (!property.name || (!ts.isPropertyAssignment(property) &&
               !ts.isShorthandPropertyAssignment(property))) continue;
             const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
               ts.isNumericLiteral(property.name) ? property.name.text : null;
             if (name === null) continue;
             const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
-            indexMemberAssignmentsForTarget(target, [name], { source: value });
+            properties.set(name, { source: value });
           }
         }
+        for (const [name, value] of properties) indexMemberAssignmentsForTarget(target, [name], value);
       }
     }
     if (objectMethodCall === 'defineProperty' && !shadowedObject) {
@@ -1325,6 +1327,17 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const operator = node.operatorToken.kind;
       if (operator === ts.SyntaxKind.EqualsToken) return resolveSet(node.right, seen);
       if (operator === ts.SyntaxKind.CommaToken) return resolveSet(node.right, seen);
+      if (operator === ts.SyntaxKind.PlusToken) {
+        const left = resolveSet(node.left, seen);
+        const right = resolveSet(node.right, seen);
+        if (!left.size || !right.size || left.size * right.size > 64 ||
+          [...left, ...right].some(value => typeof value !== 'string')) return empty;
+        const result = new Set();
+        for (const leftValue of left) {
+          for (const rightValue of right) result.add(leftValue + rightValue);
+        }
+        return result;
+      }
       if (operator === ts.SyntaxKind.QuestionQuestionToken) {
         const left = resolveSet(node.left, seen);
         const result = new Set([...left].filter(atom => atom !== null && atom !== UNDEFINED_VALUE));
@@ -1483,8 +1496,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const addReturnExpression = expression => {
         const returned = transparentExpression(expression) || expression;
         if (ts.isConditionalExpression(returned)) {
-          addReturnExpression(returned.whenTrue);
-          addReturnExpression(returned.whenFalse);
+          const condition = staticTruthiness(returned.condition, seen);
+          if (condition !== false) addReturnExpression(returned.whenTrue);
+          if (condition !== true) addReturnExpression(returned.whenFalse);
           return;
         }
         if (ts.isObjectLiteralExpression(returned)) {
@@ -1971,6 +1985,17 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       return found;
     }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'create' && ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'Object') {
+      const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression.expression));
+      const methodDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression));
+      const objectIsBuiltin = !objectDeclaration || isAmbientDeclaration(objectDeclaration);
+      const methodIsBuiltin = !methodDeclaration || isAmbientDeclaration(methodDeclaration);
+      if (objectIsBuiltin && methodIsBuiltin && node.arguments[0]) {
+        return literalProperty(node.arguments[0], name, seen);
+      }
+    }
     if (ts.isObjectLiteralExpression(node)) {
       for (const property of [...node.properties].reverse()) {
         if (ts.isSpreadAssignment(property)) {
@@ -2365,10 +2390,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       hasAtom(staticValue(callee.expression), PROCESS_OBJECT);
   }
 
-  function isUnshadowedNativePromiseResolve(expression) {
+  function isUnshadowedNativePromiseFactory(expression) {
     if (!ts.isCallExpression(expression) ||
       !ts.isPropertyAccessExpression(expression.expression) ||
-      expression.expression.name.text !== 'resolve') return false;
+      !['resolve', 'reject'].includes(expression.expression.name.text)) return false;
     const promise = expression.expression.expression;
     if (!ts.isIdentifier(promise) || promise.text !== 'Promise') return false;
     return !checker.getSymbolAtLocation(promise)?.declarations?.some(declaration =>
@@ -2379,7 +2404,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (ts.isAwaitExpression(expression)) return false;
     const transparent = transparentExpression(expression);
     if (transparent) return isNativePromiseResult(transparent, visited);
-    if (isUnshadowedNativePromiseResolve(expression)) return true;
+    if (isUnshadowedNativePromiseFactory(expression)) return true;
     if (!ts.isIdentifier(expression)) return false;
     const symbol = checker.getSymbolAtLocation(expression);
     if (!symbol || visited.has(symbol)) return false;
@@ -2575,8 +2600,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       const arrayCallbackMethod = staticMemberName(callee);
       const arrayCallback = callArguments[0] || node.arguments[0];
-      if (arrayCallbackMethod && (finiteArrayCallbackMethods.has(arrayCallbackMethod) ||
-        finiteArrayReducerMethods.has(arrayCallbackMethod)) && arrayCallback) {
+      const callbackMethodSymbol = checker.getSymbolAtLocation(callee);
+      const callbackMethodDeclaration = symbolDeclaration(callbackMethodSymbol);
+      const callbackMethodIsCustom = Boolean(callbackMethodDeclaration &&
+        !callbackMethodDeclaration.getSourceFile().isDeclarationFile &&
+        !isAmbientDeclaration(callbackMethodDeclaration));
+      if (arrayCallbackMethod && !callbackMethodIsCustom &&
+        (finiteArrayCallbackMethods.has(arrayCallbackMethod) ||
+          finiteArrayReducerMethods.has(arrayCallbackMethod)) && arrayCallback) {
         const elements = literalArrayElements(callee.expression);
         const callbackAtoms = staticValue(arrayCallback);
         if (hasAtom(callbackAtoms, PID_PROBE)) {

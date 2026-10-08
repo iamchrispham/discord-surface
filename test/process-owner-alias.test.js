@@ -31,6 +31,25 @@ runFixture("const proc = process; function newProbe(pid) { proc.kill(pid, 0); }"
 runFixture("const {kill: probe} = process; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("finite concatenated property names preserve probe identity", () => {
+  runFixture("function newProbe(pid) { process['ki' + 'll'](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { process['ki' + 'lls'](pid, 0); }", [], []);
+});
+
+test("Object.assign resolves bounded aliased sources in order", () => {
+  runFixture("const source = {probe: process.kill}; const api = {}; Object.assign(api, source); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const source = {probe: process.kill}; const api = {}; Object.assign(api, source, {probe: () => true}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("Object.create preserves bounded prototype probe properties", () => {
+  runFixture("const api = Object.create({probe: process.kill}); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const api = Object.create({probe: () => true}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("known custom forEach methods are not treated as array callbacks", () => {
+  runFixture("const registry = {forEach(callback) { return true; }}; function newProbe(pid) { registry.forEach(process.kill); }", [], []);
+});
+
 test("local process shadow is not a probe", () => {
 runFixture("const process = { kill() {} }; function newProbe(pid) { process.kill(pid, 0); }", [], []);
 });
@@ -230,6 +249,8 @@ test("finite CommonJS specifier values retain local module provenance", () => {
 test("native Promise rejection handlers are inventoried", () => {
   runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).then(undefined, process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
   runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).then(undefined, reason => reason); }", [], []);
+  runFixture("function newProbe(pid) { Promise.reject(pid).catch(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { const Promise = {reject: value => ({catch: callback => true})}; Promise.reject(pid).catch(process.kill); }", [], []);
 });
 
 test("static template eval source is parsed without evaluating it", () => {
@@ -262,6 +283,8 @@ test("constructor callable and object returns preserve probe aliases", () => {
   runFixture("function Factory() { return process.kill; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function Factory() { return { probe: process.kill }; } const api = new Factory(); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function Factory() { return 1; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("function Factory() { return true ? (() => true) : process.kill; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("function Factory() { return condition ? (() => true) : process.kill; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 
   const importedCallable = inventoryFiles({
     "private-alias.js": "import { Factory } from './factory'; const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }",
