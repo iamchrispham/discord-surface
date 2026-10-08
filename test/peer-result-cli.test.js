@@ -58,34 +58,131 @@ function createNetworkTrap(f) {
   const marker = path.join(dir, 'network-trap-hit');
   fs.writeFileSync(preload, `
     const fs = require('node:fs');
+    const preload = ${JSON.stringify(preload)};
     const marker = ${JSON.stringify(marker)};
-    const blocked = name => () => {
+    const probeLabels = {
+      fetch: 'fetch',
+      'http.get': 'node:http.get',
+      'socket.connect': 'node:net.Socket.connect',
+      'dns.lookup': 'node:dns.lookup',
+      'http2.connect': 'node:http2.connect'
+    };
+    const blocked = fallback => (...args) => {
+      const probe = process.env.PEER_RESULT_TEST_NETWORK_PROBE;
+      const name = probeLabels[probe] || fallback;
       fs.writeFileSync(marker, name);
       throw new Error('NETWORK_BLOCKED:' + name);
     };
-    globalThis.fetch = blocked('fetch');
-    for (const [moduleName, methods] of Object.entries({
-      'node:http': ['request', 'get'],
-      'node:https': ['request', 'get'],
-      'node:net': ['connect', 'createConnection'],
-      'node:tls': ['connect'],
-      'node:dgram': ['createSocket'],
-      'node:dns': ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny',
-        'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa',
-        'resolveSrv', 'resolveTxt', 'reverse'],
-      'node:http2': ['connect']
-    })) {
-      const api = require(moduleName);
-      for (const method of methods) api[method] = blocked(moduleName + '.' + method);
+    const patchBindingMethod = (bindingName, ownerName, methodName, label) => {
+      const owner = process.binding(bindingName)[ownerName];
+      if (!owner || typeof owner.prototype?.[methodName] !== 'function') {
+        throw new Error('NETWORK_TRAP_UNSUPPORTED:' + bindingName + '.' + ownerName + '.' + methodName);
+      }
+      owner.prototype[methodName] = blocked(label);
+    };
+    patchBindingMethod('tcp_wrap', 'TCP', 'connect', 'tcp_wrap.TCP.connect');
+    const udpPrototype = process.binding('udp_wrap').UDP.prototype;
+    for (const methodName of Object.getOwnPropertyNames(udpPrototype)) {
+      if (/^(bind|connect|send)/.test(methodName) && typeof udpPrototype[methodName] === 'function') {
+        udpPrototype[methodName] = blocked('udp_wrap.UDP.' + methodName);
+      }
     }
-    const net = require('node:net');
-    net.Socket.prototype.connect = blocked('node:net.Socket.connect');
+    const channelPrototype = process.binding('cares_wrap').ChannelWrap.prototype;
+    for (const methodName of Object.getOwnPropertyNames(channelPrototype)) {
+      if (methodName.startsWith('query') && typeof channelPrototype[methodName] === 'function') {
+        channelPrototype[methodName] = blocked('cares_wrap.ChannelWrap.' + methodName);
+      }
+    }
+
     const dns = require('node:dns');
-    for (const method of ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny',
-      'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa',
-      'resolveSrv', 'resolveTxt', 'reverse']) {
-      dns.promises[method] = blocked('node:dns.promises.' + method);
-    }
+    dns.lookup = blocked('node:dns.lookup');
+    dns.promises.lookup = blocked('node:dns.promises.lookup');
+
+    const processWrap = process.binding('process_wrap');
+    const addNetworkTrap = options => {
+      const childOptions = options || {};
+      const envPairs = Array.isArray(childOptions.envPairs) ? childOptions.envPairs : [];
+      const existing = envPairs.find(pair => pair.startsWith('NODE_OPTIONS='));
+      const existingOptions = existing ? existing.slice('NODE_OPTIONS='.length) : '';
+      const nextOptions = existingOptions.includes(preload)
+        ? existingOptions
+        : [existingOptions, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' ');
+      return { ...childOptions,
+        envPairs: [...envPairs.filter(pair => !pair.startsWith('NODE_OPTIONS=')), 'NODE_OPTIONS=' + nextOptions] };
+    };
+    const processSpawn = processWrap.Process.prototype.spawn;
+    processWrap.Process.prototype.spawn = function(options) {
+      return processSpawn.call(this, addNetworkTrap(options));
+    };
+    const spawnSyncBinding = process.binding('spawn_sync');
+    const spawnSync = spawnSyncBinding.spawn;
+    spawnSyncBinding.spawn = function(options) {
+      return spawnSync.call(this, addNetworkTrap(options));
+    };
+
+    const runProbe = probe => {
+      const net = require('node:net');
+      const probeActions = {
+        fetch: () => globalThis.fetch('http://127.0.0.1:8080/'),
+        'http.get': () => require('node:http').get('http://127.0.0.1:9/'),
+        'socket.connect': () => new net.Socket().connect(9, '127.0.0.1'),
+        'socket.prototype.connect': () => {
+          const socket = new net.Socket();
+          Object.getPrototypeOf(socket).connect.call(socket, 9, '127.0.0.1');
+        },
+        'dns.lookup': () => dns.lookup('localhost', () => {}),
+        'dns.promises.lookup': () => dns.promises.lookup('localhost'),
+        'http2.connect': () => require('node:http2').connect('http://127.0.0.1:9'),
+        'dns.resolver': () => {
+          const resolver = new dns.Resolver();
+          resolver.setServers(['127.0.0.1:9']);
+          resolver.resolve4('trap.invalid', () => {});
+        },
+        'dns.promises.resolver': () => {
+          const resolver = new dns.promises.Resolver();
+          resolver.setServers(['127.0.0.1:9']);
+          resolver.resolve4('trap.invalid').catch(() => {});
+        },
+        'dns.resolveCaa': () => {
+          dns.setServers(['127.0.0.1:9']);
+          dns.resolveCaa('trap.invalid', () => {});
+        },
+        'dns.resolveTlsa': () => {
+          dns.setServers(['127.0.0.1:9']);
+          dns.resolveTlsa('trap.invalid', () => {});
+        },
+        'dns.setServers': () => {
+          dns.setServers(['127.0.0.1:9']);
+          dns.resolve4('trap.invalid', () => {});
+        },
+        'dns.promises.setServers': () => {
+          const resolver = new dns.promises.Resolver();
+          resolver.setServers(['127.0.0.1:9']);
+          resolver.resolve4('trap.invalid').catch(() => {});
+        },
+        'datagram.send': () => {
+          const socket = require('node:dgram').createSocket({ type: 'udp4',
+            lookup: (_host, _options, callback) => callback(null, '127.0.0.1', 4) });
+          socket.send(Buffer.from('probe'), 9, 'trap.invalid', () => {});
+        },
+        'tcp.raw': () => {
+          const binding = process.binding('tcp_wrap');
+          new binding.TCP(binding.constants.SOCKET).connect({}, '127.0.0.1', 9, 4);
+        },
+        'child_process.spawn': () => {
+          const child = require('node:child_process').spawn(process.execPath,
+            ['-e', "require('node:net').connect(9, '127.0.0.1')"], { env: {}, stdio: 'ignore' });
+          child.on('error', () => {});
+          child.on('exit', () => {});
+        },
+        'child_process.spawnSync': () => require('node:child_process').spawnSync(process.execPath,
+          ['-e', "require('node:net').connect(9, '127.0.0.1')"], { env: {} })
+      };
+      const action = probeActions[probe];
+      if (!action) throw new Error('NETWORK_TRAP_UNKNOWN_PROBE:' + probe);
+      action();
+    };
+
     const Module = require('node:module');
     const originalLoad = Module._load;
     Module._load = function(request, parent, isMain) {
@@ -93,13 +190,7 @@ function createNetworkTrap(f) {
       if (request !== 'node:sqlite') return loaded;
       const DatabaseSync = function(...args) {
         const probe = process.env.PEER_RESULT_TEST_NETWORK_PROBE;
-        if (probe === 'fetch') {
-          globalThis.fetch('http://127.0.0.1:9/');
-        }
-        if (probe === 'http.get') require('node:http').get('http://127.0.0.1:9/');
-        if (probe === 'socket.connect') new (require('node:net').Socket)().connect(9, '127.0.0.1');
-        if (probe === 'dns.lookup') require('node:dns').lookup('localhost', () => {});
-        if (probe === 'http2.connect') require('node:http2').connect('http://127.0.0.1:9');
+        if (probe) runProbe(probe);
         return new loaded.DatabaseSync(...args);
       };
       DatabaseSync.prototype = loaded.DatabaseSync.prototype;
@@ -346,4 +437,49 @@ test('output failure still closes the database', async t => {
   const h = commandHarness(f, { print() { throw failure; } });
   await assert.rejects(h.command(args, dependencies), error => error === failure);
   assert.throws(() => h.opened().getConfig());
+});
+
+test('network trap covers shared transport boundaries and control probes', t => {
+  const f = prepared(t);
+  const trap = createNetworkTrap(f);
+  const argv = ['peer-result', '--provider', 'codex', '--db', f.db,
+    '--correlation-id', f.request.id];
+  const nodeOptions = `--require=${JSON.stringify(trap.preload)}`;
+  const environment = {
+    CODEX_THREAD_ID: NATIVE,
+    CODEX_SESSION_ID: NATIVE,
+    NODE_OPTIONS: nodeOptions
+  };
+  const controls = [];
+  const run = probe => runCli(f, argv, {
+    ...environment,
+    ...(probe ? { PEER_RESULT_TEST_NETWORK_PROBE: probe } : {})
+  });
+  const record = (probe, result) => {
+    const marker = fs.existsSync(trap.marker) ? fs.readFileSync(trap.marker, 'utf8') : null;
+    controls.push({ probe, status: result.status, signal: result.signal, marker });
+    return marker;
+  };
+
+  try {
+    const publicRead = run();
+    assert.equal(record('public-read', publicRead), null);
+    assert.equal(publicRead.status, 0, publicRead.stderr);
+
+    const probes = [
+      'fetch', 'http.get', 'socket.connect', 'socket.prototype.connect',
+      'dns.lookup', 'dns.promises.lookup', 'http2.connect', 'dns.resolver',
+      'dns.promises.resolver', 'dns.resolveCaa', 'dns.resolveTlsa',
+      'dns.setServers', 'dns.promises.setServers', 'datagram.send', 'tcp.raw',
+      'child_process.spawn', 'child_process.spawnSync'
+    ];
+    for (const probe of probes) {
+      fs.rmSync(trap.marker, { force: true });
+      const result = run(probe);
+      const marker = record(probe, result);
+      assert.ok(marker, `${probe} bypassed the network trap; status=${result.status}\n${result.stderr}`);
+    }
+  } finally {
+    process.stdout.write(`PEER_RESULT_NETWORK_CONTROL_LOG ${JSON.stringify(controls)}\n`);
+  }
 });
