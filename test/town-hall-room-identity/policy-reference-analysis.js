@@ -185,6 +185,12 @@ function reExportBindings(sourceFile, exportedName) {
       reExports.push({ specifier: statement.moduleSpecifier.text, importedName: exportedName });
       continue;
     }
+    if (ts.isNamespaceExport(statement.exportClause)) {
+      if (statement.exportClause.name.text === exportedName) {
+        reExports.push({ specifier: statement.moduleSpecifier.text, namespace: true });
+      }
+      continue;
+    }
     if (!ts.isNamedExports(statement.exportClause)) continue;
     const element = statement.exportClause.elements.find(candidate =>
       !candidate.isTypeOnly && candidate.name.text === exportedName);
@@ -196,6 +202,28 @@ function reExportBindings(sourceFile, exportedName) {
     }
   }
   return reExports;
+}
+
+function isTownHallNamespaceModule(sourceFile, specifier, exportedName, sourceFiles, seen = new Set()) {
+  const barrel = resolveSourceFile(sourceFile, specifier, sourceFiles);
+  if (!barrel) return false;
+  const sourceRoot = require('node:path').resolve(__dirname, '../../src');
+  const barrelPath = sourcePath(barrel, sourceRoot, require('node:path'));
+  const marker = `${barrelPath}\u0000${exportedName}`;
+  if (seen.has(marker)) return false;
+  seen.add(marker);
+  return reExportBindings(barrel, exportedName).some(reExport => {
+    if (reExport.namespace) {
+      return isTownHallPlanModule(barrel, reExport.specifier, 'isTownHallRoom', sourceFiles);
+    }
+    return isTownHallNamespaceModule(
+      barrel,
+      reExport.specifier,
+      reExport.importedName,
+      sourceFiles,
+      seen,
+    );
+  });
 }
 
 function isTownHallPlanModule(sourceFile, specifier, exportedName, sourceFiles = [], seen = new Set()) {
@@ -259,10 +287,24 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
         namespace: true,
         specifier: ts.isStringLiteralLike(moduleExpression) ? moduleExpression.text : null });
     }
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
-        ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
-        node.initializer.arguments.length === 1 && ts.isStringLiteralLike(node.initializer.arguments[0])) {
-      const specifier = node.initializer.arguments[0].text;
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      const initializer = ts.isAwaitExpression(node.initializer)
+        ? node.initializer.expression
+        : node.initializer;
+      const isRequireCall = ts.isCallExpression(initializer) &&
+        ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require';
+      const isDynamicImport = ts.isCallExpression(initializer) &&
+        initializer.expression.kind === ts.SyntaxKind.ImportKeyword;
+      if (!isRequireCall && !isDynamicImport) {
+        ts.forEachChild(node, visitImports);
+        return;
+      }
+      if (initializer.arguments.length !== 1 ||
+          !ts.isStringLiteralLike(initializer.arguments[0])) {
+        ts.forEachChild(node, visitImports);
+        return;
+      }
+      const specifier = initializer.arguments[0].text;
       if (ts.isIdentifier(node.name)) {
         const local = bindings.find(binding => binding.name === node.name.text &&
           binding.declaration === node);
@@ -278,6 +320,8 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
             specifier });
         }
       }
+      ts.forEachChild(node, visitImports);
+      return;
     }
     ts.forEachChild(node, visitImports);
   };
@@ -292,8 +336,14 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
     localCandidates[0] || importedTarget || null;
-  const namespaces = imports.filter(binding => binding.namespace &&
-    isTownHallPlanModule(sourceFile, binding.specifier, name, sourceFiles));
+  const namespaces = imports.filter(binding => binding.namespace
+    ? isTownHallPlanModule(sourceFile, binding.specifier, name, sourceFiles)
+    : binding.importedName !== name && isTownHallNamespaceModule(
+      sourceFile,
+      binding.specifier,
+      binding.importedName,
+      sourceFiles,
+    ));
   let count = 0;
   const visit = node => {
     if (target && ts.isIdentifier(node) && node.text === target.name &&

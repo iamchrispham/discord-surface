@@ -110,7 +110,41 @@ function regexInput(node) {
         callPropertyName(parent.expression.expression) === 'search') {
       return parent.arguments[0] || null;
     }
+    if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
+        ts.isPropertyAccessExpression(parent.expression) &&
+        parent.expression.name.text === 'call' &&
+        ['test', 'exec'].includes(callPropertyName(parent.expression.expression))) {
+      return parent.arguments[1] || null;
+    }
     current = parent;
+  }
+  if (ts.isRegularExpressionLiteral(node) && ts.isVariableDeclaration(node.parent) &&
+      node.parent.initializer === node && ts.isIdentifier(node.parent.name)) {
+    const sourceFile = node.getSourceFile();
+    const declaration = node.parent;
+    const bindings = collectBindings(sourceFile);
+    const binding = bindings.find(candidate => candidate.declaration === declaration);
+    const scope = enclosingFunction(declaration) || sourceFile;
+    let input = null;
+    const visit = candidate => {
+      if (input) return;
+      if (ts.isIdentifier(candidate) && candidate.text === declaration.name.text &&
+          candidate !== declaration.name) {
+        const resolved = resolveBinding(candidate, bindings);
+        if (resolved === binding || resolved === declaration ||
+            resolved === declaration.name || resolved?.declaration === declaration) {
+          input = regexInput(candidate);
+          if (input) return;
+        }
+      }
+      ts.forEachChild(candidate, visit);
+    };
+    if (ts.isSourceFile(scope)) {
+      visit(scope);
+    } else {
+      visit(scope.body || scope);
+    }
+    if (input) return input;
   }
   return null;
 }
@@ -1695,6 +1729,44 @@ test('room policy inventory records only town-hall room validators', () => {
   const importEqualsNamespaceReferenceFixture = ts.createSourceFile('peer/import-equals-namespace-reference-fixture.cts', String.raw`import plan = require('./town-hall-plan.cjs');
   plan.isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(importEqualsNamespaceReferenceFixture, 'isTownHallRoom'), 1);
+  const namespaceExportBarrelFixture = createSourceFile('peer/namespace-export-barrel.ts',
+    String.raw`export * as plan from './town-hall-plan.js';`);
+  const namespaceExportConsumerFixture = createSourceFile('peer/namespace-export-consumer.ts',
+    String.raw`import { plan } from './namespace-export-barrel.js';
+    plan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(namespaceExportConsumerFixture, 'isTownHallRoom', [
+    namespaceExportBarrelFixture,
+    namespaceExportConsumerFixture,
+  ]), 1);
+  const unrelatedNamespaceExportBarrelFixture = createSourceFile(
+    'peer/unrelated-namespace-export-barrel.ts',
+    String.raw`export * as voiceRoom from './voice-room.js';`);
+  const unrelatedNamespaceExportConsumerFixture = createSourceFile(
+    'peer/unrelated-namespace-export-consumer.ts',
+    String.raw`import { voiceRoom } from './unrelated-namespace-export-barrel.js';
+    voiceRoom.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(
+    unrelatedNamespaceExportConsumerFixture,
+    'isTownHallRoom',
+    [unrelatedNamespaceExportBarrelFixture, unrelatedNamespaceExportConsumerFixture],
+  ), 0);
+  const dynamicImportReferenceFixture = createSourceFile(
+    'peer/dynamic-import-reference-fixture.ts',
+    String.raw`async function invoke() {
+      const { isTownHallRoom } = await import('./town-hall-plan.js');
+      return isTownHallRoom({});
+    }`);
+  assert.equal(countIdentifierReferences(dynamicImportReferenceFixture, 'isTownHallRoom'), 1);
+  const unrelatedDynamicImportReferenceFixture = createSourceFile(
+    'peer/unrelated-dynamic-import-reference-fixture.ts',
+    String.raw`async function invoke() {
+      const { isTownHallRoom } = await import('./voice-room.js');
+      return isTownHallRoom({});
+    }`);
+  assert.equal(countIdentifierReferences(
+    unrelatedDynamicImportReferenceFixture,
+    'isTownHallRoom',
+  ), 0);
   const destructuredShadowReferenceFixture = ts.createSourceFile('peer/destructured-shadow-reference-fixture.ts', String.raw`export function isTownHallRoom(room) { return room; }
   function parameterShadow({ isTownHallRoom }) { return isTownHallRoom({}); }
   function localShadow() {
@@ -1738,6 +1810,82 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/commonjs-room-helper.js': 1
   });
+  const runtimeCjsRoomHelper = {
+    file: 'peer/runtime-cjs-room-helper.cts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    module.exports = validateGuildId;`
+  };
+  const runtimeCjsRoomConsumer = {
+    file: 'peer/runtime-cjs-room-consumer.cts',
+    text: String.raw`const validateGuildId = require('./runtime-cjs-room-helper.cjs');
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, runtimeCjsRoomHelper, runtimeCjsRoomConsumer]), {
+    ...expectedPolicies,
+    'peer/runtime-cjs-room-helper.cts': 1
+  });
+  const runtimeMjsRoomHelper = {
+    file: 'peer/runtime-mjs-room-helper.mts',
+    text: String.raw`export function validateChannelId(value) { return /^\d{1,21}$/.test(value); }`
+  };
+  const runtimeMjsRoomConsumer = {
+    file: 'peer/runtime-mjs-room-consumer.mts',
+    text: String.raw`import { validateChannelId } from './runtime-mjs-room-helper.mjs';
+    function validateRoom(room) { return validateChannelId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, runtimeMjsRoomHelper, runtimeMjsRoomConsumer]), {
+    ...expectedPolicies,
+    'peer/runtime-mjs-room-helper.mts': 1
+  });
+  const runtimeExtensionNegativeHelper = {
+    file: 'peer/runtime-extension-negative-helper.cts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    module.exports = validateGuildId;`
+  };
+  const runtimeExtensionNegativeConsumer = {
+    file: 'peer/runtime-extension-negative-consumer.cts',
+    text: String.raw`const validateGuildId = require('./runtime-extension-negative-helper.cjs');
+    function validateMessage(message) { return validateGuildId(message.id); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    runtimeExtensionNegativeHelper,
+    runtimeExtensionNegativeConsumer,
+  ]), expectedPolicies);
+  const borrowedTestMatcherRoom = {
+    file: 'peer/borrowed-test-matcher-room.ts',
+    text: String.raw`function validateRoom(room) {
+      const pattern = /^\d{1,21}$/;
+      return RegExp.prototype.test.call(pattern, room.guildId);
+    }`
+  };
+  const borrowedExecMatcherRoom = {
+    file: 'peer/borrowed-exec-matcher-room.ts',
+    text: String.raw`function validateRoom(room) {
+      const pattern = /^\d{1,21}$/;
+      return RegExp.prototype.exec.call(pattern, room.channelId) !== null;
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    borrowedTestMatcherRoom,
+    borrowedExecMatcherRoom,
+  ]), {
+    ...expectedPolicies,
+    'peer/borrowed-test-matcher-room.ts': 1,
+    'peer/borrowed-exec-matcher-room.ts': 1,
+  });
+  const borrowedMatcherOrdinaryField = {
+    file: 'peer/borrowed-matcher-ordinary-field.ts',
+    text: String.raw`function validateRoom(room) {
+      const pattern = /^\d{1,21}$/;
+      return RegExp.prototype.test.call(pattern, room.id);
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    borrowedMatcherOrdinaryField,
+  ]), expectedPolicies);
   const exportEqualsHelper = {
     file: 'peer/export-equals-room-helper.cts',
     text: String.raw`const validateGuildId = value => /^\d{1,21}$/.test(value);
