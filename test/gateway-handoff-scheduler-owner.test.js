@@ -223,6 +223,26 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
   );
   assert.deepEqual(classStateInventory(conditionalReceiverAlias), ['privateConditionalReceiverAlias'],
     'conditional receiver reassignment erased a possible Gateway alias');
+  const uninvokedGatewayToOther = withMember(
+    'privateUninvokedGatewayToOther(other) { let gateway = this; const reset = () => { gateway = other; }; return gateway.deferredHandoffRecoveryChannels; }'
+  );
+  assert.deepEqual(classStateInventory(uninvokedGatewayToOther), ['privateUninvokedGatewayToOther'],
+    'uninvoked callback erased the enclosing Gateway alias');
+  const uninvokedOtherToGateway = withMember(
+    'privateUninvokedOtherToGateway(other) { let gateway = other; const reset = () => { gateway = this; }; return gateway.deferredHandoffRecoveryChannels; }'
+  );
+  assert.deepEqual(classStateInventory(uninvokedOtherToGateway), [],
+    'uninvoked callback changed the enclosing non-Gateway alias');
+  const callbackLocalWrite = withMember(
+    'privateCallbackLocalWrite(other) { let gateway = this; const reset = () => { gateway = other; return gateway.deferredHandoffRecoveryChannels; }; return reset; }'
+  );
+  assert.deepEqual(classStateInventory(callbackLocalWrite), [],
+    'callback-local reassignment leaked into its own receiver checks');
+  const invokedIifeWrite = withMember(
+    'privateInvokedIifeWrite(other) { let gateway = this; (() => { gateway = other; })(); return gateway.deferredHandoffRecoveryChannels; }'
+  );
+  assert.deepEqual(classStateInventory(invokedIifeWrite), [],
+    'immediately invoked function write did not affect the enclosing alias');
   for (const [name, member] of [
     ['privateGlobalThisTimerOwner', 'privateGlobalThisTimerOwner() { globalThis.setTimeout(() => {}, 1); }'],
     ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }'],
@@ -262,6 +282,27 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
     ['privateDynamicBracketTimerName', 'privateDynamicBracketTimerName(timerName) { globalThis[timerName](() => {}, 1); }']
   ]) {
     assert.deepEqual(classStateInventory(withMember(member)), [], `${name}: unrelated scope was treated as Gateway ownership`);
+  }
+  for (const [name, member] of [
+    ["privateNodeTimersRequireReceiver", "privateNodeTimersRequireReceiver() { require('node:timers').setTimeout(() => {}, 1); }"],
+    ["privateLegacyTimersRequireReceiver", "privateLegacyTimersRequireReceiver() { require('timers').setTimeout(() => {}, 1); }"],
+    ["privateNodeTimersRequireCallReceiver", "privateNodeTimersRequireCallReceiver() { require('node:timers').setTimeout.call(globalThis, () => {}, 1); }"],
+    ["privateLegacyTimersRequireApplyReceiver", "privateLegacyTimersRequireApplyReceiver() { require('timers').setTimeout.apply(globalThis, [() => {}, 1]); }"]
+  ]) {
+    const inventory = classStateInventory(withMember(member));
+    assert.ok(inventory.includes(name + ': timer API'), name + ': direct/imported timer receiver escaped inventory');
+  }
+  const importedTimerCall = classStateInventory("import { setTimeout as schedule } from 'node:timers';\n" +
+    withMember("privateImportedTimerCall() { schedule.call(globalThis, () => {}, 1); }"));
+  assert.ok(importedTimerCall.includes('privateImportedTimerCall: timer API'),
+    'imported timer .call receiver escaped inventory');
+  for (const [name, member] of [
+    ['shadowed require', "privateShadowedDirectTimersRequire(require) { require('node:timers').setTimeout(() => {}, 1); }"],
+    ['ordinary direct require', "privateOrdinaryDirectTimersRequire() { require('ordinary-timers').setTimeout(() => {}, 1); }"],
+    ['ordinary timer apply', "privateOrdinaryTimerApply() { const timers = require('ordinary-timers'); timers.setTimeout.apply(globalThis, [() => {}, 1]); }"]
+  ]) {
+    assert.deepEqual(classStateInventory(withMember(member)), [],
+      name + ': shadowed or ordinary timer receiver was treated as a Node timer');
   }
   assert.deepEqual(classStateInventory(withMember("privateOrdinaryTimerNamespace() { const timers = require('ordinary-timers'); timers.setTimeout(() => {}, 1); }")), [],
     'same-named ordinary timer module was treated as node:timers');
