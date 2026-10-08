@@ -134,6 +134,13 @@ function createPolicyRegexAnalysis({
       };
       visitObject(info.ast);
     }
+    const classValueExpression = member => {
+      if (ts.isPropertyDeclaration(member)) return member.initializer;
+      if (!ts.isGetAccessorDeclaration(member) || !member.body ||
+          member.body.statements.length !== 1) return null;
+      const statement = member.body.statements[0];
+      return ts.isReturnStatement(statement) ? statement.expression : null;
+    };
     let classProperty = node.parent;
     while (classProperty &&
         (ts.isParenthesizedExpression(classProperty) || ts.isAsExpression(classProperty) ||
@@ -141,8 +148,16 @@ function createPolicyRegexAnalysis({
           (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(classProperty)))) {
       classProperty = classProperty.parent;
     }
-    classProperty = classProperty && ts.isPropertyDeclaration(classProperty) &&
-      isAncestor(classProperty.initializer, node) ? classProperty : null;
+    if (classProperty && ts.isReturnStatement(classProperty)) {
+      const body = classProperty.parent;
+      const accessor = body && ts.isBlock(body) ? body.parent : null;
+      const value = accessor && ts.isGetAccessorDeclaration(accessor)
+        ? classValueExpression(accessor)
+        : null;
+      classProperty = value && isAncestor(value, node) ? accessor : null;
+    }
+    const classValue = classProperty ? classValueExpression(classProperty) : null;
+    classProperty = classValue && isAncestor(classValue, node) ? classProperty : null;
     const classDeclaration = classProperty?.parent && ts.isClassDeclaration(classProperty.parent)
       ? classProperty.parent
       : null;
@@ -425,6 +440,10 @@ function createPolicyRegexAnalysis({
     }
     const localName = typeof exported === 'string' ? exported : name;
     const binding = findBinding(info, localName, info.ast);
+    if (binding?.kind === 'import' && binding.specifier && binding.imported) {
+      const target = resolveModule(info, binding.specifier);
+      return target ? resolveRegexExport(target, binding.imported, seen) : null;
+    }
     if (binding?.declaration && ts.isVariableDeclaration(binding.declaration) &&
         binding.declaration.initializer) {
       return resolveRegexValue(info, binding.declaration.initializer, name);

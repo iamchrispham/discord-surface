@@ -3,7 +3,8 @@
 const ts = require('typescript');
 
 function isScope(node) {
-  return Boolean(node) && (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node) ||
+  return Boolean(node) && (ts.isSourceFile(node) || ts.isBlock(node) || ts.isCaseBlock(node) ||
+    ts.isModuleBlock(node) ||
     ts.isFunctionLike(node) || ts.isCatchClause(node) || ts.isForStatement(node) ||
     ts.isForInStatement(node) || ts.isForOfStatement(node));
 }
@@ -228,6 +229,43 @@ function commonJsExportAssignment(node) {
   };
 }
 
+function commonJsObjectReexport(expression, exportedName) {
+  if (!ts.isObjectLiteralExpression(expression)) return null;
+  const property = expression.properties.find(candidate => {
+    if (!ts.isPropertyAssignment(candidate)) return false;
+    const key = candidate.name;
+    return (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) && key.text === exportedName;
+  });
+  return property ? commonJsRequireReexport(property.initializer) : null;
+}
+
+function localImportReexport(sourceFile, localName) {
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause ||
+        statement.importClause.isTypeOnly || !ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      continue;
+    }
+    const clause = statement.importClause;
+    if (clause.name?.text === localName) {
+      return { specifier: statement.moduleSpecifier.text, importedName: 'default' };
+    }
+    const bindings = clause.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings) && bindings.name.text === localName) {
+      return { specifier: statement.moduleSpecifier.text, namespace: true };
+    }
+    if (!bindings || !ts.isNamedImports(bindings)) continue;
+    const element = bindings.elements.find(candidate =>
+      !candidate.isTypeOnly && candidate.name.text === localName);
+    if (element) {
+      return {
+        specifier: statement.moduleSpecifier.text,
+        importedName: element.propertyName?.text || element.name.text,
+      };
+    }
+  }
+  return null;
+}
+
 function reExportBindings(sourceFile, exportedName) {
   const bindings = collectBindings(sourceFile);
   for (const statement of sourceFile.statements) {
@@ -252,24 +290,37 @@ function reExportBindings(sourceFile, exportedName) {
     }
     if (ts.isExpressionStatement(statement)) {
       const assignment = commonJsExportAssignment(statement.expression);
-      const reExport = assignment?.reExport;
-      if (reExport && assignment.exportIdentifier &&
-          !resolveBinding(assignment.exportIdentifier, bindings) &&
-          !resolveBinding(reExport.requireIdentifier, bindings) &&
-          ((assignment.target === 'default' && reExport.importedName === 'default') ||
-            assignment.target === exportedName)) {
-        reExports.push({
-          specifier: reExport.specifier,
-          importedName: assignment.target === 'default' ? exportedName : reExport.importedName,
-        });
+      if (assignment?.exportIdentifier &&
+          !resolveBinding(assignment.exportIdentifier, bindings)) {
+        let reExport = assignment.reExport;
+        let importedName = assignment.target === 'default'
+          ? exportedName
+          : reExport?.importedName;
+        if (!reExport && assignment.target === 'default') {
+          reExport = commonJsObjectReexport(assignment.right, exportedName);
+          importedName = reExport?.importedName;
+        }
+        if (reExport && !resolveBinding(reExport.requireIdentifier, bindings) &&
+            ((assignment.target === 'default' &&
+              (assignment.reExport?.importedName === 'default' ||
+                !assignment.reExport)) || assignment.target === exportedName)) {
+          reExports.push({ specifier: reExport.specifier, importedName });
+        }
       }
       continue;
     }
-    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly ||
-        !statement.moduleSpecifier ||
-        !ts.isStringLiteralLike(statement.moduleSpecifier)) {
+    if (!ts.isExportDeclaration(statement) || statement.isTypeOnly) continue;
+    if (!statement.moduleSpecifier) {
+      if (!statement.exportClause || !ts.isNamedExports(statement.exportClause)) continue;
+      const element = statement.exportClause.elements.find(candidate =>
+        !candidate.isTypeOnly && candidate.name.text === exportedName);
+      if (!element) continue;
+      const localName = element.propertyName?.text || element.name.text;
+      const localImport = localImportReexport(sourceFile, localName);
+      if (localImport) reExports.push(localImport);
       continue;
     }
+    if (!ts.isStringLiteralLike(statement.moduleSpecifier)) continue;
     if (!statement.exportClause) {
       reExports.push({ specifier: statement.moduleSpecifier.text, importedName: exportedName });
       continue;

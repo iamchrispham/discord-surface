@@ -290,6 +290,31 @@ test('namespace re-exports retain imported regex policies', () => {
   assert.deepEqual(roomDigitPolicies([pattern, barrel, negativeConsumer]), {});
 });
 
+test('local import and export statements retain regex policies', () => {
+  const pattern = {
+    file: 'peer/local-import-export-pattern.ts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const barrel = {
+    file: 'peer/local-import-export-barrel.ts',
+    text: String.raw`import { ROOM_ID } from './local-import-export-pattern';
+      export { ROOM_ID };`,
+  };
+  const consumer = {
+    file: 'peer/local-import-export-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './local-import-export-barrel';
+      function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, barrel, consumer]), { [pattern.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/local-import-export-negative-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './local-import-export-barrel';
+      function validateTownHallRoom(room) { return ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, barrel, negativeConsumer]), {});
+});
+
 test('instance regex fields follow direct and local constructor receivers', () => {
   const direct = {
     file: 'peer/direct-instance-pattern.ts',
@@ -312,6 +337,30 @@ test('instance regex fields follow direct and local constructor receivers', () =
     file: 'peer/instance-pattern-ordinary.ts',
     text: String.raw`class Patterns { ROOM_ID = /^\d{1,21}$/; }
       function validateTownHallRoom(room) { return new Patterns().ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinary]), {});
+});
+
+test('static regex getters follow direct return values without executing code', () => {
+  const getter = {
+    file: 'peer/static-getter-pattern.ts',
+    text: String.raw`class TownHallPatterns {
+      static get ROOM_ID() { return /^\d{1,21}$/; }
+    }
+    function validateTownHallRoom(room) {
+      return TownHallPatterns.ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([getter]), { [getter.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/static-getter-ordinary.ts',
+    text: String.raw`class TownHallPatterns {
+      static get ROOM_ID() { return /^\d{1,21}$/; }
+    }
+    function validateTownHallRoom(room) {
+      return TownHallPatterns.ROOM_ID.test(room.name);
+    }`,
   };
   assert.deepEqual(roomDigitPolicies([ordinary]), {});
 });

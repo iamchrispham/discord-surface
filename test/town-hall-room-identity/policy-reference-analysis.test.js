@@ -79,3 +79,107 @@ test('reference analysis counts direct awaited dynamic namespace members', () =>
   }`);
   assert.equal(countIdentifierReferences(unrelatedImport, 'isTownHallRoom'), 0);
 });
+
+test('reference analysis follows object and local-import re-export barrels', () => {
+  const plan = ts.createSourceFile(
+    'peer/town-hall-plan.ts',
+    'export function isTownHallRoom(room) { return room; }',
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const objectBarrel = ts.createSourceFile(
+    'peer/object-barrel.cjs',
+    String.raw`module.exports = {
+      isTownHallRoom: require('./town-hall-plan').isTownHallRoom,
+    };`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const objectConsumer = source(String.raw`import { isTownHallRoom } from './object-barrel';
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(objectConsumer, 'isTownHallRoom', [plan, objectBarrel]), 1);
+
+  const localEsmBarrel = ts.createSourceFile(
+    'peer/local-esm-barrel.ts',
+    String.raw`import { isTownHallRoom } from './town-hall-plan';
+      export { isTownHallRoom };`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const localEsmConsumer = source(String.raw`import { isTownHallRoom } from './local-esm-barrel';
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(localEsmConsumer, 'isTownHallRoom', [plan, localEsmBarrel]), 1);
+
+  const directCommonJsBarrel = ts.createSourceFile(
+    'peer/direct-commonjs-barrel.cjs',
+    String.raw`module.exports = require('./town-hall-plan');`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const directEsmBarrel = ts.createSourceFile(
+    'peer/direct-esm-barrel.ts',
+    String.raw`export { isTownHallRoom } from './town-hall-plan';`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const directCommonJsConsumer = source(String.raw`import { isTownHallRoom } from './direct-commonjs-barrel';
+    isTownHallRoom(room);`);
+  const directEsmConsumer = source(String.raw`import { isTownHallRoom } from './direct-esm-barrel';
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(
+    directCommonJsConsumer,
+    'isTownHallRoom',
+    [plan, directCommonJsBarrel],
+  ), 1);
+  assert.equal(countIdentifierReferences(
+    directEsmConsumer,
+    'isTownHallRoom',
+    [plan, directEsmBarrel],
+  ), 1);
+
+  const voice = ts.createSourceFile(
+    'peer/voice-room.ts',
+    'export function isTownHallRoom(room) { return room; }',
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedBarrel = ts.createSourceFile(
+    'peer/unrelated-object-barrel.cjs',
+    String.raw`module.exports = {
+      isTownHallRoom: require('./voice-room').isTownHallRoom,
+    };`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedConsumer = source(String.raw`import { isTownHallRoom } from './unrelated-object-barrel';
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(
+    unrelatedConsumer,
+    'isTownHallRoom',
+    [voice, unrelatedBarrel],
+  ), 0);
+
+  const parameterShadow = source(String.raw`import { isTownHallRoom } from './local-esm-barrel';
+    function shadow(isTownHallRoom) { return isTownHallRoom(room); }`);
+  assert.equal(countIdentifierReferences(parameterShadow, 'isTownHallRoom', [plan, localEsmBarrel]), 0);
+});
+
+test('switch case bindings do not hide imported guard calls after the switch', () => {
+  const switchCase = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    switch (kind) {
+      case 'local':
+        let isTownHallRoom = room => room;
+        isTownHallRoom(room);
+        break;
+    }
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(switchCase, 'isTownHallRoom'), 1);
+
+  const bracedShadow = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    if (kind) {
+      let isTownHallRoom = room => room;
+      isTownHallRoom(room);
+    }
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(bracedShadow, 'isTownHallRoom'), 1);
+});
