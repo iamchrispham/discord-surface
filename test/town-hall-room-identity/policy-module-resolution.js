@@ -115,8 +115,10 @@ function createPolicyModuleGraph({
       if (candidates[0]) return candidates[0];
       if (binding) {
         const local = info.functions.get(expression.text);
+        const importedBinding = ['import', 'commonjs-import'].includes(binding.kind) &&
+          info.imports.has(expression.text);
         if (local && (local.node === binding.declaration || local.node === binding.source ||
-            info.imports.has(expression.text))) {
+            importedBinding)) {
           return local;
         }
         return null;

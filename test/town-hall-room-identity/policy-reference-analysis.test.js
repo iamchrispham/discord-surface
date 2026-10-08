@@ -57,3 +57,15 @@ test('reference analysis follows TypeScript export-equals barrels', () => {
     plan.isTownHallRoom(room);`);
   assert.equal(countIdentifierReferences(unrelatedConsumer, 'isTownHallRoom', [unrelatedBarrel]), 0);
 });
+
+test('reference analysis counts direct awaited dynamic namespace members', () => {
+  const directImport = source(String.raw`async function check(room) {
+    return (await import('./town-hall-plan.js')).isTownHallRoom(room);
+  }`);
+  assert.equal(countIdentifierReferences(directImport, 'isTownHallRoom'), 1);
+
+  const unrelatedImport = source(String.raw`async function check(room) {
+    return (await import('./voice-room.js')).isTownHallRoom(room);
+  }`);
+  assert.equal(countIdentifierReferences(unrelatedImport, 'isTownHallRoom'), 0);
+});

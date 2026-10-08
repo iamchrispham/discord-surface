@@ -223,3 +223,142 @@ test('local and imported pattern factories preserve returned regex inputs', () =
   };
   assert.deepEqual(roomDigitPolicies([importedFactory, importedNegativeConsumer]), {});
 });
+
+test('fixed-key array callbacks preserve finite room fields', () => {
+  const some = {
+    file: 'peer/fixed-key-some.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return !['guildId', 'channelId'].some(key => !/^\d{1,21}$/.test(room[key]));
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([some]), { [some.file]: 1 });
+
+  const filter = {
+    file: 'peer/fixed-key-filter.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return ['guildId', 'channelId'].filter(key => !/^\d{1,21}$/.test(room[key])).length === 0;
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([filter]), { [filter.file]: 1 });
+
+  const mapped = {
+    file: 'peer/fixed-key-map.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return ['guildId', 'channelId'].map(key => /^\d{1,21}$/.test(room[key])).every(Boolean);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([mapped]), { [mapped.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/fixed-key-some-ordinary.ts',
+    text: String.raw`function validateRoom(room) {
+      return !['guildId', 'channelId'].some(key => !/^\d{1,21}$/.test(room[key]));
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinary]), {});
+
+  const dynamic = {
+    file: 'peer/dynamic-key-some.ts',
+    text: String.raw`function validateTownHallRoom(room, keys) {
+      return !keys.some(key => !/^\d{1,21}$/.test(room[key]));
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([dynamic]), {});
+});
+
+test('namespace re-exports retain imported regex policies', () => {
+  const pattern = {
+    file: 'peer/namespace-reexport-pattern.ts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const barrel = {
+    file: 'peer/namespace-reexport-barrel.ts',
+    text: String.raw`export * as patterns from './namespace-reexport-pattern';`,
+  };
+  const consumer = {
+    file: 'peer/namespace-reexport-consumer.ts',
+    text: String.raw`import { patterns } from './namespace-reexport-barrel';
+      function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, barrel, consumer]), { [pattern.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/namespace-reexport-negative.ts',
+    text: String.raw`import { patterns } from './namespace-reexport-barrel';
+      function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, barrel, negativeConsumer]), {});
+});
+
+test('instance regex fields follow direct and local constructor receivers', () => {
+  const direct = {
+    file: 'peer/direct-instance-pattern.ts',
+    text: String.raw`class Patterns { ROOM_ID = /^\d{1,21}$/; }
+      function validateTownHallRoom(room) { return new Patterns().ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([direct]), { [direct.file]: 1 });
+
+  const local = {
+    file: 'peer/local-instance-pattern.ts',
+    text: String.raw`class Patterns { ROOM_ID = /^\d{1,21}$/; }
+      function validateTownHallRoom(room) {
+        const patterns = new Patterns();
+        return patterns.ROOM_ID.test(room.guildId);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([local]), { [local.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/instance-pattern-ordinary.ts',
+    text: String.raw`class Patterns { ROOM_ID = /^\d{1,21}$/; }
+      function validateTownHallRoom(room) { return new Patterns().ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinary]), {});
+});
+
+test('shadowed imported helpers do not contribute their regex policy', () => {
+  const helper = {
+    file: 'peer/shadowed-room-helper.ts',
+    text: String.raw`export function check(value) { return /^\d{1,22}$/.test(value); }`,
+  };
+  const ordinary = {
+    file: 'peer/imported-room-helper.ts',
+    text: String.raw`import { check } from './shadowed-room-helper';
+      function validateTownHallRoom(room) { return check(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, ordinary]), { [helper.file]: 1 });
+
+  const parameterShadow = {
+    file: 'peer/parameter-shadow-room-helper.ts',
+    text: String.raw`import { check } from './shadowed-room-helper';
+      function validateTownHallRoom(room, check) { return check(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, parameterShadow]), {});
+
+  const functionShadow = {
+    file: 'peer/function-shadow-room-helper.ts',
+    text: String.raw`import { check } from './shadowed-room-helper';
+      function validateTownHallRoom(room) {
+        function check(value) { return value === room.guildId; }
+        return check(room.guildId);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, functionShadow]), {});
+
+  const catchShadow = {
+    file: 'peer/catch-shadow-room-helper.ts',
+    text: String.raw`import { check } from './shadowed-room-helper';
+      function validateTownHallRoom(room) {
+        try { throw value => value === room.guildId; }
+        catch (check) { return check(room.guildId); }
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, catchShadow]), {});
+
+  const ordinaryField = {
+    file: 'peer/imported-room-helper-ordinary.ts',
+    text: String.raw`import { check } from './shadowed-room-helper';
+      function validateTownHallRoom(room) { return check(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, ordinaryField]), {});
+});

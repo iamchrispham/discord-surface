@@ -25,14 +25,17 @@ function finiteStringValues(expression, bindings, seen = new Set()) {
   seen.add(declaration);
   if (ts.isParameter(declaration)) {
     const callback = declaration.parent;
-    const everyCall = callback.parent;
-    if (callback.parameters[0] !== declaration ||
-        !ts.isCallExpression(everyCall) || everyCall.arguments[0] !== callback ||
-        !ts.isPropertyAccessExpression(everyCall.expression) ||
-        everyCall.expression.name.text !== 'every') {
+    const arrayCall = callback.parent;
+    if ((!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) ||
+        callback.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword) ||
+        callback.parameters[0] !== declaration ||
+        !ts.isCallExpression(arrayCall) || arrayCall.arguments[0] !== callback ||
+        !ts.isPropertyAccessExpression(arrayCall.expression) ||
+        !['every', 'some', 'filter', 'find', 'findIndex', 'forEach', 'map', 'flatMap']
+          .includes(arrayCall.expression.name.text)) {
       return null;
     }
-    return finiteStringValues(everyCall.expression.expression, bindings, seen);
+    return finiteStringValues(arrayCall.expression.expression, bindings, seen);
   }
   if (!ts.isVariableDeclaration(declaration)) return null;
   if (declaration.initializer) {
@@ -618,7 +621,7 @@ function roomDigitPolicies(records) {
 
   for (const info of infos) {
     const visit = node => {
-      if (ts.isVariableDeclaration(node)) {
+      if (ts.isVariableDeclaration(node) && !ts.isCatchClause(node.parent)) {
         const scope = variableDeclarationScope(node);
         addPatternBindings(node.name, node.initializer || null, info, {
           declaration: node,
@@ -647,7 +650,21 @@ function roomDigitPolicies(records) {
           };
           info.functions.set(name, fn);
           info.functionDefs.push(fn);
+          if (node.name) {
+            info.bindings.push({
+              name: node.name.text,
+              kind: 'function',
+              declaration: node,
+              scope: node.parent,
+            });
+          }
         }
+      } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+        addPatternBindings(node.variableDeclaration.name, null, info, {
+          kind: 'catch',
+          declaration: node.variableDeclaration,
+          scope: node,
+        });
       } else if ((ts.isMethodDeclaration(node) || ts.isPropertyAssignment(node)) && node.name &&
           (ts.isObjectLiteralExpression(node.parent) || ts.isClassDeclaration(node.parent))) {
         const owner = node.parent.parent;
@@ -930,6 +947,8 @@ function roomDigitPolicies(records) {
               ? { kind: 'reexport', specifier, imported }
               : imported);
           }
+        } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause) && specifier) {
+          info.exports.set(statement.exportClause.name.text, { kind: 'namespace', specifier });
         } else if (!statement.exportClause && specifier) {
           info.starExports.push(specifier);
         }
@@ -1109,6 +1128,7 @@ function roomDigitPolicies(records) {
     importedRegexInputs,
     namespaceRegexInputs,
     resolveRegexExport,
+    resolveNamespaceExport,
     resolveImportedString,
   } = regexAnalysis;
 
@@ -1152,19 +1172,26 @@ function roomDigitPolicies(records) {
     const consumerBindings = collectBindings(consumer.ast);
     for (const [localName, imported] of consumer.imports) {
       const defaultImport = imported.imported === 'default';
-      const references = imported.namespace
-        ? namespaceRegexInputs(consumer, localName)
-        : defaultImport
-          ? [
-            ...importedRegexInputs(consumer, localName, imported)
-              .map(input => ({ importedName: imported.imported, input })),
-            ...namespaceRegexInputs(consumer, localName),
-          ]
-          : importedRegexInputs(consumer, localName, imported)
-            .map(input => ({ importedName: imported.imported, input }));
+      const target = resolveModule(consumer, imported.specifier);
+      const namespaceTarget = !imported.namespace && !defaultImport && target
+        ? resolveNamespaceExport(target, imported.imported)
+        : null;
+      let references;
+      if (imported.namespace || namespaceTarget) {
+        references = namespaceRegexInputs(consumer, localName);
+      } else if (defaultImport) {
+        references = [
+          ...importedRegexInputs(consumer, localName, imported)
+            .map(input => ({ importedName: imported.imported, input })),
+          ...namespaceRegexInputs(consumer, localName),
+        ];
+      } else {
+        references = importedRegexInputs(consumer, localName, imported)
+          .map(input => ({ importedName: imported.imported, input }));
+      }
       for (const { importedName, input } of references) {
-        const target = resolveModule(consumer, imported.specifier);
-        const resolved = target && resolveRegexExport(target, importedName);
+        const resolvedTarget = namespaceTarget || target;
+        const resolved = resolvedTarget && resolveRegexExport(resolvedTarget, importedName);
         if (!resolved || !hasAsciiDigitPattern(resolved.pattern)) continue;
         const scope = enclosingFunction(input) || consumer.ast;
         const binding = ts.isIdentifier(input) && findBinding(consumer, input.text, input);

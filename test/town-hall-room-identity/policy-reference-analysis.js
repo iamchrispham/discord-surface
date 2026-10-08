@@ -469,14 +469,24 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
           ? node.argumentExpression.text
           : null;
       const receiver = node.expression;
+      let importedNamespace = receiver;
+      while (ts.isParenthesizedExpression(importedNamespace) ||
+          ts.isAwaitExpression(importedNamespace)) {
+        importedNamespace = importedNamespace.expression;
+      }
       const directRequire = ts.isCallExpression(receiver) &&
         ts.isIdentifier(receiver.expression) && receiver.expression.text === 'require' &&
         receiver.arguments.length === 1 && ts.isStringLiteralLike(receiver.arguments[0]) &&
         isTownHallPlanModule(sourceFile, receiver.arguments[0].text, property, sourceFiles) &&
         !resolveBinding(receiver.expression, bindings);
+      const directImport = ts.isCallExpression(importedNamespace) &&
+        importedNamespace.expression.kind === ts.SyntaxKind.ImportKeyword &&
+        importedNamespace.arguments.length === 1 &&
+        ts.isStringLiteralLike(importedNamespace.arguments[0]) &&
+        isTownHallPlanModule(sourceFile, importedNamespace.arguments[0].text, property, sourceFiles);
       const namespaceMember = ts.isIdentifier(receiver) &&
         namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration);
-      if (property === name && (namespaceMember || directRequire)) {
+      if (property === name && (namespaceMember || directRequire || directImport)) {
         count += 1;
       }
     }

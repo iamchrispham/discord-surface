@@ -147,18 +147,42 @@ function createPolicyRegexAnalysis({
       ? classProperty.parent
       : null;
     if (classProperty && classDeclaration?.name && ts.isIdentifier(classDeclaration.name) &&
-        classProperty.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) &&
         (ts.isIdentifier(classProperty.name) || ts.isStringLiteralLike(classProperty.name))) {
-      const ownerName = classDeclaration.name.text;
       const propertyName = classProperty.name.text;
       const classBindings = collectBindings(info.ast);
+      const isConstructor = expression => {
+        const value = unwrapPolicyExpression(expression);
+        return ts.isNewExpression(value) && ts.isIdentifier(value.expression) &&
+          resolveBinding(value.expression, classBindings) === classDeclaration;
+      };
+      const isLocalInstance = expression => {
+        const value = unwrapPolicyExpression(expression);
+        if (!ts.isIdentifier(value)) return false;
+        const declaration = resolveBinding(value, classBindings);
+        if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) {
+          return false;
+        }
+        const declarationList = declaration.parent;
+        return ts.isVariableDeclarationList(declarationList) &&
+          Boolean(declarationList.flags & ts.NodeFlags.Const) &&
+          isConstructor(declaration.initializer);
+      };
+      const isStaticClass = expression => {
+        const value = unwrapPolicyExpression(expression);
+        return ts.isIdentifier(value) &&
+          resolveBinding(value, classBindings) === classDeclaration;
+      };
+      const isStatic = classProperty.modifiers?.some(
+        modifier => modifier.kind === ts.SyntaxKind.StaticKeyword,
+      );
       const visitClass = current => {
-        if (ts.isIdentifier(current) && current.text === ownerName && current !== classDeclaration.name &&
-            resolveBinding(current, classBindings) === classDeclaration) {
-          const member = current.parent;
-          if ((ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member)) &&
-              member.expression === current && policyPropertyKey(member) === propertyName) {
-            const input = regexInput(member);
+        if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+          const receiver = current.expression;
+          const receiverMatches = isStatic
+            ? isStaticClass(receiver)
+            : isConstructor(receiver) || isLocalInstance(receiver);
+          if (policyPropertyKey(current) === propertyName && receiverMatches) {
+            const input = regexInput(current);
             if (input) inputs.push(input);
           }
         }
@@ -273,6 +297,8 @@ function createPolicyRegexAnalysis({
   const namespaceRegexInputs = (info, namespaceName) => {
     const inputs = [];
     const aliases = [];
+    const isNamedNamespace = binding => binding?.kind === 'import' &&
+      Boolean(resolveNamespaceExport(resolveModule(info, binding.specifier), binding.imported));
     const visitAliases = node => {
       if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
           node.initializer && ts.isIdentifier(node.initializer) &&
@@ -281,7 +307,8 @@ function createPolicyRegexAnalysis({
         const isDefaultImport = binding?.kind === 'import' && binding.imported === 'default';
         const isCommonJsNamespace = binding?.kind === 'commonjs-import' &&
           binding.imported === 'default';
-        if (binding && (binding.kind === 'namespace-import' || isDefaultImport || isCommonJsNamespace)) {
+        if (binding && (binding.kind === 'namespace-import' || isDefaultImport ||
+            isCommonJsNamespace || isNamedNamespace(binding))) {
           for (const element of node.name.elements) {
             if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
             const property = element.propertyName || element.name;
@@ -302,7 +329,8 @@ function createPolicyRegexAnalysis({
         const isDefaultImport = binding?.kind === 'import' && binding.imported === 'default';
         const isCommonJsNamespace = binding?.kind === 'commonjs-import' &&
           binding.imported === 'default';
-        if (!binding || (binding.kind !== 'namespace-import' && !isDefaultImport && !isCommonJsNamespace)) {
+        if (!binding || (binding.kind !== 'namespace-import' && !isDefaultImport &&
+            !isCommonJsNamespace && !isNamedNamespace(binding))) {
           ts.forEachChild(node, visit);
           return;
         }
@@ -415,6 +443,19 @@ function createPolicyRegexAnalysis({
     return result;
   };
 
+  const resolveNamespaceExport = (info, name, seen = new Set()) => {
+    if (!info) return null;
+    const marker = `${info.file}\u0000${name}`;
+    if (seen.has(marker)) return null;
+    seen.add(marker);
+    const exported = info.exports.get(name);
+    if (!exported || typeof exported !== 'object') return null;
+    if (exported.kind === 'namespace') return resolveModule(info, exported.specifier);
+    if (exported.kind !== 'reexport') return null;
+    const target = resolveModule(info, exported.specifier);
+    return target ? resolveNamespaceExport(target, exported.imported, seen) : null;
+  };
+
   function resolveStringExport(info, name, seen = new Set()) {
     const marker = `${info.file}\u0000${name}`;
     if (seen.has(marker)) return null;
@@ -458,6 +499,7 @@ function createPolicyRegexAnalysis({
     importedRegexInputs,
     namespaceRegexInputs,
     resolveRegexExport,
+    resolveNamespaceExport,
     resolveImportedString,
   };
 }
