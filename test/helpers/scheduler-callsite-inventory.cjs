@@ -61,6 +61,7 @@ function isDestructuringAssignmentObject(node) {
       current = parent;
       continue;
     }
+    if ((ts.isForOfStatement(parent) || ts.isForInStatement(parent)) && parent.initializer === current) return true;
     if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       unwrapParentheses(parent.left) === unwrapParentheses(current)) return true;
     return false;

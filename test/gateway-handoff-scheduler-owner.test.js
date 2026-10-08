@@ -113,6 +113,25 @@ test('public scheduler inventory pins source owners and rejects only new schedul
       'function destructuredSite(gateway) { const { scheduleDeferredHandoffRecovery: schedule } = gateway; return schedule.bind(gateway); }\n' +
       'function shorthandSite(gateway) { const { scheduleDeferredHandoffRecovery } = gateway; return scheduleDeferredHandoffRecovery.bind(gateway); }\n' +
       'function restSite(gateway) { const { ...scheduleDeferredHandoffRecovery } = gateway; return scheduleDeferredHandoffRecovery; }\n');
+    const loopHeaderExpected = [
+      { file: 'loop-headers.js', owner: 'forInAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+      { file: 'loop-headers.js', owner: 'forInLiteralKeySite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+      { file: 'loop-headers.js', owner: 'forOfAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+      { file: 'loop-headers.js', owner: 'forOfShorthandSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+      { file: 'loop-headers.js', owner: 'nestedForOfSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+      { file: 'loop-headers.js', owner: 'pendingPollForOfSite', scheduler: 'schedulePendingHandoffRecoveryPoll' }
+    ];
+    fs.writeFileSync(path.join(sourceRoot, 'loop-headers.js'),
+      'function forOfAliasSite(gateways) { let schedule; for ({ scheduleDeferredHandoffRecovery: schedule } of gateways) schedule(); }\n' +
+      'function forInAliasSite(gateways) { let schedule; for ({ scheduleDeferredHandoffRecovery: schedule } in gateways) schedule(); }\n' +
+      'function forOfShorthandSite(gateways) { let scheduleDeferredHandoffRecovery; for ({ scheduleDeferredHandoffRecovery } of gateways) scheduleDeferredHandoffRecovery(); }\n' +
+      "function forInLiteralKeySite(gateways) { let poll; for ({ ['schedulePendingHandoffRecoveryPoll']: poll } in gateways) poll(); }\n" +
+      'function nestedForOfSite(gateways) { let schedule; for (const group of gateways) for ({ scheduleDeferredHandoffRecovery: schedule } of group) schedule(); }\n' +
+      'function pendingPollForOfSite(gateways) { let poll; for ({ schedulePendingHandoffRecoveryPoll: poll } of gateways) poll(); }\n' +
+      'function ordinaryObjectDataSite() { return { scheduleDeferredHandoffRecovery: () => {} }; }\n' +
+      'function unrelatedLoopKeySite(gateways) { let value; for ({ unrelatedKey: value } of gateways) {} }\n');
+    const expectedWithLoopHeaders = [...expected, ...loopHeaderExpected].sort((left, right) =>
+      left.file < right.file ? -1 : left.file > right.file ? 1 : 0);
     fs.writeFileSync(path.join(sourceRoot, 'dot.js'),
       "function dotSite(gateway) { gateway.scheduleDeferredHandoffRecovery('dot'); }\n");
     fs.writeFileSync(path.join(sourceRoot, 'forwarded.cjs'),
@@ -122,19 +141,27 @@ test('public scheduler inventory pins source owners and rejects only new schedul
     fs.writeFileSync(path.join(sourceRoot, 'optional.mjs'),
       "function optionalBracketSite(gateway) { (gateway)?.['schedulePendingHandoffRecoveryPoll']?.(); }\n" +
       "function optionalSite(gateway) { gateway?.scheduleDeferredHandoffRecovery?.('optional'); }\n");
-    assert.deepEqual(schedulerCallsiteInventory(sourceRoot), expected);
-    assert.deepEqual(assertSchedulerCallsiteInventory(sourceRoot, expected), expected);
+    assert.deepEqual(schedulerCallsiteInventory(sourceRoot), expectedWithLoopHeaders);
+    assert.deepEqual(assertSchedulerCallsiteInventory(sourceRoot, expectedWithLoopHeaders), expectedWithLoopHeaders);
 
     const newConsumer = path.join(sourceRoot, 'audit-new-consumer.js');
     fs.writeFileSync(newConsumer,
       "exports.auditScheduler = gateway => gateway?.scheduleDeferredHandoffRecovery?.('audit-new-site');\n");
-    assert.throws(() => assertSchedulerCallsiteInventory(sourceRoot, expected),
+    assert.throws(() => assertSchedulerCallsiteInventory(sourceRoot, expectedWithLoopHeaders),
       error => error.code === 'ERR_ASSERTION' &&
         error.message.includes('public scheduler callsite inventory changed'));
     fs.rmSync(newConsumer);
 
+    const newLoopConsumer = path.join(sourceRoot, 'audit-new-loop-consumer.js');
+    fs.writeFileSync(newLoopConsumer,
+      'exports.auditScheduler = gateways => { let schedule; for ({ scheduleDeferredHandoffRecovery: schedule } of gateways) schedule(); };\n');
+    assert.throws(() => assertSchedulerCallsiteInventory(sourceRoot, expectedWithLoopHeaders),
+      error => error.code === 'ERR_ASSERTION' &&
+        error.message.includes('public scheduler callsite inventory changed'));
+    fs.rmSync(newLoopConsumer);
+
     fs.writeFileSync(path.join(sourceRoot, 'audit-ordinary.js'), "exports.value = 'unrelated';\n");
-    assert.doesNotThrow(() => assertSchedulerCallsiteInventory(sourceRoot, expected));
+    assert.doesNotThrow(() => assertSchedulerCallsiteInventory(sourceRoot, expectedWithLoopHeaders));
   } finally {
     fs.rmSync(sourceRoot, { recursive: true, force: true });
   }
