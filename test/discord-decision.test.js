@@ -9,6 +9,7 @@ const { PermissionFlagsBits } = require('discord.js');
 
 const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
+const { createDecisionConsumer } = require('../src/discord/decision');
 const { encodeDecisionCustomId, sendInteractionFollowup } = require('../src/discord-interaction');
 const { DECISION_RECEIPT_KINDS, READINESS, SurfaceState } = require('../src/state');
 
@@ -535,6 +536,43 @@ test('rejection recovery sends a follow-up only after an accepted callback', { t
   assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
 
+test('rejection outcome persistence failures escape both follow-up paths', { timeout: 30000 }, async t => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/discord/decision.ts'), 'utf8');
+  assert.equal((source.match(/state\.recordDecisionRejectionOutcome\(/g) || []).length, 1);
+
+  const interrupted = await fixture(t);
+  const interruptedId = 'rejection-write-interrupted';
+  const admitted = interrupted.state.admitDecisionClickAndBeginAuthorization({
+    interactionId: interruptedId,
+    presentationId: interrupted.presentation.presentationId,
+    selectedKey: 'hold',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: interrupted.presentation.messageId,
+    binding: interrupted.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(interrupted.state.recordDecisionAuthorizationOutcome(interruptedId, 'denied').accepted, true);
+  assert.equal(interrupted.state.recordDecisionCallbackOutcome(interruptedId, 'unknown').accepted, true);
+  interrupted.state.recordDecisionRejectionOutcome = () => { throw new Error('rejection outcome write failed'); };
+
+  await assert.rejects(
+    interrupted.gateway.handleInteraction(component(interrupted.presentation, interruptedId, 1), new AbortController().signal),
+    /rejection outcome write failed/
+  );
+
+  const followup = await fixture(t);
+  followup.gateway.authorizeDecisionInteraction = async () => false;
+  followup.state.recordDecisionRejectionOutcome = () => { throw new Error('rejection outcome write failed'); };
+
+  await assert.rejects(
+    followup.gateway.handleInteraction(component(followup.presentation, 'rejection-write-followup', 1), new AbortController().signal),
+    /rejection outcome write failed/
+  );
+  assert.equal(followup.callbacks.length, 2);
+});
+
 test('recovery resumes an admitted click without repeating its callback and preserves the question target', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const admitted = f.state.admitDecisionClickAndBeginCallback({
@@ -662,6 +700,45 @@ test('short-answer decision interaction does not require Attach Files permission
   assert.equal(f.state.getDecisionClick('missing-attach')?.projectionOutcome, null);
   assert.equal(f.callbacks.length, 1);
   assert.equal(f.edits.length, 0);
+});
+
+test('missing projection handler retains short-answer custody after native submission', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { questionText: 'q'.repeat(1800) });
+  const interactionId = 'short-answer-without-projector';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'short-answer-without-projector',
+    answer: 'accepted answer'
+  }).accepted, true);
+
+  const consumer = createDecisionConsumer({
+    state: f.state,
+    processAccepted: (message, signal, options) => f.gateway.consumer.processAccepted(message, signal, options)
+  });
+  await consumer.recover(new AbortController().signal);
+
+  const click = f.state.getDecisionClick(interactionId);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(click.nativeReturn?.outcome, 'submitted');
+  assert.equal(click.projectionOutcome, 'not_sent');
+  assert.equal(click.state, 'materialized_projection_pending');
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
 });
 
 test('long-answer projection refuses attachment without Attach Files permission', { timeout: 30000 }, async t => {
@@ -1527,12 +1604,29 @@ test('same-interaction replay retries an unknown long projection after native di
     projectionAttempts += 1;
     if (projectionAttempts === 1) throw Object.assign(new Error('projection response was lost'), { outcome: 'unknown' });
   };
+  const recoveryCalls = [];
+  f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+    recoveryCalls.push({ channelIds: [...channelIds], options });
+    return null;
+  };
+  const currentTime = Date.now;
+  let now = currentTime();
+  Date.now = () => now;
+  try {
+    await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
+    assert.equal(f.dispatches.length, 1);
+    await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(projectionAttempts, 1);
+    assert.deepEqual(recoveryCalls.map(call => call.options.delayMs), [1000, 1000]);
 
-  await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
-  assert.equal(f.dispatches.length, 1);
-  await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
-  assert.equal(f.dispatches.length, 1);
-  assert.equal(projectionAttempts, 2);
+    now += 1001;
+    await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(projectionAttempts, 2);
+  } finally {
+    Date.now = currentTime;
+  }
 });
 
 test('restart retains custody for an interrupted rejection followup', { timeout: 30000 }, async t => {

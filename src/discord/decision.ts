@@ -362,6 +362,19 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return 0;
   }
 
+  function deferDecisionUntilRecoveryDeadline(click: DecisionClick, signal?: AbortSignal): number {
+    const remainingDelay = pendingRecoveryDelay(click.interactionId);
+    if (remainingDelay <= 0) return 0;
+    if (!signal?.aborted) {
+      scheduleRecovery(new Set([click.channelId]), { delayMs: remainingDelay, decisionId: click.interactionId });
+    }
+    return remainingDelay;
+  }
+
+  function recordRejectionOutcome(click: DecisionClick, outcome: DecisionTransportOutcome): void {
+    state.recordDecisionRejectionOutcome(click.interactionId, outcome);
+  }
+
   async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean | null> {
     if (typeof options.authorize !== 'function') return true;
     try {
@@ -415,14 +428,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       const outcome = click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.REJECTED
         ? DECISION_TRANSPORT_OUTCOMES.REJECTED
         : DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
-      try {
-        state.recordDecisionRejectionOutcome(click.interactionId, outcome);
-      } catch {}
+      recordRejectionOutcome(click, outcome);
       return null;
     }
-    const remainingDelay = pendingRecoveryDelay(click.interactionId);
+    const remainingDelay = deferDecisionUntilRecoveryDeadline(click, signal);
     if (remainingDelay > 0) {
-      if (!signal?.aborted) scheduleRecovery(new Set([click.channelId]), { delayMs: remainingDelay, decisionId: click.interactionId });
       return null;
     }
     const begin = state.beginDecisionRejectionFollowup(click.interactionId) as { accepted?: boolean; click?: DecisionClick | null };
@@ -453,7 +463,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       click.rejectionOutcome !== DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED;
     const retryFirstUnknown = outcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.rejectionOutcome === null;
     const scheduleRetry = (retryFirstRateLimit || retryFirstUnknown) && !signal?.aborted;
-    try { state.recordDecisionRejectionOutcome(click.interactionId, outcome); } catch {}
+    recordRejectionOutcome(click, outcome);
     if (scheduleRetry) {
       scheduleRecovery(new Set([click.channelId]), {
         ...(retryDelayMs > 0 ? { delayMs: retryDelayMs } : {}),
@@ -532,10 +542,6 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       return false;
     }
     if (typeof options.project !== 'function') {
-      if (click.canonical.answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT) {
-        projectionRetryAttempts.delete(click.interactionId);
-        return true;
-      }
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.NOT_SENT);
       projectionRetryAttempts.delete(click.interactionId);
       return false;
@@ -586,6 +592,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   async function continueClick(click: DecisionClick, signal?: AbortSignal, { recovery = false } = {}): Promise<DecisionConsumerResult> {
+    const remainingDelay = deferDecisionUntilRecoveryDeadline(click, signal);
+    if (remainingDelay > 0) {
+      const current = state.getDecisionClick(click.interactionId) || click;
+      return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+    }
     const presentation = state.getDecisionPresentation(click.presentationId);
     if (!presentation) return invalidResult(DECISION_REASONS.UNKNOWN_PRESENTATION);
     let current = state.getDecisionClick(click.interactionId) || click;
@@ -823,13 +834,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         decisionRecoveryDeadlines.delete(pendingClick.interactionId);
       }
       if (enforceRetryDeadline) {
-        const remainingDelay = pendingRecoveryDelay(pendingClick.interactionId);
+        const remainingDelay = deferDecisionUntilRecoveryDeadline(pendingClick, signal);
         if (remainingDelay > 0) {
           remaining.push(pendingClick);
-          scheduleRecovery(new Set([pendingClick.channelId]), {
-            delayMs: remainingDelay,
-            decisionId: pendingClick.interactionId
-          });
           continue;
         }
       }
