@@ -24,7 +24,7 @@ export interface TownHallRoom {
 
 const UINT64_MAX = 18446744073709551615n;
 
-export function isTownHallRoom(value: unknown): boolean {
+export function isTownHallRoom(value: unknown): value is TownHallRoom {
   try {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
     const guildDescriptor = Object.getOwnPropertyDescriptor(value, 'guildId');

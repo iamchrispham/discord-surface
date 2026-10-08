@@ -33,3 +33,27 @@ test('reference analysis follows aliases and namespace members without shadows',
   }`);
   assert.equal(countIdentifierReferences(directCommonJs, 'isTownHallRoom'), 1);
 });
+
+test('reference analysis follows TypeScript export-equals barrels', () => {
+  const barrel = ts.createSourceFile(
+    'peer/town-hall-plan-barrel.cts',
+    String.raw`import plan = require('./town-hall-plan');
+      export = plan;`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const consumer = source(String.raw`import plan = require('./town-hall-plan-barrel');
+    plan.isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(consumer, 'isTownHallRoom', [barrel]), 1);
+
+  const unrelatedBarrel = ts.createSourceFile(
+    'peer/unrelated-plan-barrel.cts',
+    String.raw`import plan = require('./voice-room');
+      export = plan;`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedConsumer = source(String.raw`import plan = require('./unrelated-plan-barrel');
+    plan.isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(unrelatedConsumer, 'isTownHallRoom', [unrelatedBarrel]), 0);
+});

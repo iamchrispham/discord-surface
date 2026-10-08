@@ -1025,6 +1025,13 @@ function roomDigitPolicies(records) {
   const expressionIsRoomField = (node, info, seen = new Set()) => {
     const expression = unwrapPolicyExpression(node);
     if (!expression) return false;
+    if (ts.isBinaryExpression(expression) &&
+        [ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.BarBarToken].includes(
+          expression.operatorToken.kind,
+        )) {
+      return expressionIsRoomField(expression.left, info, new Set(seen)) &&
+        expressionIsRoomField(expression.right, info, new Set(seen));
+    }
     if (ts.isConditionalExpression(expression)) {
       return expressionIsRoomField(expression.whenTrue, info, new Set(seen)) &&
         expressionIsRoomField(expression.whenFalse, info, new Set(seen));

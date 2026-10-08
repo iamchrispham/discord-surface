@@ -120,6 +120,76 @@ test('borrowed String.match calls keep the regex connected to its input', () => 
   assert.deepEqual(roomDigitPolicies([importedPattern, importedPatternNegativeConsumer]), {});
 });
 
+test('room-field fallbacks include only room identifier alternatives', () => {
+  const nullishFallback = {
+    file: 'peer/nullish-room-fallback.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.guildId ?? room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([nullishFallback]), { [nullishFallback.file]: 1 });
+
+  const logicalFallback = {
+    file: 'peer/logical-room-fallback.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.guildId || room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([logicalFallback]), { [logicalFallback.file]: 1 });
+
+  const mixedFallback = {
+    file: 'peer/mixed-room-fallback.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.guildId ?? room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([mixedFallback]), {});
+});
+
+test('regex aliases assigned after declaration retain binding-aware inputs', () => {
+  const consumer = {
+    file: 'peer/assigned-room-pattern.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      let pattern;
+      pattern = /^\d{1,21}$/;
+      return pattern.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/assigned-room-pattern-negative.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      let pattern;
+      pattern = /^\d{1,21}$/;
+      return pattern.test(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([negativeConsumer]), {});
+});
+
+test('destructured regex aliases from namespaces retain room inputs', () => {
+  const pattern = {
+    file: 'peer/namespace-pattern.ts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const consumer = {
+    file: 'peer/namespace-pattern-consumer.ts',
+    text: String.raw`import * as patterns from './namespace-pattern';
+    const { ROOM_ID: pattern } = patterns;
+    function validateTownHallRoom(room) { return pattern.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, consumer]), { [pattern.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/namespace-pattern-negative.ts',
+    text: String.raw`import * as patterns from './namespace-pattern';
+    const { ROOM_ID: pattern } = patterns;
+    function validateTownHallRoom(room) { return pattern.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, negativeConsumer]), {});
+});
+
 test('local and imported pattern factories preserve returned regex inputs', () => {
   const localFactory = {
     file: 'peer/local-pattern-factory.ts',

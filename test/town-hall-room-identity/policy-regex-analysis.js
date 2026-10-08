@@ -172,6 +172,19 @@ function createPolicyRegexAnalysis({
     }
     declaration = declaration && ts.isVariableDeclaration(declaration) &&
       ts.isIdentifier(declaration.name) && isAncestor(declaration.initializer, node) ? declaration : null;
+    if (!declaration) {
+      let assignment = node.parent;
+      while (assignment && !ts.isBinaryExpression(assignment) && assignment.parent) {
+        assignment = assignment.parent;
+      }
+      if (assignment && ts.isBinaryExpression(assignment) &&
+          assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          isAncestor(assignment.right, node) && ts.isIdentifier(assignment.left)) {
+        const binding = findBinding(info, assignment.left.text, assignment.left);
+        declaration = binding?.declaration && ts.isVariableDeclaration(binding.declaration) &&
+          ts.isIdentifier(binding.declaration.name) ? binding.declaration : null;
+      }
+    }
     if (!declaration) return inputs;
     const seenDeclarations = new Set();
     const collectDeclarationInputs = currentDeclaration => {
@@ -259,6 +272,30 @@ function createPolicyRegexAnalysis({
 
   const namespaceRegexInputs = (info, namespaceName) => {
     const inputs = [];
+    const aliases = [];
+    const visitAliases = node => {
+      if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
+          node.initializer && ts.isIdentifier(node.initializer) &&
+          node.initializer.text === namespaceName) {
+        const binding = findBinding(info, namespaceName, node.initializer);
+        const isDefaultImport = binding?.kind === 'import' && binding.imported === 'default';
+        const isCommonJsNamespace = binding?.kind === 'commonjs-import' &&
+          binding.imported === 'default';
+        if (binding && (binding.kind === 'namespace-import' || isDefaultImport || isCommonJsNamespace)) {
+          for (const element of node.name.elements) {
+            if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+            const property = element.propertyName || element.name;
+            if (!ts.isIdentifier(property) && !ts.isStringLiteralLike(property)) continue;
+            const alias = findBinding(info, element.name.text, element.name);
+            if (alias) {
+              aliases.push({ binding: alias, name: element.name.text, importedName: property.text });
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, visitAliases);
+    };
+    visitAliases(info.ast);
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === namespaceName) {
         const binding = findBinding(info, namespaceName, node);
@@ -275,6 +312,16 @@ function createPolicyRegexAnalysis({
           const importedName = policyPropertyKey(member);
           const input = importedName && regexInput(member);
           if (input) inputs.push({ importedName, input });
+        }
+      }
+      if (ts.isIdentifier(node)) {
+        const alias = aliases.find(candidate => candidate.name === node.text &&
+          findBinding(info, candidate.name, node) === candidate.binding);
+        const member = node.parent;
+        if (alias && (ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member)) &&
+            member.expression === node) {
+          const input = regexInput(node);
+          if (input) inputs.push({ importedName: alias.importedName, input });
         }
       }
       ts.forEachChild(node, visit);

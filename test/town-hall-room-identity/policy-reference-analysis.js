@@ -230,8 +230,26 @@ function commonJsExportAssignment(node) {
 
 function reExportBindings(sourceFile, exportedName) {
   const bindings = collectBindings(sourceFile);
+  for (const statement of sourceFile.statements) {
+    if (ts.isImportEqualsDeclaration(statement) && !statement.isTypeOnly) {
+      bindings.push({ declaration: statement, name: statement.name.text, scope: sourceFile });
+    }
+  }
   const reExports = [];
   for (const statement of sourceFile.statements) {
+    if (ts.isExportAssignment(statement)) {
+      if (statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+        const declaration = resolveBinding(statement.expression, bindings);
+        if (declaration && ts.isImportEqualsDeclaration(declaration) &&
+            !declaration.isTypeOnly && ts.isExternalModuleReference(declaration.moduleReference)) {
+          const moduleExpression = declaration.moduleReference.expression;
+          if (ts.isStringLiteralLike(moduleExpression)) {
+            reExports.push({ specifier: moduleExpression.text, namespace: true });
+          }
+        }
+      }
+      continue;
+    }
     if (ts.isExpressionStatement(statement)) {
       const assignment = commonJsExportAssignment(statement.expression);
       const reExport = assignment?.reExport;

@@ -2,7 +2,7 @@ import {
   TOWN_HALL_ROOM_MARKER,
   validateTownHallRoomIdentity
 } from '../../src/peer/town-hall-room-identity';
-import type { TownHallRoom } from '../../src/peer/town-hall-plan';
+import { isTownHallRoom, type TownHallRoom } from '../../src/peer/town-hall-plan';
 
 const room: TownHallRoom = Object.freeze({
   guildId: '111111111111111111',
@@ -17,6 +17,13 @@ const partial: { guildId: string } = { guildId: room.guildId };
 
 const accepted: boolean = validateTownHallRoomIdentity(response, room);
 const marker: '[discord-surface:town-hall:v1]' = TOWN_HALL_ROOM_MARKER;
+
+if (isTownHallRoom(response)) {
+  const narrowedGuildId: string = response.guildId;
+  const narrowedChannelId: string = response.channelId;
+  void narrowedGuildId;
+  void narrowedChannelId;
+}
 
 void marker;
 
