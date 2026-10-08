@@ -106,13 +106,13 @@ function classStateInventory(sourceText) {
           ['scheduleDeferredHandoffRecovery', 'schedulePendingHandoffRecoveryPoll'].includes(memberName))) {
           violations.push(memberName);
         }
-        if (timerOwners.includes(memberName) && memberName !== 'scheduleLiveCheckpointRetry') violations.push(`${memberName}: timer API`);
+        if (timerOwners.includes(memberName)) violations.push(`${memberName}: timer API`);
       }
     }
     ts.forEachChild(node, visit);
   }
   visit(source);
-  if (timerOwners.join(',') !== 'scheduleLiveCheckpointRetry') violations.push(`unexpected timer owners: ${timerOwners.join(',')}`);
+  if (timerOwners.length !== 0) violations.push(`unexpected timer owners: ${timerOwners.join(',')}`);
   violations.push(...facadeOwnerInventory(ts, source, { ownerName: 'handoffSchedulerHandlers', factoryName: FACTORY_NAME, facadeNames: Object.keys(METHOD_HASHES) }));
   return violations;
 }

@@ -1,5 +1,7 @@
 import { COURIER_ATTEMPT_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES } from './constants';
-import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
+import { attemptId, attemptKey, createEnvelope, payloadHash, CourierPromptLimitError } from './envelope';
+import { hasCourierForwardClaim } from './forward';
+import { courierPredecessorRouteMatches, retiredCourierPredecessor } from './retirement';
 import { findMatchingRoute, isCourierOriginAllowed, type RouteMatch } from './route';
 import type {
   CourierAttempt,
@@ -9,6 +11,7 @@ import type {
   CourierMessage,
   CourierOutcome,
   CourierOutcomeRecord,
+  CourierEnvelope,
   CourierState,
   CourierRoute,
   SqlRow
@@ -110,7 +113,11 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
           : { accepted: false, status: COURIER_RESULT_STATUSES.SETTLED, message };
       }
       const existing = latestAttempt(deps, state, messageId);
-      if (existing) {
+      const predecessorAttemptId = existing && message.watcherNotice &&
+        !state.hasNativeAcknowledgment(message) && !hasCourierForwardClaim(state, messageId)
+        ? retiredCourierPredecessor(deps, state, messageId)
+        : null;
+      if (existing && predecessorAttemptId !== existing.attempt.attemptId) {
         return { accepted: false, duplicate: true, status: COURIER_RESULT_STATUSES.DUPLICATE, message, ...existing };
       }
       const match = findMatchingRoute(deps, state, message, input.routeId);
@@ -119,12 +126,25 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
         return { accepted: false, status: match.status, message, route: match.route || null };
       }
       const route = match.route as CourierRoute;
+      if (predecessorAttemptId && !courierPredecessorRouteMatches(
+        deps, state, messageId, predecessorAttemptId, route
+      )) {
+        rejection(deps, state, messageId, COURIER_RESULT_STATUSES.STALE, { routeId: route.routeId });
+        return { accepted: false, status: COURIER_RESULT_STATUSES.STALE, message, route };
+      }
       const hash = payloadHash(message, input);
-      const key = attemptKey(message, route, hash);
+      const key = attemptKey(message, route, hash, predecessorAttemptId);
       const id = attemptId(key);
-      const envelope = createEnvelope(message, route, id, hash, input);
+      let envelope: CourierEnvelope;
+      try {
+        envelope = createEnvelope(message, route, id, hash, input, predecessorAttemptId);
+      } catch (error) {
+        if (error instanceof CourierPromptLimitError) return { accepted: false, status: COURIER_RESULT_STATUSES.CONFLICT, message };
+        throw error;
+      }
       const detail = {
         attemptId: id,
+        ...(predecessorAttemptId ? { predecessorAttemptId, inputPrompt: input.prompt } : {}),
         attemptKey: key,
         state: COURIER_ATTEMPT_STATES.CLAIMED,
         messageId,
@@ -164,13 +184,20 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
       }
       if (record.outcome) return { authorized: false, duplicate: true, status: COURIER_RESULT_STATUSES.DUPLICATE, message, route: match.route, ...record };
       const route = match.route as CourierRoute;
+      const predecessorAttemptId = record.attempt.predecessorAttemptId || null;
+      if (predecessorAttemptId && (!message.watcherNotice || state.hasNativeAcknowledgment(message) ||
+          hasCourierForwardClaim(state, messageId) ||
+          retiredCourierPredecessor(deps, state, messageId, record.attempt.receiptId) !== predecessorAttemptId ||
+          !courierPredecessorRouteMatches(deps, state, messageId, predecessorAttemptId, route, record.attempt.receiptId))) {
+        return { authorized: false, status: COURIER_RESULT_STATUSES.STALE, message, route, ...record };
+      }
       const hash = payloadHash(message, input);
-      const key = attemptKey(message, route, hash);
+      const key = attemptKey(message, route, hash, predecessorAttemptId);
       if (key !== record.attempt.attemptKey || hash !== record.attempt.payloadHash) {
         rejection(deps, state, messageId, COURIER_RESULT_STATUSES.CONFLICT, { routeId: route.routeId });
         return { authorized: false, status: COURIER_RESULT_STATUSES.CONFLICT, message, route, ...record };
       }
-      const envelope = createEnvelope(message, route, id, hash, input);
+      const envelope = createEnvelope(message, route, id, hash, input, predecessorAttemptId);
       if (JSON.stringify(envelope) !== JSON.stringify(record.attempt.envelope)) {
         rejection(deps, state, messageId, COURIER_RESULT_STATUSES.CONFLICT, { routeId: route.routeId });
         return { authorized: false, status: COURIER_RESULT_STATUSES.CONFLICT, message, route, ...record };
