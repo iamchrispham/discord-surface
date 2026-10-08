@@ -365,9 +365,29 @@ function isTownHallContextName(name, sourceFile) {
     (isGenericRoomValidatorName(name) && !neutralFile && isRoomPolicyFile(sourceFile));
 }
 
+function isAnonymousDefaultRoomPolicy(scope, sourceFile) {
+  const fileName = sourceFile?.fileName || '';
+  if (!isRoomPolicyFile(sourceFile) || !isTownHallName(fileName)) return false;
+  if (ts.isFunctionDeclaration(scope)) {
+    return !scope.name && scope.modifiers?.some(
+      modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword,
+    );
+  }
+  if (!ts.isArrowFunction(scope) && !ts.isFunctionExpression(scope)) return false;
+  let current = scope;
+  while (current.parent &&
+      (ts.isParenthesizedExpression(current.parent) || ts.isAsExpression(current.parent))) {
+    current = current.parent;
+  }
+  const assignment = current.parent;
+  return ts.isExportAssignment(assignment) && !assignment.isExportEquals &&
+    assignment.expression === current;
+}
+
 function hasTownHallDeclarationContext(scope, sourceFile) {
   let current = scope;
   while (current) {
+    if (isAnonymousDefaultRoomPolicy(current, sourceFile)) return true;
     const binding = ts.isFunctionLike(current) ? functionBinding(current) : null;
     if (binding && isTownHallContextName(bindingName(binding), sourceFile)) return true;
     if (current.name && ts.isIdentifier(current.name) &&
@@ -3329,7 +3349,84 @@ test('room policy inventory records only town-hall room validators', () => {
     'isTownHallRoom',
     [unrelatedCommonJsBarrelFixture],
   ), 0);
+  const esmNamedTownHallBarrelFixture = ts.createSourceFile(
+    'peer/town-hall-plan-named-barrel.ts',
+    "export { isTownHallRoom } from './town-hall-plan';",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const esmNamedTownHallBarrelConsumerFixture = ts.createSourceFile(
+    'peer/esm-named-town-hall-barrel-consumer.ts',
+    "import { isTownHallRoom as roomGuard } from './town-hall-plan-named-barrel'; roomGuard({});",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(
+    esmNamedTownHallBarrelConsumerFixture,
+    'isTownHallRoom',
+    [esmNamedTownHallBarrelFixture],
+  ), 1);
+  const esmStarTownHallBarrelFixture = ts.createSourceFile(
+    'peer/town-hall-plan-star-barrel.ts',
+    "export * from './town-hall-plan';",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const esmStarTownHallBarrelConsumerFixture = ts.createSourceFile(
+    'peer/esm-star-town-hall-barrel-consumer.ts',
+    "import { isTownHallRoom as roomGuard } from './town-hall-plan-star-barrel'; roomGuard({});",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(
+    esmStarTownHallBarrelConsumerFixture,
+    'isTownHallRoom',
+    [esmStarTownHallBarrelFixture],
+  ), 1);
+  const typeOnlyGuardReferenceFixture = ts.createSourceFile(
+    'peer/type-only-guard-reference-fixture.ts',
+    "import type { isTownHallRoom } from './town-hall-plan'; type Guard = typeof isTownHallRoom;",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(typeOnlyGuardReferenceFixture, 'isTownHallRoom'), 0);
+  const typeQueryGuardReferenceFixture = ts.createSourceFile(
+    'peer/type-query-guard-reference-fixture.ts',
+    "import { isTownHallRoom } from './town-hall-plan'; type Guard = typeof isTownHallRoom;",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(typeQueryGuardReferenceFixture, 'isTownHallRoom'), 0);
   const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
     ? { ...record, text: record.text + inline.text } : record);
   assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);
+  const anonymousDefaultRoomFunction = {
+    file: 'peer/town-hall-anonymous-function-validator.ts',
+    text: 'export default function (room) { return /^\\d{1,20}$/.test(room.guildId); }',
+  };
+  assert.deepEqual(roomDigitPolicies([...records, anonymousDefaultRoomFunction]), {
+    ...expectedPolicies,
+    [anonymousDefaultRoomFunction.file]: 1,
+  });
+  const anonymousDefaultRoomArrow = {
+    file: 'peer/town-hall-anonymous-arrow-validator.ts',
+    text: 'export default room => /^\\d{1,20}$/.test(room.guildId);',
+  };
+  assert.deepEqual(roomDigitPolicies([...records, anonymousDefaultRoomArrow]), {
+    ...expectedPolicies,
+    [anonymousDefaultRoomArrow.file]: 1,
+  });
+  const ordinaryDefaultRoomFunction = {
+    file: 'peer/ordinary-anonymous-function-validator.ts',
+    text: 'export default function (room) { return /^\\d{1,20}$/.test(room.guildId); }',
+  };
+  const ordinaryDefaultRoomArrow = {
+    file: 'peer/ordinary-anonymous-arrow-validator.ts',
+    text: 'export default room => /^\\d{1,20}$/.test(room.guildId);',
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    ordinaryDefaultRoomFunction,
+    ordinaryDefaultRoomArrow,
+  ]), expectedPolicies);
 });
