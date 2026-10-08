@@ -366,6 +366,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     return staticStringText(name.expression);
   }
   function assignmentPropertyNameText(expression) {
+    if (ts.isIdentifier(expression)) return expression.text;
     if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
     if (ts.isElementAccessExpression(expression) && expression.argumentExpression) {
       return staticStringText(expression.argumentExpression);
@@ -391,13 +392,31 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       || ts.isArrowFunction(implementation)
       || ts.isClassExpression(implementation);
   }
+  function hasDirectImplementationReturn(body) {
+    return Boolean(body) && body.statements.some(statement => ts.isReturnStatement(statement)
+      && statement.expression
+      && isImplementationExpression(statement.expression));
+  }
   function isImplementationDescriptor(expression) {
     const descriptor = unwrapExpression(expression);
     if (!ts.isObjectLiteralExpression(descriptor)) return false;
     return descriptor.properties.some(property => {
-      if (!property.name || propertyNameText(property.name) !== 'value') return false;
-      if (ts.isMethodDeclaration(property)) return true;
-      return ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer);
+      if (!property.name) return false;
+      const name = propertyNameText(property.name);
+      if (name === 'value') {
+        if (ts.isMethodDeclaration(property)) return true;
+        return ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer);
+      }
+      if (name !== 'get') return false;
+      if (ts.isMethodDeclaration(property)) return hasDirectImplementationReturn(property.body);
+      if (!ts.isPropertyAssignment(property)) return false;
+      const getter = unwrapExpression(property.initializer);
+      if (ts.isArrowFunction(getter)) {
+        return ts.isBlock(getter.body)
+          ? hasDirectImplementationReturn(getter.body)
+          : isImplementationExpression(getter.body);
+      }
+      return ts.isFunctionExpression(getter) && hasDirectImplementationReturn(getter.body);
     });
   }
   function isDefinePropertyImplementation(node) {
@@ -622,6 +641,13 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['defineProperties unrelated property', 'Object.defineProperties(exports, { otherCapture: { value() {} } });', false],
     ['defineProperties value alias', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: importedCapture } });', false],
     ['defineProperties null value', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: null } });', false],
+    ['defineProperty getter implementation', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { get() { return pid => null; } });", true],
+    ['defineProperty getter imported alias', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { get() { return importedCapture; } });", false],
+    ['defineProperties getter implementation', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { get() { return pid => null; } } });', true],
+    ['defineProperties getter imported alias', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { get() { return importedCapture; } } });', false],
+    ['bare binding assignment implementation', 'let captureProcessOwnerIdentity; captureProcessOwnerIdentity = function () {};', true],
+    ['bare binding assignment imported alias', 'let captureProcessOwnerIdentity; captureProcessOwnerIdentity = importedCapture;', false],
+    ['bare binding assignment null', 'let captureProcessOwnerIdentity; captureProcessOwnerIdentity = null;', false],
     ['ambient function declaration', 'declare function captureProcessOwnerIdentity(pid: number): Owner | null;', false, ts.ScriptKind.TS],
     ['ambient class method', 'declare class Example { captureProcessOwnerIdentity() {} }', false, ts.ScriptKind.TS],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
