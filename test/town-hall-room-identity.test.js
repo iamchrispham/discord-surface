@@ -348,7 +348,7 @@ test('room guard rejects accessor descriptors with inherited value fields', () =
   const accessorRoom = {};
   for (const [key, value] of [['guildId', GUILD], ['channelId', CHANNEL]]) {
     Object.defineProperty(accessorRoom, key, {
-      get() { return { value }; },
+      get() { return value; },
       configurable: true,
       enumerable: true
     });

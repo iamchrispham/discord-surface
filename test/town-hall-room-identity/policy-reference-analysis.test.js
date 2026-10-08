@@ -34,6 +34,16 @@ test('reference analysis follows aliases and namespace members without shadows',
   assert.equal(countIdentifierReferences(directCommonJs, 'isTownHallRoom'), 1);
 });
 
+test('reference analysis resolves the built town-hall facade to its source owner', () => {
+  const distFacade = source(String.raw`const plan = require('../../dist/peer/town-hall-plan.js');
+    plan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(distFacade, 'isTownHallRoom'), 1);
+
+  const unrelatedDistFacade = source(String.raw`const plan = require('../../dist/peer/voice-room.js');
+    plan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(unrelatedDistFacade, 'isTownHallRoom'), 0);
+});
+
 test('reference analysis follows TypeScript export-equals barrels', () => {
   const barrel = ts.createSourceFile(
     'peer/town-hall-plan-barrel.cts',

@@ -150,7 +150,7 @@ export function planTownHallBroadcast(input: unknown): TownHallPlan {
   const targets: AgentAddress[] = [];
   for (let index = 0; index < recipients.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(recipients, String(index));
-    if (!descriptor || !('value' in descriptor)) throw invalid();
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) throw invalid();
     targets.push(copyAddress(descriptor.value));
   }
 

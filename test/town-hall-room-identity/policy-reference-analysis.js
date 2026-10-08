@@ -326,7 +326,9 @@ function isTownHallPlanModule(sourceFile, specifier, exportedName, sourceFiles =
     return false;
   }
   const sourceModule = extension ? modulePath.slice(0, -extension.length) : modulePath;
-  if (sourceModule === nodePath.resolve(sourceRoot, 'peer/town-hall-plan')) return true;
+  const planSource = nodePath.resolve(sourceRoot, 'peer/town-hall-plan');
+  const planFacade = nodePath.resolve(sourceRoot, '../dist/peer/town-hall-plan');
+  if (sourceModule === planSource || sourceModule === planFacade) return true;
   if (!sourceFiles.length) return false;
   const barrel = resolveSourceFile(sourceFile, specifier, sourceFiles);
   if (!barrel) return false;

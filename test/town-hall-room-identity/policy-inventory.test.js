@@ -75,6 +75,20 @@ test('room policy inventory records only town-hall room validators', () => {
     if (count) references[file] = count;
   }
   assert.deepEqual(references, { 'peer/town-hall-plan.ts': 1, 'peer/town-hall-room-identity.ts': 1 });
+  const distFacadeSentinel = ts.createSourceFile(
+    'peer/town-hall-audit-dist-consumer.js',
+    String.raw`const plan = require('../../dist/peer/town-hall-plan.js'); plan.isTownHallRoom({});`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(distFacadeSentinel, 'isTownHallRoom'), 1);
+  const unrelatedDistFacade = ts.createSourceFile(
+    'peer/unrelated-dist-consumer.js',
+    String.raw`const plan = require('../../dist/peer/voice-room.js'); plan.isTownHallRoom({});`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(unrelatedDistFacade, 'isTownHallRoom'), 0);
   const referenceFixture = ts.createSourceFile('peer/reference-fixture.ts', String.raw`// isTownHallRoom
   const label = 'isTownHallRoom';
   interface Options { isTownHallRoom: boolean }
@@ -1321,7 +1335,8 @@ test('room policy inventory records only town-hall room validators', () => {
     return candidate.guildId.search(/^\d{1,21}$/) !== -1;
   }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedSearch]), expectedPolicies);
-  const unrelatedBounded = { file: 'peer/snowflake.ts', text: String.raw`function validateId(value) { return /^\d{1,20}$/.test(value); }` };
+  const unrelatedBounded = { file: 'peer/snowflake.ts', text: String.raw`function boundedId(value) { return /^\d{1,20}$/.test(value); }
+    function validateUser(user) { return boundedId(user.id); }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedBounded]), expectedPolicies);
   const unrelatedOwnerPattern = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(value) { return /^\d{1,20}$/.test(value); }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedOwnerPattern]), expectedPolicies);
@@ -1392,6 +1407,13 @@ test('room policy inventory records only town-hall room validators', () => {
     return /^\d*$/.test(room.guildId) && room.guildId.length <= 20;
   }` };
   assert.deepEqual(roomDigitPolicies([...records, emptySplit]), expectedPolicies);
+  const emptyTownHallSplit = { file: 'peer/private-town-hall-room.ts', text: String.raw`function isPrivateTownHallRoom(room) {
+    return /^\d*$/.test(room.guildId) && room.guildId.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, emptyTownHallSplit]), {
+    ...expectedPolicies,
+    'peer/private-town-hall-room.ts': 1
+  });
   const emptyAlias = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     const value = room.channelId;
     return /^\d*$/.test(value) && value.length <= 20;
