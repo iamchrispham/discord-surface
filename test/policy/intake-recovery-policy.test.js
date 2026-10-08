@@ -1772,7 +1772,15 @@ const isUnshadowedIdentifierAt = (tokens, name, index, pairs) => {
   return !resolveVisibleBinding(lexicalBindings, name, index, lexicalScopes);
 };
 
-const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), resolvingArrays = new Set()) => {
+const valueHasGapOutcome = (
+  tokens,
+  start,
+  end,
+  pairs,
+  aliases = new Set(),
+  resolvingArrays = new Set(),
+  allowPromiseRace = false
+) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
   const projectedValue = parenthesizedObjectMemberValueRangeAt(
@@ -1781,20 +1789,44 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), reso
     expression.end,
     pairs
   );
-  if (projectedValue) return valueHasGapOutcome(tokens, projectedValue[0], projectedValue[1], pairs, aliases, resolvingArrays);
+  if (projectedValue) return valueHasGapOutcome(
+    tokens,
+    projectedValue[0],
+    projectedValue[1],
+    pairs,
+    aliases,
+    resolvingArrays,
+    allowPromiseRace
+  );
   const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
   if (commaSegments.length > 1) {
     const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
-    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays);
+    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays, allowPromiseRace);
   }
   const assignmentIndex = topLevelToken(tokens, expression.start, expression.end, '=');
   if (assignmentIndex >= 0) {
     const outcomeValueStart = outcomeAssignmentValueStart(tokens, expression.start);
     if (outcomeValueStart === null || outcomeValueStart <= assignmentIndex) return false;
-    return valueHasGapOutcome(tokens, outcomeValueStart, expression.end, pairs, aliases, resolvingArrays);
+    return valueHasGapOutcome(
+      tokens,
+      outcomeValueStart,
+      expression.end,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace
+    );
   }
   if (tokens[expression.start]?.value === 'await') {
-    return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases, resolvingArrays);
+    return valueHasGapOutcome(
+      tokens,
+      expression.start + 1,
+      expression.end,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace
+    );
   }
   if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
   if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
@@ -1812,7 +1844,8 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), reso
       arrayElement[1],
       pairs,
       aliases,
-      nextResolvingArrays
+      nextResolvingArrays,
+      allowPromiseRace
     );
   }
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
@@ -1825,15 +1858,41 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), reso
   const isObjectFreeze = tokens[wrapperStart]?.value === 'Object'
     && tokens[wrapperStart + 1]?.value === '.'
     && tokens[wrapperStart + 2]?.value === 'freeze';
+  const isPromiseRace = tokens[wrapperStart]?.value === 'Promise'
+    && tokens[wrapperStart + 1]?.value === '.'
+    && tokens[wrapperStart + 2]?.value === 'race'
+    && allowPromiseRace
+    && isUnshadowedIdentifierAt(tokens, 'Promise', wrapperStart, pairs);
   const isPrimitiveString = tokens[wrapperStart]?.value === 'String'
     && tokens[wrapperStart - 1]?.value !== 'new'
     && isUnshadowedIdentifierAt(tokens, 'String', wrapperStart, pairs);
   const wrapperOpening = wrapperStart + (isPrimitiveString ? 1 : 3);
-  if ((!isPromiseResolve && !isObjectFreeze && !isPrimitiveString)
+  if ((!isPromiseResolve && !isObjectFreeze && !isPromiseRace && !isPrimitiveString)
     || tokens[wrapperOpening]?.value !== '(') return false;
   const wrapperClosing = pairs.get(wrapperOpening);
   if (wrapperClosing !== expression.end - 1) return false;
   const effectiveArgument = topLevelSegments(tokens, wrapperOpening + 1, wrapperClosing)[0];
+  if (isPromiseRace) {
+    if (!effectiveArgument || tokens[effectiveArgument[0]]?.value !== '[') return false;
+    const arrayClosing = pairs.get(effectiveArgument[0]);
+    if (arrayClosing !== effectiveArgument[1] - 1) return false;
+    const elements = topLevelSegments(tokens, effectiveArgument[0] + 1, arrayClosing);
+    const nonEmptyElements = elements.filter(([elementStart, elementEnd]) => elementStart < elementEnd);
+    if (nonEmptyElements.length !== 1 || elements.slice(0, -1).some(
+      ([elementStart, elementEnd]) => elementStart >= elementEnd
+    )) return false;
+    const [elementStart, elementEnd] = nonEmptyElements[0];
+    if (tokens[elementStart]?.value === '...') return false;
+    return valueHasGapOutcome(
+      tokens,
+      elementStart,
+      elementEnd,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace
+    );
+  }
   return effectiveArgument !== undefined
     && valueHasGapOutcome(
       tokens,
@@ -1841,11 +1900,20 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), reso
       effectiveArgument[1],
       pairs,
       aliases,
-      resolvingArrays
+      resolvingArrays,
+      allowPromiseRace
     );
 };
 
-const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRanges, aliases) => {
+const valueHasGapOutsideNestedFunctions = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  aliases,
+  allowPromiseRace = false
+) => {
   const nestedFunctions = functionRanges
     .filter(range => range.start >= start && range.closing <= end)
     .sort((left, right) => left.start - right.start || right.closing - left.closing);
@@ -1856,15 +1924,23 @@ const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRa
       const bodyStart = range.expression ? range.bodyStart : range.opening + 1;
       const bodyEnd = range.expression ? range.bodyEnd : range.closing;
       const invokedOutcome = range.expression
-        ? valueHasGapOutsideNestedFunctions(tokens, bodyStart, bodyEnd, pairs, functionRanges, aliases)
+        ? valueHasGapOutsideNestedFunctions(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          pairs,
+          functionRanges,
+          aliases,
+          allowPromiseRace
+        )
         : hasGapOutcome(tokens, bodyStart, bodyEnd, range.opening, pairs, functionRanges, aliases);
       if (invokedOutcome) return true;
     }
-    if (valueHasGapOutcome(tokens, cursor, range.start, pairs, aliases)) return true;
+    if (valueHasGapOutcome(tokens, cursor, range.start, pairs, aliases, new Set(), allowPromiseRace)) return true;
     cursor = range.closing + 1;
   }
   if (cursor >= end) return false;
-  return valueHasGapOutcome(tokens, cursor, end, pairs, aliases);
+  return valueHasGapOutcome(tokens, cursor, end, pairs, aliases, new Set(), allowPromiseRace);
 };
 
 const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases, functionRanges = []) => {
@@ -2289,6 +2365,102 @@ const localFunctionWasReassigned = (tokens, name, start, end) => {
   return false;
 };
 
+const localFunctionDeclarationWasReassignedAt = (tokens, range, useIndex, pairs, functionRanges) => {
+  const name = localFunctionBindingNameAt(tokens, range, pairs);
+  if (name === null) return false;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const declarationScope = lexicalScopePath(lexicalScopes, range.start);
+  for (let index = range.closing + 1; index < useIndex; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    const isAssignment = ['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??='].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value);
+    if (!isAssignment
+      || !isLexicallyVisible(declarationScope, lexicalScopePath(lexicalScopes, index))) continue;
+    if (!resolveVisibleBinding(bindings, name, index + 1, lexicalScopes)) return true;
+  }
+  return false;
+};
+
+const localFunctionForCallAt = (
+  tokens,
+  name,
+  useIndex,
+  pairs,
+  functionRanges,
+  knownLocalFunctions,
+  resolvingBindings = new Set()
+) => {
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const visibleBinding = resolveVisibleBinding(bindings, name, useIndex, lexicalScopes);
+  if (visibleBinding) {
+    if (visibleBinding.index >= useIndex || resolvingBindings.has(visibleBinding.index)
+      || !Number.isInteger(visibleBinding.expressionStart)
+      || !Number.isInteger(visibleBinding.expressionEnd)) return null;
+    for (let index = visibleBinding.index + 1; index < useIndex; index += 1) {
+      if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+      const isAssignment = ['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??='].includes(tokens[index + 1]?.value)
+        || ['++', '--'].includes(tokens[index + 1]?.value)
+        || ['++', '--'].includes(tokens[index - 1]?.value);
+      if (!isAssignment) continue;
+      const assignedBinding = resolveVisibleBinding(bindings, name, index + 1, lexicalScopes);
+      if (assignedBinding?.index === visibleBinding.index) return null;
+    }
+
+    const functionValue = functionRanges.find(range => (
+      localFunctionBindingNameAt(tokens, range, pairs) === name
+      && visibleBinding.expressionStart <= range.start
+      && range.start < visibleBinding.expressionEnd
+      && range.closing < useIndex
+    ));
+    if (functionValue) return functionValue;
+
+    const initializer = trimExpressionRange(
+      tokens,
+      visibleBinding.expressionStart,
+      visibleBinding.expressionEnd,
+      pairs
+    );
+    if (initializer.end - initializer.start !== 1
+      || tokens[initializer.start]?.type !== 'identifier') return null;
+    const nextResolvingBindings = new Set(resolvingBindings);
+    nextResolvingBindings.add(visibleBinding.index);
+    return localFunctionForCallAt(
+      tokens,
+      tokens[initializer.start].value,
+      initializer.start,
+      pairs,
+      functionRanges,
+      knownLocalFunctions,
+      nextResolvingBindings
+    );
+  }
+
+  if (!knownLocalFunctions.has(name)) return null;
+  const useFunctionScope = functionScopeOpeningAt(useIndex, functionRanges);
+  const lexicalScopeAtUse = lexicalScopePath(lexicalScopes, useIndex);
+  const candidates = functionRanges
+    .filter(range => localFunctionBindingNameAt(tokens, range, pairs) === name
+      && range.start < useIndex
+      && range.closing < useIndex
+      && functionParentOpening(range, functionRanges) === useFunctionScope
+      && isLexicallyVisible(lexicalScopePath(lexicalScopes, range.start), lexicalScopeAtUse))
+    .sort((left, right) => lexicalScopePath(lexicalScopes, right.start).length
+      - lexicalScopePath(lexicalScopes, left.start).length
+      || right.start - left.start);
+  const localFunction = candidates[0];
+  if (!localFunction) return null;
+
+  const functionNameIndex = tokens[localFunction.start]?.value === 'async'
+    ? localFunction.start + 1
+    : localFunction.start;
+  if (tokens[functionNameIndex]?.value !== 'function'
+    || localFunctionDeclarationWasReassignedAt(tokens, localFunction, useIndex, pairs, functionRanges)) return null;
+  return localFunction;
+};
+
 const functionParameterRangesAt = (tokens, range, pairs) => {
   let syntaxStart = range.start;
   if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
@@ -2422,7 +2594,8 @@ const promiseHandlerOutcomesAt = (
       bodyEnd,
       pairs,
       functionRanges,
-      handlerAliases
+      handlerAliases,
+      true
     )
     : hasGapOutcome(
       tokens,
@@ -2596,10 +2769,15 @@ const localFunctionCallHasGapOutcome = (
     if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.'
       || tokens[index + 1]?.value !== '(') continue;
     const name = tokens[index].value;
-    const localFunction = knownLocalFunctions.get(name);
-    if (!localFunction || localFunction.closing >= index
-      || resolvingFunctions.has(localFunction)
-      || localFunctionWasReassigned(tokens, name, localFunction.closing + 1, index)) continue;
+    const localFunction = localFunctionForCallAt(
+      tokens,
+      name,
+      index,
+      pairs,
+      functionRanges,
+      knownLocalFunctions
+    );
+    if (!localFunction || resolvingFunctions.has(localFunction)) continue;
 
     const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
     const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
@@ -2615,7 +2793,7 @@ const localFunctionCallHasGapOutcome = (
       const argument = callArguments[parameterIndex];
       const argumentWasProvided = argument !== undefined && argument[0] < argument[1];
       if (argumentWasProvided
-        && valueHasGapOutcome(tokens, argument[0], argument[1], pairs, aliases)) {
+        && valueHasGapOutcome(tokens, argument[0], argument[1], pairs, aliases, new Set(), true)) {
         callAliases.add(parameterName);
       } else if (!argumentWasProvided && parameter.defaultStart !== null
         && valueHasGapOutcome(
@@ -2623,7 +2801,9 @@ const localFunctionCallHasGapOutcome = (
           parameter.defaultStart,
           parameter.defaultEnd,
           pairs,
-          aliases
+          aliases,
+          new Set(),
+          true
         )) {
         callAliases.add(parameterName);
       } else {
@@ -2639,7 +2819,8 @@ const localFunctionCallHasGapOutcome = (
         callbackEnd,
         pairs,
         functionRanges,
-        callAliases
+        callAliases,
+        true
       ) || localFunctionCallHasGapOutcome(
         tokens,
         callbackStart,
@@ -2724,6 +2905,7 @@ const hasGapOutcome = (
   const knownBooleanAliases = new Map();
   const localAssignments = findIdentifierAssignments(tokens, findLexicalScopes(tokens, pairs));
   const knownLocalFunctions = new Map();
+  const unreachableRanges = new Map();
   const localFunctionScope = functionScopeOpeningAt(start, functionRanges);
   for (const candidate of functionRanges) {
     if (candidate.start >= start || candidate.closing >= start
@@ -2735,6 +2917,11 @@ const hasGapOutcome = (
     .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
     .map(range => [range.start, range]));
   for (let index = start; index < end; index += 1) {
+    const unreachableThrough = unreachableRanges.get(index);
+    if (unreachableThrough !== undefined) {
+      index = unreachableThrough;
+      continue;
+    }
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
       const bindingName = localFunctionBindingNameAt(tokens, nestedFunction, pairs);
@@ -2775,7 +2962,8 @@ const hasGapOutcome = (
             bodyEnd,
             pairs,
             functionRanges,
-            knownAliases
+            knownAliases,
+            true
           )) return true;
         if (callbackKind !== 'discarded' && hasGapOutcome(
           tokens,
@@ -2792,21 +2980,36 @@ const hasGapOutcome = (
       continue;
     }
     const token = tokens[index];
-    if (token.value === 'if' && tokens[index + 1]?.value === '(') {
+    if (['if', 'while', 'for'].includes(token.value) && tokens[index + 1]?.value === '(') {
       const conditionClosing = pairs.get(index + 1);
-      const condition = conditionClosing === undefined
+      let conditionStart = index + 2;
+      let conditionEnd = conditionClosing;
+      let unreachableUpdate = null;
+      if (token.value === 'for' && conditionClosing !== undefined) {
+        const initializerEnd = topLevelToken(tokens, index + 2, conditionClosing, ';');
+        const conditionSeparator = initializerEnd < 0
+          ? -1
+          : topLevelToken(tokens, initializerEnd + 1, conditionClosing, ';');
+        if (initializerEnd < 0 || conditionSeparator < 0) conditionEnd = undefined;
+        else {
+          conditionStart = initializerEnd + 1;
+          conditionEnd = conditionSeparator;
+          unreachableUpdate = [conditionSeparator + 1, conditionClosing];
+        }
+      }
+      const condition = conditionClosing === undefined || conditionEnd === undefined
         ? null
-        : staticBooleanValueAt(tokens, index + 2, conditionClosing, pairs, knownBooleanAliases);
+        : staticBooleanValueAt(tokens, conditionStart, conditionEnd, pairs, knownBooleanAliases);
       const bodyStart = conditionClosing === undefined ? -1 : conditionClosing + 1;
       const bodyClosing = tokens[bodyStart]?.value === '{' ? pairs.get(bodyStart) : undefined;
       const bodyEnd = bodyClosing === undefined
         ? findStatementEnd(tokens, bodyStart, end)
         : bodyClosing + 1;
-      if (bodyEnd > bodyStart && condition === false) {
+      if (token.value === 'if' && bodyEnd > bodyStart && condition === false) {
         index = bodyEnd - 1;
         continue;
       }
-      if (bodyEnd > bodyStart && condition === true && tokens[bodyEnd]?.value === 'else') {
+      if (token.value === 'if' && bodyEnd > bodyStart && condition === true && tokens[bodyEnd]?.value === 'else') {
         const elseStart = bodyEnd + 1;
         const elseClosing = tokens[elseStart]?.value === '{' ? pairs.get(elseStart) : undefined;
         const elseEnd = elseClosing === undefined
@@ -2816,6 +3019,12 @@ const hasGapOutcome = (
           index = elseEnd - 1;
           continue;
         }
+      }
+      if (token.value !== 'if' && bodyEnd > bodyStart && condition === false) {
+        if (unreachableUpdate && unreachableUpdate[0] < unreachableUpdate[1]) {
+          unreachableRanges.set(unreachableUpdate[0], unreachableUpdate[1] - 1);
+        }
+        unreachableRanges.set(bodyStart, bodyEnd - 1);
       }
     }
     if (token.type === 'identifier' && tokens[index + 1]?.value === '=') {
@@ -2853,14 +3062,13 @@ const hasGapOutcome = (
     }
     if (token.type === 'identifier' && tokens[index + 1]?.value === '(') {
       const isMemberCall = tokens[index - 1]?.value === '.';
-      let localFunction = null;
-      if (isMemberCall) {
-        localFunction = localObjectMethodAt(tokens, index, index, pairs, functionRanges);
-      } else if (tokens[index - 1]?.value !== '.') {
-        localFunction = knownLocalFunctions.get(token.value);
-      }
-      if (localFunction && localFunction.closing < index
-        && !localFunctionWasReassigned(tokens, token.value, localFunction.closing + 1, index)) {
+      const localFunction = isMemberCall
+        ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
+        : localFunctionForCallAt(tokens, token.value, index, pairs, functionRanges, knownLocalFunctions);
+      const memberReassigned = isMemberCall && localFunction
+        ? localFunctionWasReassigned(tokens, token.value, localFunction.closing + 1, index)
+        : false;
+      if (localFunction && !memberReassigned && !resolvingFunctions.has(localFunction)) {
         const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
         const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
         const callbackHasGap = localFunction.expression
@@ -2907,7 +3115,8 @@ const hasGapOutcome = (
         statementEnd,
         pairs,
         functionRanges,
-        knownAliases
+        knownAliases,
+        true
       );
       if (returnIsEffective && promiseChainGap === true) return true;
       if (returnIsEffective && promiseChainGap === null
@@ -2917,7 +3126,8 @@ const hasGapOutcome = (
         statementEnd,
         pairs,
         functionRanges,
-        knownAliases
+        knownAliases,
+        true
       ) || localFunctionCallHasGapOutcome(
         tokens,
         expressionStart,
@@ -6178,6 +6388,43 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     regressionAssert.equal(offendersFor(invokedGap).length, 1);
     regressionAssert.equal(offendersFor(invokedSafe).length, 0);
     regressionAssert.equal(offendersFor(uninvoked).length, 0);
+  });
+
+  regressionTest('deadline policy inventory resolves local helper aliases at their use sites', () => {
+    const gapWriterAlias = `function write() { state.markIntakeBoundary(id, READINESS.GAP, detail); } const alias = write; if (deadlineReached) alias();`;
+    const safeWriterAlias = `function write() { state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); } const alias = write; if (deadlineReached) alias();`;
+    const reassignedAlias = `function write() { state.markIntakeBoundary(id, READINESS.GAP, detail); } let alias = write; alias = () => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); if (deadlineReached) alias();`;
+    const shadowedAlias = `function write() { state.markIntakeBoundary(id, READINESS.GAP, detail); } const alias = write; if (deadlineReached) { const alias = () => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); alias(); }`;
+    const gapReturnAlias = `function write() { return READINESS.GAP; } const alias = write; if (deadlineReached) return alias();`;
+    regressionAssert.equal(offendersFor(gapWriterAlias).length, 1);
+    regressionAssert.equal(offendersFor(safeWriterAlias).length, 0);
+    regressionAssert.equal(offendersFor(reassignedAlias).length, 0);
+    regressionAssert.equal(offendersFor(shadowedAlias).length, 0);
+    regressionAssert.equal(offendersFor(gapReturnAlias).length, 1);
+  });
+
+  regressionTest('deadline policy inventory prunes only unreachable loop bodies and updates', () => {
+    const whileUnreachable = `if (deadlineReached) { while (false) return READINESS.GAP; return READINESS.UNAVAILABLE; }`;
+    const forUnreachable = `if (deadlineReached) { for (; false; state.markIntakeBoundary(id, READINESS.GAP, detail)) return READINESS.GAP; return READINESS.UNAVAILABLE; }`;
+    const forInitializerGap = `if (deadlineReached) { for (state.markIntakeBoundary(id, READINESS.GAP, detail); false; poll()) return READINESS.GAP; return READINESS.UNAVAILABLE; }`;
+    const doWhileGap = `if (deadlineReached) { do return READINESS.GAP; while (false); }`;
+    regressionAssert.equal(offendersFor(whileUnreachable).length, 0);
+    regressionAssert.equal(offendersFor(forUnreachable).length, 0);
+    regressionAssert.equal(offendersFor(forInitializerGap).length, 1);
+    regressionAssert.equal(offendersFor(doWhileGap).length, 1);
+  });
+
+  regressionTest('deadline policy inventory classifies singleton Promise.race values by result shape', () => {
+    const gapRace = `if (deadlineReached) return Promise.race([READINESS.GAP]);`;
+    const unavailableRace = `if (deadlineReached) return Promise.race([READINESS.UNAVAILABLE]);`;
+    const discardedRace = `if (deadlineReached) Promise.race([READINESS.GAP]);`;
+    const shadowedPromise = `const Promise = { race: values => values[0] }; if (deadlineReached) return Promise.race([READINESS.GAP]);`;
+    const arrayResult = `if (deadlineReached) return Promise.all([READINESS.GAP]);`;
+    regressionAssert.equal(offendersFor(gapRace).length, 1);
+    regressionAssert.equal(offendersFor(unavailableRace).length, 0);
+    regressionAssert.equal(offendersFor(discardedRace).length, 0);
+    regressionAssert.equal(offendersFor(shadowedPromise).length, 0);
+    regressionAssert.equal(offendersFor(arrayResult).length, 0);
   });
 
   regressionTest('deadline policy inventory applies defaults only to omitted helper arguments', () => {
