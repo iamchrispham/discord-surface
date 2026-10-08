@@ -52,6 +52,46 @@ function invoke(f, flags = [], identity = NATIVE) {
     '--correlation-id', f.request.id, ...flags], { CODEX_THREAD_ID: identity, CODEX_SESSION_ID: identity });
 }
 
+function createNetworkTrap(f) {
+  const dir = path.dirname(f.db);
+  const preload = path.join(dir, 'cli-network-trap.cjs');
+  const marker = path.join(dir, 'network-trap-hit');
+  fs.writeFileSync(preload, `
+    const fs = require('node:fs');
+    const marker = ${JSON.stringify(marker)};
+    const blocked = name => () => {
+      fs.writeFileSync(marker, name);
+      throw new Error('NETWORK_BLOCKED:' + name);
+    };
+    globalThis.fetch = blocked('fetch');
+    for (const [moduleName, methods] of Object.entries({
+      'node:http': ['request', 'get'],
+      'node:https': ['request', 'get'],
+      'node:net': ['connect', 'createConnection'],
+      'node:tls': ['connect'],
+      'node:dgram': ['createSocket']
+    })) {
+      const api = require(moduleName);
+      for (const method of methods) api[method] = blocked(moduleName + '.' + method);
+    }
+    const Module = require('node:module');
+    const originalLoad = Module._load;
+    Module._load = function(request, parent, isMain) {
+      const loaded = originalLoad.call(this, request, parent, isMain);
+      if (request !== 'node:sqlite') return loaded;
+      const DatabaseSync = function(...args) {
+        if (process.env.PEER_RESULT_TEST_NETWORK_PROBE === '1') {
+          globalThis.fetch('http://127.0.0.1:9/');
+        }
+        return new loaded.DatabaseSync(...args);
+      };
+      DatabaseSync.prototype = loaded.DatabaseSync.prototype;
+      return { ...loaded, DatabaseSync };
+    };
+  `);
+  return { marker, preload };
+}
+
 test('public CLI reads the current caller result without credentials or custody changes', t => {
   const f = prepared(t);
   const dir = path.dirname(f.db);
@@ -75,6 +115,39 @@ test('public CLI reads the current caller result without credentials or custody 
   assert.equal(fs.statSync(f.db).mode & 0o777, 0o644, 'inspection changed database permissions');
 });
 
+test('public CLI projects native acknowledgment separately from send and completion', t => {
+  const f = prepared(t);
+  const message = f.state.getMessage('10002');
+  f.state.receipt('10002', 'native-ack', { messageId: '10002', nativeId: message.nativeId,
+    provider: message.provider, generation: message.generation });
+  assert.equal(f.state.hasNativeAcknowledgment(message), true, 'fixture must create acknowledgment evidence');
+  const before = f.state.listReceipts();
+  const result = invoke(f);
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.sendOutcome, 'sent');
+  assert.equal(output.results[0].nativeAcknowledged, true);
+  assert.equal(output.results[0].completed, false);
+  assert.deepEqual(f.state.listReceipts(), before);
+});
+
+test('public inspection is network-free and its trap catches an injected request', t => {
+  const f = prepared(t);
+  const trap = createNetworkTrap(f);
+  const args = ['peer-result', '--provider', 'codex', '--db', f.db,
+    '--correlation-id', f.request.id];
+  const environment = { NODE_OPTIONS: `--require ${JSON.stringify(trap.preload)}`,
+    CODEX_THREAD_ID: NATIVE, CODEX_SESSION_ID: NATIVE };
+  const result = runCli(f, args, environment);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(trap.marker), false, 'inspection attempted network access');
+
+  const probe = runCli(f, args, { ...environment, PEER_RESULT_TEST_NETWORK_PROBE: '1' });
+  assert.equal(probe.status, 1);
+  assert.match(probe.stderr, /NETWORK_BLOCKED:fetch/);
+  assert.equal(fs.readFileSync(trap.marker, 'utf8'), 'fetch');
+});
+
 test('public CLI refuses another caller correlation and cannot select a native UUID', t => {
   const f = prepared(t);
   const before = f.state.listReceipts();
@@ -93,9 +166,29 @@ test('public CLI refuses absent or conflicting native invocation identity', t =>
   assert.equal(missing.status, 1);
   assert.equal(missing.stdout, '');
   const result = runCli(f, ['peer-result', '--provider', 'codex', '--db', f.db,
-    '--correlation-id', f.request.id], { CODEX_THREAD_ID: NATIVE, CODEX_SESSION_ID: OTHER });
+    '--correlation-id', f.request.id], { CODEX_THREAD_ID: OTHER, CODEX_SESSION_ID: NATIVE });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
+});
+
+test('unknown-command usage matches the public help command list', t => {
+  const f = prepared(t);
+  const help = runCli(f, ['--help']);
+  assert.equal(help.status, 0, help.stderr);
+  const unknown = runCli(f, ['__unknown_command_for_test__']);
+  assert.equal(unknown.status, 1);
+  const helpStart = help.stdout.indexOf('Commands:');
+  assert.notEqual(helpStart, -1, 'public help did not expose its command list');
+  const helpList = help.stdout.slice(helpStart + 'Commands:'.length).split('\n\n', 1)[0];
+  const helpCommands = helpList.split(',').map(command => command.replace(/\s+/g, ' ').trim());
+  for (const command of ['peer-result', 'watcher-arm', 'watcher-send', 'watcher-consume']) {
+    assert.ok(helpCommands.includes(command), `public help omitted ${command}`);
+  }
+  const usageLine = unknown.stderr.split('\n').find(line => line.includes('usage:'));
+  assert.ok(usageLine, 'unknown command did not print usage');
+  const usage = usageLine.slice(usageLine.indexOf('usage:') + 'usage:'.length);
+  const usageCommands = usage.split(',').map(command => command.replace(/\s+/g, ' ').trim());
+  assert.deepEqual(usageCommands, helpCommands);
 });
 
 test('public CLI rejects unknown and repeated flags before opening a database', t => {
