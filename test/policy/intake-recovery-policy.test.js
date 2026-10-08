@@ -707,9 +707,10 @@ const enclosingFinallyHandlerEnd = (tokens, completionIndex, pairs) => {
   return end;
 };
 
-const includeAbruptCompletionHandlers = (tokens, decision, pairs) => {
+const includeAbruptCompletionHandlers = (tokens, decision, pairs, functionRanges) => {
   if (!decision) return decision;
   let end = decision.end;
+  const continuations = [...(decision.continuations || [])];
   let expanded = true;
   while (expanded) {
     expanded = false;
@@ -723,13 +724,22 @@ const includeAbruptCompletionHandlers = (tokens, decision, pairs) => {
         }
       }
       if (!['break', 'continue', 'return', 'throw'].includes(completion)) continue;
+      if (completion === 'break') {
+        const continuation = findLoopBreakContinuation(tokens, index, pairs, functionRanges);
+        if (continuation
+          && !continuations.some(range => range.start === continuation.start && range.end === continuation.end)) {
+          continuations.push(continuation);
+          expanded = true;
+        }
+      }
       const finallyEnd = enclosingFinallyHandlerEnd(tokens, index, pairs);
       if (finallyEnd === null || finallyEnd <= end) continue;
       end = finallyEnd;
       expanded = true;
     }
   }
-  return end === decision.end ? decision : { ...decision, end };
+  if (end === decision.end && continuations.length === (decision.continuations || []).length) return decision;
+  return { ...decision, end, continuations };
 };
 
 const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pairs, aliasNegated = false) => {
@@ -965,6 +975,43 @@ const findFallthroughStatementsEnd = (tokens, start, end, pairs, functionRanges)
   return cursor;
 };
 
+const findLoopBreakContinuation = (tokens, breakIndex, pairs, functionRanges) => {
+  const enclosingBreakables = [];
+  for (let index = breakIndex - 1; index >= 0; index -= 1) {
+    const kind = tokens[index]?.value;
+    if (!['for', 'while', 'switch'].includes(kind)) continue;
+    const opening = index + 1;
+    if (tokens[opening]?.value !== '(') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined || closing >= breakIndex) continue;
+    const bodyStart = closing + 1;
+    const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
+    if (breakIndex < bodyStart || breakIndex >= bodyEnd) continue;
+    const nestedFunction = functionRanges.some(range =>
+      range.start > index && range.opening < breakIndex && breakIndex < range.closing
+    );
+    if (nestedFunction) continue;
+    enclosingBreakables.push({ index, kind, bodyEnd, bodyStart });
+  }
+
+  const target = enclosingBreakables.sort((left, right) =>
+    (left.bodyEnd - left.bodyStart) - (right.bodyEnd - right.bodyStart)
+      || right.index - left.index
+  )[0];
+  if (!target || target.kind === 'switch') return null;
+
+  const scopeEnd = findFallthroughScopeEnd(tokens, target.index, pairs, functionRanges);
+  const fallthroughEnd = findFallthroughStatementsEnd(
+    tokens,
+    target.bodyEnd,
+    scopeEnd,
+    pairs,
+    functionRanges
+  );
+  if (fallthroughEnd <= target.bodyEnd) return null;
+  return branchRange(tokens, target.bodyEnd, fallthroughEnd, pairs);
+};
+
 const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
     if (!['while', 'for'].includes(tokens[index]?.value)) continue;
@@ -1036,12 +1083,33 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
       );
       return branchRange(tokens, consequentEnd, fallthroughEnd, pairs);
     }
-    return branchRange(
+    const selectedStart = deadlineBranchIsNegated ? alternateStart : consequentStart;
+    const selectedEnd = deadlineBranchIsNegated
+      ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs)
+      : consequentEnd;
+    const selected = branchRange(tokens, selectedStart, selectedEnd, pairs);
+    const selectedBodyStart = tokens[selectedStart]?.value === '{' ? selectedStart + 1 : selectedStart;
+    const selectedBodyEnd = tokens[selectedStart]?.value === '{' ? selectedEnd - 1 : selectedEnd;
+    if (switchArmHasAbruptCompletion(tokens, selectedBodyStart, selectedBodyEnd, pairs, functionRanges)) {
+      return selected;
+    }
+
+    const ifEnd = alternateStart === consequentEnd
+      ? consequentEnd
+      : findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs);
+    const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges);
+    const fallthroughEnd = findFallthroughStatementsEnd(
       tokens,
-      deadlineBranchIsNegated ? alternateStart : consequentStart,
-      deadlineBranchIsNegated ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs) : consequentEnd,
-      pairs
+      ifEnd,
+      scopeEnd,
+      pairs,
+      functionRanges
     );
+    if (fallthroughEnd <= ifEnd) return selected;
+    return {
+      ...selected,
+      continuations: [branchRange(tokens, ifEnd, fallthroughEnd, pairs)]
+    };
   }
   const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
   if (loopDecision) return loopDecision;
@@ -1225,6 +1293,28 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases);
 };
 
+const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const nestedFunctions = functionRanges
+    .filter(range => range.start >= start && range.closing <= end)
+    .sort((left, right) => left.start - right.start || right.closing - left.closing);
+  let cursor = start;
+  for (const range of nestedFunctions) {
+    if (range.start < cursor) continue;
+    if (isImmediatelyInvokedFunction(tokens, pairs, range)) {
+      const bodyStart = range.expression ? range.bodyStart : range.opening + 1;
+      const bodyEnd = range.expression ? range.bodyEnd : range.closing;
+      const invokedOutcome = range.expression
+        ? valueHasGapOutsideNestedFunctions(tokens, bodyStart, bodyEnd, pairs, functionRanges, aliases)
+        : hasGapOutcome(tokens, bodyStart, bodyEnd, range.opening, pairs, functionRanges, aliases);
+      if (invokedOutcome) return true;
+    }
+    if (valueHasGapOutcome(tokens, cursor, range.start, pairs, aliases)) return true;
+    cursor = range.closing + 1;
+  }
+  if (cursor >= end) return false;
+  return valueHasGapOutcome(tokens, cursor, end, pairs, aliases);
+};
+
 const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases) => {
   if (tokens[index]?.value !== 'Object' || tokens[index + 1]?.value !== '.'
     || tokens[index + 2]?.value !== 'assign' || tokens[index + 3]?.value !== '(') return false;
@@ -1349,7 +1439,8 @@ const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
     const opening = pairs.get(next);
     if (opening === undefined) return false;
     const preceding = tokens[opening - 1];
-    if (preceding?.type === 'identifier' || [']', '.', '?.'].includes(preceding?.value)
+    if ((preceding?.type === 'identifier' && preceding.value !== 'return')
+      || [']', '.', '?.'].includes(preceding?.value)
       || (preceding?.value === ')' && !isControlHeaderClose(tokens, pairs, opening - 1))) return false;
     next += 1;
   }
@@ -1397,7 +1488,7 @@ const isScheduledCallback = (tokens, pairs, range) => {
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)) return true;
-  return callee === 'then' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value);
+  return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value);
 };
 
 const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
@@ -1414,7 +1505,14 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
         if (nestedFunction.expression
-          && valueHasGapOutcome(tokens, bodyStart, bodyEnd, pairs, knownAliases)) return true;
+          && valueHasGapOutsideNestedFunctions(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            functionRanges,
+            knownAliases
+          )) return true;
         if (hasGapOutcome(
           tokens,
           bodyStart,
@@ -1433,7 +1531,14 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (valueHasGapOutcome(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
+      if (valueHasGapOutsideNestedFunctions(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases
+      )) return true;
       if (hasBoundaryWriterGap(
         tokens,
         expressionStart,
@@ -1515,7 +1620,14 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       )) return true;
     }
   }
-  return opening === null && valueHasGapOutcome(tokens, start, end, pairs, knownAliases);
+  return opening === null && valueHasGapOutsideNestedFunctions(
+    tokens,
+    start,
+    end,
+    pairs,
+    functionRanges,
+    knownAliases
+  );
 };
 
 const isDeadlineTriggerAt = (tokens, index) => {
@@ -2012,6 +2124,43 @@ const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges, a
   return Boolean(findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs));
 };
 
+const deadlineDecisionHasGapOutcome = (
+  tokens,
+  decision,
+  pairs,
+  functionRanges,
+  lexicalScopes,
+  lexicalBindings,
+  assignments
+) => [decision, ...(decision.continuations || [])].some(range => {
+  const knownAliases = visibleGapAliasesAt(
+    tokens,
+    range.start,
+    pairs,
+    lexicalScopes,
+    functionRanges
+  );
+  const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+    tokens,
+    range.start,
+    pairs,
+    lexicalScopes,
+    lexicalBindings,
+    assignments
+  );
+  const outcome = hasGapOutcome(
+    tokens,
+    range.start,
+    range.end,
+    range.opening,
+    pairs,
+    functionRanges,
+    knownAliases,
+    knownWriterAliases
+  );
+  return outcome;
+});
+
 const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
   const tokens = tokenizeSource(source);
   const pairs = findTokenPairs(tokens);
@@ -2075,32 +2224,17 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         const decision = includeAbruptCompletionHandlers(
           tokens,
           extractDeadlineDecision(tokens, index, pairs, functionRanges, aliasNegated),
-          pairs
-        );
-        const knownAliases = visibleGapAliasesAt(
-          tokens,
-          decision.start,
           pairs,
-          lexicalScopes,
           functionRanges
         );
-        const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+        if (deadlineDecisionHasGapOutcome(
           tokens,
-          decision.start,
+          decision,
           pairs,
+          functionRanges,
           lexicalScopes,
           lexicalBindings,
           assignments
-        );
-        if (hasGapOutcome(
-          tokens,
-          decision.start,
-          decision.end,
-          decision.opening,
-          pairs,
-          functionRanges,
-          knownAliases,
-          knownWriterAliases
         )) {
           lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
         }
@@ -2111,32 +2245,17 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     const decision = includeAbruptCompletionHandlers(
       tokens,
       extractDeadlineDecision(tokens, index, pairs, functionRanges),
-      pairs
-    );
-    const knownAliases = visibleGapAliasesAt(
-      tokens,
-      decision.start,
       pairs,
-      lexicalScopes,
       functionRanges
     );
-    const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+    if (deadlineDecisionHasGapOutcome(
       tokens,
-      decision.start,
+      decision,
       pairs,
+      functionRanges,
       lexicalScopes,
       lexicalBindings,
       assignments
-    );
-    if (hasGapOutcome(
-      tokens,
-      decision.start,
-      decision.end,
-      decision.opening,
-      pairs,
-      functionRanges,
-      knownAliases,
-      knownWriterAliases
     )) {
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
     }
@@ -2210,32 +2329,17 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       const decision = includeAbruptCompletionHandlers(
         tokens,
         extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated),
-        pairs
-      );
-      const knownAliases = visibleGapAliasesAt(
-        tokens,
-        decision.start,
         pairs,
-        lexicalScopes,
         functionRanges
       );
-      const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+      if (deadlineDecisionHasGapOutcome(
         tokens,
-        decision.start,
+        decision,
         pairs,
+        functionRanges,
         lexicalScopes,
         lexicalBindings,
         assignments
-      );
-      if (hasGapOutcome(
-        tokens,
-        decision.start,
-        decision.end,
-        decision.opening,
-        pairs,
-        functionRanges,
-        knownAliases,
-        knownWriterAliases
       )) {
         lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
       }
@@ -3516,11 +3620,37 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     regressionAssert.equal(offendersFor(unscheduledCallback).length, 0);
   });
 
+  regressionTest('deadline policy inventory inspects rejected promise catch callbacks', () => {
+    const rejectedPromiseCallback = `function wait() { if (deadlineReached) return Promise.reject().catch(() => READINESS.GAP); }`;
+    regressionAssert.equal(offendersFor(rejectedPromiseCallback).length, 1);
+  });
+
   regressionTest('deadline policy inventory follows timer-scheduled boundary writers', () => {
     const timeoutCallback = `if (deadlineReached) setTimeout(() => state.markIntakeBoundary(id, READINESS.GAP, detail), 0);`;
     const immediateCallback = `if (deadlineReached) setImmediate(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
     regressionAssert.equal(offendersFor(timeoutCallback).length, 1);
     regressionAssert.equal(offendersFor(immediateCallback).length, 1);
+  });
+
+  regressionTest('deadline policy inventory distinguishes returned arrows from invoked arrows', () => {
+    const returnedArrow = `function wait() { if (deadlineReached) return () => READINESS.GAP; }`;
+    const invokedArrow = `function wait() { if (deadlineReached) return (() => READINESS.GAP)(); }`;
+    regressionAssert.equal(offendersFor(returnedArrow).length, 0);
+    regressionAssert.equal(offendersFor(invokedArrow).length, 1);
+  });
+
+  regressionTest('deadline policy inventory follows completing deadline arms', () => {
+    const completingArm = `function wait() { if (deadlineReached) { cleanup(); } else { return READINESS.READY; } return READINESS.GAP; }`;
+    const abruptArm = `function wait() { if (deadlineReached) { return READINESS.READY; } return READINESS.GAP; }`;
+    regressionAssert.equal(offendersFor(completingArm).length, 1);
+    regressionAssert.equal(offendersFor(abruptArm).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows loop-targeting deadline breaks', () => {
+    const loopBreakExit = `async function wait() { while (true) { if (deadlineReached) break; await poll(); } return READINESS.GAP; }`;
+    const switchBreakStaysInsideLoop = `async function wait() { while (true) { if (deadlineReached) { switch (kind) { case 'x': break; } await poll(); } } return READINESS.GAP; }`;
+    regressionAssert.equal(offendersFor(loopBreakExit).length, 1);
+    regressionAssert.equal(offendersFor(switchBreakStaysInsideLoop).length, 0);
   });
 
   regressionTest('deadline policy inventory scans every Object.assign source', () => {
