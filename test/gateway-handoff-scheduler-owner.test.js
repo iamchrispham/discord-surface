@@ -41,6 +41,11 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   assert.equal(exactOwnerContract({ ownerText: owner.replace(factoryParameter.getText(ownerSource),
     `${factoryParameter.name.getText(ownerSource)} = {}`) }), false,
   'factory parameter default changed the injected contract');
+  const pendingOptionPattern = '{ pendingGeneration = false }';
+  assert.equal(owner.includes(pendingOptionPattern), true);
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(pendingOptionPattern,
+    '{ otherName: pendingGeneration = false }') }), false,
+  'pending-generation property alias changed the option contract');
   const asCrlf = text => text.replace(/\r\n?/g, '\n').replace(/\n/g, '\r\n');
   assert.equal(exactOwnerContract({ gatewayText: asCrlf(gateway), ownerText: asCrlf(owner) }), true,
     'CRLF source changed the normalized owner contract');
@@ -153,6 +158,40 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   assert.deepEqual(classStateInventory(gateway), []);
   assert.equal(methodOf(sourceFile(GATEWAY_PATH, gateway), 'scheduleDeferredHandoffRecovery').parameters.length, 1);
   assert.equal(methodOf(sourceFile(GATEWAY_PATH, gateway), 'schedulePendingHandoffRecoveryPoll').parameters.length, 0);
+});
+
+test('Gateway scheduler ownership handles grouped receivers, qualified timers and dynamic this scopes', () => {
+  const gateway = fs.readFileSync(GATEWAY_PATH, 'utf8');
+  const withMember = member => {
+    const source = gateway.replace(
+      '  scheduleDeferredHandoffRecovery(channelId) {',
+      `  ${member}\n\n  scheduleDeferredHandoffRecovery(channelId) {`
+    );
+    assert.notEqual(source, gateway);
+    return source;
+  };
+  for (const [name, member] of [
+    ['privateParenthesizedPropertyReader', 'privateParenthesizedPropertyReader() { return (this).deferredHandoffRecoveryChannels; }'],
+    ['privateParenthesizedElementReader', "privateParenthesizedElementReader() { return (this)['pendingHandoffRecoveryPollTimer']; }"],
+    ['privateArrowStateReader', 'privateArrowStateReader() { return (() => this.deferredHandoffRecoveryChannels)(); }']
+  ]) {
+    assert.deepEqual(classStateInventory(withMember(member)), [name], `${name}: scheduler owner escaped inventory`);
+  }
+  for (const [name, member] of [
+    ['privateGlobalThisTimerOwner', 'privateGlobalThisTimerOwner() { globalThis.setTimeout(() => {}, 1); }'],
+    ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }']
+  ]) {
+    const inventory = classStateInventory(withMember(member));
+    assert.ok(inventory.includes(`${name}: timer API`), `${name}: qualified global timer escaped inventory`);
+  }
+  for (const [name, member] of [
+    ['privateNestedFunctionThisReader', 'privateNestedFunctionThisReader() { function inspect() { return this.deferredHandoffRecoveryChannels; } return inspect.call({}); }'],
+    ['privateNestedClassThisReader', 'privateNestedClassThisReader() { class Inspect { read() { return this.pendingHandoffRecoveryPollTimer; } } return Inspect; }'],
+    ['privateShadowedGlobalThisTimer', 'privateShadowedGlobalThisTimer(globalThis) { globalThis.setTimeout(() => {}, 1); }'],
+    ['privateShadowedGlobalTimer', 'privateShadowedGlobalTimer(global) { global.clearTimeout(1); }']
+  ]) {
+    assert.deepEqual(classStateInventory(withMember(member)), [], `${name}: unrelated scope was treated as Gateway ownership`);
+  }
 });
 
 test('public scheduler inventory pins source owners and rejects only new scheduler references', () => {

@@ -204,9 +204,22 @@ function classStateInventory(sourceText) {
   function isUnshadowedTimerCall(node) {
     if (!ts.isCallExpression(node)) return false;
     const callee = unwrapParentheses(node.expression);
-    if (!ts.isIdentifier(callee) || !timerApiNames.has(callee.text)) return false;
+    let timerName;
+    let shadowedName;
+    if (ts.isIdentifier(callee)) {
+      timerName = callee.text;
+      shadowedName = timerName;
+    } else if (ts.isPropertyAccessExpression(callee)) {
+      const receiver = unwrapParentheses(callee.expression);
+      if (!ts.isIdentifier(receiver) || !['global', 'globalThis'].includes(receiver.text)) return false;
+      timerName = callee.name.text;
+      shadowedName = receiver.text;
+    } else {
+      return false;
+    }
+    if (!timerApiNames.has(timerName)) return false;
     for (let scope = node.parent; scope; scope = scope.parent) {
-      if (scopeDeclaresTimerName(scope, callee.text)) return false;
+      if (scopeDeclaresTimerName(scope, shadowedName)) return false;
     }
     return true;
   }
@@ -217,10 +230,20 @@ function classStateInventory(sourceText) {
 
         const memberName = member.name?.getText(source) || 'unnamed class member';
         let accessesSchedulerState = false;
-        function scan(bodyNode) {
-          if (ts.isPropertyAccessExpression(bodyNode) && ts.isThis(bodyNode.expression) &&
+        function scan(bodyNode, tracksGatewayThis = true) {
+          const startsDynamicThisScope = ts.isClassDeclaration(bodyNode) || ts.isClassExpression(bodyNode) ||
+            ts.isFunctionDeclaration(bodyNode) || ts.isFunctionExpression(bodyNode) ||
+            ts.isMethodDeclaration(bodyNode) || ts.isConstructorDeclaration(bodyNode) ||
+            ts.isGetAccessor(bodyNode) || ts.isSetAccessor(bodyNode);
+          const tracksGatewayThisHere = tracksGatewayThis && !startsDynamicThisScope;
+          if (isUnshadowedTimerCall(bodyNode) && !timerOwners.includes(memberName)) {
+            timerOwners.push(memberName);
+          }
+          if (tracksGatewayThisHere && ts.isPropertyAccessExpression(bodyNode) &&
+            ts.isThis(unwrapParentheses(bodyNode.expression)) &&
             HANDOFF_STATE_FIELDS.has(bodyNode.name.text)) accessesSchedulerState = true;
-          if (ts.isElementAccessExpression(bodyNode) && ts.isThis(bodyNode.expression)) {
+          if (tracksGatewayThisHere && ts.isElementAccessExpression(bodyNode) &&
+            ts.isThis(unwrapParentheses(bodyNode.expression))) {
             const key = unwrapParentheses(bodyNode.argumentExpression);
             if (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) {
               if (HANDOFF_STATE_FIELDS.has(key.text)) accessesSchedulerState = true;
@@ -228,16 +251,15 @@ function classStateInventory(sourceText) {
               accessesSchedulerState = true;
             }
           }
-          if (ts.isVariableDeclaration(bodyNode) && bindingPatternHasSchedulerField(bodyNode.name) &&
+          if (tracksGatewayThisHere && ts.isVariableDeclaration(bodyNode) &&
+            bindingPatternHasSchedulerField(bodyNode.name) &&
             bodyNode.initializer && ts.isThis(unwrapParentheses(bodyNode.initializer))) accessesSchedulerState = true;
-          if (ts.isBinaryExpression(bodyNode) && bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          if (tracksGatewayThisHere && ts.isBinaryExpression(bodyNode) &&
+            bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
             ts.isThis(unwrapParentheses(bodyNode.right)) &&
             assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
-          if (isUnshadowedTimerCall(bodyNode) && !timerOwners.includes(memberName)) {
-            timerOwners.push(memberName);
-          }
 
-          ts.forEachChild(bodyNode, scan);
+          ts.forEachChild(bodyNode, child => scan(child, tracksGatewayThisHere));
         }
         if (member.body) scan(member.body);
         if (member.initializer) scan(member.initializer);
@@ -323,6 +345,7 @@ function exactOwnerContract(sourceOverrides = {}) {
     deferred.parameters[1].initializer.properties.length !== 0) return false;
   const option = deferred.parameters[1].name.elements[0];
   if (!ts.isBindingElement(option) || !isIdentifier(option.name, 'pendingGeneration') ||
+    (option.propertyName && option.propertyName.text !== 'pendingGeneration') ||
     option.initializer?.kind !== ts.SyntaxKind.FalseKeyword) return false;
   for (const methodName of gatewayMethods) {
     const declaration = declarations.find(candidate => candidate.name.text === methodName);
