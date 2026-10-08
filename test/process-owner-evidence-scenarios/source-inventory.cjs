@@ -1126,6 +1126,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (!initializer) return false;
       const index = declaration.parent.elements.indexOf(declaration);
       if (index < 0 || !ts.isArrayLiteralExpression(initializer)) return false;
+      if (declaration.dotDotDotToken) {
+        if (initializer.elements.some(ts.isSpreadElement)) return false;
+        return [ts.factory.createArrayLiteralExpression(initializer.elements.slice(index))];
+      }
       const element = initializer.elements[index];
       return element && !ts.isSpreadElement(element) ? [element] : false;
     }
@@ -1174,6 +1178,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (!declaration || visited.has(symbol)) return [];
     const symbolSeen = new Set(seen).add(symbol);
     const sources = [];
+    if (ts.isBindingElement(declaration) && declaration.dotDotDotToken &&
+      ts.isArrayBindingPattern(declaration.parent)) {
+      for (const source of bindingSources(declaration, symbolSeen) || []) {
+        sources.push(...arrayElementSources(source, index, symbolSeen));
+      }
+    }
     for (const argument of parameterArguments.get(symbol) || []) {
       if (argument && argument.restIndex === index && argument.source) sources.push(argument.source);
     }
@@ -1227,6 +1237,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       return [];
     };
+    if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) return returnsFrom(callee);
     const expressionsFor = symbol => {
       if (!symbol || visited.has(symbol) || seenSymbols.has(symbol)) return [];
       seenSymbols.add(symbol);
@@ -1470,12 +1481,17 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       };
       if (isCommonJsRequireFunction(node.expression)) {
         const moduleName = node.arguments[0];
-        if (moduleName && ts.isStringLiteral(moduleName)) {
-          if (moduleName.text === 'node:process' || moduleName.text === 'process') {
-            return new Set([PROCESS_OBJECT]);
+        const moduleNames = resolveSet(moduleName, seen);
+        const result = new Set();
+        for (const resolvedName of moduleNames) {
+          if (typeof resolvedName !== 'string') continue;
+          if (resolvedName === 'node:process' || resolvedName === 'process') {
+            result.add(PROCESS_OBJECT);
+          } else if (moduleResolver) {
+            for (const atom of moduleResolver.resolveRequire(virtualPath, resolvedName)) result.add(atom);
           }
-          if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName.text);
         }
+        if (result.size) return result;
       }
       if (ts.isPropertyAccessExpression(node.expression)) {
         const receiver = node.expression.expression;
@@ -2125,7 +2141,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   function isDefinitelyTruthy(node) {
-    return staticTruthiness(node) === true;
+    const state = staticTruthiness(node);
+    if (state !== null) return state;
+    if (!node || (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node))) return false;
+    const names = accessNames(node);
+    if (!names.size) return false;
+    const sources = [...names].flatMap(name => propertyOriginNodes(node.expression, String(name)));
+    return sources.length > 0 && sources.every(source => staticTruthiness(source) === true);
   }
 
   function isDefinitelyFalsy(node) {
@@ -2411,11 +2433,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       if (isForwardingCallbackApi(callee)) indexForwardedCallback(node, owner);
       if (isNativePromiseThen(callee)) {
-        const callback = callArguments[0] || node.arguments[0];
-        const callbackAtoms = callback && staticValue(callback);
-        if (callbackAtoms && [PID_PROBE, BOUND_PROBE, ...INVOCATION_METHODS]
-          .some(atom => hasAtom(callbackAtoms, atom))) {
-          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        const callbacks = [callArguments[0] || node.arguments[0], callArguments[1] || node.arguments[1]];
+        const hasProbeHandler = callbacks.some(callback => {
+          const callbackAtoms = callback && staticValue(callback);
+          return callbackAtoms && [PID_PROBE, BOUND_PROBE, ...INVOCATION_METHODS]
+            .some(atom => hasAtom(callbackAtoms, atom));
+        });
+        if (hasProbeHandler) {
+          violations.push('unsupported process probe ' + fileName + ':' + owner);
         }
       }
       const borrowedArrayMethod = ts.isPropertyAccessExpression(callee) &&
@@ -2597,7 +2622,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (hasAtom(resolved, LEGACY_OWNER)) legacyCalls.push({ file: fileName, owner });
       }
     }
-    if (!generatedOwner && ts.isStringLiteral(node) && node.text.includes('process.kill')) {
+    if (!generatedOwner && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      node.text.includes('process.kill')) {
       const nested = parseOwnerSites(fileName, node.text, enclosingOwner(node));
       kills.push(...nested.kills);
       legacyCalls.push(...nested.legacyCalls);

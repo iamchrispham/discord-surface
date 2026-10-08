@@ -189,3 +189,51 @@ test("logical member assignment probe alias", () => {
   runFixture("const obj = { probe: undefined }; obj.probe ??= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const obj = { probe: undefined }; obj.probe ||= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
+
+test("known member values prune unreachable logical assignment probes", () => {
+  runFixture("const api = { probe: () => true }; api.probe ||= process.kill; function newProbe(pid) { api.probe(pid, 0); }", [], []);
+  runFixture("const api = getApi(); api.probe ||= process.kill; function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const process = { kill() {} }; const api = { probe: () => true }; api.probe ||= process.kill; function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("array rest bindings retain indexed process probe provenance", () => {
+  runFixture("const [...probes] = [process.kill]; function newProbe(pid) { probes[0](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const [skip, ...probes] = [0, process.kill]; function newProbe(pid) { probes[0](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const [...probes] = [() => true]; function newProbe(pid) { probes[0](pid, 0); }", [], []);
+  runFixture("const source = getProbes(); const [...probes] = source; function newProbe(pid) { probes[0](pid, 0); }", [], []);
+});
+
+test("immediately invoked callable returns retain process probe provenance", () => {
+  runFixture("const probe = (() => process.kill)(); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const probe = (() => () => true)(); function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("const process = { kill() {} }; const probe = (() => process.kill)(); function newProbe(pid) { probe(pid, 0); }", [], []);
+});
+
+test("finite CommonJS specifier values retain local module provenance", () => {
+  const aliasedSpecifier = inventoryFiles({
+    "private-alias.js": "const spec = './producer'; const api = require(spec); function newProbe(pid) { api.probe(pid, 0); }",
+    "producer.cjs": "exports.probe = process.kill;"
+  });
+  assert.deepEqual(aliasedSpecifier.kills, ["private-alias.js\u0000newProbe"]);
+  assert.deepEqual(aliasedSpecifier.violations, ["unclassified process probe private-alias.js:newProbe"]);
+
+  const templateSpecifier = inventoryFiles({
+    "private-alias.js": "const spec = `./producer`; const api = require(spec); function newProbe(pid) { api.probe(pid, 0); }",
+    "producer.cjs": "exports.probe = process.kill;"
+  });
+  assert.deepEqual(templateSpecifier.kills, ["private-alias.js\u0000newProbe"]);
+  assert.deepEqual(templateSpecifier.violations, ["unclassified process probe private-alias.js:newProbe"]);
+
+  runFixture("const spec = getProducerPath(); const api = require(spec); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("native Promise rejection handlers are inventoried", () => {
+  runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).then(undefined, process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).then(undefined, reason => reason); }", [], []);
+});
+
+test("static template eval source is parsed without evaluating it", () => {
+  runFixture("function newProbe(pid) { eval(`process.kill(pid, 0)`); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { eval(`const value = 1`); }", [], []);
+  runFixture("function newProbe(pid, source) { eval(`process.kill(${source}, 0)`); }", [], []);
+});
