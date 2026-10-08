@@ -29,6 +29,18 @@ function schedulerAccessName(node) {
   return null;
 }
 
+function schedulerBindingName(node) {
+  if (!ts.isBindingElement(node) || node.dotDotDotToken || !ts.isObjectBindingPattern(node.parent)) return null;
+  const key = node.propertyName ?? node.name;
+  if (ts.isIdentifier(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
+  if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
+  if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression) &&
+    SCHEDULER_METHODS.has(key.expression.text)) {
+    return key.expression.text;
+  }
+  return null;
+}
+
 function enclosingSchedulerOwner(node, source) {
   let current = node.parent;
   let fallback = null;
@@ -79,8 +91,9 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, scriptKind);
     assert.deepEqual(source.parseDiagnostics, [], `${filePath}: parse diagnostics`);
     function visit(node) {
-      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-        const scheduler = schedulerAccessName(node);
+      const isObjectBindingElement = ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent);
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || isObjectBindingElement) {
+        const scheduler = isObjectBindingElement ? schedulerBindingName(node) : schedulerAccessName(node);
         if (scheduler) {
           inventory.push({
             file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),

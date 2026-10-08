@@ -81,6 +81,8 @@ test('public scheduler inventory pins source owners and rejects only new schedul
     { file: 'bound.js', owner: 'boundSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'bracket.ts', owner: 'bracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'capture.js', owner: 'captureSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'destructured.js', owner: 'destructuredSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'destructured.js', owner: 'shorthandSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'dot.js', owner: 'dotSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'forwarded.cjs', owner: 'forwardedSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'grouped.js', owner: 'groupedSite', scheduler: 'scheduleDeferredHandoffRecovery' },
@@ -95,6 +97,10 @@ test('public scheduler inventory pins source owners and rejects only new schedul
       "function bracketSite(gateway: any) { gateway['schedulePendingHandoffRecoveryPoll'](); }\n");
     fs.writeFileSync(path.join(sourceRoot, 'capture.js'),
       'function captureSite(gateway) { const schedule = gateway?.scheduleDeferredHandoffRecovery; return schedule; }\n');
+    fs.writeFileSync(path.join(sourceRoot, 'destructured.js'),
+      'function destructuredSite(gateway) { const { scheduleDeferredHandoffRecovery: schedule } = gateway; return schedule.bind(gateway); }\n' +
+      'function shorthandSite(gateway) { const { scheduleDeferredHandoffRecovery } = gateway; return scheduleDeferredHandoffRecovery.bind(gateway); }\n' +
+      'function restSite(gateway) { const { ...scheduleDeferredHandoffRecovery } = gateway; return scheduleDeferredHandoffRecovery; }\n');
     fs.writeFileSync(path.join(sourceRoot, 'dot.js'),
       "function dotSite(gateway) { gateway.scheduleDeferredHandoffRecovery('dot'); }\n");
     fs.writeFileSync(path.join(sourceRoot, 'forwarded.cjs'),
