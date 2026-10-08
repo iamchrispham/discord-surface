@@ -30,15 +30,16 @@ function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationH
       for (const row of dispatching) {
         const message = this.getMessage(row.discord_id);
         const courierAttempt = this.getCourierAttempt(row.discord_id);
-        const courierOutcome = courierAttempt?.outcome?.outcome;
+        const courierRetired = Boolean(courierAttempt &&
+          this.hasRetiredCourierAttempt(row.discord_id, courierAttempt.attempt.receiptId));
+        const courierOutcome = courierRetired ? null : courierAttempt?.outcome?.outcome;
         if (this.hasNativeAcknowledgment(message)) {
           this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.SUBMITTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
           this.receipt(row.discord_id, 'dispatch-already-acknowledged', { generation: message.generation, afterRestart: true });
           continue;
         }
-        if (message.watcherNotice && courierAttempt && !this.hasCourierForwardClaim(row.discord_id) &&
-            this.hasRetiredCourierAttempt(row.discord_id, courierAttempt.attempt.receiptId)) {
+        if (message.watcherNotice && courierRetired && !this.hasCourierForwardClaim(row.discord_id)) {
           this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.ACCEPTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
           this.receipt(row.discord_id, 'dispatch-not-submitted-after-restart', { afterRestart: true, retiredAttemptId: courierAttempt.attempt.attemptId });
