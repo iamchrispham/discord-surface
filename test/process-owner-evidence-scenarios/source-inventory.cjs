@@ -610,17 +610,20 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
     ts.forEachChild(expression, indexRightHandSide);
   };
-  const bindingPropertyName = binding => {
-    if (!ts.isBindingElement(binding)) return null;
+  const bindingPropertyNames = binding => {
+    if (!ts.isBindingElement(binding)) return [];
     if (binding.propertyName) {
-      return ts.isIdentifier(binding.propertyName) || ts.isStringLiteral(binding.propertyName)
-        ? binding.propertyName.text
-        : ts.isComputedPropertyName(binding.propertyName)
-          ? [...staticValue(binding.propertyName.expression)].find(value => typeof value === 'string' ||
-            typeof value === 'number')?.toString() || null
-          : null;
+      if (ts.isIdentifier(binding.propertyName) || ts.isStringLiteral(binding.propertyName)) {
+        return [binding.propertyName.text];
+      }
+      if (ts.isComputedPropertyName(binding.propertyName)) {
+        return [...new Set([...staticValue(binding.propertyName.expression)]
+          .filter(value => typeof value === 'string' || typeof value === 'number')
+          .map(value => value.toString()))];
+      }
+      return [];
     }
-    return ts.isIdentifier(binding.name) ? binding.name.text : null;
+    return ts.isIdentifier(binding.name) ? [binding.name.text] : [];
   };
   const projectBindingArgument = (argument, path) => {
     let source = argument;
@@ -681,9 +684,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (!ts.isObjectBindingPattern(name)) return;
     for (const binding of name.elements) {
       if (!ts.isBindingElement(binding) || binding.dotDotDotToken || !binding.name) continue;
-      const propertyName = bindingPropertyName(binding);
-      if (propertyName === null) continue;
-      indexParameterBinding(binding.name, argument, parameter, restArguments, invocation, [...path, propertyName]);
+      for (const propertyName of bindingPropertyNames(binding)) {
+        indexParameterBinding(binding.name, argument, parameter, restArguments, invocation, [...path, propertyName]);
+      }
     }
   };
   const invocationWrapperName = callee => {
@@ -1055,11 +1058,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (!ts.isBindingElement(binding) || visited.has(binding)) return [];
     if (ts.isArrayBindingPattern(binding.parent)) return bindingSources(binding, visited);
     if (!ts.isObjectBindingPattern(binding.parent)) return [];
-    const name = bindingPropertyName(binding);
-    if (!name) return [];
+    const names = bindingPropertyNames(binding);
+    if (!names.length) return [];
     const sources = bindingSources(binding, visited);
     const values = [];
-    for (const source of sources || []) values.push(...propertyOriginNodes(source, name, visited));
+    for (const source of sources || []) {
+      for (const name of names) values.push(...propertyOriginNodes(source, name, visited));
+    }
     return values;
   }
 
@@ -1392,8 +1397,17 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           })));
         }
       }
-      if (ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
-        !symbolDeclaration(checker.getSymbolAtLocation(node.expression)) && !hasLocalRequireBinding(node)) {
+      const isCommonJsRequireFunction = (expression, visitedSymbols = new Set()) => {
+        const candidate = transparentExpression(expression) || expression;
+        if (!ts.isIdentifier(candidate)) return false;
+        const symbol = checker.getSymbolAtLocation(candidate);
+        const declaration = symbolDeclaration(symbol);
+        if (candidate.text === 'require' && !declaration && !hasLocalRequireBinding(node)) return true;
+        if (!symbol || visitedSymbols.has(symbol) || !declaration || !ts.isVariableDeclaration(declaration) ||
+          !declaration.initializer) return false;
+        return isCommonJsRequireFunction(declaration.initializer, new Set(visitedSymbols).add(symbol));
+      };
+      if (isCommonJsRequireFunction(node.expression)) {
         const moduleName = node.arguments[0];
         if (moduleName && ts.isStringLiteral(moduleName)) {
           if (moduleName.text === 'node:process' || moduleName.text === 'process') {
@@ -1669,8 +1683,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (declaration.initializer) sources.push({ source: declaration.initializer });
       } else if (ts.isBindingElement(declaration) &&
         (ts.isObjectBindingPattern(declaration.parent) || ts.isArrayBindingPattern(declaration.parent))) {
-        const name = ts.isObjectBindingPattern(declaration.parent) ? bindingPropertyName(declaration) : null;
-        for (const source of bindingSources(declaration) || []) sources.push({ source, name });
+        const names = ts.isObjectBindingPattern(declaration.parent) ? bindingPropertyNames(declaration) : [null];
+        for (const source of bindingSources(declaration) || []) {
+          for (const name of names) sources.push({ source, name });
+        }
         if (declaration.initializer) sources.push({ source: declaration.initializer });
       } else if (ts.isPropertyDeclaration(declaration) && declaration.initializer) {
         sources.push({ source: declaration.initializer });
@@ -1808,9 +1824,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       return found;
     }
     if (ts.isObjectLiteralExpression(node)) {
-      for (const property of node.properties) {
+      for (const property of [...node.properties].reverse()) {
         if (ts.isSpreadAssignment(property)) {
           for (const atom of literalProperty(property.expression, name, seen)) found.add(atom);
+          if (found.size) return found;
           continue;
         }
         if (ts.isGetAccessorDeclaration(property)) {
@@ -1825,7 +1842,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
             if (!ts.isReturnStatement(statement) || !statement.expression) continue;
             for (const atom of resolveSet(statement.expression, seen)) found.add(atom);
           }
-          continue;
+          return found;
         }
         if (!property.name) continue;
         const shorthand = ts.isShorthandPropertyAssignment(property);
@@ -1838,6 +1855,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (!keys.includes(name)) continue;
         const value = shorthand ? property.name : property.initializer;
         for (const atom of resolveSet(value, seen)) found.add(atom);
+        return found;
       }
       return found;
     }
@@ -2037,11 +2055,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (ts.isArrayBindingPattern(binding.parent)) {
       return sources.some(source => valueMayBeUndefined(source, visited));
     }
-    const name = bindingPropertyName(binding);
-    if (!name) return true;
+    const names = bindingPropertyNames(binding);
+    if (!names.length) return true;
     for (const source of sources) {
-      const origins = propertyOriginNodes(source, name, visited);
-      if (!origins.length || origins.some(origin => valueMayBeUndefined(origin, visited))) return true;
+      for (const name of names) {
+        const origins = propertyOriginNodes(source, name, visited);
+        if (!origins.length || origins.some(origin => valueMayBeUndefined(origin, visited))) return true;
+      }
     }
     return false;
   }
@@ -2054,28 +2074,30 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         for (const atom of resolveSet(source, visited)) sourceSet.add(atom);
       }
     }
-    const name = bindingPropertyName(binding);
+    const names = bindingPropertyNames(binding);
     if (binding.initializer && bindingDefaultMayApply(binding, sources, visited)) {
       for (const atom of resolveSet(binding.initializer, visited)) result.add(atom);
     }
     if (sources) {
       for (const source of sources) {
-        for (const atom of literalProperty(source, name, visited)) result.add(atom);
+        for (const name of names) {
+          for (const atom of literalProperty(source, name, visited)) result.add(atom);
+        }
       }
     }
     if (ts.isArrayBindingPattern(binding.parent)) {
       for (const atom of sourceSet) result.add(atom);
     }
-    if (name === 'directPostOwnerAlive') {
+    if (names.includes('directPostOwnerAlive')) {
       result.add(LEGACY_OWNER);
       return;
     }
-    if (name === 'kill' && hasAtom(sourceSet, PROCESS_OBJECT)) result.add(PID_PROBE);
-    if (name === 'call' && hasAtom(sourceSet, PID_PROBE)) result.add(CALL_METHOD);
-    if (name === 'apply' && hasAtom(sourceSet, PID_PROBE)) result.add(APPLY_METHOD);
-    if (name === 'apply' && hasAtom(sourceSet, REFLECT_OBJECT)) result.add(REFLECT_APPLY);
-    if (name === 'call' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_CALL_METHOD);
-    if (name === 'apply' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_APPLY_METHOD);
+    if (names.includes('kill') && hasAtom(sourceSet, PROCESS_OBJECT)) result.add(PID_PROBE);
+    if (names.includes('call') && hasAtom(sourceSet, PID_PROBE)) result.add(CALL_METHOD);
+    if (names.includes('apply') && hasAtom(sourceSet, PID_PROBE)) result.add(APPLY_METHOD);
+    if (names.includes('apply') && hasAtom(sourceSet, REFLECT_OBJECT)) result.add(REFLECT_APPLY);
+    if (names.includes('call') && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_CALL_METHOD);
+    if (names.includes('apply') && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_APPLY_METHOD);
   }
 
   function forwardedCallbackName(callee, visited = new Set()) {

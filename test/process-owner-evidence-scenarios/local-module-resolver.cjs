@@ -1356,6 +1356,26 @@ function createLocalModuleResolver(files) {
 
   const BOUND_PROBE = 'bound-process-probe';
   const GLOBAL_OBJECT = 'global-object';
+  const staticCondition = (expression, currentPath, visited = new Set()) => {
+    const node = unwrap(expression);
+    if (!node) return null;
+    if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+    if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
+    if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
+      const value = staticCondition(node.operand, currentPath, visited);
+      return value === null ? null : !value;
+    }
+    if (!ts.isIdentifier(node)) return null;
+    const bindingKey = `${currentPath}:${node.text}`;
+    if (visited.has(bindingKey)) return null;
+    const bindings = modules.get(currentPath)?.bindings.get(node.text) || [];
+    if (!bindings.length) return null;
+    const nextVisited = new Set(visited).add(bindingKey);
+    const values = bindings.map(binding => staticCondition(binding, currentPath, nextVisited));
+    return values.every(value => value === true) ? true
+      : values.every(value => value === false) ? false
+        : null;
+  };
   const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map(),
     bindingOverrides = new Map()) => {
     if (expression?.namespaceModulePath) return new Set([moduleAtom(expression.namespaceModulePath)]);
@@ -1380,6 +1400,11 @@ function createLocalModuleResolver(files) {
       return new Set([{ callable: node, modulePath: currentPath }]);
     }
     if (ts.isConditionalExpression(node)) {
+      const condition = staticCondition(node.condition, currentPath);
+      if (condition !== null) {
+        return evaluate(condition ? node.whenTrue : node.whenFalse, currentPath, seen,
+          parameterBindings, bindingOverrides);
+      }
       const result = evaluate(node.whenTrue, currentPath, seen, parameterBindings, bindingOverrides);
       for (const atom of evaluate(node.whenFalse, currentPath, seen, parameterBindings, bindingOverrides)) {
         result.add(atom);

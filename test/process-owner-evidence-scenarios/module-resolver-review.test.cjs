@@ -743,6 +743,31 @@ test('conditional process probe aliases honor statically known branches', () => 
   });
 });
 
+test('computed destructuring projects every static property key', () => {
+  expectProbe({
+    'use.js': "const key = flag ? 'other' : 'kill'; const { [key]: probe } = process; probe(pid, 0);"
+  });
+});
+
+test('imported conditional values honor statically known branches', () => {
+  expectOrdinary({
+    'producer.js': 'const ordinary = () => true; export const probe = true ? ordinary : process.kill;',
+    'use.js': "import { probe } from './producer.js'; probe(1, 0);"
+  });
+});
+
+test('CommonJS require aliases retain loader identity', () => {
+  expectProbe({
+    'use.js': "const load = require; const proc = load('node:process'); proc.kill(pid, 0);"
+  });
+});
+
+test('later object properties override probe values from spreads', () => {
+  expectOrdinary({
+    'use.js': 'const defaults = { probe: process.kill }; const deps = { ...defaults, probe: () => true }; deps.probe(pid, 0);'
+  });
+});
+
 test('assignment destructuring defaults resolve only when applied', () => {
   expectProbe({
     'use.js': 'let probe; ({ probe = process.kill } = {}); probe(1, 0);'
