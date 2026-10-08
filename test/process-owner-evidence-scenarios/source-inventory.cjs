@@ -437,28 +437,72 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           source: arithmeticAssignment ? expression : expression.right
         });
       } else if (ts.isObjectLiteralExpression(left)) {
-        for (const property of left.properties) {
-          let target = null;
-          let name = null;
-          if (ts.isPropertyAssignment(property)) {
-            name = ts.isIdentifier(property.name) ? property.name.text
-              : ts.isStringLiteral(property.name) ? property.name.text
-                : ts.isComputedPropertyName(property.name)
-                  ? [...staticValue(property.name.expression)].find(value => typeof value === 'string' ||
-                    typeof value === 'number')?.toString() || null
-                  : null;
-            // Resolve the target identifier node directly; its symbol is the
-            // lexical place, which is what a call-site identifier resolves to.
-            const targets = assignmentTargetIdentifiers(property.initializer);
-            target = targets.length ? checker.getSymbolAtLocation(targets[0]) : null;
-          } else if (ts.isShorthandPropertyAssignment(property)) {
-            name = property.name.text;
-            // For shorthand, `getSymbolAtLocation(property.name)` returns the
-            // shorthand property symbol, not the assigned variable; the value
-            // symbol is the lexical place the call site uses.
-            target = checker.getShorthandAssignmentValueSymbol(property);
+        const propertyValue = (source, name) => {
+          const object = ts.isParenthesizedExpression(source) ? source.expression : source;
+          if (!ts.isObjectLiteralExpression(object)) return null;
+          for (const property of object.properties) {
+            const propertyName = ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)
+              ? ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) || ts.isNumericLiteral(property.name)
+                ? property.name.text : null
+              : null;
+            if (propertyName !== String(name)) continue;
+            return ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
           }
-          if (target) recordAssignment(target, { source: expression.right, name });
+          return null;
+        };
+        const patternPropertyName = property => ts.isIdentifier(property.name) ||
+          ts.isStringLiteral(property.name) || ts.isNumericLiteral(property.name)
+          ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+            ? [...staticValue(property.name.expression)].find(value => typeof value === 'string' ||
+              typeof value === 'number')?.toString() || null
+            : null;
+        const recordPattern = (pattern, source) => {
+          const target = ts.isParenthesizedExpression(pattern) ? pattern.expression : pattern;
+          if (ts.isIdentifier(target)) {
+            const symbol = ts.isShorthandPropertyAssignment(target.parent) && target.parent.name === target
+              ? checker.getShorthandAssignmentValueSymbol(target.parent)
+              : checker.getSymbolAtLocation(target);
+            recordAssignment(symbol, { source });
+            return;
+          }
+          if (ts.isObjectLiteralExpression(target)) {
+            for (const property of target.properties) {
+              const name = patternPropertyName(property);
+              if (name === null) continue;
+              const nestedTarget = ts.isPropertyAssignment(property) ? property.initializer
+                : ts.isShorthandPropertyAssignment(property) ? property.name : null;
+              if (!nestedTarget) continue;
+              const nestedSource = propertyValue(source, name);
+              if (nestedSource) recordPattern(nestedTarget, nestedSource);
+            }
+            return;
+          }
+          if (ts.isArrayLiteralExpression(target) && ts.isArrayLiteralExpression(source)) {
+            for (let index = 0; index < target.elements.length; index += 1) {
+              const element = target.elements[index];
+              const value = source.elements[index];
+              if (!element || !value || ts.isSpreadElement(element) || ts.isSpreadElement(value)) continue;
+              recordPattern(element, value);
+            }
+          }
+        };
+        if (ts.isObjectLiteralExpression(expression.right)) {
+          recordPattern(left, expression.right);
+        } else {
+          for (const property of left.properties) {
+            let target = null;
+            let name = null;
+            if (ts.isPropertyAssignment(property)) {
+              name = patternPropertyName(property);
+              const targets = assignmentTargetIdentifiers(property.initializer);
+              target = targets.length ? checker.getSymbolAtLocation(targets[0]) : null;
+            } else if (ts.isShorthandPropertyAssignment(property)) {
+              name = property.name.text;
+              target = checker.getShorthandAssignmentValueSymbol(property);
+            }
+            if (target) recordAssignment(target, { source: expression.right, name });
+          }
         }
       } else if (ts.isArrayLiteralExpression(left) && ts.isArrayLiteralExpression(expression.right)) {
         for (let index = 0; index < left.elements.length; index += 1) {
@@ -1295,7 +1339,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       }
       for (const expression of callableReturnExpressions(callee, seen)) {
-        for (const atom of resolveSet(expression, seen)) result.add(atom);
+        if (ts.isObjectLiteralExpression(expression)) {
+          result.add({ objectLiteral: expression, modulePath: virtualPath });
+        } else {
+          for (const atom of resolveSet(expression, seen)) result.add(atom);
+        }
       }
       return result;
     }
@@ -1998,6 +2046,27 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const expandedArguments = expandCallArguments(node.arguments);
       const callArguments = expandedArguments || [];
       if (isForwardingCallbackApi(callee)) indexForwardedCallback(node, owner);
+      const borrowedArrayMethod = ts.isPropertyAccessExpression(callee) &&
+        (callee.name.text === 'call' || callee.name.text === 'apply') &&
+        ts.isPropertyAccessExpression(callee.expression) ? callee.expression : null;
+      const arrayPrototype = borrowedArrayMethod?.expression;
+      const arrayIdentifier = arrayPrototype && ts.isPropertyAccessExpression(arrayPrototype) &&
+        arrayPrototype.name.text === 'prototype' && ts.isIdentifier(arrayPrototype.expression)
+        ? arrayPrototype.expression : null;
+      const isGlobalArrayPrototype = Boolean(arrayIdentifier && arrayIdentifier.text === 'Array' &&
+        !checker.getSymbolAtLocation(arrayIdentifier)?.declarations?.some(declaration =>
+          declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration)));
+      const borrowedMethodName = borrowedArrayMethod?.name.text;
+      if (isGlobalArrayPrototype && finiteArrayCallbackMethods.has(borrowedMethodName)) {
+        const receiver = callArguments[0];
+        const methodArguments = callee.name.text === 'call' ? callArguments.slice(1)
+          : literalArrayElements(callArguments[1], new Set(), true) || [];
+        const callback = methodArguments[0];
+        const elements = receiver ? literalArrayElements(receiver, new Set(), true) : null;
+        if (callback && elements?.length && hasAtom(staticValue(callback), PID_PROBE)) {
+          kills.push({ file: fileName, owner });
+        }
+      }
       const isArrayFrom = ts.isPropertyAccessExpression(callee) &&
         ts.isIdentifier(callee.expression) && callee.expression.text === 'Array' && callee.name.text === 'from' &&
         !checker.getSymbolAtLocation(callee.expression)?.declarations?.some(declaration =>
@@ -2131,9 +2200,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         const probeTarget = callArguments[0] && staticValue(callArguments[0]);
-        if (hasAtom(resolved, REFLECT_APPLY) && probeTarget &&
+        const reflectApplyArguments = callArguments[2]
+          ? literalArrayElements(callArguments[2], new Set(), true) : null;
+        const helperReceivesProbe = reflectApplyArguments?.some(argument => argumentMayCarryProbe(argument)) || false;
+        if (hasAtom(resolved, REFLECT_APPLY) && ((probeTarget &&
           [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, REFLECT_APPLY, ...INVOCATION_METHODS]
-            .some(atom => hasAtom(probeTarget, atom))) {
+            .some(atom => hasAtom(probeTarget, atom))) || helperReceivesProbe)) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         if (hasAtom(resolved, LEGACY_OWNER)) legacyCalls.push({ file: fileName, owner });

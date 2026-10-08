@@ -422,10 +422,15 @@ function createLocalModuleResolver(files) {
         (!ts.isStringLiteral(key) && !ts.isNoSubstitutionTemplateLiteral(key)) ||
         !ts.isObjectLiteralExpression(descriptor)) return;
       for (const property of descriptor.properties) {
-        if (!ts.isPropertyAssignment(property) || !property.name) continue;
+        if (!property.name) continue;
         const propertyName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
           ? property.name.text : null;
-        if (propertyName === 'value') addExport(key.text, property.initializer);
+        if (propertyName === 'value' && ts.isPropertyAssignment(property)) {
+          addExport(key.text, property.initializer);
+        } else if (propertyName === 'get') {
+          const getter = ts.isPropertyAssignment(property) ? property.initializer : property;
+          for (const expression of callableReturnExpressions(getter)) addExport(key.text, expression);
+        }
       }
     };
     const recordObjectAssign = expression => {
@@ -435,16 +440,23 @@ function createLocalModuleResolver(files) {
         module.declaredBindings.has('Object')) return;
       const target = expression.arguments[0];
       if (!target || !isExportObjectExpression(target)) return;
+      const objectLiteralsFor = (source, visited = new Set()) => {
+        const value = unwrap(source);
+        if (ts.isObjectLiteralExpression(value)) return [value];
+        if (!ts.isIdentifier(value) || visited.has(value.text)) return [];
+        const next = new Set(visited).add(value.text);
+        return (module.bindings.get(value.text) || []).flatMap(binding => objectLiteralsFor(binding, next));
+      };
       for (const source of expression.arguments.slice(1)) {
-        const object = unwrap(source);
-        if (!ts.isObjectLiteralExpression(object)) continue;
-        for (const property of object.properties) {
-          if (!property.name || (!ts.isPropertyAssignment(property) &&
-            !ts.isShorthandPropertyAssignment(property))) continue;
-          const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
-            ts.isNumericLiteral(property.name) ? property.name.text : null;
-          if (name === null) continue;
-          addExport(name, ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer);
+        for (const object of objectLiteralsFor(source)) {
+          for (const property of object.properties) {
+            if (!property.name || (!ts.isPropertyAssignment(property) &&
+              !ts.isShorthandPropertyAssignment(property))) continue;
+            const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+              ts.isNumericLiteral(property.name) ? property.name.text : null;
+            if (name === null) continue;
+            addExport(name, ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer);
+          }
         }
       }
     };
@@ -803,6 +815,23 @@ function createLocalModuleResolver(files) {
     return expressions;
   };
 
+  const constructorPropertyExpressions = (declaration, name) => {
+    const constructor = declaration.members.find(member => ts.isConstructorDeclaration(member));
+    if (!constructor?.body) return [];
+    const expressions = [];
+    const visit = node => {
+      if (node !== constructor.body && ts.isFunctionLike(node)) return;
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const left = unwrap(node.left);
+        if (ts.isPropertyAccessExpression(left) && left.name.text === String(name) &&
+          left.expression.kind === ts.SyntaxKind.ThisKeyword) expressions.push(node.right);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(constructor.body);
+    return expressions;
+  };
+
   const resolveClassProperty = (atom, name, currentPath, visited) => {
     if (!atom?.classDeclaration) return new Set();
     if (visited.has(atom.classDeclaration)) return new Set();
@@ -810,6 +839,7 @@ function createLocalModuleResolver(files) {
     const declaration = atom.classDeclaration;
     const seen = new Set(visited).add(declaration);
     const expressions = classPropertyExpressions(declaration, name, !atom.instance);
+    if (atom.instance) expressions.push(...constructorPropertyExpressions(declaration, name));
     let hasParameterProperty = false;
     for (const expression of expressions) {
       if (ts.isGetAccessorDeclaration(expression)) {
@@ -884,6 +914,20 @@ function createLocalModuleResolver(files) {
         for (const nested of resolveExport(modulePath, String(name), visited)) result.add(nested);
       } else {
         for (const nested of resolveClassProperty(atom, name, currentPath, visited)) result.add(nested);
+      }
+      if (atom?.callable && ts.isFunctionDeclaration(atom.callable) && atom.callable.name) {
+        const callablePath = atom.modulePath || modulePath || currentPath;
+        for (const statement of atom.callable.getSourceFile().statements) {
+          if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
+            statement.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) continue;
+          const left = unwrap(statement.expression.left);
+          if (!ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) continue;
+          if (!ts.isIdentifier(left.expression) || left.expression.text !== atom.callable.name.text) continue;
+          const assignedName = ts.isPropertyAccessExpression(left) ? left.name.text
+            : staticPropertyValue(left.argumentExpression, callablePath);
+          if (String(assignedName) !== String(name)) continue;
+          for (const nested of evaluate(statement.expression.right, callablePath, visited)) result.add(nested);
+        }
       }
     }
     return result;
@@ -1148,6 +1192,9 @@ function createLocalModuleResolver(files) {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
+    if (ts.isObjectLiteralExpression(node)) {
+      return new Set([{ objectLiteral: node, modulePath: currentPath }]);
+    }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
       return new Set([{ classDeclaration: node, modulePath: currentPath, instance: false }]);
     }

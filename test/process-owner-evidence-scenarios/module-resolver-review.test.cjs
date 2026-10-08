@@ -284,6 +284,38 @@ test('statically bounded defineProperty exports retain probe values', () => {
     'producer.js': "Object.defineProperty(exports, 'probe', { value: () => true });",
     'use.js': "require('./producer.js').probe(1, 0);"
   });
+  expectProbe({
+    'producer.js': "Object.defineProperty(module.exports, 'probe', { get() { return process.kill; } });",
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('Object.assign exports resolve local object bindings', () => {
+  expectProbe({
+    'producer.js': 'const api = { probe: process.kill }; Object.assign(module.exports, api);',
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('callable exports retain attached properties', () => {
+  expectProbe({
+    'producer.js': 'function api() {} api.probe = process.kill; module.exports = api;',
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('constructed imported classes resolve constructor assignments', () => {
+  expectProbe({
+    'producer.js': 'class Check { constructor() { this.probe = process.kill; } } module.exports = Check;',
+    'use.js': "const Check = require('./producer.js'); new Check().probe(1, 0);"
+  });
+});
+
+test('object-valued callable returns retain probe properties across imports', () => {
+  expectProbe({
+    'producer.js': 'export function make() { return { probe: process.kill }; }',
+    'use.js': "import { make } from './producer.js'; make().probe(1, 0);"
+  });
 });
 
 test('namespace-import destructuring resolves exported properties', () => {

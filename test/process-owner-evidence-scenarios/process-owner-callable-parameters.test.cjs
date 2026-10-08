@@ -66,6 +66,43 @@ test("process nextTick aliases forward callback arguments", () => {
   );
 });
 
+test("nested destructuring assignments preserve probe paths", () => {
+  runFixture(
+    "let probe; ({ x: { probe } } = { x: { probe: process.kill } }); probe(123, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+});
+
+test("object-valued callable returns preserve probe properties", () => {
+  runFixture(
+    "function make() { return { probe: process.kill }; } function check(pid) { make().probe(pid, 0); } check(1);",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("Reflect.apply refuses probe arguments passed to callable helpers", () => {
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } function check(pid) { Reflect.apply(invoke, null, [process.kill, pid]); } check(1);",
+    [],
+    ["unsupported process probe private-alias.js:check"]
+  );
+});
+
+test("borrowed finite-array callback methods resolve probes", () => {
+  for (const invocation of [
+    "Array.prototype.map.call([pid], process.kill);",
+    "Array.prototype.map.apply([pid], [process.kill]);"
+  ]) {
+    runFixture(
+      `function check(pid) { ${invocation} } check(1);`,
+      ["private-alias.js\u0000check"],
+      ["unclassified process probe private-alias.js:check"]
+    );
+  }
+});
+
 test("reverse-search array callbacks forward probe arguments", () => {
   for (const method of ["findLast", "findLastIndex"]) {
     runFixture(
