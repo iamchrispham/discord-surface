@@ -1388,24 +1388,38 @@ const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases, functio
     .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
   const sourceScopeStart = containingFunction ? containingFunction.opening + 1 : 0;
   const argumentsList = topLevelSegments(tokens, opening + 1, closing);
-  return argumentsList.slice(1).some(([patchStart, patchEnd]) => {
-    if (tokens[patchStart]?.value === '{'
-      && pairs.get(patchStart) === patchEnd - 1
-      && valueHasGapOutcome(tokens, patchStart, patchEnd, pairs, aliases)) return true;
-    if (patchEnd - patchStart !== 1 || tokens[patchStart]?.type !== 'identifier') return false;
-    const patchName = tokens[patchStart].value;
+  const objectRangeForSource = (sourceStart, sourceEnd) => {
+    if (tokens[sourceStart]?.value === '{' && pairs.get(sourceStart) === sourceEnd - 1) {
+      return [sourceStart, sourceEnd];
+    }
+    if (sourceEnd - sourceStart !== 1 || tokens[sourceStart]?.type !== 'identifier') return null;
+    const sourceName = tokens[sourceStart].value;
     for (let declaration = sourceScopeStart; declaration < index; declaration += 1) {
       if (tokens[declaration]?.value !== 'const'
-        || tokens[declaration + 1]?.value !== patchName
+        || tokens[declaration + 1]?.value !== sourceName
         || tokens[declaration + 2]?.value !== '=') continue;
       const valueStart = declaration + 3;
       const declarationEnd = findStatementRange(tokens, declaration).end;
-      if (tokens[valueStart]?.value === '{'
-        && pairs.get(valueStart) === declarationEnd - 2
-        && valueHasGapOutcome(tokens, valueStart, declarationEnd - 1, pairs, aliases)) return true;
+      if (tokens[valueStart]?.value === '{' && pairs.get(valueStart) === declarationEnd - 2) {
+        return [valueStart, declarationEnd - 1];
+      }
     }
-    return false;
-  });
+    return null;
+  };
+  const objectAssignSourceSetsState = ([objectStart, objectEnd]) => topLevelSegments(
+    tokens,
+    objectStart + 1,
+    objectEnd - 1
+  ).some(([propertyStart]) => tokens[propertyStart]?.value === 'state'
+    && tokens[propertyStart + 1]?.value === ':');
+
+  let hasGapOutcome = false;
+  for (const [patchStart, patchEnd] of argumentsList.slice(1)) {
+    const patchRange = objectRangeForSource(patchStart, patchEnd);
+    if (!patchRange || !objectAssignSourceSetsState(patchRange)) continue;
+    hasGapOutcome = valueHasGapOutcome(tokens, patchRange[0], patchRange[1], pairs, aliases);
+  }
+  return hasGapOutcome;
 };
 
 const outcomeAssignmentValueStart = (tokens, index) => {
@@ -1530,6 +1544,8 @@ const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
   return tokens[next]?.value === '(';
 };
 
+const PROMISE_EXECUTOR_CALLBACK = 'promise-executor';
+
 const isScheduledCallback = (tokens, pairs, range) => {
   const start = range.start;
   let callbackStart;
@@ -1569,12 +1585,54 @@ const isScheduledCallback = (tokens, pairs, range) => {
   let calleeIndex = callOpening - 1;
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
+  if (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new') {
+    return PROMISE_EXECUTOR_CALLBACK;
+  }
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
-    || (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new')
     || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
   return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value)
     ? 'outcome'
     : false;
+};
+
+const promiseExecutorHasGapResolution = (tokens, range, bodyStart, bodyEnd, pairs, aliases) => {
+  let parameterStart = range.start;
+  if (tokens[parameterStart]?.value === '=>') {
+    parameterStart = tokens[parameterStart - 1]?.value === ')'
+      ? pairs.get(parameterStart - 1)
+      : parameterStart - 1;
+  }
+  if (tokens[parameterStart]?.value === 'async') parameterStart += 1;
+  if (tokens[parameterStart]?.value === 'function') {
+    while (parameterStart < range.opening && tokens[parameterStart]?.value !== '(') parameterStart += 1;
+  }
+
+  let resolverName;
+  if (tokens[parameterStart]?.value === '(') {
+    const parameterEnd = pairs.get(parameterStart);
+    if (parameterEnd !== undefined) {
+      const parameters = topLevelSegments(tokens, parameterStart + 1, parameterEnd);
+      const firstParameter = parameters[0];
+      if (firstParameter && firstParameter[1] - firstParameter[0] === 1
+        && tokens[firstParameter[0]]?.type === 'identifier') {
+        resolverName = tokens[firstParameter[0]].value;
+      }
+    }
+  } else if (tokens[parameterStart]?.type === 'identifier') {
+    resolverName = tokens[parameterStart].value;
+  }
+  if (!resolverName) return false;
+
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    if (tokens[index]?.value !== resolverName || tokens[index + 1]?.value !== '(') continue;
+    const callClosing = pairs.get(index + 1);
+    if (callClosing === undefined || callClosing >= bodyEnd) continue;
+    if (topLevelSegments(tokens, index + 2, callClosing).some(([valueStart, valueEnd]) => (
+      valueHasGapOutcome(tokens, valueStart, valueEnd, pairs, aliases)
+    ))) return true;
+    index = callClosing;
+  }
+  return false;
 };
 
 const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
@@ -1590,6 +1648,18 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
+        if (callbackKind === PROMISE_EXECUTOR_CALLBACK) {
+          if (promiseExecutorHasGapResolution(
+            tokens,
+            nestedFunction,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            knownAliases
+          )) return true;
+          index = nestedFunction.closing;
+          continue;
+        }
         if (callbackKind === 'discarded'
           && hasBoundaryWriterGap(
             tokens,
@@ -1646,8 +1716,21 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         knownWriterAliases
       )) return true;
       for (const callback of functionRanges) {
-        if (callback.expression || callback.start < expressionStart || callback.closing >= statementEnd
-          || !isScheduledCallback(tokens, pairs, callback)) continue;
+        if (callback.start < expressionStart || callback.closing >= statementEnd) continue;
+        const callbackKind = isScheduledCallback(tokens, pairs, callback);
+        if (!callbackKind) continue;
+        if (callbackKind === PROMISE_EXECUTOR_CALLBACK) {
+          if (promiseExecutorHasGapResolution(
+            tokens,
+            callback,
+            callback.expression ? callback.bodyStart : callback.opening + 1,
+            callback.expression ? callback.bodyEnd : callback.closing,
+            pairs,
+            knownAliases
+          )) return true;
+          continue;
+        }
+        if (callback.expression) continue;
         if (hasGapOutcome(
           tokens,
           callback.opening + 1,
@@ -3174,11 +3257,47 @@ test('deadline policy inventory follows deadline returns into finally handlers',
 });
 
 test('deadline policy inventory inspects Object.assign outcome mutations', () => {
-  const offenders = findDeadlineGapOffenders([{
-    relative: 'discord/deadline-object-assign-outcome.js',
-    source: 'if (deadlineReached) { Object.assign(result, { state: READINESS.GAP }); return result; }'
-  }]);
-  assert.deepEqual(offenders, ['discord/deadline-object-assign-outcome.js:1']);
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-object-assign-outcome.js',
+      source: 'if (deadlineReached) { Object.assign(result, { state: READINESS.GAP }); return result; }'
+    },
+    {
+      relative: 'discord/deadline-object-assign-overridden-gap.js',
+      source: 'if (deadlineReached) { Object.assign(result, { state: READINESS.GAP }, { state: READINESS.UNAVAILABLE }); return result; }'
+    },
+    {
+      relative: 'discord/deadline-object-assign-later-gap.js',
+      source: 'if (deadlineReached) { Object.assign(result, { state: READINESS.UNAVAILABLE }, { state: READINESS.GAP }); return result; }'
+    },
+    {
+      relative: 'discord/deadline-object-assign-unrelated-later-source.js',
+      source: 'if (deadlineReached) { Object.assign(result, { state: READINESS.GAP }, { detail: "expired" }); return result; }'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-object-assign-outcome.js:1',
+    'discord/deadline-object-assign-later-gap.js:1',
+    'discord/deadline-object-assign-unrelated-later-source.js:1'
+  ]);
+});
+
+test('deadline policy inventory tracks Promise executor fulfillment outcomes', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-promise-resolver-gap.js',
+      source: 'if (deadlineReached) return new Promise(resolve => resolve(READINESS.GAP));'
+    },
+    {
+      relative: 'discord/deadline-promise-executor-return.js',
+      source: 'if (deadlineReached) return new Promise(resolve => { return READINESS.GAP; });'
+    },
+    {
+      relative: 'discord/deadline-promise-resolver-unavailable.js',
+      source: 'if (deadlineReached) return new Promise(resolve => resolve(READINESS.UNAVAILABLE));'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-promise-resolver-gap.js:1']);
 });
 
 test('deadline policy inventory recognizes computed gap constants', () => {
