@@ -34,6 +34,34 @@ test('reference analysis follows aliases and namespace members without shadows',
   assert.equal(countIdentifierReferences(directCommonJs, 'isTownHallRoom'), 1);
 });
 
+test('reference analysis resolves constant computed ESM namespace members', () => {
+  const esm = source(String.raw`import * as plan from './town-hall-plan';
+    const key = 'isTownHallRoom';
+    plan[key]({});`);
+  assert.equal(countIdentifierReferences(esm, 'isTownHallRoom'), 1);
+});
+
+test('reference analysis resolves constant computed CommonJS namespace members', () => {
+  const commonJs = source(String.raw`const plan = require('./town-hall-plan');
+    const key = 'isTownHallRoom';
+    plan[key]({});`);
+  assert.equal(countIdentifierReferences(commonJs, 'isTownHallRoom'), 1);
+});
+
+test('reference analysis honors a computed key parameter shadow', () => {
+  const shadowedParameter = source(String.raw`import * as plan from './town-hall-plan';
+    const key = 'isTownHallRoom';
+    function check(key) { return plan[key]({}); }`);
+  assert.equal(countIdentifierReferences(shadowedParameter, 'isTownHallRoom'), 0);
+});
+
+test('reference analysis honors a computed key local shadow', () => {
+  const shadowedLocal = source(String.raw`const plan = require('./town-hall-plan');
+    const key = 'isTownHallRoom';
+    function check() { const key = 'unrelated'; return plan[key]({}); }`);
+  assert.equal(countIdentifierReferences(shadowedLocal, 'isTownHallRoom'), 0);
+});
+
 test('reference analysis resolves the built town-hall facade to its source owner', () => {
   const distFacade = source(String.raw`const plan = require('../../dist/peer/town-hall-plan.js');
     plan.isTownHallRoom({});`);

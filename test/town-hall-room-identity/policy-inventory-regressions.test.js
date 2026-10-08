@@ -224,6 +224,76 @@ test('local and imported pattern factories preserve returned regex inputs', () =
   assert.deepEqual(roomDigitPolicies([importedFactory, importedNegativeConsumer]), {});
 });
 
+test('stored local factory result preserves test room input', () => {
+  const storedTest = {
+    file: 'peer/stored-pattern-test.ts',
+    text: String.raw`function getPattern() { return /^\\d{1,21}$/; }
+    function validateTownHallRoom(room) { const pattern = getPattern(); return pattern.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([storedTest]), { [storedTest.file]: 1 });
+});
+
+test('stored local factory result preserves exec room input', () => {
+  const storedExec = {
+    file: 'peer/stored-pattern-exec.ts',
+    text: String.raw`function getPattern() { return /^\\d{1,21}$/; }
+    function validateTownHallRoom(room) { const pattern = getPattern(); return pattern.exec(room.channelId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([storedExec]), { [storedExec.file]: 1 });
+});
+
+test('stored local factory result ignores unrelated fields', () => {
+  const storedNegative = {
+    file: 'peer/stored-pattern-negative.ts',
+    text: String.raw`function getPattern() { return /^\\d{1,21}$/; }
+    function validateTownHallRoom(room) { const pattern = getPattern(); return pattern.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([storedNegative]), {});
+});
+
+test('RegExp parameter shadows are not treated as the native constructor', () => {
+  const parameterShadow = {
+    file: 'peer/regexp-parameter-shadow.ts',
+    text: String.raw`function validateTownHallRoom(room, RegExp) {
+      return RegExp('^\\d{1,21}$').test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([parameterShadow]), {});
+});
+
+test('RegExp local shadows are not treated as the native constructor', () => {
+  const localShadow = {
+    file: 'peer/regexp-local-shadow.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const RegExp = makeMatcher;
+      return RegExp('^\\d{1,21}$').test(room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([localShadow]), {});
+});
+
+test('array destructuring preserves source positions and room field identities', () => {
+  const consumer = {
+    file: 'peer/array-room-destructure.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const [, guildId, channelId] = [room.name, room.guildId, room.channelId];
+      return /^\\d{1,21}$/.test(guildId) && /^\\d{1,20}$/.test(channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 2 });
+});
+
+test('array destructuring ignores unrelated room fields', () => {
+  const unrelated = {
+    file: 'peer/array-unrelated-destructure.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const [unused, guildId] = [room.guildId, room.name];
+      return /^\\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([unrelated]), {});
+});
+
 test('fixed-key array callbacks preserve finite room fields', () => {
   const some = {
     file: 'peer/fixed-key-some.ts',

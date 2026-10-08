@@ -98,6 +98,25 @@ function createPolicyRegexAnalysis({
             ts.isCallExpression(matcher.parent) && matcher.parent.arguments[0]) {
           inputs.push(matcher.parent.arguments[0]);
         }
+        const declaration = callNode.parent;
+        if (ts.isVariableDeclaration(declaration) && declaration.initializer === callNode &&
+            ts.isIdentifier(declaration.name)) {
+          const storedBinding = findBinding(info, declaration.name.text, declaration.name);
+          const matcherScope = enclosingFunction(callNode);
+          if (storedBinding && matcherScope?.body) {
+            const findStoredMatcherInputs = candidate => {
+              if ((ts.isPropertyAccessExpression(candidate) || ts.isElementAccessExpression(candidate)) &&
+                  ts.isIdentifier(candidate.expression) &&
+                  findBinding(info, candidate.expression.text, candidate.expression) === storedBinding &&
+                  ['test', 'exec'].includes(callPropertyName(candidate)) &&
+                  ts.isCallExpression(candidate.parent) && candidate.parent.arguments[0]) {
+                inputs.push(candidate.parent.arguments[0]);
+              }
+              ts.forEachChild(candidate, findStoredMatcherInputs);
+            };
+            findStoredMatcherInputs(matcherScope.body);
+          }
+        }
       }
     }
     let propertyAssignment = node.parent;

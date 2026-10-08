@@ -547,6 +547,7 @@ function legacyRoomDigitPolicies(records, resolveImport = null) {
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
+          !resolveBinding(node.expression, bindings) &&
           node.arguments?.length) {
         pattern = resolveStringValue(node.arguments[0], bindings, new Set(),
           resolveImport ? (identifier, seen) => resolveImport(file, identifier, seen) : null);
@@ -615,6 +616,15 @@ function roomDigitPolicies(records) {
         } else {
           addPatternBindings(element.name, source, info, extra);
         }
+      }
+    }
+    if (ts.isArrayBindingPattern(pattern) && ts.isArrayLiteralExpression(source)) {
+      for (let index = 0; index < pattern.elements.length; index += 1) {
+        const element = pattern.elements[index];
+        const sourceElement = source.elements[index];
+        if (!ts.isBindingElement(element) || element.dotDotDotToken || !sourceElement ||
+            ts.isOmittedExpression(sourceElement) || element.initializer) continue;
+        addPatternBindings(element.name, sourceElement, info, extra);
       }
     }
   };
@@ -1149,6 +1159,7 @@ function roomDigitPolicies(records) {
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
+          !resolveBinding(node.expression, legacyBindings) &&
           node.arguments?.length) {
         pattern = resolveStringValue(node.arguments[0], legacyBindings, new Set(),
           (identifier, seen) => resolveImportedString(info, identifier, seen));

@@ -95,6 +95,17 @@ function resolveBinding(reference, bindings) {
   return candidates[0]?.declaration || null;
 }
 
+function resolveConstantString(expression, bindings, seen = new Set()) {
+  if (ts.isStringLiteralLike(expression)) return expression.text;
+  if (!ts.isIdentifier(expression)) return null;
+  const binding = resolveBinding(expression, bindings);
+  if (!binding || seen.has(binding) || !ts.isVariableDeclaration(binding) ||
+      !ts.isVariableDeclarationList(binding.parent) ||
+      !(binding.parent.flags & ts.NodeFlags.Const) || !binding.initializer) return null;
+  seen.add(binding);
+  return resolveConstantString(binding.initializer, bindings, seen);
+}
+
 function isTypePosition(node) {
   let current = node.parent;
   while (current) {
@@ -536,11 +547,9 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
       if (targetReference || namespaceAliasReference) count += 1;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const property = ts.isPropertyAccessExpression(node)
-        ? node.name.text
-        : node.argumentExpression && ts.isStringLiteralLike(node.argumentExpression)
-          ? node.argumentExpression.text
-          : null;
+      let property = null;
+      if (ts.isPropertyAccessExpression(node)) property = node.name.text;
+      else if (node.argumentExpression) property = resolveConstantString(node.argumentExpression, bindings);
       const receiver = node.expression;
       let importedNamespace = receiver;
       while (ts.isParenthesizedExpression(importedNamespace) ||
