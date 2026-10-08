@@ -230,8 +230,11 @@ function bindingInput(value: DecisionBinding | null): DecisionBindingInput | nul
   return { ...value, provider: value.provider, readiness: value.readiness as Readiness };
 }
 
-function savedBindingIsActive(click: DecisionClick, state: DecisionConsumerState): boolean {
-  const current = state.getBinding(click.channelId);
+function savedBindingIsActive(
+  click: DecisionClick,
+  state: DecisionConsumerState,
+  current = state.getBinding(click.channelId)
+): boolean {
   return current?.active === true && current.generation === click.binding.generation;
 }
 
@@ -862,14 +865,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         continue;
       }
       const activeBinding = state.getBinding(pendingClick.channelId);
-      if (pendingClick.authorizationOutcome === null &&
-        (!activeBinding || activeBinding.active !== true || activeBinding.generation !== pendingClick.binding.generation)) {
-        const transition = authorizationTransition(pendingClick.interactionId, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
-        if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
-          await deliverRejection(transition.click || pendingClick, signal);
+      if (!savedBindingIsActive(pendingClick, state, activeBinding)) {
+        if (pendingClick.authorizationOutcome === null) {
+          const transition = authorizationTransition(pendingClick.interactionId, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
+          if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+            await deliverRejection(transition.click || pendingClick, signal);
+          }
+          const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
+          if (unresolved) remaining.push(unresolved);
+        } else {
+          remaining.push(pendingClick);
         }
-        const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
-        if (unresolved) remaining.push(unresolved);
         continue;
       }
       if (!bindingInput(activeBinding)) {

@@ -330,7 +330,7 @@ async function sendCallbackRequest(
     const response = await Promise.race([request, deadline]);
     const status = responseStatus(response);
     if (response?.ok !== true) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return {
         outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }),
@@ -338,7 +338,7 @@ async function sendCallbackRequest(
       };
     }
     if (!requestSpec.withResponse) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) };
     }
     let responseBody: unknown = null;
@@ -346,7 +346,7 @@ async function sendCallbackRequest(
     catch (error) { if (timedOut) throw error; }
     const responseId = responseMessageId(responseBody);
     if (!responseId) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return {
         outcome: INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }),
@@ -355,7 +355,7 @@ async function sendCallbackRequest(
         terminal: true
       };
     }
-    await Promise.race([cancelBody(response), deadline]);
+    try { await Promise.race([cancelBody(response), deadline]); } catch {}
     return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: responseId, visibility: 'available' };
   } catch (error) {
     return {

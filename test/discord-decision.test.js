@@ -276,6 +276,50 @@ test('original held click resumes through startDecisionRecovery without a second
   assert.equal(decisionMessages(f.state).length, 1);
 });
 
+test('decision recovery retains authorized clicks when their saved binding is replaced or retired', { timeout: 30000 }, async t => {
+  const scenarios = [
+    { name: 'replacement generation', current: binding => ({ ...binding, generation: binding.generation + 1 }) },
+    { name: 'inactive binding', current: binding => ({ ...binding, active: false }) }
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async subtest => {
+      const f = await fixture(subtest);
+      const interactionId = `held-authorized-${scenario.name.replaceAll(' ', '-')}`;
+      const listener = f.listeners.get('interactionCreate');
+      assert.equal(typeof listener, 'function');
+      f.gateway.authorizeDecisionInteraction = async () => true;
+
+      listener(component(f.presentation, interactionId, 0));
+      await waitForCondition(() => f.callbacks.length === 1, 'held decision callback was not attempted');
+      await Promise.all([...f.gateway.inFlight]);
+
+      const held = f.state.getDecisionClick(interactionId);
+      assert.equal(held.authorizationOutcome, 'authorized');
+      assert.equal(held.state, 'canonical_pending');
+      assert.equal(held.canonical, null);
+
+      const getBinding = f.state.getBinding.bind(f.state);
+      f.state.getBinding = channelId => {
+        const binding = getBinding(channelId);
+        return channelId === 'channel' && binding ? scenario.current(binding) : binding;
+      };
+      f.gateway.ready = true;
+      f.gateway.started = true;
+      f.gateway.transportReady = true;
+
+      const remaining = await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+      const recovered = f.state.getDecisionClick(interactionId);
+      assert.equal(recovered.state, 'canonical_pending');
+      assert.equal(recovered.canonical, null);
+      assert.equal(recovered.nativeReturn, null);
+      assert.deepEqual(f.state.listDecisionPendingWork().map(click => click.interactionId), [interactionId]);
+      assert.deepEqual(remaining.map(click => click.interactionId), [interactionId]);
+      assert.equal(f.dispatches.length, 0);
+    });
+  }
+});
+
 test('queues a channel-scoped decision recovery requested during an active pass', { timeout: 8000 }, async t => {
   const f = await fixture(t);
   const calls = [];
