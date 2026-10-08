@@ -54,6 +54,9 @@ function invoke(f, flags = [], identity = NATIVE) {
 
 test('public CLI reads the current caller result without credentials or custody changes', t => {
   const f = prepared(t);
+  const dir = path.dirname(f.db);
+  fs.chmodSync(dir, 0o755);
+  fs.chmodSync(f.db, 0o644);
   const before = f.state.listReceipts();
   assert.equal(fs.existsSync(f.state.requireConfig().secretFile), false);
   const result = invoke(f);
@@ -68,6 +71,8 @@ test('public CLI reads the current caller result without credentials or custody 
   assert.equal(output.results[0].completed, false);
   assert.deepEqual(f.state.listReceipts(), before);
   assert.equal(f.state.getMessage('10002').state, 'accepted');
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o755, 'inspection changed directory permissions');
+  assert.equal(fs.statSync(f.db).mode & 0o777, 0o644, 'inspection changed database permissions');
 });
 
 test('public CLI refuses another caller correlation and cannot select a native UUID', t => {
@@ -109,10 +114,17 @@ test('public CLI rejects unknown and repeated flags before opening a database', 
       }
     };
   `);
+  const environment = { NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+    CODEX_THREAD_ID: NATIVE, CODEX_SESSION_ID: NATIVE };
+  const valid = runCli(f, ['peer-result', '--provider', 'codex', '--db', f.db,
+    '--correlation-id', f.request.id], environment);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(JSON.parse(valid.stdout).results[0].text, f.packet.text);
+  assert.equal(fs.existsSync(marker), true, 'constructor marker is not active');
   for (const flags of [['--typo', 'value'], ['--provider', 'claude'], ['--native-id', NATIVE]]) {
     fs.rmSync(marker, { force: true });
     const result = runCli(f, ['peer-result', '--provider', 'codex', '--db', untouched,
-      '--correlation-id', f.request.id, ...flags], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+      '--correlation-id', f.request.id, ...flags], environment);
     assert.equal(result.status, 1);
     assert.equal(fs.existsSync(marker), false, 'invalid flags reached state open');
     assert.equal(fs.existsSync(untouched), false);
