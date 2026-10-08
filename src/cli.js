@@ -28,6 +28,7 @@ const { createRecoveryCommands } = require('./cli/recovery-commands');
 const { createBoardRefreshCommands } = require('./cli/board-refresh-commands');
 const { createWatcherCommands } = require('./cli/watcher-commands');
 const { createBindingCommands } = require('./cli/binding-commands');
+const { createPeerResultCommand } = require('./cli/peer-result');
 const { resolveCurrentCodexWatcherCaller } = require('./cli/codex-watcher-caller');
 const { writePid, acquireHeldLockUntilAvailable } = require('./cli/runtime-custody');
 const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessInspection(__filename);
@@ -166,7 +167,7 @@ const ordinaryHandoffInternal = createOrdinaryHandoff({ required, openState, req
 
 const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 
-Commands: mcp, configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
+Commands: mcp, peer-result, configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address,
 agent-send, agent-complete, agent-withdraw, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
@@ -238,6 +239,7 @@ A stopped or stale Gateway leaves the durable retirement for the next startup.
 function printUsage(command) {
   let usage = GENERAL_USAGE;
   if (command === 'mcp') usage = 'Usage: discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]\n\nRuns authenticated peer tools over stdio. Native caller identity must be available.\n';
+  if (command === 'peer-result') usage = 'Usage: discord-surface peer-result --provider codex|claude --correlation-id ID [--state-dir DIR] [--db FILE]\n\nInspect the current native caller\'s correlated replies without acknowledging or completing custody.\n';
   if (command === 'agent-send') usage = AGENT_SEND_USAGE;
   if (command === 'agent-complete') usage = AGENT_COMPLETE_USAGE;
   if (command === 'agent-withdraw') usage = AGENT_WITHDRAW_USAGE;
@@ -395,6 +397,7 @@ const { nativeReply, claudeReply, agentComplete, agentWithdraw } = createNativeC
 const { watcherArm, watcherSend, watcherConsume } = createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, resolveCurrentCodexWatcherCaller, gatewayProcessStatus, requestGatewayRecovery });
 const { recoverCourier, recover } = createRecoveryCommands({ required, openState, print, gatewayProcessStatus, requestGatewayRecovery, GATEWAY_CAPABILITIES });
 const { bindingArgs, bind, threadEnroll, unbind } = createBindingCommands({ required, openState, print, requestGatewayRecovery, gatewayProcessStatus });
+const peerResult = createPeerResultCommand({ required, openState, print, resolveCurrentClaudeCaller });
 
 const { createBindingWakeController, runRuntime, start, stop } = createRuntimeLifecycle({ openState, pathsFor, SurfaceState, resolveCourierRoute, print, pidMatches, waitForExit, acquireHeldLockUntilAvailable, writePid, cliPath: __filename });
 
@@ -444,6 +447,7 @@ async function main() {
     case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
     case 'courier-input': return require('./courier-input').courierInput(args);
     case 'mcp': return require('./peer/server').startPeerMcp(args);
+    case 'peer-result': return peerResult(args);
     case 'configure': return configure(args);
     case 'bind': return bind(args);
     case 'ordinary-bind':
