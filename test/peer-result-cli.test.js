@@ -69,10 +69,22 @@ function createNetworkTrap(f) {
       'node:https': ['request', 'get'],
       'node:net': ['connect', 'createConnection'],
       'node:tls': ['connect'],
-      'node:dgram': ['createSocket']
+      'node:dgram': ['createSocket'],
+      'node:dns': ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny',
+        'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa',
+        'resolveSrv', 'resolveTxt', 'reverse'],
+      'node:http2': ['connect']
     })) {
       const api = require(moduleName);
       for (const method of methods) api[method] = blocked(moduleName + '.' + method);
+    }
+    const net = require('node:net');
+    net.Socket.prototype.connect = blocked('node:net.Socket.connect');
+    const dns = require('node:dns');
+    for (const method of ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny',
+      'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa',
+      'resolveSrv', 'resolveTxt', 'reverse']) {
+      dns.promises[method] = blocked('node:dns.promises.' + method);
     }
     const Module = require('node:module');
     const originalLoad = Module._load;
@@ -80,9 +92,14 @@ function createNetworkTrap(f) {
       const loaded = originalLoad.call(this, request, parent, isMain);
       if (request !== 'node:sqlite') return loaded;
       const DatabaseSync = function(...args) {
-        if (process.env.PEER_RESULT_TEST_NETWORK_PROBE === '1') {
+        const probe = process.env.PEER_RESULT_TEST_NETWORK_PROBE;
+        if (probe === 'fetch') {
           globalThis.fetch('http://127.0.0.1:9/');
         }
+        if (probe === 'http.get') require('node:http').get('http://127.0.0.1:9/');
+        if (probe === 'socket.connect') new (require('node:net').Socket)().connect(9, '127.0.0.1');
+        if (probe === 'dns.lookup') require('node:dns').lookup('localhost', () => {});
+        if (probe === 'http2.connect') require('node:http2').connect('http://127.0.0.1:9');
         return new loaded.DatabaseSync(...args);
       };
       DatabaseSync.prototype = loaded.DatabaseSync.prototype;
@@ -118,17 +135,24 @@ test('public CLI reads the current caller result without credentials or custody 
 test('public CLI projects native acknowledgment separately from send and completion', t => {
   const f = prepared(t);
   const message = f.state.getMessage('10002');
-  f.state.receipt('10002', 'native-ack', { messageId: '10002', nativeId: message.nativeId,
-    provider: message.provider, generation: message.generation });
-  assert.equal(f.state.hasNativeAcknowledgment(message), true, 'fixture must create acknowledgment evidence');
+  f.state.claimDispatch(message.id);
+  f.state.markSubmitted(message.id);
+  require('../src/acknowledgment').recordNativeAcknowledgment(f.state, {
+    provider: message.provider, nativeId: message.nativeId, generation: message.generation, messageId: message.id
+  });
+  const submitted = f.state.getMessage(message.id);
+  assert.equal(submitted.state, 'submitted');
+  assert.equal(f.state.hasNativeAcknowledgment(submitted), true);
   const before = f.state.listReceipts();
   const result = invoke(f);
   assert.equal(result.status, 0, result.stderr);
   const output = JSON.parse(result.stdout);
   assert.equal(output.sendOutcome, 'sent');
+  assert.equal(output.results[0].state, 'submitted');
   assert.equal(output.results[0].nativeAcknowledged, true);
   assert.equal(output.results[0].completed, false);
   assert.deepEqual(f.state.listReceipts(), before);
+  assert.equal(f.state.getMessage(message.id).state, 'submitted');
 });
 
 test('public inspection is network-free and its trap catches an injected request', t => {
@@ -142,10 +166,19 @@ test('public inspection is network-free and its trap catches an injected request
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(trap.marker), false, 'inspection attempted network access');
 
-  const probe = runCli(f, args, { ...environment, PEER_RESULT_TEST_NETWORK_PROBE: '1' });
-  assert.equal(probe.status, 1);
-  assert.match(probe.stderr, /NETWORK_BLOCKED:fetch/);
-  assert.equal(fs.readFileSync(trap.marker, 'utf8'), 'fetch');
+  for (const [probeName, expected] of [
+    ['fetch', 'fetch'],
+    ['http.get', 'node:http.get'],
+    ['socket.connect', 'node:net.Socket.connect'],
+    ['dns.lookup', 'node:dns.lookup'],
+    ['http2.connect', 'node:http2.connect']
+  ]) {
+    fs.rmSync(trap.marker, { force: true });
+    const probe = runCli(f, args, { ...environment, PEER_RESULT_TEST_NETWORK_PROBE: probeName });
+    assert.equal(probe.status, 1, probeName);
+    assert.ok(probe.stderr.includes(`NETWORK_BLOCKED:${expected}`), probeName);
+    assert.equal(fs.readFileSync(trap.marker, 'utf8'), expected, probeName);
+  }
 });
 
 test('public CLI refuses another caller correlation and cannot select a native UUID', t => {
