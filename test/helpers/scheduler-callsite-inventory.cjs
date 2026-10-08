@@ -22,9 +22,9 @@ function schedulerAccessName(node) {
   if (ts.isPropertyAccessExpression(access) && SCHEDULER_METHODS.has(access.name.text)) {
     return access.name.text;
   }
-  if (ts.isElementAccessExpression(access) && access.argumentExpression &&
-    ts.isStringLiteralLike(access.argumentExpression) && SCHEDULER_METHODS.has(access.argumentExpression.text)) {
-    return access.argumentExpression.text;
+  if (ts.isElementAccessExpression(access) && access.argumentExpression) {
+    const key = unwrapParentheses(access.argumentExpression);
+    if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   }
   return null;
 }
@@ -32,9 +32,11 @@ function schedulerAccessName(node) {
 function schedulerLiteralKeyName(key) {
   if (ts.isIdentifier(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
-  if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression) &&
-    SCHEDULER_METHODS.has(key.expression.text)) {
-    return key.expression.text;
+  if (ts.isComputedPropertyName(key)) {
+    const expression = unwrapParentheses(key.expression);
+    if (ts.isStringLiteralLike(expression) && SCHEDULER_METHODS.has(expression.text)) {
+      return expression.text;
+    }
   }
   return null;
 }

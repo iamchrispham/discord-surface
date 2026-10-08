@@ -119,6 +119,98 @@ function classStateInventory(sourceText) {
     ].includes(expression.kind);
   }
 
+  const timerApiNames = new Set(['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval']);
+  function bindingContainsName(bindingName, soughtName) {
+    if (ts.isIdentifier(bindingName)) return bindingName.text === soughtName;
+    if (ts.isObjectBindingPattern(bindingName) || ts.isArrayBindingPattern(bindingName)) {
+      return bindingName.elements.some(element => ts.isBindingElement(element) &&
+        bindingContainsName(element.name, soughtName));
+    }
+    return false;
+  }
+
+  function declarationListContainsName(declarations, soughtName, blockScopedOnly = false) {
+    if (blockScopedOnly && (declarations.flags & ts.NodeFlags.BlockScoped) === 0) return false;
+    return declarations.declarations.some(declaration => bindingContainsName(declaration.name, soughtName));
+  }
+
+  function statementsContainName(statements, soughtName, blockScopedOnly = false) {
+    return statements.some(statement => {
+      if (ts.isVariableStatement(statement)) {
+        return declarationListContainsName(statement.declarationList, soughtName, blockScopedOnly);
+      }
+      if (blockScopedOnly && !ts.isFunctionDeclaration(statement) && !ts.isClassDeclaration(statement)) return false;
+      return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) || ts.isModuleDeclaration(statement)) &&
+        statement.name && ts.isIdentifier(statement.name) && statement.name.text === soughtName;
+    });
+  }
+
+  function functionHasVarBinding(functionNode, soughtName) {
+    if (!functionNode.body) return false;
+    let found = false;
+    function scan(node) {
+      if (node !== functionNode.body && (ts.isFunctionLike(node) ||
+        ts.isClassDeclaration(node) || ts.isClassExpression(node))) return;
+      if (ts.isVariableDeclaration(node) && ts.isVariableDeclarationList(node.parent) &&
+        (node.parent.flags & ts.NodeFlags.BlockScoped) === 0 && bindingContainsName(node.name, soughtName)) {
+        found = true;
+        return;
+      }
+      ts.forEachChild(node, scan);
+    }
+    scan(functionNode.body);
+    return found;
+  }
+
+  function sourceFileContainsName(sourceNode, soughtName) {
+    return sourceNode.statements.some(statement => {
+      if (ts.isImportDeclaration(statement)) {
+        const clause = statement.importClause;
+        if (!clause) return false;
+        if (clause.name?.text === soughtName) return true;
+        const bindings = clause.namedBindings;
+        if (bindings && ts.isNamespaceImport(bindings)) return bindings.name.text === soughtName;
+        return Boolean(bindings && ts.isNamedImports(bindings) &&
+          bindings.elements.some(element => element.name.text === soughtName));
+      }
+      if (ts.isImportEqualsDeclaration(statement)) return statement.name.text === soughtName;
+      if (ts.isVariableStatement(statement)) {
+        return declarationListContainsName(statement.declarationList, soughtName);
+      }
+      return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) || ts.isModuleDeclaration(statement)) &&
+        statement.name && ts.isIdentifier(statement.name) && statement.name.text === soughtName;
+    });
+  }
+
+  function scopeDeclaresTimerName(scope, soughtName) {
+    if (ts.isFunctionLike(scope)) {
+      if (scope.parameters.some(parameter => bindingContainsName(parameter.name, soughtName)) ||
+        (ts.isFunctionExpression(scope) && scope.name?.text === soughtName) ||
+        functionHasVarBinding(scope, soughtName)) return true;
+    }
+    if (ts.isBlock(scope) && statementsContainName(scope.statements, soughtName, true)) return true;
+    if (ts.isCaseBlock(scope) && scope.clauses.some(clause =>
+      statementsContainName(clause.statements, soughtName, true))) return true;
+    if (ts.isCatchClause(scope) && scope.variableDeclaration &&
+      bindingContainsName(scope.variableDeclaration.name, soughtName)) return true;
+    if ((ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+      scope.initializer && ts.isVariableDeclarationList(scope.initializer) &&
+      declarationListContainsName(scope.initializer, soughtName)) return true;
+    return ts.isSourceFile(scope) && sourceFileContainsName(scope, soughtName);
+  }
+
+  function isUnshadowedTimerCall(node) {
+    if (!ts.isCallExpression(node)) return false;
+    const callee = unwrapParentheses(node.expression);
+    if (!ts.isIdentifier(callee) || !timerApiNames.has(callee.text)) return false;
+    for (let scope = node.parent; scope; scope = scope.parent) {
+      if (scopeDeclaresTimerName(scope, callee.text)) return false;
+    }
+    return true;
+  }
+
   function visit(node) {
     if (ts.isClassDeclaration(node) && node.name?.text === 'DiscordGateway') {
       for (const member of node.members) {
@@ -137,11 +229,11 @@ function classStateInventory(sourceText) {
             }
           }
           if (ts.isVariableDeclaration(bodyNode) && bindingPatternHasSchedulerField(bodyNode.name) &&
-            bodyNode.initializer && ts.isThis(bodyNode.initializer)) accessesSchedulerState = true;
+            bodyNode.initializer && ts.isThis(unwrapParentheses(bodyNode.initializer))) accessesSchedulerState = true;
           if (ts.isBinaryExpression(bodyNode) && bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
             ts.isThis(unwrapParentheses(bodyNode.right)) &&
             assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
-          if (ts.isIdentifier(bodyNode) && ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].includes(bodyNode.text)) {
+          if (isUnshadowedTimerCall(bodyNode) && !timerOwners.includes(memberName)) {
             timerOwners.push(memberName);
           }
 
@@ -199,9 +291,23 @@ function exactOwnerContract(sourceOverrides = {}) {
   if (declarations.length !== 2 || declarations.some(declaration => !declaration.body)) return false;
   if (declarations.map(declaration => declaration.name?.text).sort().join(',') !== gatewayMethods.slice().sort().join(',')) return false;
   const factoryParameters = factory.parameters;
-  if (factoryParameters.length !== 1 || !ts.isObjectBindingPattern(factoryParameters[0].name)) return false;
-  const dependencies = factoryParameters[0].name.elements.map(element => element.name.getText(ownerSource)).sort();
-  if (dependencies.join(',') !== DEPENDENCY_NAMES.slice().sort().join(',')) return false;
+  if (factoryParameters.length !== 1 || factoryParameters[0].initializer ||
+    factoryParameters[0].dotDotDotToken || !ts.isObjectBindingPattern(factoryParameters[0].name)) return false;
+  const dependencies = factoryParameters[0].name.elements.map(element => {
+    if (!ts.isBindingElement(element) || element.dotDotDotToken || element.initializer ||
+      !ts.isIdentifier(element.name)) return null;
+    const localName = element.name.text;
+    if (!element.propertyName) return localName;
+    const propertyName = ts.isComputedPropertyName(element.propertyName)
+      ? unwrapParentheses(element.propertyName.expression)
+      : element.propertyName;
+    const injectedName = ts.isIdentifier(propertyName) || ts.isStringLiteralLike(propertyName)
+      ? propertyName.text
+      : null;
+    return injectedName === localName ? localName : null;
+  });
+  if (dependencies.some(dependency => dependency === null) ||
+    dependencies.slice().sort().join(',') !== DEPENDENCY_NAMES.slice().sort().join(',')) return false;
   const returned = statements[2];
   if (!ts.isReturnStatement(returned) || !returned.expression || !ts.isObjectLiteralExpression(returned.expression)) return false;
   const returnedNames = returned.expression.properties.map(property =>

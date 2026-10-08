@@ -19,6 +19,28 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   assert.equal(exactOwnerContract(), true);
   const gateway = fs.readFileSync(GATEWAY_PATH, 'utf8');
   const owner = fs.readFileSync(OWNER_PATH, 'utf8');
+  const ownerSource = sourceFile(OWNER_PATH, owner);
+  const ownerFactory = ownerSource.statements.find(statement => ts.isFunctionDeclaration(statement) &&
+    statement.name?.text === 'createHandoffSchedulerHandlers');
+  assert.ok(ownerFactory);
+  const dependencyElements = ownerFactory.parameters[0].name.elements;
+  const firstDependency = dependencyElements[0];
+  const lastDependency = dependencyElements[dependencyElements.length - 1];
+  const firstDependencyName = firstDependency.name.getText(ownerSource);
+  const lastDependencyName = lastDependency.name.getText(ownerSource);
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(firstDependency.getText(ownerSource),
+    `unexpectedDependency: ${firstDependencyName}`) }), false,
+  'factory dependency alias changed the injected property name');
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(firstDependency.getText(ownerSource),
+    `${firstDependencyName} = undefined`) }), false,
+  'factory dependency default changed the injected contract');
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(lastDependency.getText(ownerSource),
+    `...${lastDependencyName}`) }), false,
+  'factory dependency rest binding changed the injected contract');
+  const factoryParameter = ownerFactory.parameters[0];
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(factoryParameter.getText(ownerSource),
+    `${factoryParameter.name.getText(ownerSource)} = {}`) }), false,
+  'factory parameter default changed the injected contract');
   const asCrlf = text => text.replace(/\r\n?/g, '\n').replace(/\n/g, '\r\n');
   assert.equal(exactOwnerContract({ gatewayText: asCrlf(gateway), ownerText: asCrlf(owner) }), true,
     'CRLF source changed the normalized owner contract');
@@ -49,6 +71,7 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   const destructuredStateMembers = [
     ['deferred shorthand', 'privateDeferredStateReader() { const { deferredHandoffRecoveryChannels } = this; return deferredHandoffRecoveryChannels; }'],
     ['deferred alias', 'privateDeferredStateAliasReader() { const { deferredHandoffRecoveryChannels: channels } = this; return channels; }'],
+    ['parenthesized this initializer', 'privateParenthesizedStateReader() { const { deferredHandoffRecoveryChannels } = (this); return deferredHandoffRecoveryChannels; }'],
     ['pending shorthand', 'privatePendingStateReader() { const { pendingHandoffRecoveryPollTimer } = this; return pendingHandoffRecoveryPollTimer; }'],
     ['direct state property', 'privateDirectStateReader() { return this.deferredHandoffRecoveryChannels; }']
   ];
@@ -79,7 +102,10 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     ['ordinary this field', 'privateOrdinaryStateReader() { const { gatewayName } = this; return gatewayName; }'],
     ['other-object scheduler field', 'privateOtherObjectStateReader(other) { const { deferredHandoffRecoveryChannels } = other; return deferredHandoffRecoveryChannels; }'],
     ['other-source parameter', 'privateOtherSourceParameterReader({ deferredHandoffRecoveryChannels: channels } = other) { return channels; }'],
-    ['ordinary literal element key', "privateOrdinaryElementReader() { return this['client']; }"]
+    ['ordinary literal element key', "privateOrdinaryElementReader() { return this['client']; }"],
+    ['timer property read', 'privateTimerPropertyReader(options) { return options.setTimeout; }'],
+    ['shadowed timer parameter call', 'privateShadowedTimerCall(setTimeout) { setTimeout(() => {}, 1); }'],
+    ['shadowed timer local call', 'privateShadowedTimerLocalCall() { const setTimeout = () => {}; setTimeout(() => {}, 1); }']
   ]) {
     const source = gateway.replace(
       '  scheduleDeferredHandoffRecovery(channelId) {',
@@ -135,10 +161,12 @@ test('public scheduler inventory pins source owners and rejects only new schedul
   const expected = [
     { file: 'assignment.js', owner: 'assignmentAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'assignment.js', owner: 'assignmentComputedAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'assignment.js', owner: 'assignmentGroupedComputedAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'assignment.js', owner: 'assignmentShorthandSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'assignment.js', owner: 'assignmentStringAliasSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'bound.js', owner: 'boundSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'bracket.ts', owner: 'bracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+    { file: 'bracket.ts', owner: 'groupedBracketSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'capture.js', owner: 'captureSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'destructured.js', owner: 'destructuredSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'destructured.js', owner: 'shorthandSite', scheduler: 'scheduleDeferredHandoffRecovery' },
@@ -153,6 +181,7 @@ test('public scheduler inventory pins source owners and rejects only new schedul
     fs.writeFileSync(path.join(sourceRoot, 'assignment.js'),
       'function assignmentAliasSite(gateway) { let schedule; ({ scheduleDeferredHandoffRecovery: schedule } = gateway); return schedule; }\n' +
       "function assignmentComputedAliasSite(gateway) { let schedule; ({ ['scheduleDeferredHandoffRecovery']: schedule } = gateway); return schedule; }\n" +
+      "function assignmentGroupedComputedAliasSite(gateway) { let schedule; ({ [('scheduleDeferredHandoffRecovery')]: schedule } = gateway); return schedule; }\n" +
       'function assignmentShorthandSite(gateway) { let scheduleDeferredHandoffRecovery; ({ scheduleDeferredHandoffRecovery } = gateway); return scheduleDeferredHandoffRecovery; }\n' +
       'function assignmentStringAliasSite(gateway) { let schedule; ({ "schedulePendingHandoffRecoveryPoll": schedule } = gateway); return schedule; }\n' +
       'function ordinaryObjectSite(gateway) { return { scheduleDeferredHandoffRecovery: gateway }; }\n' +
@@ -161,7 +190,8 @@ test('public scheduler inventory pins source owners and rejects only new schedul
     fs.writeFileSync(path.join(sourceRoot, 'bound.js'),
       'function boundSite(gateway) { return gateway.scheduleDeferredHandoffRecovery.bind(gateway); }\n');
     fs.writeFileSync(path.join(sourceRoot, 'bracket.ts'),
-      "function bracketSite(gateway: any) { gateway['schedulePendingHandoffRecoveryPoll'](); }\n");
+      "function bracketSite(gateway: any) { gateway['schedulePendingHandoffRecoveryPoll'](); }\n" +
+      "function groupedBracketSite(gateway: any) { gateway[('scheduleDeferredHandoffRecovery')](); }\n");
     fs.writeFileSync(path.join(sourceRoot, 'capture.js'),
       'function captureSite(gateway) { const schedule = gateway?.scheduleDeferredHandoffRecovery; return schedule; }\n');
     fs.writeFileSync(path.join(sourceRoot, 'destructured.js'),
