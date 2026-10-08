@@ -2237,12 +2237,66 @@ const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) 
     const separator = tokens[cursor]?.value;
     const methodIndex = cursor + 1;
     const callOpening = cursor + 2;
+    const method = tokens[methodIndex]?.value;
     if (!['.', '?.'].includes(separator)
-      || tokens[methodIndex]?.value !== 'then'
+      || !['then', 'finally'].includes(method)
       || tokens[callOpening]?.value !== '(') break;
     const callClosing = pairs.get(callOpening);
     if (callClosing === undefined || callClosing >= expressionEnd) return null;
     const handlerArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+    if (method === 'finally') {
+      const callbackArgument = handlerArguments[0];
+      if (callbackArgument && callbackArgument[0] < callbackArgument[1]) {
+        const callbackExpression = trimExpressionRange(
+          tokens,
+          callbackArgument[0],
+          callbackArgument[1],
+          pairs
+        );
+        const callbackRange = functionRanges
+          .filter(range => range.start >= callbackExpression.start
+            && range.closing < callbackExpression.end)
+          .filter(range => isScheduledCallback(tokens, pairs, range) === 'discarded')
+          .filter(range => !functionRanges.some(parent => parent !== range
+            && parent.start >= callbackExpression.start
+            && parent.start < range.start
+            && parent.closing > range.closing
+            && parent.closing < callbackExpression.end))
+          .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+        const ignoredCallback = callbackExpression.end - callbackExpression.start === 1
+          && ['undefined', 'null'].includes(tokens[callbackExpression.start]?.value);
+        if (!callbackRange && !ignoredCallback) return null;
+
+        if (callbackRange) {
+          const bodyStart = callbackRange.expression
+            ? callbackRange.bodyStart
+            : callbackRange.opening + 1;
+          let bodyEnd = callbackRange.expression ? callbackRange.bodyEnd : callbackRange.closing;
+          while (bodyEnd > bodyStart && tokens[bodyEnd - 1]?.value === ';') bodyEnd -= 1;
+          const alwaysThrows = !callbackRange.expression
+            && tokens[bodyStart]?.value === 'throw';
+          let returnedValueStart = bodyStart;
+          if (!callbackRange.expression) {
+            if (tokens[bodyStart]?.value === 'return') {
+              returnedValueStart += 1;
+            } else {
+              returnedValueStart = -1;
+            }
+          }
+          if (tokens[returnedValueStart]?.value === 'await') returnedValueStart += 1;
+          const rejectedCallOpening = returnedValueStart + 3;
+          const alwaysRejects = tokens[returnedValueStart]?.value === 'Promise'
+            && tokens[returnedValueStart + 1]?.value === '.'
+            && tokens[returnedValueStart + 2]?.value === 'reject'
+            && tokens[rejectedCallOpening]?.value === '('
+            && pairs.get(rejectedCallOpening) === bodyEnd - 1;
+          if (alwaysThrows || alwaysRejects) fulfillmentHasGap = false;
+        }
+      }
+      handlerCount += 1;
+      cursor = callClosing + 1;
+      continue;
+    }
     const fulfillmentHandler = handlerArguments[0];
     if (fulfillmentHandler && fulfillmentHandler[0] < fulfillmentHandler[1]) {
       const handlerExpression = trimExpressionRange(
@@ -4950,6 +5004,46 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
     'discord/reversed-strict-timestamp-deadline.js:1',
     'discord/strict-timestamp-deadline.js:1',
     'discord/nested-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory preserves fulfilled values through Promise.finally', () => {
+  const entries = [
+    {
+      relative: 'discord/finally-empty.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP).finally(() => {});'
+    },
+    {
+      relative: 'discord/finally-expression-return.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP).finally(() => READINESS.UNAVAILABLE);'
+    },
+    {
+      relative: 'discord/finally-block-return.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP).finally(() => { return READINESS.UNAVAILABLE; });'
+    },
+    {
+      relative: 'discord/finally-throw.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP).finally(() => { throw new Error(); });'
+    },
+    {
+      relative: 'discord/finally-rejected-promise.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP).finally(() => Promise.reject(new Error()));'
+    },
+    {
+      relative: 'discord/finally-return-gap-does-not-replace.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.UNAVAILABLE).finally(() => READINESS.GAP);'
+    },
+    {
+      relative: 'discord/then-outcome-control.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP);'
+    }
+  ];
+
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/finally-empty.js:1',
+    'discord/finally-expression-return.js:1',
+    'discord/finally-block-return.js:1',
+    'discord/then-outcome-control.js:1'
   ]);
 });
 
