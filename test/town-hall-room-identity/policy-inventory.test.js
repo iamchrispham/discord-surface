@@ -1641,6 +1641,14 @@ test('room policy inventory records only town-hall room validators', () => {
   const aliasedImportedReferenceFixture = ts.createSourceFile('peer/aliased-imported-reference-fixture.ts', String.raw`import { isTownHallRoom as roomGuard } from './town-hall-plan';
   roomGuard({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(aliasedImportedReferenceFixture, 'isTownHallRoom'), 1);
+  const unrelatedNamedReferenceFixture = ts.createSourceFile('peer/unrelated-named-reference-fixture.ts', String.raw`import { isTownHallRoom } from './voice-room';
+  isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(unrelatedNamedReferenceFixture, 'isTownHallRoom'), 0);
+  const unrelatedNamespaceReferenceFixture = ts.createSourceFile('peer/unrelated-namespace-reference-fixture.ts', String.raw`import * as voiceRoom from './voice-room';
+  voiceRoom.isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(unrelatedNamespaceReferenceFixture, 'isTownHallRoom'), 0);
+  const unrelatedDirectRequireReferenceFixture = ts.createSourceFile('peer/unrelated-direct-require-reference-fixture.cjs', String.raw`require('./voice-room').isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(unrelatedDirectRequireReferenceFixture, 'isTownHallRoom'), 0);
   const commonJsNamedReferenceFixture = ts.createSourceFile('peer/commonjs-named-reference-fixture.cjs', String.raw`const { isTownHallRoom: roomGuard } = require('./town-hall-plan');
   roomGuard({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(commonJsNamedReferenceFixture, 'isTownHallRoom'), 1);
@@ -1792,6 +1800,16 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/runtime-extension-room-helper.mts': 1
   });
+  const mappedRuntimeMjsNegativeConsumer = {
+    file: 'peer/runtime-extension-room-negative-consumer.mjs',
+    text: String.raw`import { validateChannelId } from './runtime-extension-room-helper.mjs';
+    function inspectRoom(room) { return validateChannelId(room.name); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    mappedRuntimeMtsHelper,
+    mappedRuntimeMjsNegativeConsumer,
+  ]), expectedPolicies);
   const exportEqualsAliasHelper = {
     file: 'peer/export-equals-room-alias-helper.cts',
     text: String.raw`const actual = value => /^\d{1,21}$/.test(value);

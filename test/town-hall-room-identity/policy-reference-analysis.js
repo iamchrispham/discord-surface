@@ -114,44 +114,69 @@ function isSemanticIdentifierReference(node) {
   return true;
 }
 
+function isTownHallPlanModule(sourceFile, specifier) {
+  if (typeof specifier !== 'string' || !specifier.startsWith('.')) return false;
+  const nodePath = require('node:path');
+  const sourceRoot = nodePath.resolve(__dirname, '../../src');
+  const sourceFilePath = nodePath.isAbsolute(sourceFile.fileName)
+    ? sourceFile.fileName
+    : nodePath.resolve(sourceRoot, sourceFile.fileName);
+  const modulePath = nodePath.resolve(nodePath.dirname(sourceFilePath), specifier);
+  const extension = nodePath.extname(modulePath);
+  if (extension && !['.ts', '.cts', '.mts', '.js', '.cjs', '.mjs'].includes(extension)) {
+    return false;
+  }
+  const sourceModule = extension ? modulePath.slice(0, -extension.length) : modulePath;
+  return sourceModule === nodePath.resolve(sourceRoot, 'peer/town-hall-plan');
+}
+
 function countIdentifierReferences(sourceFile, name) {
   const bindings = collectBindings(sourceFile);
   const imports = [];
   const visitImports = node => {
     if (ts.isImportDeclaration(node) && node.importClause) {
+      const specifier = ts.isStringLiteralLike(node.moduleSpecifier)
+        ? node.moduleSpecifier.text
+        : null;
       if (node.importClause.name) {
         imports.push({ declaration: node.importClause.name, name: node.importClause.name.text,
-          scope: sourceFile, importedName: 'default' });
+          scope: sourceFile, importedName: 'default', specifier });
       }
       const named = node.importClause.namedBindings;
       if (named && ts.isNamedImports(named)) {
         for (const element of named.elements) {
           imports.push({ declaration: element.name, name: element.name.text, scope: sourceFile,
-            importedName: element.propertyName?.text || element.name.text });
+            importedName: element.propertyName?.text || element.name.text, specifier });
         }
       }
       if (named && ts.isNamespaceImport(named)) {
-        imports.push({ declaration: named.name, name: named.name.text, scope: sourceFile, namespace: true });
+        imports.push({ declaration: named.name, name: named.name.text, scope: sourceFile,
+          namespace: true, specifier });
       }
     }
     if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
-      imports.push({ declaration: node.name, name: node.name.text, scope: sourceFile, namespace: true });
+      const moduleExpression = node.moduleReference.expression;
+      imports.push({ declaration: node.name, name: node.name.text, scope: sourceFile,
+        namespace: true,
+        specifier: ts.isStringLiteralLike(moduleExpression) ? moduleExpression.text : null });
     }
     if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
         ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
         node.initializer.arguments.length === 1 && ts.isStringLiteralLike(node.initializer.arguments[0])) {
+      const specifier = node.initializer.arguments[0].text;
       if (ts.isIdentifier(node.name)) {
         const local = bindings.find(binding => binding.name === node.name.text &&
           binding.declaration === node);
         if (local) imports.push({ declaration: local.declaration, name: local.name,
-          scope: local.scope, namespace: true });
+          scope: local.scope, namespace: true, specifier });
       } else if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
           if (!ts.isIdentifier(element.name)) continue;
           const local = bindings.find(binding => binding.name === element.name.text &&
             isAncestor(node, binding.declaration));
           if (local) imports.push({ declaration: local.declaration, name: local.name,
-            scope: local.scope, importedName: element.propertyName?.text || element.name.text });
+            scope: local.scope, importedName: element.propertyName?.text || element.name.text,
+            specifier });
         }
       }
     }
@@ -160,10 +185,15 @@ function countIdentifierReferences(sourceFile, name) {
   visitImports(sourceFile);
   bindings.push(...imports);
   const candidates = bindings.filter(binding => binding.name === name && binding.scope === sourceFile);
-  const target = candidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
+  const importedNames = new Set(imports.map(binding => binding.name));
+  const localCandidates = candidates.filter(binding => !importedNames.has(binding.name));
+  const importedTarget = imports.find(binding => binding.importedName === name &&
+    !binding.namespace && isTownHallPlanModule(sourceFile, binding.specifier));
+  const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
-    candidates[0] || imports.find(binding => binding.importedName === name) || null;
-  const namespaces = imports.filter(binding => binding.namespace);
+    localCandidates[0] || importedTarget || null;
+  const namespaces = imports.filter(binding => binding.namespace &&
+    isTownHallPlanModule(sourceFile, binding.specifier));
   let count = 0;
   const visit = node => {
     if (target && ts.isIdentifier(node) && node.text === target.name &&
@@ -181,6 +211,7 @@ function countIdentifierReferences(sourceFile, name) {
       const directRequire = ts.isCallExpression(receiver) &&
         ts.isIdentifier(receiver.expression) && receiver.expression.text === 'require' &&
         receiver.arguments.length === 1 && ts.isStringLiteralLike(receiver.arguments[0]) &&
+        isTownHallPlanModule(sourceFile, receiver.arguments[0].text) &&
         !resolveBinding(receiver.expression, bindings);
       const namespaceMember = ts.isIdentifier(receiver) &&
         namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration);
