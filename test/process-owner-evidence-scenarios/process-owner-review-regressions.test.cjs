@@ -117,3 +117,63 @@ test("review regressions retain finite probe provenance", () => {
     ["unclassified process probe private-alias.js:check"]
   );
 });
+
+test("for-of targets resolve finite array aliases and spreads", () => {
+  runFixture(
+    "const probes = [process.kill]; function check(pid) { for (const probe of probes) probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "const probes = [process.kill]; const candidates = [...probes]; function check(pid) { for (const probe of candidates) probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("nullish fallbacks exclude unreachable probe operands", () => {
+  runFixture(
+    "const ordinary = () => true; const probe = ordinary ?? process.kill; probe(1, 0);",
+    [],
+    []
+  );
+  runFixture(
+    "const ordinary = undefined; const probe = ordinary ?? process.kill; probe(1, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+});
+
+test("computed properties retain every finite key candidate", () => {
+  runFixture(
+    "const key = flag ? 'other' : 'probe'; const api = { [key]: process.kill }; function check(pid) { api.probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("extracted method aliases retain their callable parameters", () => {
+  runFixture(
+    "const api = { invoke(probe, pid) { probe(pid, 0); } }; const run = api.invoke; run(process.kill, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+});
+
+test("parameter defaults apply only when arguments are omitted or undefined", () => {
+  runFixture(
+    "function invoke(probe = process.kill, pid) { probe(pid, 0); } invoke(() => true, 1);",
+    [],
+    []
+  );
+  runFixture(
+    "function invoke(probe = process.kill, pid) { probe(pid, 0); } invoke(undefined, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture(
+    "function invoke(probe = process.kill, pid) { probe(pid, 0); } invoke();",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+});

@@ -118,6 +118,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   const memberAssignments = new Map();
   const pendingMemberAssignments = [];
   const parameterArguments = new Map();
+  const parameterCallArguments = new Map();
   const recordAssignment = (symbol, value) => {
     if (!symbol) return;
     const existing = assignments.get(symbol);
@@ -154,6 +155,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     const entry = { source: value, invocation, ...(name ? { name } : {}) };
     if (existing) existing.push(entry);
     else parameterArguments.set(symbol, [entry]);
+  };
+  const recordParameterCallArgument = (symbol, source, invocation) => {
+    if (!symbol || !invocation) return;
+    const existing = parameterCallArguments.get(symbol);
+    const entry = { source, invocation };
+    if (existing) existing.push(entry);
+    else parameterCallArguments.set(symbol, [entry]);
   };
   const recordRestParameterArguments = (symbol, values, invocation = null) => {
     if (!symbol) return;
@@ -391,12 +399,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   const indexForOfStatement = statement => {
     const iterable = ts.isParenthesizedExpression(statement.expression)
       ? statement.expression.expression : statement.expression;
-    if (!ts.isArrayLiteralExpression(iterable)) return;
+    const elements = literalArrayElements(iterable, new Set(), true);
+    if (!elements) return;
     const declarations = ts.isVariableDeclarationList(statement.initializer)
       ? statement.initializer.declarations : [statement.initializer];
     for (const declaration of declarations) {
-      for (const element of iterable.elements) {
-        if (!element || ts.isSpreadElement(element)) continue;
+      for (const element of elements) {
+        if (!element || ts.isOmittedExpression(element) || ts.isSpreadElement(element)) continue;
         recordIterationTarget(ts.isVariableDeclarationList(statement.initializer) ? declaration.name : declaration, element);
       }
     }
@@ -612,11 +621,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   };
   const indexParameterBinding = (name, argument, parameter, restArguments = null, invocation = null, path = []) => {
     if (ts.isIdentifier(name)) {
+      const symbol = checker.getSymbolAtLocation(name);
+      if (!parameter?.dotDotDotToken) recordParameterCallArgument(symbol, argument, invocation);
       if (parameter?.dotDotDotToken) {
-        recordRestParameterArguments(checker.getSymbolAtLocation(name), restArguments || [], invocation);
+        recordRestParameterArguments(symbol, restArguments || [], invocation);
       } else if (argument) {
         const source = projectBindingArgument(argument, path);
-        recordParameterArgument(checker.getSymbolAtLocation(name), source, null, invocation);
+        recordParameterArgument(symbol, source, null, invocation);
       }
       return;
     }
@@ -726,6 +737,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (ts.isIdentifier(declaration.initializer)) {
           return callableParameters(declaration.initializer, symbolSeen);
         }
+        if (ts.isPropertyAccessExpression(declaration.initializer) ||
+          ts.isElementAccessExpression(declaration.initializer)) {
+          return callableParameters(declaration.initializer, symbolSeen);
+        }
         if (ts.isCallExpression(declaration.initializer) &&
           invocationWrapperName(declaration.initializer.expression) === 'bind') {
           return callableParameters(declaration.initializer.expression.expression, symbolSeen);
@@ -769,7 +784,18 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (visited.has(source)) return null;
     const seen = new Set(visited).add(source);
     if (ts.isArrayLiteralExpression(source)) {
-      return source.elements.some(ts.isSpreadElement) ? null : source.elements;
+      if (!source.elements.some(ts.isSpreadElement)) return source.elements;
+      const elements = [];
+      for (const element of source.elements) {
+        if (!ts.isSpreadElement(element)) {
+          elements.push(element);
+          continue;
+        }
+        const spread = literalArrayElements(element.expression, seen, true);
+        if (!spread) return null;
+        elements.push(...spread);
+      }
+      return elements;
     }
     if (!resolveAliases || !ts.isIdentifier(source)) return null;
     const symbol = checker.getSymbolAtLocation(source);
@@ -787,7 +813,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     for (const candidate of candidates) {
       const elements = literalArrayElements(candidate, seen, true);
       if (!elements) return null;
-      if (resolved && resolved !== elements) return null;
+      if (resolved && (resolved.length !== elements.length ||
+        !resolved.every((element, index) => element === elements[index]))) return null;
       resolved = elements;
     }
     return resolved;
@@ -840,6 +867,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           const argument = argumentsList[index];
           if (argument && !ts.isSpreadElement(argument)) {
             indexParameterBinding(parameter.name, argument, parameter, null, node);
+          } else {
+            indexParameterBinding(parameter.name, null, parameter, null, node);
           }
         }
       } else {
@@ -853,6 +882,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
             indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index), node);
           } else if (argument && !ts.isSpreadElement(argument)) {
             indexParameterBinding(parameter.name, argument, parameter, null, node);
+          } else {
+            indexParameterBinding(parameter.name, null, parameter, null, node);
           }
         }
       }
@@ -867,6 +898,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index), node);
         } else if (argument && !ts.isSpreadElement(argument)) {
           indexParameterBinding(parameter.name, argument, parameter, null, node);
+        } else {
+          indexParameterBinding(parameter.name, null, parameter, null, node);
         }
       }
     }
@@ -1154,8 +1187,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const operator = node.operatorToken.kind;
       if (operator === ts.SyntaxKind.EqualsToken) return resolveSet(node.right, seen);
       if (operator === ts.SyntaxKind.CommaToken) return resolveSet(node.right, seen);
+      if (operator === ts.SyntaxKind.QuestionQuestionToken) {
+        const left = resolveSet(node.left, seen);
+        const result = new Set([...left].filter(atom => atom !== null && atom !== UNDEFINED_VALUE));
+        if (!isDefinitelyNonNullish(node.left)) {
+          for (const atom of resolveSet(node.right, seen)) result.add(atom);
+        }
+        return result;
+      }
       if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
-        operator === ts.SyntaxKind.QuestionQuestionToken ||
         operator === ts.SyntaxKind.BarBarEqualsToken ||
         operator === ts.SyntaxKind.QuestionQuestionEqualsToken ||
         operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken) {
@@ -1409,7 +1449,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (ts.isVariableDeclaration(declaration)) {
       addFrom(declaration.initializer);
     } else if (ts.isParameter(declaration)) {
-      addFrom(declaration.initializer);
+      const calls = parameterCallArguments.get(symbol) || [];
+      const defaultMayRun = calls.length === 0 || calls.some(call =>
+        !call.source || valueMayBeUndefined(call.source));
+      if (defaultMayRun) addFrom(declaration.initializer);
     } else if (ts.isBindingElement(declaration) &&
       (ts.isObjectBindingPattern(declaration.parent) || ts.isArrayBindingPattern(declaration.parent))) {
       addFromBindingElement(declaration, symbolSeen, result);
@@ -1504,13 +1547,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           continue;
         }
         if (ts.isGetAccessorDeclaration(property)) {
-          const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
-            ? property.name.text
+          const keys = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+            ? [property.name.text]
             : ts.isComputedPropertyName(property.name)
-              ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
-                typeof value === 'number')?.toString() || null
-              : null;
-          if (key !== name) continue;
+              ? [...staticValue(property.name.expression, seen)].filter(value => typeof value === 'string' ||
+                typeof value === 'number').map(value => value.toString())
+              : [];
+          if (!keys.includes(name)) continue;
           found = true;
           for (const statement of property.body?.statements || []) {
             if (ts.isReturnStatement(statement) && statement.expression &&
@@ -1521,12 +1564,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (!property.name) continue;
         const shorthand = ts.isShorthandPropertyAssignment(property);
         if (!shorthand && !ts.isPropertyAssignment(property)) continue;
-        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text
+        const keys = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? [property.name.text]
           : ts.isComputedPropertyName(property.name)
-            ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
-              typeof value === 'number')?.toString() || null
-            : null;
-        if (key !== name) continue;
+            ? [...staticValue(property.name.expression, seen)].filter(value => typeof value === 'string' ||
+              typeof value === 'number').map(value => value.toString())
+            : [];
+        if (!keys.includes(name)) continue;
         found = true;
         const value = shorthand ? property.name : property.initializer;
         if (mayBeUnresolved(value, seen)) return true;
@@ -1620,12 +1663,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (!property.name) continue;
         const shorthand = ts.isShorthandPropertyAssignment(property);
         if (!shorthand && !ts.isPropertyAssignment(property)) continue;
-        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text
+        const keys = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? [property.name.text]
           : ts.isComputedPropertyName(property.name)
-            ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
-              typeof value === 'number')?.toString() || null
-            : null;
-        if (key !== name) continue;
+            ? [...staticValue(property.name.expression, seen)].filter(value => typeof value === 'string' ||
+              typeof value === 'number').map(value => value.toString())
+            : [];
+        if (!keys.includes(name)) continue;
         const value = shorthand ? property.name : property.initializer;
         for (const atom of resolveSet(value, seen)) found.add(atom);
       }
