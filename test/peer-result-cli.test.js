@@ -116,20 +116,39 @@ function createNetworkTrap(f) {
       return { ...childOptions,
         envPairs: [...envPairs.filter(pair => !pair.startsWith('NODE_OPTIONS=')), 'NODE_OPTIONS=' + nextOptions] };
     };
+    const addNetworkEnvironment = environment => {
+      const nextEnvironment = { ...(environment === undefined ? process.env : environment) };
+      nextEnvironment.NODE_OPTIONS = addPreload(nextEnvironment.NODE_OPTIONS || '');
+      return nextEnvironment;
+    };
     const workerThreads = require('node:worker_threads');
     const OriginalWorker = workerThreads.Worker;
-    workerThreads.Worker = class extends OriginalWorker {
-      constructor(filename, options = {}) {
+    const GuardedWorker = new Proxy(OriginalWorker, {
+      construct(target, args, newTarget) {
+        const [filename, options = {}] = args;
         const inheritedEnv = options.env === undefined ? process.env : options.env;
         const workerOptions = { ...options };
         if (inheritedEnv !== workerThreads.SHARE_ENV) {
-          const env = { ...inheritedEnv };
-          env.NODE_OPTIONS = addPreload(env.NODE_OPTIONS || '');
-          workerOptions.env = env;
+          workerOptions.env = addNetworkEnvironment(inheritedEnv);
         }
-        super(filename, workerOptions);
+        return Reflect.construct(target, [filename, workerOptions], newTarget);
+      },
+      getPrototypeOf() {
+        return Function.prototype;
       }
-    };
+    });
+    Object.defineProperty(OriginalWorker.prototype, 'constructor', {
+      value: GuardedWorker,
+      configurable: true,
+      writable: true
+    });
+    workerThreads.Worker = GuardedWorker;
+    if (typeof process.execve === 'function') {
+      const processExecve = process.execve;
+      process.execve = function(file, args, environment) {
+        return processExecve.call(process, file, args, addNetworkEnvironment(environment));
+      };
+    }
     const processSpawn = processWrap.Process.prototype.spawn;
     processWrap.Process.prototype.spawn = function(options) {
       return processSpawn.call(this, addNetworkTrap(options));
@@ -208,8 +227,41 @@ function createNetworkTrap(f) {
             "require('node:net').connect(9, '127.0.0.1')", { eval: true, env: {} });
           worker.on('error', () => {});
           worker.on('exit', () => {});
+        },
+        'worker.constructor.chain': () => {
+          const exposedConstructor = Object.getPrototypeOf(workerThreads.Worker);
+          const code = "require('node:net').connect(9, '127.0.0.1')";
+          if (exposedConstructor === Function.prototype) {
+            let constructionError;
+            try {
+              Reflect.construct(exposedConstructor, [code, { eval: true, env: {} }]);
+            } catch (error) {
+              constructionError = error;
+            }
+            if (!(constructionError instanceof TypeError)) {
+              throw new Error('WORKER_CONSTRUCTOR_PATH_CONSTRUCTABLE');
+            }
+            return;
+          }
+          const candidate = Reflect.construct(exposedConstructor, [code, { eval: true, env: {} }]);
+          if (candidate && typeof candidate.on === 'function') {
+            candidate.on('error', () => {});
+            candidate.on('exit', () => {});
+            if (typeof candidate.terminate === 'function') candidate.terminate();
+          }
+          throw new Error('WORKER_CONSTRUCTOR_CHAIN_EXPOSED');
+        },
+        'worker.prototype.constructor': () => {
+          const worker = new workerThreads.Worker.prototype.constructor(
+            "require('node:net').connect(9, '127.0.0.1')", { eval: true, env: {} });
+          worker.on('error', () => {});
+          worker.on('exit', () => {});
         }
       };
+      if (typeof process.execve === 'function') {
+        probeActions['process.execve.empty'] = () => process.execve(process.execPath,
+          [process.execPath, '-e', "require('node:net').connect(9, '127.0.0.1')"], {});
+      }
       const action = probeActions[probe];
       if (!action) throw new Error('NETWORK_TRAP_UNKNOWN_PROBE:' + probe);
       action();
@@ -497,6 +549,11 @@ test('network trap covers shared transport boundaries and control probes', t => 
     const publicRead = run();
     assert.equal(record('public-read', publicRead), null);
     assert.equal(publicRead.status, 0, publicRead.stderr);
+    const publicResult = JSON.parse(publicRead.stdout);
+    assert.equal(publicResult.sendOutcome, 'sent');
+    assert.equal(publicResult.results[0].state, 'accepted');
+    assert.equal(publicResult.results[0].nativeAcknowledged, false);
+    assert.equal(publicResult.results[0].completed, false);
 
     const probes = [
       'fetch', 'http.get', 'socket.connect', 'socket.prototype.connect',
@@ -504,13 +561,26 @@ test('network trap covers shared transport boundaries and control probes', t => 
       'dns.promises.resolver', 'dns.resolveCaa', 'dns.resolve4',
       'dns.setServers', 'dns.promises.setServers', 'datagram.send', 'tcp.raw',
       'child_process.spawn', 'child_process.spawnSync', 'socket.connect6',
-      'dns.reverse', 'dns.lookupService', 'worker.env.empty'
+      'dns.reverse', 'dns.lookupService', 'worker.env.empty',
+      'worker.constructor.chain', 'worker.prototype.constructor',
+      ...(typeof process.execve === 'function' ? ['process.execve.empty'] : [])
     ];
     for (const probe of probes) {
       fs.rmSync(trap.marker, { force: true });
       const result = run(probe);
       const marker = record(probe, result);
+      if (probe === 'worker.constructor.chain') {
+        assert.equal(marker, null, `${probe} attempted network access`);
+        assert.equal(result.status, 0, result.stderr);
+        const readResult = JSON.parse(result.stdout);
+        assert.equal(readResult.sendOutcome, 'sent');
+        assert.equal(readResult.results[0].state, 'accepted');
+        assert.equal(readResult.results[0].nativeAcknowledged, false);
+        assert.equal(readResult.results[0].completed, false);
+        continue;
+      }
       assert.ok(marker, `${probe} bypassed the network trap; status=${result.status}\n${result.stderr}`);
+      if (probe === 'process.execve.empty') assert.equal(result.status, 1, result.stderr);
     }
   } finally {
     process.stdout.write(`PEER_RESULT_NETWORK_CONTROL_LOG ${JSON.stringify(controls)}\n`);
