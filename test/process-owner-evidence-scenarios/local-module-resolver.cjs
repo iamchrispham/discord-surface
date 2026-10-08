@@ -976,9 +976,8 @@ function createLocalModuleResolver(files) {
         if (method) {
           result.add({ callable: property, modulePath: currentPath });
         } else if (getter) {
-          const statements = property.body?.statements || [];
-          if (statements.length === 1 && ts.isReturnStatement(statements[0]) && statements[0].expression) {
-            for (const atom of evaluate(statements[0].expression, currentPath, seen, new Map(), bindingOverrides)) {
+          for (const returnExpression of callableReturnExpressions(property)) {
+            for (const atom of evaluate(returnExpression, currentPath, seen, new Map(), bindingOverrides)) {
               result.add(atom);
             }
           }
@@ -1060,22 +1059,8 @@ function createLocalModuleResolver(files) {
     return null;
   };
 
-  const callableReturnExpressions = callable => {
-    const body = callable.body;
-    if (!body) return [];
-    if (!ts.isBlock(body)) return [body];
-    const returns = [];
-    const visit = node => {
-      if (ts.isReturnStatement(node)) {
-        if (node.expression) returns.push(node.expression);
-        return;
-      }
-      if (ts.isFunctionLike(node) && node !== callable) return;
-      ts.forEachChild(node, visit);
-    };
-    visit(body);
-    return returns;
-  };
+  const callableReturnExpressions = callable =>
+    require('./reachable-callable-returns.cjs')(ts, callable);
 
   const classPropertyExpressions = (declaration, name, staticMember) => {
     const expressions = [];
@@ -1355,6 +1340,31 @@ function createLocalModuleResolver(files) {
       }
       return false;
     };
+    const bindingPathForName = (binding, name, path = []) => {
+      if (ts.isIdentifier(binding)) return binding.text === name ? path : null;
+      if (!ts.isObjectBindingPattern(binding) && !ts.isArrayBindingPattern(binding)) return null;
+      for (let index = 0; index < binding.elements.length; index += 1) {
+        const element = binding.elements[index];
+        if (!ts.isBindingElement(element) || element.dotDotDotToken) continue;
+        let segment;
+        if (ts.isArrayBindingPattern(binding)) {
+          segment = String(index);
+        } else if (!element.propertyName) {
+          segment = ts.isIdentifier(element.name) ? element.name.text : null;
+        } else if (ts.isIdentifier(element.propertyName) || ts.isStringLiteral(element.propertyName) ||
+          ts.isNumericLiteral(element.propertyName)) {
+          segment = element.propertyName.text;
+        } else if (ts.isComputedPropertyName(element.propertyName)) {
+          segment = staticPropertyValue(element.propertyName.expression, callable.getSourceFile().fileName);
+        } else {
+          segment = null;
+        }
+        if (segment === null || segment === undefined) continue;
+        const nested = bindingPathForName(element.name, name, [...path, String(segment)]);
+        if (nested) return nested;
+      }
+      return null;
+    };
     const statementDeclaresName = (statement, name) => {
       if (ts.isVariableStatement(statement) &&
         (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0) {
@@ -1385,12 +1395,14 @@ function createLocalModuleResolver(files) {
         if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
           const receiver = unwrap(left.expression);
           if (ts.isIdentifier(receiver)) {
-            const parameterIndex = parameters.findIndex(parameter => ts.isIdentifier(parameter.name) &&
-              parameter.name.text === receiver.text);
+            const parameterIndex = parameters.findIndex(parameter =>
+              bindingPathForName(parameter.name, receiver.text) !== null);
             const name = ts.isPropertyAccessExpression(left) ? left.name.text
               : staticPropertyValue(left.argumentExpression, callable.getSourceFile().fileName);
             if (parameterIndex >= 0 && name !== null && !parameterIsShadowedAt(receiver, receiver.text)) {
-              writes.push({ parameterIndex, name: String(name), expression: node.right });
+              const parameter = parameters[parameterIndex];
+              writes.push({ parameterIndex, parameterPath: bindingPathForName(parameter.name, receiver.text),
+                name: String(name), expression: node.right });
             }
           }
         }
@@ -1543,16 +1555,17 @@ function createLocalModuleResolver(files) {
         : null;
   };
   const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map(),
-    bindingOverrides = new Map()) => {
+    bindingOverrides = new Map(), thisBinding = new Set()) => {
     if (expression?.namespaceModulePath) return new Set([moduleAtom(expression.namespaceModulePath)]);
     if (expression?.snapshotExpression) {
       const overrides = new Map(bindingOverrides);
       overrides.set(currentPath, expression.snapshotBindings);
-      return evaluate(expression.snapshotExpression, currentPath, visited, parameterBindings, overrides);
+      return evaluate(expression.snapshotExpression, currentPath, visited, parameterBindings, overrides, thisBinding);
     }
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
+    if (node.kind === ts.SyntaxKind.ThisKeyword) return new Set(thisBinding);
     if (ts.isObjectLiteralExpression(node)) {
       return new Set([{ objectLiteral: node, modulePath: currentPath }]);
     }
@@ -1572,10 +1585,10 @@ function createLocalModuleResolver(files) {
       const condition = staticCondition(node.condition, currentPath);
       if (condition !== null) {
         return evaluate(condition ? node.whenTrue : node.whenFalse, currentPath, seen,
-          parameterBindings, bindingOverrides);
+          parameterBindings, bindingOverrides, thisBinding);
       }
-      const result = evaluate(node.whenTrue, currentPath, seen, parameterBindings, bindingOverrides);
-      for (const atom of evaluate(node.whenFalse, currentPath, seen, parameterBindings, bindingOverrides)) {
+      const result = evaluate(node.whenTrue, currentPath, seen, parameterBindings, bindingOverrides, thisBinding);
+      for (const atom of evaluate(node.whenFalse, currentPath, seen, parameterBindings, bindingOverrides, thisBinding)) {
         result.add(atom);
       }
       return result;
@@ -1640,7 +1653,7 @@ function createLocalModuleResolver(files) {
       const name = propertyName(node) || (ts.isElementAccessExpression(node)
         ? staticPropertyValue(node.argumentExpression, currentPath, seen) : null);
       if (!name) return new Set();
-      const receiver = evaluate(node.expression, currentPath, seen, parameterBindings, bindingOverrides);
+      const receiver = evaluate(node.expression, currentPath, seen, parameterBindings, bindingOverrides, thisBinding);
       const result = new Set();
       if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
       if (name === 'process' && receiver.has(GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
@@ -1660,7 +1673,10 @@ function createLocalModuleResolver(files) {
           currentPath && scanModule(currentPath))) {
         return evaluate(node.arguments[0], currentPath, seen, parameterBindings, bindingOverrides);
       }
-      const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
+      const callReceiver = ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)
+        ? evaluate(node.expression.expression, currentPath, seen, parameterBindings, bindingOverrides, thisBinding)
+        : new Set();
+      const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings, bindingOverrides, thisBinding);
       const result = new Set();
       for (const atom of callableAtoms) {
         if (atom === BOUND_PROBE) {
@@ -1671,7 +1687,8 @@ function createLocalModuleResolver(files) {
         const callablePath = atom.modulePath || currentPath;
         const nestedBindings = callableParameterBindings(atom.callable, node.arguments || [], currentPath, callablePath);
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
-          for (const returnAtom of evaluate(returnExpression, callablePath, seen, nestedBindings)) result.add(returnAtom);
+          for (const returnAtom of evaluate(returnExpression, callablePath, seen, nestedBindings,
+            bindingOverrides, callReceiver)) result.add(returnAtom);
         }
       }
       if (result.size) return result;
@@ -1857,7 +1874,7 @@ function createLocalModuleResolver(files) {
       }
       return result;
     },
-    resolveCall(atoms, argumentsList = [], callerPath = null, visited = new Set()) {
+    resolveCall(atoms, argumentsList = [], callerPath = null, visited = new Set(), receiverAtoms = new Set()) {
       if (argumentsList instanceof Set) {
         visited = argumentsList;
         argumentsList = [];
@@ -1875,13 +1892,36 @@ function createLocalModuleResolver(files) {
           callablePath
         );
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
-          for (const returnAtom of evaluate(returnExpression, callablePath, visited, parameterBindings)) result.add(returnAtom);
+          for (const returnAtom of evaluate(returnExpression, callablePath, visited, parameterBindings,
+            new Map(), receiverAtoms)) result.add(returnAtom);
         }
       }
       return result;
     },
     resolveCallEffects(atoms, argumentsList = [], callerPath = null) {
       const effects = [];
+      const propertySource = (expression, path) => {
+        let current = unwrap(expression);
+        for (const segment of path || []) {
+          if (!current || !ts.isObjectLiteralExpression(current)) return null;
+          let source = null;
+          for (const property of current.properties) {
+            if (ts.isPropertyAssignment(property) && property.name) {
+              let propertyName = null;
+              if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+                ts.isNumericLiteral(property.name)) propertyName = property.name.text;
+              else if (ts.isComputedPropertyName(property.name)) {
+                propertyName = staticPropertyValue(property.name.expression, callerPath);
+              }
+              if (String(propertyName) === String(segment)) source = property.initializer;
+            } else if (ts.isShorthandPropertyAssignment(property) && property.name.text === String(segment)) {
+              source = property.name;
+            }
+          }
+          current = source && unwrap(source);
+        }
+        return current || null;
+      };
       for (const atom of atoms || []) {
         if (!atom || !atom.callable) continue;
         const writes = callableParameterWrites(atom.callable);
@@ -1889,8 +1929,12 @@ function createLocalModuleResolver(files) {
         const callablePath = atom.modulePath || callerPath;
         const parameterBindings = callableParameterBindings(atom.callable, argumentsList, callerPath, callablePath);
         for (const write of writes) {
+          const argument = argumentsList?.[write.parameterIndex];
+          const targetExpression = propertySource(argument, write.parameterPath);
+          if (!targetExpression) continue;
           const values = evaluate(write.expression, callablePath, new Set(), parameterBindings);
-          if (values.size) effects.push({ parameterIndex: write.parameterIndex, name: write.name, values });
+          if (values.size) effects.push({ parameterIndex: write.parameterIndex, name: write.name, values,
+            targetExpression });
         }
       }
       return effects;

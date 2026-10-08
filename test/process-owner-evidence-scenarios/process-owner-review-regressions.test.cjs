@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { runFixture, runFilesFixture, inventoryProcessOwnerSites, SRC_ROOT } =
   require('./public-inventory-fixtures.cjs');
 
@@ -176,4 +178,101 @@ test("parameter defaults apply only when arguments are omitted or undefined", ()
     ["private-alias.js\u0000invoke"],
     ["unclassified process probe private-alias.js:invoke"]
   );
+});
+
+test("defineProperty calls preserve their returned object identity", () => {
+  runFixture(
+    "const api = Object.defineProperty({}, 'probe', { value: process.kill }); function check(pid) { api.probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "const api = Object.defineProperties({}, { probe: { value: process.kill } }); function check(pid) { api.probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("array binding patterns resolve finite array aliases", () => {
+  runFixture(
+    "const values = [process.kill]; const [probe] = values; function check(pid) { probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("callable return analysis excludes unreachable returns and honors finally", () => {
+  runFixture(
+    "function getProbe() { return () => true; return process.kill; } const probe = getProbe(); function check(pid) { probe(pid, 0); }",
+    [],
+    []
+  );
+  runFixture(
+    "function getProbe() { throw new Error(); return process.kill; } const probe = getProbe(); function check(pid) { probe(pid, 0); }",
+    [],
+    []
+  );
+  runFixture(
+    "function getProbe() { try { return process.kill; } finally { return () => true; } } const probe = getProbe(); function check(pid) { probe(pid, 0); }",
+    [],
+    []
+  );
+  runFixture(
+    "function getProbe() { try { return () => true; } finally { return process.kill; } } const probe = getProbe(); function check(pid) { probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "const api = { get probe() { try { return process.kill; } finally { return () => true; } } }; function check(pid) { api.probe(pid, 0); }",
+    [],
+    []
+  );
+  runFilesFixture({
+    "producer.js": "export function getProbe() { return () => true; return process.kill; }",
+    "consumer.js": "import { getProbe } from './producer.js'; const probe = getProbe(); function check(pid) { probe(pid, 0); }"
+  }, [], []);
+  runFilesFixture({
+    "producer.js": "export const api = { get probe() { try { return process.kill; } finally { return () => true; } } };",
+    "consumer.js": "import { api } from './producer.js'; function check(pid) { api.probe(pid, 0); }"
+  }, [], []);
+});
+
+test("imported writes project through destructured parameters", () => {
+  runFilesFixture({
+    "producer.js": "export function install({ target }) { target.probe = process.kill; }",
+    "consumer.js": "import { install } from './producer.js'; const api = {}; install({ target: api }); function check(pid) { api.probe(pid, 0); }"
+  }, ["consumer.js\u0000check"], ["unclassified process probe consumer.js:check"]);
+});
+
+test("imported method returns retain their receiver", () => {
+  runFilesFixture({
+    "producer.js": "export const api = { probe: process.kill, getProbe() { return this.probe; } };",
+    "consumer.js": "import { api } from './producer.js'; const probe = api.getProbe(); function check(pid) { probe(pid, 0); }"
+  }, ["consumer.js\u0000check"], ["unclassified process probe consumer.js:check"]);
+});
+
+test("nested source parsing is limited to executable source strings", () => {
+  runFixture("const help = 'process.kill(pid, 0)';", [], []);
+  runFixture("new Function('process.kill(pid, 0)', 'return true');", [], []);
+  runFixture("const Function = function () {}; Function('process.kill(pid, 0)');", [], []);
+  runFixture(
+    "function check(pid) { eval('process.kill(pid, 0)'); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "function check(pid) { const run = new Function('pid', 'process.kill(pid, 0)'); run(pid); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+});
+
+test("return analysis stays centralized across inventory owners", () => {
+  const ownerFiles = ['source-inventory.cjs', 'local-module-resolver.cjs'];
+  const returnSyntaxChecks = new Map(ownerFiles.map(fileName => {
+    const source = fs.readFileSync(path.join(__dirname, fileName), 'utf8');
+    return [fileName, (source.match(/\bts\.isReturnStatement\s*\(/g) || []).length];
+  }));
+  assert.equal(returnSyntaxChecks.get('source-inventory.cjs'), 1);
+  assert.equal(returnSyntaxChecks.get('local-module-resolver.cjs'), 0);
 });
