@@ -280,13 +280,19 @@ function createNetworkTrap(f) {
           "const fs=require('node:fs');",
           "const {workerData}=require('node:worker_threads');",
           "const stageWait=new Int32Array(new SharedArrayBuffer(4));",
-          "fs.writeFileSync(workerData.workerMarker,'executed');",
-          "const deadline=setTimeout(()=>{fs.writeFileSync(workerData.attemptMarker,JSON.stringify({transport:'simulated',operation:'connect',port:9,host:'127.0.0.1',state:'deadline'}));process.exit(124)},1200);",
-          "const simulatedTransport={connect(port,host){if(workerData.transport!=='simulated')throw new Error('simulated transport required');const attempt={transport:workerData.transport,operation:'connect',port,host};fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'attempted'}));while(!fs.existsSync(workerData.stageMarker))Atomics.wait(stageWait,0,0,10);return{on(event,callback){if(event==='error'){queueMicrotask(()=>{const error=Object.assign(new Error('simulated transport error'),{code:'SIMULATED'});fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'error',code:error.code}));callback(error)})}return this},destroy(){}}}};",
+          "const workerDeadline=Date.now()+1200;",
+          "const trapLoaded=Boolean(/(?:--require|--import).*trap/i.test(process.env.NODE_OPTIONS||'')||process.execArgv.some(arg=>/--(?:require|import).*trap/i.test(arg))||Object.keys(require.cache).some(path=>/trap/i.test(path)));",
+          "const attempt={transport:workerData.transport,operation:'connect',port:9,host:'127.0.0.1',trapLoaded};",
+          "let terminal=false;",
+          "const finish=(state,details={})=>{if(terminal)return false;terminal=true;fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state,...details}));return true};",
+          "const expire=()=>{if(Date.now()<workerDeadline||terminal)return false;finish('deadline');process.exit(124);return true};",
+          "fs.writeFileSync(workerData.workerMarker,JSON.stringify({executed:true,trapLoaded}));",
+          "const deadline=setTimeout(()=>{if(finish('deadline'))process.exit(124)},Math.max(0,workerDeadline-Date.now()));",
+          "const simulatedTransport={connect(port,host){if(workerData.transport!=='simulated')throw new Error('simulated transport required');fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'attempted'}));while(!fs.existsSync(workerData.stageMarker)){if(expire())return{on(){return this},destroy(){}};Atomics.wait(stageWait,0,0,Math.max(1,Math.min(10,workerDeadline-Date.now())))}if(expire())return{on(){return this},destroy(){}};return{on(event,callback){if(event==='error'){queueMicrotask(()=>{const error=Object.assign(new Error('simulated transport error'),{code:'SIMULATED'});if(expire())return;if(finish('error',{code:error.code}))callback(error)})}return this},destroy(){}}}};",
           "try{const socket=simulatedTransport.connect(9,'127.0.0.1');",
-          "socket.on('connect',()=>{clearTimeout(deadline);socket.destroy();process.exit(0)});",
-          "socket.on('error',error=>{clearTimeout(deadline);process.exit(error.code==='SIMULATED'?0:1)})}",
-          "catch(error){clearTimeout(deadline);process.exit(1)}"
+          "socket.on('connect',()=>{if(finish('connected')){clearTimeout(deadline);socket.destroy();process.exit(0)}});",
+          "socket.on('error',error=>{if(!terminal)finish('error',{code:error.code});clearTimeout(deadline);process.exit(error.code==='SIMULATED'?0:1)})}",
+          "catch(error){clearTimeout(deadline);process.exit(terminal?124:1)}"
         ].join('');
         const started = await session.post('Runtime.callFunctionOn', {
           objectId: originalWorker.value.objectId,
@@ -297,6 +303,7 @@ function createNetworkTrap(f) {
       } finally {
         session.disconnect();
       }
+      fs.writeFileSync(receipt, JSON.stringify(findings));
       const wait = new Int32Array(new SharedArrayBuffer(4));
       const deadline = Date.now() + 1800;
       let terminalAttempt = null;
@@ -306,7 +313,7 @@ function createNetworkTrap(f) {
         try {
           attempt = JSON.parse(fs.readFileSync(attemptMarker, 'utf8'));
         } catch {}
-        if (attempt && attempt.state === 'attempted' && !workerReleased) {
+        if (attempt && attempt.state === 'attempted' && !workerReleased && process.env.PEER_RESULT_TEST_INSPECTOR_HOLD_STAGE !== '1') {
           fs.writeFileSync(stageMarker, 'released');
           workerReleased = true;
         }
@@ -315,7 +322,6 @@ function createNetworkTrap(f) {
         if (!terminalAttempt) Atomics.wait(wait, 0, 0, 10);
       }
       if (!terminalAttempt) throw new Error('inspector worker did not publish a terminal simulated connect error');
-      fs.writeFileSync(receipt, JSON.stringify(findings));
     };
 
     const runProbe = probe => {
@@ -595,23 +601,52 @@ test('public CLI denies inspector access before closure guards and preserves ord
   }
 
   fs.rmSync(trap.marker, { force: true });
+  const deadlineWorkerMarker = `${workerMarker}.deadline`;
+  const deadlineAttemptMarker = `${attemptMarker}.deadline`;
+  const deadlineReceipt = `${attackReceipt}.deadline`;
+  const deadlineControl = runCli(f, args, {
+    ...baseEnvironment,
+    PEER_RESULT_TEST_DISABLE_INSPECTOR_GUARD: '1',
+    PEER_RESULT_TEST_NETWORK_PROBE: 'inspector.control',
+    PEER_RESULT_TEST_INSPECTOR_RECEIPT: deadlineReceipt,
+    PEER_RESULT_TEST_INSPECTOR_WORKER_MARKER: deadlineWorkerMarker,
+    PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER: deadlineAttemptMarker,
+    PEER_RESULT_TEST_INSPECTOR_HOLD_STAGE: '1'
+  });
+  assert.notEqual(deadlineControl.status, 0, deadlineControl.stderr);
+  assert.equal(fs.existsSync(trap.marker), false, 'deadline control unexpectedly triggered the network trap');
+  assert.ok(fs.existsSync(deadlineWorkerMarker), deadlineControl.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(deadlineWorkerMarker, 'utf8')), { executed: true, trapLoaded: false });
+  assert.deepEqual(JSON.parse(fs.readFileSync(deadlineAttemptMarker, 'utf8')), {
+    transport: 'simulated',
+    operation: 'connect',
+    port: 9,
+    host: '127.0.0.1',
+    trapLoaded: false,
+    state: 'deadline'
+  });
+  const deadlineReachability = JSON.parse(fs.readFileSync(deadlineReceipt, 'utf8'));
+  assert.ok(deadlineReachability.filter(site => site.supported !== false).every(site => site.reachable));
+
   const causalControl = runCli(f, args, {
     ...baseEnvironment,
     PEER_RESULT_TEST_DISABLE_INSPECTOR_GUARD: '1',
     PEER_RESULT_TEST_NETWORK_PROBE: 'inspector.control',
     PEER_RESULT_TEST_INSPECTOR_RECEIPT: attackReceipt,
     PEER_RESULT_TEST_INSPECTOR_WORKER_MARKER: workerMarker,
-    PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER: attemptMarker
+    PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER: attemptMarker,
+    PEER_RESULT_TEST_INSPECTOR_HOLD_STAGE: '0'
   });
   assert.equal(causalControl.status, 0, causalControl.stderr);
   assert.equal(fs.existsSync(trap.marker), false, 'disabled-guard control unexpectedly refused');
-  assert.equal(fs.readFileSync(workerMarker, 'utf8'), 'executed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(workerMarker, 'utf8')), { executed: true, trapLoaded: false });
   assert.deepEqual(JSON.parse(fs.readFileSync(attemptMarker, 'utf8')), {
     transport: 'simulated',
     operation: 'connect',
     port: 9,
     host: '127.0.0.1',
     state: 'error',
+    trapLoaded: false,
     code: 'SIMULATED'
   });
   const reachability = JSON.parse(fs.readFileSync(attackReceipt, 'utf8'));
