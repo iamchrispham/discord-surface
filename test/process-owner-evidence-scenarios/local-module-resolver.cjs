@@ -16,11 +16,12 @@ const unwrap = node => {
   return current;
 };
 
-const propertyName = node => {
+const propertyName = (node, resolveIdentifier) => {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
   if (!ts.isElementAccessExpression(node)) return null;
   const argument = unwrap(node.argumentExpression);
-  return ts.isStringLiteral(argument) || ts.isNumericLiteral(argument) ? argument.text : null;
+  if (ts.isStringLiteral(argument) || ts.isNumericLiteral(argument)) return argument.text;
+  return ts.isIdentifier(argument) ? resolveIdentifier?.(argument) ?? null : null;
 };
 
 const isRelative = specifier => specifier === '.' || specifier === '..' ||
@@ -317,7 +318,7 @@ function createLocalModuleResolver(files) {
         };
         recordPattern(left, expression.right);
       }
-      const name = propertyName(left);
+      const name = propertyName(left, identifier => staticPropertyValue(identifier, resolvedPath));
       if (!name || !ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return;
       const receiver = left.expression;
       if (isExportObjectExpression(receiver)) addExport(name, expression.right);
@@ -515,12 +516,14 @@ function createLocalModuleResolver(files) {
             else if (builtinProcess) addExport(exported, { builtin: 'process', name: imported });
             else addExport(exported, { binding: imported });
           }
-        } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause) && modulePath) {
+        } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause) &&
+          (modulePath || builtinProcess)) {
           const exported = statement.exportClause.name.text;
-          addBinding(exported, { namespaceModulePath: modulePath });
+          addBinding(exported, modulePath
+            ? { namespaceModulePath: modulePath } : { builtinNamespace: 'process' });
           addExport(exported, { binding: exported });
-        } else if (modulePath) {
-          module.wildcardExports.push(modulePath);
+        } else if (modulePath || builtinProcess) {
+          module.wildcardExports.push(modulePath || { builtin: 'process' });
         }
       }
       if (ts.isExportAssignment(statement)) {
@@ -559,14 +562,24 @@ function createLocalModuleResolver(files) {
           for (const atom of evaluateProperty(property.expression, name, currentPath, seen)) result.add(atom);
           continue;
         }
+        const getter = ts.isGetAccessorDeclaration(property);
         if (!property.name || (!ts.isPropertyAssignment(property) &&
-          !ts.isShorthandPropertyAssignment(property))) continue;
+          !ts.isShorthandPropertyAssignment(property) && !getter)) continue;
         const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
           ? property.name.text
           : ts.isComputedPropertyName(property.name)
             ? staticPropertyValue(property.name.expression, currentPath, seen)
             : null;
         if (key !== name) continue;
+        if (getter) {
+          const statements = property.body?.statements || [];
+          if (statements.length === 1 && ts.isReturnStatement(statements[0]) && statements[0].expression) {
+            for (const atom of evaluate(statements[0].expression, currentPath, seen, new Map(), bindingOverrides)) {
+              result.add(atom);
+            }
+          }
+          continue;
+        }
         const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
         for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
       }
@@ -595,6 +608,16 @@ function createLocalModuleResolver(files) {
     const atoms = evaluate(node, currentPath, seen, new Map(), bindingOverrides);
     const result = new Set();
     for (const atom of atoms) {
+      if (atom && atom.objectLiteral) {
+        for (const nested of evaluateProperty(
+          atom.objectLiteral,
+          name,
+          atom.modulePath || currentPath,
+          seen,
+          bindingOverrides
+        )) result.add(nested);
+        continue;
+      }
       const modulePath = modulePathFromAtom(atom);
       if (modulePath) for (const nested of resolveExport(modulePath, name, seen)) result.add(nested);
     }
@@ -680,6 +703,23 @@ function createLocalModuleResolver(files) {
   };
 
   const resolveProperty = (atoms, name, currentPath, visited = new Set()) => {
+    const objectAtoms = [...atoms].filter(atom => atom && atom.objectLiteral);
+    if (objectAtoms.length) {
+      const result = new Set();
+      for (const atom of objectAtoms) {
+        for (const nested of evaluateProperty(
+          atom.objectLiteral,
+          name,
+          atom.modulePath || currentPath,
+          visited
+        )) result.add(nested);
+      }
+      const remaining = new Set([...atoms].filter(atom => !atom || !atom.objectLiteral));
+      if (remaining.size) {
+        for (const nested of resolveProperty(remaining, name, currentPath, visited)) result.add(nested);
+      }
+      return result;
+    }
     const result = new Set();
     for (const atom of atoms || []) {
       const modulePath = modulePathFromAtom(atom);
@@ -1052,7 +1092,22 @@ function createLocalModuleResolver(files) {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
       ts.isStringLiteral(node.arguments[0])) {
       const currentModule = currentPath && scanModule(currentPath);
-      if (currentModule?.bindings.has('require')) return new Set();
+      const hasFunctionRequire = (() => {
+        for (let ancestor = node.parent; ancestor && !ts.isSourceFile(ancestor); ancestor = ancestor.parent) {
+          if (!ts.isFunctionLike(ancestor) || !ancestor.body || !ts.isBlock(ancestor.body)) continue;
+          if (ancestor.parameters.some(parameter => ts.isIdentifier(parameter.name) && parameter.name.text === 'require')) {
+            return true;
+          }
+          for (const statement of ancestor.body.statements) {
+            if (ts.isFunctionDeclaration(statement) && statement.name?.text === 'require') return true;
+            if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+              declaration => ts.isIdentifier(declaration.name) && declaration.name.text === 'require'
+            )) return true;
+          }
+        }
+        return false;
+      })();
+      if (currentModule?.bindings.has('require') || hasFunctionRequire) return new Set();
       const specifier = node.arguments[0].text;
       if (specifier === 'node:process' || specifier === 'process') return new Set([PROCESS_OBJECT]);
       const modulePath = currentPath && resolveRequest(currentPath, specifier);
@@ -1160,7 +1215,11 @@ function createLocalModuleResolver(files) {
     }
     if (!values.length) {
       for (const wildcardPath of module.wildcardExports || []) {
-        for (const atom of resolveExport(wildcardPath, name, seen)) result.add(atom);
+        if (wildcardPath && wildcardPath.builtin === 'process') {
+          result.add(name === 'kill' ? PID_PROBE : PROCESS_OBJECT);
+        } else {
+          for (const atom of resolveExport(wildcardPath, name, seen)) result.add(atom);
+        }
       }
     }
     return result;
@@ -1180,6 +1239,10 @@ function createLocalModuleResolver(files) {
     for (const binding of bindings) {
       if (binding && binding.base) {
         for (const atom of evaluateProperty(binding.base, binding.name, currentPath, visited)) result.add(atom);
+      } else if (binding && binding.builtinNamespace === 'process') {
+        result.add(PROCESS_OBJECT);
+      } else if (ts.isObjectLiteralExpression(binding)) {
+        result.add({ objectLiteral: binding, modulePath: currentPath });
       } else {
         for (const atom of evaluate(binding, currentPath, visited)) result.add(atom);
       }

@@ -53,7 +53,7 @@ const REFLECT_OBJECT = 'reflect-object';
 const REFLECT_APPLY = 'reflect-apply';
 const REFLECT_CALL_METHOD = 'reflect-call-method';
 const REFLECT_APPLY_METHOD = 'reflect-apply-method';
-const FORWARDED_CALLBACK_APIS = new Set(['setImmediate', 'setTimeout', 'setInterval']);
+const FORWARDED_CALLBACK_APIS = new Set(['nextTick', 'setImmediate', 'setTimeout', 'setInterval']);
 
 function sourceFiles(root) {
   const found = [];
@@ -61,7 +61,7 @@ function sourceFiles(root) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const full = path.join(directory, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (/\.(?:js|ts|cjs)$/.test(entry.name)) found.push(full);
+      else if (/\.(?:js|ts|cjs|mjs)$/.test(entry.name)) found.push(full);
     }
   };
   walk(root);
@@ -148,16 +148,16 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   const indexMemberAssignment = (access, value) => {
     indexMemberAssignmentsForTarget(access.expression, staticPropertyNames(access, true), value);
   };
-  const recordParameterArgument = (symbol, value, name = null) => {
+  const recordParameterArgument = (symbol, value, name = null, invocation = null) => {
     if (!symbol || !value) return;
     const existing = parameterArguments.get(symbol);
-    const entry = name ? { source: value, name } : value;
+    const entry = { source: value, invocation, ...(name ? { name } : {}) };
     if (existing) existing.push(entry);
     else parameterArguments.set(symbol, [entry]);
   };
-  const recordRestParameterArguments = (symbol, values) => {
+  const recordRestParameterArguments = (symbol, values, invocation = null) => {
     if (!symbol) return;
-    const entries = values.filter(Boolean).map((source, index) => ({ source, restIndex: index }));
+    const entries = values.filter(Boolean).map((source, index) => ({ source, restIndex: index, invocation }));
     if (!entries.length) return;
     const existing = parameterArguments.get(symbol);
     if (existing) existing.push(...entries);
@@ -172,6 +172,23 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         ts.isPropertyAssignment(declarations[0]) || ts.isShorthandPropertyAssignment(declarations[0]) ||
         ts.isPropertyDeclaration(declarations[0]))
       ? declarations[0] : null;
+  };
+  const hasLocalRequireBinding = node => {
+    for (let ancestor = node.parent; ancestor && !ts.isSourceFile(ancestor); ancestor = ancestor.parent) {
+      if (!ts.isFunctionLike(ancestor)) continue;
+      if (ancestor.parameters.some(parameter => ts.isIdentifier(parameter.name) && parameter.name.text === 'require')) {
+        return true;
+      }
+      if (ancestor.body && ts.isBlock(ancestor.body)) {
+        for (const statement of ancestor.body.statements) {
+          if (ts.isFunctionDeclaration(statement) && statement.name?.text === 'require') return true;
+          if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+            declaration => ts.isIdentifier(declaration.name) && declaration.name.text === 'require'
+          )) return true;
+        }
+      }
+    }
+    return false;
   };
   const receiverSymbols = (node, visited = new Set()) => {
     const symbols = new Set();
@@ -337,9 +354,39 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return [];
   };
   const recordIterationTarget = (target, source) => {
-    for (const identifier of assignmentTargetIdentifiers(target)) {
-      recordAssignment(checker.getSymbolAtLocation(identifier), { source });
-    }
+    const project = (binding, origin) => {
+      if (ts.isIdentifier(binding)) {
+        recordAssignment(checker.getSymbolAtLocation(binding), { source: origin });
+        return;
+      }
+      if (ts.isObjectBindingPattern(binding)) {
+        for (const element of binding.elements) {
+          if (element.dotDotDotToken || !element.name) continue;
+          const key = element.propertyName || element.name;
+          let projected;
+          if (ts.isIdentifier(key)) {
+            projected = ts.factory.createPropertyAccessExpression(origin, key.text);
+          } else if (ts.isStringLiteral(key) || ts.isNumericLiteral(key)) {
+            projected = ts.factory.createElementAccessExpression(origin, key);
+          } else {
+            continue;
+          }
+          project(element.name, projected);
+        }
+        return;
+      }
+      if (ts.isArrayBindingPattern(binding)) {
+        binding.elements.forEach((element, index) => {
+          if (ts.isOmittedExpression(element) || element.dotDotDotToken || !element.name) return;
+          const projected = ts.factory.createElementAccessExpression(
+            origin,
+            ts.factory.createNumericLiteral(index)
+          );
+          project(element.name, projected);
+        });
+      }
+    };
+    project(target, source);
   };
   const indexForOfStatement = statement => {
     const iterable = ts.isParenthesizedExpression(statement.expression)
@@ -466,12 +513,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
     return ts.isIdentifier(binding.name) ? binding.name.text : null;
   };
-  const indexParameterBinding = (name, argument, parameter, restArguments = null) => {
+  const indexParameterBinding = (name, argument, parameter, restArguments = null, invocation = null) => {
     if (ts.isIdentifier(name)) {
       if (parameter?.dotDotDotToken) {
-        recordRestParameterArguments(checker.getSymbolAtLocation(name), restArguments || []);
+        recordRestParameterArguments(checker.getSymbolAtLocation(name), restArguments || [], invocation);
       } else if (argument) {
-        recordParameterArgument(checker.getSymbolAtLocation(name), argument);
+        recordParameterArgument(checker.getSymbolAtLocation(name), argument, null, invocation);
       }
       return;
     }
@@ -481,7 +528,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const binding = name.elements[index];
         const source = argument.elements[index];
         if (ts.isBindingElement(binding) && ts.isIdentifier(binding.name) && source && !ts.isSpreadElement(source)) {
-          recordParameterArgument(checker.getSymbolAtLocation(binding.name), source);
+          recordParameterArgument(checker.getSymbolAtLocation(binding.name), source, null, invocation);
         }
       }
       return;
@@ -490,7 +537,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     for (const binding of name.elements) {
       if (!ts.isBindingElement(binding) || !ts.isIdentifier(binding.name)) continue;
       const propertyName = bindingPropertyName(binding);
-      recordParameterArgument(checker.getSymbolAtLocation(binding.name), argument, propertyName);
+      recordParameterArgument(checker.getSymbolAtLocation(binding.name), argument, propertyName, invocation);
     }
   };
   const invocationWrapperName = callee => {
@@ -650,7 +697,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return resolved;
   };
   const finiteArrayCallbackMethods = new Set([
-    'forEach', 'map', 'filter', 'some', 'every', 'find', 'findIndex', 'flatMap'
+    'forEach', 'map', 'filter', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'flatMap'
   ]);
   const finiteArrayReducerMethods = new Set(['reduce', 'reduceRight']);
   const finiteReducerSignalArguments = (method, elements, argumentsList) => {
@@ -671,7 +718,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const parameter = callback.parameters[0];
         if (parameter && ts.isIdentifier(parameter.name)) {
           for (const element of callbackElements) {
-            if (element) indexParameterBinding(parameter.name, element, parameter);
+            if (element) indexParameterBinding(parameter.name, element, parameter, null, node);
           }
         }
       }
@@ -689,7 +736,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           const parameter = parameters[index];
           const argument = argumentsList[index];
           if (argument && !ts.isSpreadElement(argument)) {
-            indexParameterBinding(parameter.name, argument, parameter);
+            indexParameterBinding(parameter.name, argument, parameter, null, node);
           }
         }
       } else {
@@ -703,9 +750,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           const parameter = parameters[index];
           const argument = argumentsList[index];
           if (parameter.dotDotDotToken) {
-            indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index));
+            indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index), node);
           } else if (argument && !ts.isSpreadElement(argument)) {
-            indexParameterBinding(parameter.name, argument, parameter);
+            indexParameterBinding(parameter.name, argument, parameter, null, node);
           }
         }
       }
@@ -720,13 +767,63 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const parameter = parameters[index];
         const argument = argumentsList[index];
         if (parameter.dotDotDotToken) {
-          indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index));
+          indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index), node);
         } else if (argument && !ts.isSpreadElement(argument)) {
-          indexParameterBinding(parameter.name, argument, parameter);
+          indexParameterBinding(parameter.name, argument, parameter, null, node);
         }
       }
     }
     ts.forEachChild(node, indexParameterArguments);
+  };
+  const correlatedProcessProbeSignals = (callee, signal) => {
+    const calleeSymbol = checker.getSymbolAtLocation(callee);
+    const signalSymbol = checker.getSymbolAtLocation(signal);
+    if (!calleeSymbol || !signalSymbol) return null;
+    const calleeArguments = parameterArguments.get(calleeSymbol) || [];
+    const signalArguments = parameterArguments.get(signalSymbol) || [];
+    const isKnownOrdinaryCallable = source => {
+      const node = transparentExpression(source) || source;
+      if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return true;
+      if (!ts.isIdentifier(node)) return false;
+      const declaration = symbolDeclaration(checker.getSymbolAtLocation(node));
+      if (!declaration) return false;
+      return ts.isFunctionDeclaration(declaration) ||
+        (ts.isVariableDeclaration(declaration) && declaration.initializer &&
+          (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)));
+    };
+    const values = new Set();
+    let foundProbeInvocation = false;
+    let unresolved = false;
+    for (const entry of calleeArguments) {
+      if (!entry?.invocation || !entry.source) return null;
+      const targetValues = staticValue(entry.source);
+      if (!targetValues.size) {
+        if (isKnownOrdinaryCallable(entry.source)) continue;
+        if (mayBeUnresolved(entry.source)) return null;
+        continue;
+      }
+      if (!hasAtom(targetValues, PID_PROBE)) {
+        if (isKnownOrdinaryCallable(entry.source)) continue;
+        if (mayBeUnresolved(entry.source)) return null;
+        continue;
+      }
+      foundProbeInvocation = true;
+      const pairedArguments = signalArguments.filter(candidate => candidate?.invocation === entry.invocation);
+      if (!pairedArguments.length) {
+        unresolved = true;
+        continue;
+      }
+      for (const paired of pairedArguments) {
+        if (!paired.source) {
+          unresolved = true;
+          continue;
+        }
+        const pairedValues = staticValue(paired.source);
+        for (const value of pairedValues) values.add(value);
+        if (!pairedValues.size || mayBeUnresolved(paired.source)) unresolved = true;
+      }
+    }
+    return foundProbeInvocation ? { values, unresolved } : null;
   };
   function accessNames(node, visited) {
     if (ts.isPropertyAccessExpression(node)) return new Set([node.name.text]);
@@ -1094,12 +1191,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
 
     if (ts.isCallExpression(node)) {
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-        ts.isStringLiteral(node.arguments[0]) &&
-        (node.arguments[0].text === 'node:process' || node.arguments[0].text === 'process')) {
-        return new Set([PROCESS_OBJECT]);
+        ts.isStringLiteral(node.arguments[0])) {
+        const moduleName = node.arguments[0].text;
+        if (moduleName === 'node:process' || moduleName === 'process') return new Set([PROCESS_OBJECT]);
+        if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName);
       }
       if (ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
-        !symbolDeclaration(checker.getSymbolAtLocation(node.expression))) {
+        !symbolDeclaration(checker.getSymbolAtLocation(node.expression)) && !hasLocalRequireBinding(node)) {
         const moduleName = node.arguments[0];
         if (moduleName && ts.isStringLiteral(moduleName)) {
           if (moduleName.text === 'node:process' || moduleName.text === 'process') {
@@ -1382,12 +1480,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (transparent) return literalProperty(transparent, name, seen);
     if (moduleResolver?.resolveProperty) {
       for (const atom of resolveSet(node, seen)) {
-        if (!moduleResolver.modulePathFromAtom(atom)) continue;
+        if (!moduleResolver.modulePathFromAtom(atom) && !atom?.objectLiteral) continue;
         for (const resolved of moduleResolver.resolveProperty([atom], name, virtualPath, seen)) found.add(resolved);
       }
       if (found.size) return found;
     }
     if (moduleResolver && ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+      !hasLocalRequireBinding(node) &&
       node.expression.text === 'require' && ts.isStringLiteral(node.arguments[0])) {
       for (const atom of moduleResolver.resolveRequire(virtualPath, node.arguments[0].text)) {
         const modulePath = moduleResolver.modulePathFromAtom(atom);
@@ -1454,6 +1553,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
     if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
       origins.push(declaration.initializer);
+    }
+    for (const argument of parameterArguments.get(symbol) || []) {
+      if (argument && typeof argument === 'object' && 'source' in argument) {
+        if (!argument.name || argument.name === name) origins.push(argument.source);
+      } else {
+        origins.push(argument);
+      }
     }
     for (const assigned of assignments.get(symbol) || []) if (!assigned.name) origins.push(assigned.source);
     for (const origin of origins) {
@@ -1675,6 +1781,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (members.size !== 1) return null;
       const member = [...members][0];
       if (typeof member !== 'string' || !FORWARDED_CALLBACK_APIS.has(member)) return null;
+      if (member === 'nextTick' && hasAtom(staticValue(callee.expression), PROCESS_OBJECT)) return member;
       if (isTimerRequire(callee.expression)) return member;
       const receiverSymbol = checker.getSymbolAtLocation(callee.expression);
       for (const declaration of receiverSymbol?.declarations || []) {
@@ -1879,7 +1986,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const importedCallable = [...resolved].some(atom =>
           atom?.callable && atom.modulePath && atom.modulePath !== virtualPath);
         const probeBearingArguments = node.arguments.some(argument => argumentMayCarryProbe(argument));
-        if (importedCallable && probeBearingArguments) {
+        if (importedCallable && probeBearingArguments && staticValue(node).size === 0) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         const isBind = calleeNames.has('bind');
@@ -1905,9 +2012,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const isProbe = hasAtom(resolved, PID_PROBE);
         if (isProbe && !isBind) {
           const signal = callArguments[1];
-          const values = signal ? staticValue(signal) : new Set();
+          const correlated = signal ? correlatedProcessProbeSignals(callee, signal) : null;
+          const values = correlated ? correlated.values : signal ? staticValue(signal) : new Set();
           if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
-          if (expandedArguments === null || (signal && (values.size === 0 || mayBeUnresolved(signal)))) {
+          if (expandedArguments === null || (signal && (correlated
+            ? correlated.unresolved : values.size === 0 || mayBeUnresolved(signal)))) {
             violations.push(`unsupported process probe ${fileName}:${owner}`);
           }
         }

@@ -122,6 +122,66 @@ test('direct process re-exports preserve named and default origins', () => {
   });
 });
 
+test('object-valued named exports and statically bounded getters preserve properties', () => {
+  expectProbe({
+    'producer.js': 'export const api = { probe: process.kill };',
+    'use.js': "import { api } from './producer.js'; api.probe(1, 0);"
+  });
+  expectProbe({
+    'producer.js': 'module.exports = { get probe() { return process.kill; } };',
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.js': 'module.exports = { get probe() { return () => true; } };',
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('finite computed CommonJS export keys resolve identifier values', () => {
+  expectProbe({
+    'producer.js': "const key = 'probe'; exports[key] = process.kill;",
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.js': "const key = 'probe'; exports[key] = () => true;",
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('builtin namespace and wildcard re-exports retain process probes', () => {
+  expectProbe({
+    'producer.js': "export * from 'node:process';",
+    'use.js': "import { kill } from './producer.js'; kill(1, 0);"
+  });
+  expectProbe({
+    'producer.js': "export * as proc from 'node:process';",
+    'use.js': "import { proc } from './producer.js'; proc.kill(1, 0);"
+  });
+});
+
+test('relative dynamic-import namespaces resolve local exports', () => {
+  const result = inventoryFiles({
+    'producer.js': 'export const probe = process.kill;',
+    'use.js': "async function run() { const mod = await import('./producer.js'); mod.probe(1, 0); } run();"
+  });
+  assert.deepEqual(result.kills, ['use.js\u0000run']);
+  assert.deepEqual(result.violations, ['unclassified process probe use.js:run']);
+});
+
+test('function-scoped require shadows do not resolve local modules', () => {
+  expectOrdinary({
+    'producer.js': "module.exports = process.kill;",
+    'helper.js': "export function getProbe() { function require() { return () => true; } return require('./producer.js'); }",
+    'use.js': "import { getProbe } from './helper.js'; getProbe()(1, 0);"
+  });
+});
+
+test('executable mjs modules enter the public inventory', () => {
+  const result = inventoryFiles({ 'owner.mjs': 'process.kill(1, 0);' });
+  assert.deepEqual(result.kills, ['owner.mjs\u0000null']);
+  assert.deepEqual(result.violations, ['unclassified process probe owner.mjs:null']);
+});
+
 test('imported callable bodies with probe arguments are conservatively refused', () => {
   const result = inventoryFiles({
     'producer.js': 'export function invoke(probe, pid) { probe(pid, 0); }',
@@ -133,6 +193,12 @@ test('imported callable bodies with probe arguments are conservatively refused',
     'producer.js': 'export function invoke(probe, pid) { probe(pid, 0); }',
     'use.js': "import { invoke } from './producer.js'; invoke(() => true, 1);"
   });
+  const identityResult = inventoryFiles({
+    'producer.js': 'export const identity = value => value;',
+    'use.js': "import { identity } from './producer.js'; function newProbe(pid) { identity(process.kill)(pid, 0); }"
+  });
+  assert.deepEqual(identityResult.kills, ['use.js\u0000newProbe']);
+  assert.deepEqual(identityResult.violations, ['unclassified process probe use.js:newProbe']);
 });
 
 test('callable module writes and logical assignments retain only reachable probe sources', () => {
