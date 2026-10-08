@@ -1610,7 +1610,16 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), reso
     || tokens[wrapperOpening]?.value !== '(') return false;
   const wrapperClosing = pairs.get(wrapperOpening);
   if (wrapperClosing !== expression.end - 1) return false;
-  return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases, resolvingArrays);
+  const effectiveArgument = topLevelSegments(tokens, wrapperOpening + 1, wrapperClosing)[0];
+  return effectiveArgument !== undefined
+    && valueHasGapOutcome(
+      tokens,
+      effectiveArgument[0],
+      effectiveArgument[1],
+      pairs,
+      aliases,
+      resolvingArrays
+    );
 };
 
 const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRanges, aliases) => {
@@ -1903,6 +1912,7 @@ const isScheduledCallback = (tokens, pairs, range) => {
     return PROMISE_EXECUTOR_CALLBACK;
   }
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
+    || (callee === 'forEach' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))
     || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
   if (!['then', 'catch'].includes(callee) || !['.', '?.'].includes(tokens[calleeIndex - 1]?.value)) return false;
   return promiseHandlerIsUnreachable(tokens, range, callee, calleeIndex, callOpening, callClosing, pairs)
@@ -2012,27 +2022,31 @@ const localFunctionWasReassigned = (tokens, name, start, end) => {
   return false;
 };
 
-const callbackParameterNameAt = (tokens, range, pairs) => {
+const functionParameterNamesAt = (tokens, range, pairs) => {
+  let syntaxStart = range.start;
+  if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
   let parameterOpening;
   let parameterClosing;
-  if (tokens[range.start]?.value === 'function') {
-    parameterOpening = range.start + 1;
+  if (tokens[syntaxStart]?.value === 'function') {
+    parameterOpening = syntaxStart + 1;
     while (parameterOpening < range.opening && tokens[parameterOpening]?.value !== '(') {
       parameterOpening += 1;
     }
     parameterClosing = pairs.get(parameterOpening);
-  } else {
+  } else if (tokens[range.start]?.value === '=>') {
     parameterClosing = range.start - 1;
     if (tokens[parameterClosing]?.value === ')') parameterOpening = pairs.get(parameterClosing);
-    else return tokens[parameterClosing]?.type === 'identifier' ? tokens[parameterClosing].value : null;
+    else return tokens[parameterClosing]?.type === 'identifier' ? [tokens[parameterClosing].value] : [];
+  } else {
+    return [];
   }
-  if (parameterOpening === undefined || parameterClosing === undefined) return null;
-  const firstParameter = topLevelSegments(tokens, parameterOpening + 1, parameterClosing)[0];
-  return firstParameter && firstParameter[1] - firstParameter[0] === 1
-    && tokens[firstParameter[0]]?.type === 'identifier'
-    ? tokens[firstParameter[0]].value
-    : null;
+  if (parameterOpening === undefined || parameterClosing === undefined) return [];
+  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing).map(([start, end]) => (
+    end - start === 1 && tokens[start]?.type === 'identifier' ? tokens[start].value : null
+  ));
 };
+
+const callbackParameterNameAt = (tokens, range, pairs) => functionParameterNamesAt(tokens, range, pairs)[0] ?? null;
 
 const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
@@ -2156,6 +2170,22 @@ const localFunctionCallHasGapOutcome = (
 
     const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
     const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+    const callOpening = index + 1;
+    const callClosing = pairs.get(callOpening);
+    if (callClosing === undefined) continue;
+    const callAliases = new Set(aliases);
+    const parameterNames = functionParameterNamesAt(tokens, localFunction, pairs);
+    const callArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+    parameterNames.forEach((parameterName, parameterIndex) => {
+      if (parameterName === null) return;
+      const argument = callArguments[parameterIndex];
+      if (argument !== undefined
+        && valueHasGapOutcome(tokens, argument[0], argument[1], pairs, aliases)) {
+        callAliases.add(parameterName);
+      } else {
+        callAliases.delete(parameterName);
+      }
+    });
     const nextResolvingFunctions = new Set(resolvingFunctions);
     nextResolvingFunctions.add(localFunction);
     const callbackHasGap = localFunction.expression
@@ -2165,7 +2195,7 @@ const localFunctionCallHasGapOutcome = (
         callbackEnd,
         pairs,
         functionRanges,
-        aliases
+        callAliases
       ) || localFunctionCallHasGapOutcome(
         tokens,
         callbackStart,
@@ -2173,7 +2203,7 @@ const localFunctionCallHasGapOutcome = (
         pairs,
         functionRanges,
         knownLocalFunctions,
-        aliases,
+        callAliases,
         writerAliases,
         nextResolvingFunctions
       )
@@ -2184,7 +2214,7 @@ const localFunctionCallHasGapOutcome = (
         localFunction.opening,
         pairs,
         functionRanges,
-        aliases,
+        callAliases,
         writerAliases,
         nextResolvingFunctions
       );
@@ -3370,6 +3400,20 @@ test('deadline policy inventory unwraps awaited gap outcomes', () => {
   assert.deepEqual(offenders, ['discord/deadline-awaited-gap.js:1']);
 });
 
+test('deadline policy inventory reads only effective identity-wrapper arguments', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-promise-resolve-ignored-gap.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.UNAVAILABLE, READINESS.GAP);'
+    },
+    {
+      relative: 'discord/deadline-object-freeze-ignored-gap.js',
+      source: 'if (deadlineReached) return Object.freeze({ readiness: READINESS.UNAVAILABLE }, READINESS.GAP);'
+    }
+  ]);
+  assert.deepEqual(offenders, []);
+});
+
 test('deadline policy inventory recognizes optional-chain gap constants', () => {
   const offenders = findDeadlineGapOffenders([
     {
@@ -3451,6 +3495,38 @@ test('deadline policy inventory follows synchronous local helper return values',
     }
   ]);
   assert.deepEqual(offenders, ['discord/deadline-local-helper-gap.js:1']);
+});
+
+test('deadline policy inventory binds local helper arguments to parameters', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-local-helper-arguments.js',
+    source: [
+      'function outcome(value) { return value; }',
+      'function overwritten(value) { value = READINESS.UNAVAILABLE; return value; }',
+      'function persist(value) { state.markIntakeBoundary(id, value, detail); }',
+      'if (deadlineReached) return outcome(READINESS.GAP);',
+      'if (deadlineReached) return outcome(READINESS.UNAVAILABLE);',
+      'if (deadlineReached) return overwritten(READINESS.GAP);',
+      'if (deadlineReached) return persist(READINESS.GAP);',
+      'if (deadlineReached) return persist(READINESS.UNAVAILABLE);'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-local-helper-arguments.js:4',
+    'discord/deadline-local-helper-arguments.js:7'
+  ]);
+});
+
+test('deadline policy inventory detects eager forEach writes but ignores callback returns', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-eager-foreach.js',
+    source: [
+      'if (deadlineReached) [id].forEach(id => state.markIntakeBoundary(id, READINESS.GAP, detail));',
+      'if (deadlineReached) [id].forEach(id => READINESS.GAP);',
+      'if (deadlineReached) [id].forEach(id => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail));'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-eager-foreach.js:1']);
 });
 
 test('deadline policy inventory respects abrupt finally overrides of gap returns', () => {
