@@ -19,6 +19,15 @@ test("distinct class instances do not share member probe writes", () => {
   runFixture("class C { probe() {} } const a = new C(); const b = new C(); a.probe = process.kill; function check(pid) { b.probe(pid, 0); }", [], []);
 });
 
+test("object methods resolve this properties through their call receiver", () => {
+  runFixture(
+    "const api = { probe: process.kill, run(pid) { this.probe(pid, 0); } }; api.run(1);",
+    ["private-alias.js\u0000run"],
+    ["unclassified process probe private-alias.js:run"]
+  );
+  runFixture("const api = { probe: () => true, run(pid) { this.probe(pid, 0); } }; api.run(1);", [], []);
+});
+
 test("class-field callables retain parameters and returned probe aliases", () => {
   runFixture("class Helpers { invoke = (probe, pid) => probe(pid, 0); } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
   runFixture("class Helpers { invoke = (probe, pid) => probe(pid, 9); } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", [], []);

@@ -264,9 +264,9 @@ test('imported callable invocation wrappers preserve forwarded probe arguments',
   }
 });
 
-test('omitted and undefined process.kill signals are unsupported', () => {
-  expectUnsupported({ 'use.js': 'process.kill(1);' });
-  expectUnsupported({ 'use.js': 'process.kill(1, undefined);' });
+test('omitted and undefined process.kill signals use the ordinary default', () => {
+  expectOrdinary({ 'use.js': 'process.kill(1);' });
+  expectOrdinary({ 'use.js': 'process.kill(1, undefined);' });
 });
 
 test('finite Reflect.get probe lookups resolve only the unshadowed builtin', () => {
@@ -584,6 +584,32 @@ test('detached CommonJS exports are not resolved as live exports', () => {
   expectProbe({
     'producer.cjs': 'module.exports = { probe: () => true }; module.exports = exports; exports.probe = process.kill;',
     'use.js': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.cjs': 'exports.probe = process.kill; module.exports = { probe: () => true };',
+    'use.cjs': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+});
+
+test('CommonJS module receiver respects lexical bindings', () => {
+  expectOrdinary({
+    'producer.cjs': '{ const module = { exports: {} }; module.exports.probe = process.kill; } exports.probe = () => true;',
+    'use.cjs': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+});
+
+test('imported callable parameter writes update caller object properties', () => {
+  expectProbe({
+    'producer.cjs': 'module.exports = api => { api.probe = process.kill; };',
+    'use.js': "const install = require('./producer.cjs'); const api = {}; install(api); api.probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.cjs': 'module.exports = api => { api.probe = () => true; };',
+    'use.cjs': "const install = require('./producer.cjs'); const api = {}; install(api); api.probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.cjs': 'module.exports = api => { { const api = {}; api.probe = process.kill; } };',
+    'use.cjs': "const install = require('./producer.cjs'); const api = {}; install(api); api.probe(1, 0);"
   });
 });
 

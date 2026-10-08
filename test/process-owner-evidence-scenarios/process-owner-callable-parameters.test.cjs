@@ -103,6 +103,38 @@ test("borrowed finite-array callback methods resolve probes", () => {
   }
 });
 
+test("borrowed reducer methods resolve callback signal positions", () => {
+  for (const invocation of [
+    "Array.prototype.reduce.call([pid, 0], process.kill);",
+    "Array.prototype.reduceRight.call([0, pid], process.kill);",
+    "Array.prototype.reduce.apply([pid, 0], [process.kill]);"
+  ]) {
+    runFixture(
+      `function check(pid) { ${invocation} } check(1);`,
+      ["private-alias.js\u0000check"],
+      ["unclassified process probe private-alias.js:check"]
+    );
+  }
+});
+
+test("native Promise.then refuses destructive process-kill callbacks", () => {
+  runFixture("Promise.resolve(pid).then(process.kill);", [], ["unsupported process probe private-alias.js:null"]);
+  runFixture("function check(Promise) { Promise.resolve(pid).then(process.kill); }", [], []);
+});
+
+test("forwarded timer callbacks with default signals remain refused", () => {
+  for (const invocation of [
+    "setTimeout(process.kill, 1, pid);",
+    "setTimeout(process.kill, 1, pid, undefined);"
+  ]) {
+    runFixture(
+      `function check(pid) { ${invocation} } check(1);`,
+      [],
+      ["unsupported process probe private-alias.js:check"]
+    );
+  }
+});
+
 test("reverse-search array callbacks forward probe arguments", () => {
   for (const method of ["findLast", "findLastIndex"]) {
     runFixture(
@@ -124,4 +156,13 @@ test("for-of object and array destructuring project probe properties", () => {
     ["private-alias.js\u0000null"],
     ["unclassified process probe private-alias.js:null"]
   );
+});
+
+test("object-rest bindings retain only copied probe properties", () => {
+  runFixture(
+    "const { ...api } = { probe: process.kill }; api.probe(1, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+  runFixture("const { probe: ignored, ...api } = { probe: process.kill }; api.probe(1, 0);", [], []);
 });
