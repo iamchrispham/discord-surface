@@ -2395,7 +2395,22 @@ const hasGapOutcome = (
     const assignmentValueStart = outcomeAssignmentValueStart(tokens, index);
     if (assignmentValueStart !== null) {
       const statementEnd = findStatementEnd(tokens, assignmentValueStart, end);
-      if (valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases)) return true;
+      const assignedGap = valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases);
+      const declaredAlias = ['const', 'let', 'var'].includes(token.value)
+        && tokens[index + 1]?.type === 'identifier'
+        ? tokens[index + 1].value
+        : null;
+      const assignmentTarget = assignmentTargetAt(tokens, index, end, pairs);
+      const aliasName = assignmentTarget?.name || declaredAlias;
+      const isSimpleLocalAssignment = declaredAlias !== null
+        || (token.type === 'identifier' && tokens[index + 1]?.value === '=');
+      if (assignedGap && !isSimpleLocalAssignment) return true;
+      if (aliasName) {
+        if (assignedGap) knownAliases.add(aliasName);
+        else knownAliases.delete(aliasName);
+      } else if (assignedGap) {
+        return true;
+      }
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -2433,7 +2448,8 @@ const hasGapOutcome = (
       );
       if (stateArgument === undefined) knownWriterAliases.delete(assignmentTarget.name);
       else knownWriterAliases.set(assignmentTarget.name, stateArgument);
-      if (assignedGap && OUTCOME_NAMES.has(assignmentTarget.name)) return true;
+      const isSimpleLocalAssignment = token.type === 'identifier' && tokens[index + 1]?.value === '=';
+      if (assignedGap && OUTCOME_NAMES.has(assignmentTarget.name) && !isSimpleLocalAssignment) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -2450,7 +2466,7 @@ const hasGapOutcome = (
   );
 };
 
-const isDeadlineTriggerAt = (tokens, index) => {
+const isDeadlineTriggerAt = (tokens, index, isDeadlineTimestampAlias = () => false) => {
   const value = tokens[index]?.value;
   if (value === 'deadlineReached') return true;
   if (value === 'DEADLINE' || (tokens[index]?.type === 'string' && value === 'deadline')) {
@@ -2482,7 +2498,7 @@ const isDeadlineTriggerAt = (tokens, index) => {
     if (tokens[operandStart]?.type !== 'identifier') return null;
     let end = operandStart + 1;
     while (['.', '?.'].includes(tokens[end]?.value) && tokens[end + 1]?.type === 'identifier') end += 2;
-    if (!/deadline/i.test(tokens[end - 1]?.value)) return null;
+    if (!/deadline/i.test(tokens[end - 1]?.value) && !isDeadlineTimestampAlias(operandStart)) return null;
 
     if (openingParentheses > 0) {
       for (let index = 0; index < openingParentheses; index += 1) {
@@ -3059,10 +3075,75 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
     };
   });
+  const deadlineTimestampAliases = [];
+  let timestampAliasesAdded = true;
+  while (timestampAliasesAdded) {
+    timestampAliasesAdded = false;
+    for (const assignment of assignments) {
+      if (assignment.bindingIndex === undefined
+        || deadlineTimestampAliases.some(alias => alias.index === assignment.index
+          && alias.bindingIndex === assignment.bindingIndex)) continue;
+      const valueRange = trimExpressionRange(
+        tokens,
+        assignment.expressionStart,
+        assignment.expressionEnd,
+        pairs
+      );
+      if (valueRange.end - valueRange.start !== 1) continue;
+      const sourceToken = tokens[valueRange.start];
+      if (sourceToken?.type !== 'identifier') continue;
+      const sourceBinding = resolveVisibleBinding(
+        lexicalBindings,
+        sourceToken.value,
+        valueRange.start,
+        lexicalScopes
+      );
+      const sourceAlias = deadlineTimestampAliases.find(alias => alias.name === sourceToken.value
+        && alias.bindingIndex === sourceBinding?.index
+        && alias.index < valueRange.start);
+      if (!/deadline/i.test(sourceToken.value) && !sourceAlias) continue;
+      if (sourceAlias) {
+        const sourceAssignments = resolveVisibleAssignments(
+          assignments,
+          sourceAlias.name,
+          valueRange.start,
+          lexicalScopes,
+          sourceBinding.index,
+          tokens,
+          pairs
+        );
+        if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
+      }
+      deadlineTimestampAliases.push({
+        name: assignment.name,
+        index: assignment.index,
+        bindingIndex: assignment.bindingIndex
+      });
+      timestampAliasesAdded = true;
+    }
+  }
+  const isDeadlineTimestampAliasAt = tokenIndex => {
+    const token = tokens[tokenIndex];
+    if (token?.type !== 'identifier') return false;
+    const binding = resolveVisibleBinding(lexicalBindings, token.value, tokenIndex, lexicalScopes);
+    if (!binding) return false;
+    return deadlineTimestampAliases.some(alias => alias.name === token.value
+      && alias.bindingIndex === binding.index
+      && alias.index < tokenIndex
+      && resolveVisibleAssignments(
+        assignments,
+        alias.name,
+        tokenIndex,
+        lexicalScopes,
+        binding.index,
+        tokens,
+        pairs
+      ).some(candidate => candidate.index === alias.index));
+  };
   const lines = new Set();
   const deadlineAliases = [];
   for (let index = 0; index < tokens.length; index += 1) {
-    if (!isDeadlineTriggerAt(tokens, index)) continue;
+    if (!isDeadlineTriggerAt(tokens, index, isDeadlineTimestampAliasAt)) continue;
     const alias = findAssignedAlias(tokens, index);
     if (alias) {
       let aliasNegationCount = 0;
@@ -3228,6 +3309,38 @@ test('deadline policy inventory has no direct deadline-to-gap decision', () => {
   const sourceRoot = path.join(__dirname, '../../src');
   const offenders = findDeadlineGapOffenders(readSourceInventory(sourceRoot));
   assert.deepEqual(offenders, [], 'new deadline decisions must not map expiry directly to a history gap');
+});
+
+test('deadline policy inventory resolves aliases of deadline timestamps', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-timestamp-alias-gap.js',
+      source: 'const expiresAt = deadline; if (Date.now() >= expiresAt) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-timestamp-alias-unavailable.js',
+      source: 'const expiresAt = deadline; if (Date.now() >= expiresAt) return READINESS.UNAVAILABLE;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-timestamp-alias-gap.js:1']);
+});
+
+test('deadline policy inventory waits for local gap outcomes to escape', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-local-gap-overwritten.js',
+      source: 'if (deadlineReached) { let result = READINESS.GAP; result = READINESS.UNAVAILABLE; return result; }'
+    },
+    {
+      relative: 'discord/deadline-local-gap-unused.js',
+      source: 'if (deadlineReached) { const result = READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/deadline-local-gap-returned.js',
+      source: 'if (deadlineReached) { const result = READINESS.GAP; return result; }'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-local-gap-returned.js:1']);
 });
 
 test('deadline policy inventory maps local boundary state arguments', () => {
