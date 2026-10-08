@@ -391,19 +391,38 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       || ts.isArrowFunction(implementation)
       || ts.isClassExpression(implementation);
   }
-  function isDefinePropertyImplementation(node) {
-    if (!ts.isCallExpression(node)
-      || !ts.isPropertyAccessExpression(node.expression)
-      || !ts.isIdentifier(node.expression.expression)
-      || node.expression.expression.text !== 'Object'
-      || node.expression.name.text !== 'defineProperty'
-      || node.arguments.length < 3) return false;
-    const descriptor = unwrapExpression(node.arguments[2]);
+  function isImplementationDescriptor(expression) {
+    const descriptor = unwrapExpression(expression);
     if (!ts.isObjectLiteralExpression(descriptor)) return false;
     return descriptor.properties.some(property => {
       if (!property.name || propertyNameText(property.name) !== 'value') return false;
       if (ts.isMethodDeclaration(property)) return true;
       return ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer);
+    });
+  }
+  function isDefinePropertyImplementation(node) {
+    return ts.isCallExpression(node)
+      && ts.isPropertyAccessExpression(node.expression)
+      && ts.isIdentifier(node.expression.expression)
+      && node.expression.expression.text === 'Object'
+      && node.expression.name.text === 'defineProperty'
+      && node.arguments.length >= 3
+      && isImplementationDescriptor(node.arguments[2]);
+  }
+  function definePropertiesImplementationNames(node) {
+    if (!ts.isCallExpression(node)
+      || !ts.isPropertyAccessExpression(node.expression)
+      || !ts.isIdentifier(node.expression.expression)
+      || node.expression.expression.text !== 'Object'
+      || node.expression.name.text !== 'defineProperties'
+      || node.arguments.length < 2) return [];
+    const descriptors = unwrapExpression(node.arguments[1]);
+    if (!ts.isObjectLiteralExpression(descriptors)) return [];
+    return descriptors.properties.flatMap(property => {
+      if (!ts.isPropertyAssignment(property) || !property.name) return [];
+      const name = propertyNameText(property.name);
+      if (!name || !isImplementationDescriptor(property.initializer)) return [];
+      return [name];
     });
   }
   function hasAmbientAncestor(node) {
@@ -478,6 +497,9 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         const name = staticStringText(node.arguments[1]);
         if (name && isDefinePropertyImplementation(node)) names.push(name);
       }
+      if (ts.isCallExpression(node)) {
+        names.push(...definePropertiesImplementationNames(node));
+      }
       if (isRuntimeMemberImplementation(node) && node.name) {
         const name = propertyNameText(node.name);
         if (name) names.push(name);
@@ -514,6 +536,22 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(ownerFunction.parameters[0].getText(ownerAst), 'pid');
   assert.equal(strip(ownerAst.statements[2].getText(ownerAst)), 'module.exports={captureProcessOwnerIdentity};');
   assert.equal(declaredNames(ownerAst).filter(name => name === 'captureProcessOwnerIdentity').length, 1);
+
+  const cjsFixtureDirectory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), '.process-owner-census-'));
+  try {
+    const cjsFixturePath = path.join(cjsFixtureDirectory, 'capture-owner.cjs');
+    const definePropertiesFixturePath = path.join(cjsFixtureDirectory, 'capture-owner-descriptors.cjs');
+    fs.writeFileSync(cjsFixturePath, 'function captureProcessOwnerIdentity(pid) { return pid; }');
+    fs.writeFileSync(definePropertiesFixturePath, 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value() {} } });');
+    const cjsDeclaringFiles = sourceFiles(cjsFixtureDirectory)
+      .filter(filePath => declaredNames(parse(
+        fs.readFileSync(filePath, 'utf8'),
+        sourceScriptKind(filePath)
+      )).includes('captureProcessOwnerIdentity'));
+    assert.deepEqual(cjsDeclaringFiles.sort(), [cjsFixturePath, definePropertiesFixturePath].sort());
+  } finally {
+    fs.rmSync(cjsFixtureDirectory, { recursive: true, force: true });
+  }
 
   const methodControls = [
     ['ambient namespace class', 'declare namespace Types { export class captureProcessOwnerIdentity {} }', false, ts.ScriptKind.TS],
@@ -576,6 +614,14 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['defineProperty descriptor', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value() {} });", true],
     ['defineProperty value implementation', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value: function () {} });", true],
     ['defineProperty value alias', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value: captureProcessOwnerIdentity });", false],
+    ['defineProperties descriptor method', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value() {} } });', true],
+    ['defineProperties function value', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: function () {} } });', true],
+    ['defineProperties arrow value', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: () => null } });', true],
+    ['defineProperties class value', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: class {} } });', true],
+    ['defineProperties computed name', "Object.defineProperties(exports, { ['captureProcessOwnerIdentity']: { value() {} } });", true],
+    ['defineProperties unrelated property', 'Object.defineProperties(exports, { otherCapture: { value() {} } });', false],
+    ['defineProperties value alias', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: importedCapture } });', false],
+    ['defineProperties null value', 'Object.defineProperties(exports, { captureProcessOwnerIdentity: { value: null } });', false],
     ['ambient function declaration', 'declare function captureProcessOwnerIdentity(pid: number): Owner | null;', false, ts.ScriptKind.TS],
     ['ambient class method', 'declare class Example { captureProcessOwnerIdentity() {} }', false, ts.ScriptKind.TS],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
@@ -599,20 +645,6 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     )).includes('captureProcessOwnerIdentity'))
     .map(filePath => path.relative(root, filePath));
   assert.deepEqual(declaringFiles, [path.relative(root, ownerPath)]);
-
-  const cjsFixtureDirectory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), '.process-owner-census-'));
-  try {
-    const cjsFixturePath = path.join(cjsFixtureDirectory, 'capture-owner.cjs');
-    fs.writeFileSync(cjsFixturePath, 'function captureProcessOwnerIdentity(pid) { return pid; }');
-    const cjsDeclaringFiles = sourceFiles(cjsFixtureDirectory)
-      .filter(filePath => declaredNames(parse(
-        fs.readFileSync(filePath, 'utf8'),
-        sourceScriptKind(filePath)
-      )).includes('captureProcessOwnerIdentity'));
-    assert.deepEqual(cjsDeclaringFiles, [cjsFixturePath]);
-  } finally {
-    fs.rmSync(cjsFixtureDirectory, { recursive: true, force: true });
-  }
 
   const stateAst = parse(fs.readFileSync(statePath, 'utf8'));
   const imports = stateAst.statements.filter(statement => ts.isVariableStatement(statement)
