@@ -23,6 +23,14 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   const ownerFactory = ownerSource.statements.find(statement => ts.isFunctionDeclaration(statement) &&
     statement.name?.text === 'createHandoffSchedulerHandlers');
   assert.ok(ownerFactory);
+  const deferredHandler = ownerFactory.body.statements.find(statement => ts.isFunctionDeclaration(statement) &&
+    statement.name?.text === 'scheduleDeferredHandoffRecovery');
+  assert.ok(deferredHandler);
+  const channelParameter = deferredHandler.parameters[0].getText(ownerSource);
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(channelParameter, `${channelParameter} = 'fallback'`) }), false,
+    'channel default changed missing and undefined behavior');
+  assert.equal(exactOwnerContract({ ownerText: owner.replace(channelParameter, `...${channelParameter}`) }), false,
+    'channel rest parameter changed the extracted handler contract');
   const dependencyElements = ownerFactory.parameters[0].name.elements;
   const firstDependency = dependencyElements[0];
   const lastDependency = dependencyElements[dependencyElements.length - 1];
@@ -187,6 +195,14 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
     assert.deepEqual(classStateInventory(withMember(member)), [name], `${name}: scheduler owner escaped inventory`);
   }
   for (const [name, member] of [
+    ['privateReceiverAliasPropertyReader', 'privateReceiverAliasPropertyReader() { const gateway = this; return gateway.deferredHandoffRecoveryChannels; }'],
+    ['privateReceiverAliasElementReader', "privateReceiverAliasElementReader() { let gateway; gateway = this; return gateway['pendingHandoffRecoveryPollTimer']; }"],
+    ['privateReceiverAliasDestructureReader', 'privateReceiverAliasDestructureReader() { const gateway = this; const { deferredHandoffRecoveryChannels: channels } = gateway; return channels; }'],
+    ['privateReceiverAliasChainReader', 'privateReceiverAliasChainReader() { const gateway = this; const owner = gateway; return owner.deferredHandoffRecoveryChannels; }']
+  ]) {
+    assert.deepEqual(classStateInventory(withMember(member)), [name], `${name}: Gateway receiver alias escaped inventory`);
+  }
+  for (const [name, member] of [
     ['privateGlobalThisTimerOwner', 'privateGlobalThisTimerOwner() { globalThis.setTimeout(() => {}, 1); }'],
     ['privateGlobalTimerOwner', 'privateGlobalTimerOwner() { global.clearTimeout(1); }'],
     ['privateGlobalThisBracketTimerOwner', "privateGlobalThisBracketTimerOwner() { globalThis['setTimeout'](() => {}, 1); }"],
@@ -196,8 +212,23 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
     assert.ok(inventory.includes(`${name}: timer API`), `${name}: qualified global timer escaped inventory`);
   }
   for (const [name, member] of [
+    ['privateRequiredTimerNamespace', "privateRequiredTimerNamespace() { const timers = require('node:timers'); timers.setTimeout(() => {}, 1); }"],
+    ['privateRequiredTimerAlias', "privateRequiredTimerAlias() { const { setTimeout: schedule } = require('node:timers'); schedule(() => {}, 1); }"],
+    ['privateImportedTimerNamespace', 'privateImportedTimerNamespace() { timers.setTimeout(() => {}, 1); }'],
+    ['privateImportedTimerAlias', 'privateImportedTimerAlias() { schedule(() => {}, 1); }']
+  ]) {
+    let prelude = '';
+    if (name === 'privateImportedTimerNamespace') prelude = "import * as timers from 'node:timers';\n";
+    if (name === 'privateImportedTimerAlias') prelude = "import { setTimeout as schedule } from 'node:timers';\n";
+    const inventory = classStateInventory(`${prelude}${withMember(member)}`);
+    assert.ok(inventory.includes(`${name}: timer API`), `${name}: imported Node timer escaped inventory`);
+  }
+  for (const [name, member] of [
     ['privateNestedFunctionThisReader', 'privateNestedFunctionThisReader() { function inspect() { return this.deferredHandoffRecoveryChannels; } return inspect.call({}); }'],
     ['privateNestedClassThisReader', 'privateNestedClassThisReader() { class Inspect { read() { return this.pendingHandoffRecoveryPollTimer; } } return Inspect; }'],
+    ['privateReceiverAliasReassigned', 'privateReceiverAliasReassigned(other) { let gateway = this; gateway = other; return gateway.deferredHandoffRecoveryChannels; }'],
+    ['privateReceiverAliasShadowed', 'privateReceiverAliasShadowed(other) { const gateway = this; { const gateway = other; return gateway.deferredHandoffRecoveryChannels; } }'],
+    ['privateDynamicThisAliasReader', 'privateDynamicThisAliasReader() { function inspect() { const gateway = this; return gateway.deferredHandoffRecoveryChannels; } return inspect.call({}); }'],
     ['privateShadowedGlobalThisTimer', 'privateShadowedGlobalThisTimer(globalThis) { globalThis.setTimeout(() => {}, 1); }'],
     ['privateShadowedGlobalTimer', 'privateShadowedGlobalTimer(global) { global.clearTimeout(1); }'],
     ['privateShadowedBracketGlobalTimer', "privateShadowedBracketGlobalTimer(global) { global['clearTimeout'](1); }"],
@@ -205,6 +236,12 @@ test('Gateway scheduler ownership handles grouped receivers, qualified timers an
   ]) {
     assert.deepEqual(classStateInventory(withMember(member)), [], `${name}: unrelated scope was treated as Gateway ownership`);
   }
+  assert.deepEqual(classStateInventory(withMember("privateOrdinaryTimerNamespace() { const timers = require('ordinary-timers'); timers.setTimeout(() => {}, 1); }")), [],
+    'same-named ordinary timer module was treated as node:timers');
+  assert.deepEqual(classStateInventory(`import * as timers from 'node:timers';\n${withMember('privateShadowedImportedTimer(timers) { timers.setTimeout(() => {}, 1); }')}`), [],
+    'shadowed namespace timer binding was treated as node:timers');
+  assert.deepEqual(classStateInventory(`import { setTimeout as schedule } from 'node:timers';\n${withMember('privateShadowedImportedTimerAlias(schedule) { schedule(() => {}, 1); }')}`), [],
+    'shadowed named timer binding was treated as node:timers');
 });
 
 test('public scheduler inventory pins source owners and rejects only new scheduler references', () => {

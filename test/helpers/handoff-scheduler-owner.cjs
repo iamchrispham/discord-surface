@@ -203,17 +203,243 @@ function classStateInventory(sourceText) {
     return ts.isSourceFile(scope) && sourceFileContainsName(scope, soughtName);
   }
 
+  function bindingIdentifier(bindingName, soughtName) {
+    if (ts.isIdentifier(bindingName)) return bindingName.text === soughtName ? bindingName : null;
+    if (ts.isObjectBindingPattern(bindingName) || ts.isArrayBindingPattern(bindingName)) {
+      for (const element of bindingName.elements) {
+        if (!ts.isBindingElement(element)) continue;
+        const match = bindingIdentifier(element.name, soughtName);
+        if (match) return match;
+      }
+    }
+    return null;
+  }
+
+  function variableBinding(declarations, soughtName, blockScopedOnly = false) {
+    if (blockScopedOnly && (declarations.flags & ts.NodeFlags.BlockScoped) === 0) return null;
+    for (const declaration of declarations.declarations) {
+      const match = bindingIdentifier(declaration.name, soughtName);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  function statementBinding(statements, soughtName, blockScopedOnly = false) {
+    for (const statement of statements) {
+      if (ts.isVariableStatement(statement)) {
+        const match = variableBinding(statement.declarationList, soughtName, blockScopedOnly);
+        if (match) return match;
+        continue;
+      }
+      if (blockScopedOnly && !ts.isFunctionDeclaration(statement) && !ts.isClassDeclaration(statement)) continue;
+      if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) || ts.isModuleDeclaration(statement)) && statement.name) {
+        const match = bindingIdentifier(statement.name, soughtName);
+        if (match) return match;
+      }
+    }
+    return null;
+  }
+
+  function functionVarBinding(functionNode, soughtName) {
+    if (!functionNode.body) return null;
+    let found = null;
+    function scan(node) {
+      if (found || (node !== functionNode.body && (ts.isFunctionLike(node) ||
+        ts.isClassDeclaration(node) || ts.isClassExpression(node)))) return;
+      if (ts.isVariableDeclaration(node) && ts.isVariableDeclarationList(node.parent) &&
+        (node.parent.flags & ts.NodeFlags.BlockScoped) === 0) {
+        found = bindingIdentifier(node.name, soughtName);
+        if (found) return;
+      }
+      ts.forEachChild(node, scan);
+    }
+    scan(functionNode.body);
+    return found;
+  }
+
+  function scopeBinding(scope, soughtName) {
+    if (ts.isFunctionLike(scope)) {
+      for (const parameter of scope.parameters) {
+        const match = bindingIdentifier(parameter.name, soughtName);
+        if (match) return match;
+      }
+      if (ts.isFunctionExpression(scope) && scope.name?.text === soughtName) return scope.name;
+      return functionVarBinding(scope, soughtName);
+    }
+    if (ts.isBlock(scope)) return statementBinding(scope.statements, soughtName, true);
+    if (ts.isCaseBlock(scope)) {
+      for (const clause of scope.clauses) {
+        const match = statementBinding(clause.statements, soughtName, true);
+        if (match) return match;
+      }
+    }
+    if (ts.isCatchClause(scope) && scope.variableDeclaration) {
+      const match = bindingIdentifier(scope.variableDeclaration.name, soughtName);
+      if (match) return match;
+    }
+    if ((ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+      scope.initializer && ts.isVariableDeclarationList(scope.initializer)) {
+      const match = variableBinding(scope.initializer, soughtName);
+      if (match) return match;
+    }
+    if (ts.isSourceFile(scope)) {
+      for (const statement of scope.statements) {
+        if (ts.isImportDeclaration(statement)) {
+          const clause = statement.importClause;
+          if (!clause) continue;
+          if (clause.name?.text === soughtName) return clause.name;
+          const bindings = clause.namedBindings;
+          if (bindings && ts.isNamespaceImport(bindings) && bindings.name.text === soughtName) return bindings.name;
+          if (bindings && ts.isNamedImports(bindings)) {
+            const named = bindings.elements.find(element => element.name.text === soughtName);
+            if (named) return named.name;
+          }
+        }
+        if (ts.isImportEqualsDeclaration(statement) && statement.name.text === soughtName) return statement.name;
+        const match = statementBinding([statement], soughtName);
+        if (match) return match;
+      }
+    }
+    return null;
+  }
+
+  function lexicalBinding(identifier) {
+    if (!ts.isIdentifier(identifier)) return null;
+    for (let scope = identifier.parent; scope; scope = scope.parent) {
+      const binding = scopeBinding(scope, identifier.text);
+      if (binding) return binding;
+    }
+    return null;
+  }
+
+  function moduleSpecifierForImportBinding(binding) {
+    if (ts.isNamespaceImport(binding)) {
+      const declaration = binding.parent.parent;
+      return ts.isImportDeclaration(declaration) ? declaration.moduleSpecifier : null;
+    }
+    if (ts.isImportSpecifier(binding)) {
+      const declaration = binding.parent.parent.parent;
+      return ts.isImportDeclaration(declaration) ? declaration.moduleSpecifier : null;
+    }
+    return null;
+  }
+
+  function isNodeTimersModuleSpecifier(specifier) {
+    return Boolean(specifier && ts.isStringLiteralLike(specifier) && specifier.text === 'node:timers');
+  }
+
+  function isNodeTimersRequire(expression) {
+    const call = unwrapParentheses(expression);
+    if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) ||
+      call.expression.text !== 'require' || lexicalBinding(call.expression) || call.arguments.length !== 1) return false;
+    const specifier = unwrapParentheses(call.arguments[0]);
+    return ts.isStringLiteralLike(specifier) && specifier.text === 'node:timers';
+  }
+
+  function nodeTimersNamespaceBinding(binding, seen = new Set()) {
+    if (!binding || seen.has(binding)) return false;
+    seen.add(binding);
+    if (ts.isIdentifier(binding) && ts.isNamespaceImport(binding.parent)) binding = binding.parent;
+    if (ts.isNamespaceImport(binding)) return isNodeTimersModuleSpecifier(moduleSpecifierForImportBinding(binding));
+    if (!ts.isIdentifier(binding)) return false;
+    if (ts.isVariableDeclaration(binding.parent) && binding.parent.initializer) {
+      const initializer = unwrapParentheses(binding.parent.initializer);
+      if (isNodeTimersRequire(initializer)) return true;
+      if (ts.isIdentifier(initializer)) return nodeTimersNamespaceBinding(lexicalBinding(initializer), seen);
+    }
+    return false;
+  }
+
+  function nodeTimersFunctionBinding(binding, seen = new Set()) {
+    if (!binding || seen.has(binding)) return null;
+    seen.add(binding);
+    if (ts.isIdentifier(binding) && ts.isImportSpecifier(binding.parent)) binding = binding.parent;
+    if (ts.isImportSpecifier(binding) && isNodeTimersModuleSpecifier(moduleSpecifierForImportBinding(binding))) {
+      const importedName = binding.propertyName || binding.name;
+      return timerApiNames.has(importedName.text) ? importedName.text : null;
+    }
+    if (!ts.isIdentifier(binding)) return null;
+    if (ts.isBindingElement(binding.parent)) {
+      const element = binding.parent;
+      const declaration = element.parent.parent;
+      if (ts.isVariableDeclaration(declaration) && isNodeTimersRequire(declaration.initializer)) {
+        const importedName = element.propertyName || element.name;
+        return ts.isIdentifier(importedName) || ts.isStringLiteralLike(importedName)
+          ? (timerApiNames.has(importedName.text) ? importedName.text : null)
+          : null;
+      }
+    }
+    if (ts.isVariableDeclaration(binding.parent) && binding.parent.initializer) {
+      const initializer = unwrapParentheses(binding.parent.initializer);
+      if (ts.isIdentifier(initializer)) return nodeTimersFunctionBinding(lexicalBinding(initializer), seen);
+    }
+    return null;
+  }
+
+  function receiverAliasEvents(member) {
+    const events = new Map();
+    function statusAt(binding, position) {
+      const changes = binding && events.get(binding);
+      if (!changes) return false;
+      let status = false;
+      for (const change of changes) {
+        if (change.position > position) break;
+        status = change.isGatewayThis;
+      }
+      return status;
+    }
+    function receiverIsGatewayThis(expression, tracksGatewayThis) {
+      expression = unwrapParentheses(expression);
+      if (!expression) return false;
+      if (ts.isThis(expression)) return tracksGatewayThis;
+      if (ts.isIdentifier(expression)) return statusAt(lexicalBinding(expression), expression.pos);
+      return false;
+    }
+    function record(binding, position, isGatewayThis) {
+      if (!binding) return;
+      const changes = events.get(binding) || [];
+      changes.push({ position, isGatewayThis });
+      events.set(binding, changes);
+    }
+    function collect(node, tracksGatewayThis = true) {
+      const startsDynamicThisScope = ts.isClassDeclaration(node) || ts.isClassExpression(node) ||
+        ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
+        ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node) ||
+        ts.isGetAccessor(node) || ts.isSetAccessor(node);
+      const tracksGatewayThisHere = tracksGatewayThis && !startsDynamicThisScope;
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        const value = receiverIsGatewayThis(node.initializer, tracksGatewayThisHere);
+        record(node.name, node.end, value);
+      }
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(unwrapParentheses(node.left))) {
+        const left = unwrapParentheses(node.left);
+        const value = receiverIsGatewayThis(node.right, tracksGatewayThisHere);
+        record(lexicalBinding(left), node.end, value);
+      }
+      ts.forEachChild(node, child => collect(child, tracksGatewayThisHere));
+    }
+    if (member.body) collect(member.body);
+    if (member.initializer) collect(member.initializer);
+    for (const parameter of member.parameters || []) collect(parameter);
+    for (const changes of events.values()) changes.sort((left, right) => left.position - right.position);
+    return { receiverIsGatewayThis, statusAt };
+  }
+
   function isUnshadowedTimerCall(node) {
     if (!ts.isCallExpression(node)) return false;
     const callee = unwrapParentheses(node.expression);
     let timerName;
     let shadowedName;
     if (ts.isIdentifier(callee)) {
+      const importedTimerName = nodeTimersFunctionBinding(lexicalBinding(callee));
+      if (importedTimerName) return true;
       timerName = callee.text;
       shadowedName = timerName;
     } else if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
       const receiver = unwrapParentheses(callee.expression);
-      if (!ts.isIdentifier(receiver) || !['global', 'globalThis'].includes(receiver.text)) return false;
+      if (!ts.isIdentifier(receiver)) return false;
       if (ts.isPropertyAccessExpression(callee)) {
         timerName = callee.name.text;
       } else {
@@ -221,6 +447,8 @@ function classStateInventory(sourceText) {
         if (!property || (!ts.isStringLiteral(property) && !ts.isNoSubstitutionTemplateLiteral(property))) return false;
         timerName = property.text;
       }
+      if (timerApiNames.has(timerName) && nodeTimersNamespaceBinding(lexicalBinding(receiver))) return true;
+      if (!['global', 'globalThis'].includes(receiver.text)) return false;
       shadowedName = receiver.text;
     } else {
       return false;
@@ -237,6 +465,7 @@ function classStateInventory(sourceText) {
       for (const member of node.members) {
 
         const memberName = member.name?.getText(source) || 'unnamed class member';
+        const receiverAliases = receiverAliasEvents(member);
         let accessesSchedulerState = false;
         function scan(bodyNode, tracksGatewayThis = true) {
           const startsDynamicThisScope = ts.isClassDeclaration(bodyNode) || ts.isClassExpression(bodyNode) ||
@@ -247,11 +476,11 @@ function classStateInventory(sourceText) {
           if (isUnshadowedTimerCall(bodyNode) && !timerOwners.includes(memberName)) {
             timerOwners.push(memberName);
           }
-          if (tracksGatewayThisHere && ts.isPropertyAccessExpression(bodyNode) &&
-            ts.isThis(unwrapParentheses(bodyNode.expression)) &&
+          if (ts.isPropertyAccessExpression(bodyNode) &&
+            receiverAliases.receiverIsGatewayThis(bodyNode.expression, tracksGatewayThisHere) &&
             HANDOFF_STATE_FIELDS.has(bodyNode.name.text)) accessesSchedulerState = true;
-          if (tracksGatewayThisHere && ts.isElementAccessExpression(bodyNode) &&
-            ts.isThis(unwrapParentheses(bodyNode.expression))) {
+          if (ts.isElementAccessExpression(bodyNode) &&
+            receiverAliases.receiverIsGatewayThis(bodyNode.expression, tracksGatewayThisHere)) {
             const key = unwrapParentheses(bodyNode.argumentExpression);
             if (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) {
               if (HANDOFF_STATE_FIELDS.has(key.text)) accessesSchedulerState = true;
@@ -259,12 +488,14 @@ function classStateInventory(sourceText) {
               accessesSchedulerState = true;
             }
           }
-          if (tracksGatewayThisHere && ts.isVariableDeclaration(bodyNode) &&
+          if (ts.isVariableDeclaration(bodyNode) &&
             bindingPatternHasSchedulerField(bodyNode.name) &&
-            bodyNode.initializer && ts.isThis(unwrapParentheses(bodyNode.initializer))) accessesSchedulerState = true;
-          if (tracksGatewayThisHere && ts.isBinaryExpression(bodyNode) &&
+            bodyNode.initializer && receiverAliases.receiverIsGatewayThis(bodyNode.initializer, tracksGatewayThisHere)) {
+            accessesSchedulerState = true;
+          }
+          if (ts.isBinaryExpression(bodyNode) &&
             bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-            ts.isThis(unwrapParentheses(bodyNode.right)) &&
+            receiverAliases.receiverIsGatewayThis(bodyNode.right, tracksGatewayThisHere) &&
             assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
 
           ts.forEachChild(bodyNode, child => scan(child, tracksGatewayThisHere));
@@ -272,7 +503,7 @@ function classStateInventory(sourceText) {
         if (member.body) scan(member.body);
         if (member.initializer) scan(member.initializer);
         for (const parameter of member.parameters || []) {
-          if (parameter.initializer && ts.isThis(unwrapParentheses(parameter.initializer)) &&
+          if (parameter.initializer && receiverAliases.receiverIsGatewayThis(parameter.initializer, true) &&
             bindingPatternHasSchedulerField(parameter.name)) {
             accessesSchedulerState = true;
           }
@@ -346,7 +577,8 @@ function exactOwnerContract(sourceOverrides = {}) {
   const deferred = declarations.find(declaration => declaration.name.text === 'scheduleDeferredHandoffRecovery');
   const poll = declarations.find(declaration => declaration.name.text === 'schedulePendingHandoffRecoveryPoll');
   if (poll.parameters.length !== 0 || deferred.parameters.length !== 2) return false;
-  if (!isIdentifier(deferred.parameters[0].name, 'channelId') ||
+  if (!isIdentifier(deferred.parameters[0].name, 'channelId') || deferred.parameters[0].initializer ||
+    deferred.parameters[0].dotDotDotToken ||
     !ts.isObjectBindingPattern(deferred.parameters[1].name) ||
     deferred.parameters[1].name.elements.length !== 1 ||
     deferred.parameters[1].initializer?.kind !== ts.SyntaxKind.ObjectLiteralExpression ||
