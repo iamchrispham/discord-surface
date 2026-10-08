@@ -273,19 +273,22 @@ function createNetworkTrap(f) {
         if (typeof process.execve === 'function' && !(await wrapperHasScope('execve', 'processExecve'))) {
           throw new Error('execve [[Scopes]] did not expose processExecve');
         }
+        const workerData = { transport: 'simulated', workerMarker, attemptMarker };
+        const workerOptions = { eval: true, env: {}, workerData };
         const workerSource = [
           "const fs=require('node:fs');",
-          'fs.writeFileSync(' + JSON.stringify(workerMarker) + ", 'executed');",
-          "const net=require('node:net');",
-          'const deadline=setTimeout(()=>{fs.writeFileSync(' + JSON.stringify(attemptMarker) + ",'deadline');process.exit(124)},1200);",
-          "try{const socket=net.connect(9,'127.0.0.1');",
-          "socket.on('connect',()=>{fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'connected');clearTimeout(deadline);socket.destroy();process.exit(0)});",
-          "socket.on('error',error=>{fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'attempted:'+error.code);clearTimeout(deadline);process.exit(0)})}",
-          "catch(error){fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'attempted:'+error.code);clearTimeout(deadline);process.exit(0)}"
+          "const {workerData}=require('node:worker_threads');",
+          "fs.writeFileSync(workerData.workerMarker,'executed');",
+          "const deadline=setTimeout(()=>{fs.writeFileSync(workerData.attemptMarker,'deadline');process.exit(124)},1200);",
+          "const simulatedTransport={connect(port,host){if(workerData.transport!=='simulated')throw new Error('simulated transport required');const attempt={transport:workerData.transport,operation:'connect',port,host};fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'attempted'}));return{on(event,callback){if(event==='error'){queueMicrotask(()=>{const error=Object.assign(new Error('simulated transport error'),{code:'SIMULATED'});fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'error',code:error.code}));callback(error)})}return this},destroy(){}}}};",
+          "try{const socket=simulatedTransport.connect(9,'127.0.0.1');",
+          "socket.on('connect',()=>{clearTimeout(deadline);socket.destroy();process.exit(0)});",
+          "socket.on('error',error=>{clearTimeout(deadline);process.exit(error.code==='SIMULATED'?0:1)})}",
+          "catch(error){clearTimeout(deadline);process.exit(1)}"
         ].join('');
         const started = await session.post('Runtime.callFunctionOn', {
           objectId: originalWorker.value.objectId,
-          functionDeclaration: 'function(){ return new this(' + JSON.stringify(workerSource) + ', {eval:true, env:{}}); }',
+          functionDeclaration: 'function(){ return new this(' + JSON.stringify(workerSource) + ', ' + JSON.stringify(workerOptions) + '); }',
           returnByValue: false
         });
         if (started.exceptionDetails) throw new Error('Worker construction failed');
@@ -587,7 +590,14 @@ test('public CLI denies inspector access before closure guards and preserves ord
   assert.equal(causalControl.status, 0, causalControl.stderr);
   assert.equal(fs.existsSync(trap.marker), false, 'disabled-guard control unexpectedly refused');
   assert.equal(fs.readFileSync(workerMarker, 'utf8'), 'executed');
-  assert.match(fs.readFileSync(attemptMarker, 'utf8'), /^(attempted:.+|connected)$/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(attemptMarker, 'utf8')), {
+    transport: 'simulated',
+    operation: 'connect',
+    port: 9,
+    host: '127.0.0.1',
+    state: 'error',
+    code: 'SIMULATED'
+  });
   const reachability = JSON.parse(fs.readFileSync(attackReceipt, 'utf8'));
   assert.ok(reachability.filter(site => site.supported !== false).every(site => site.reachable));
   assert.equal(reachability[0].site, 'Worker');
