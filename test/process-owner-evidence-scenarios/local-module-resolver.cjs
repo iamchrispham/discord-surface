@@ -23,7 +23,8 @@ const propertyName = node => {
   return ts.isStringLiteral(argument) || ts.isNumericLiteral(argument) ? argument.text : null;
 };
 
-const isRelative = specifier => specifier.startsWith('./') || specifier.startsWith('../');
+const isRelative = specifier => specifier === '.' || specifier === '..' ||
+  specifier.startsWith('./') || specifier.startsWith('../');
 
 function createLocalModuleResolver(files) {
   const modules = new Map();
@@ -169,6 +170,7 @@ function createLocalModuleResolver(files) {
         }
         return;
       }
+      module.declaredBindings.add(declaration.name.text);
       addBinding(declaration.name.text, declaration);
       if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
       if (isDefault) {
@@ -181,6 +183,7 @@ function createLocalModuleResolver(files) {
         if (exported && isDefault) addDefaultExport(declaration);
         return;
       }
+      module.declaredBindings.add(declaration.name.text);
       addBinding(declaration.name.text, declaration);
       if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
       if (isDefault) addDefaultExport(declaration);
@@ -270,7 +273,7 @@ function createLocalModuleResolver(files) {
         !module.declaredBindings.has('process')) return false;
       return null;
     };
-    const recordAssignment = expression => {
+    const recordAssignment = (expression, includedNames = null) => {
       if (!ts.isBinaryExpression(expression)) return;
       const operator = expression.operatorToken.kind;
       const logicalOperator = [ts.SyntaxKind.QuestionQuestionEqualsToken,
@@ -278,11 +281,41 @@ function createLocalModuleResolver(files) {
       if (operator !== ts.SyntaxKind.EqualsToken && !logicalOperator) return;
       const left = unwrap(expression.left);
       if (ts.isIdentifier(left)) {
+        if (includedNames && !includedNames.has(left.text)) return;
         if (operator === ts.SyntaxKind.QuestionQuestionEqualsToken && staticNullishness(left) === false) return;
         if (operator === ts.SyntaxKind.BarBarEqualsToken && staticTruthiness(left) === true) return;
         if (operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken && staticTruthiness(left) === false) return;
         addBinding(left.text, expression.right);
         recordExportAlias(left.text, expression.right);
+      } else if (ts.isArrayLiteralExpression(left) || ts.isObjectLiteralExpression(left)) {
+        const recordPattern = (pattern, source, property = null) => {
+          const target = unwrap(pattern);
+          if (ts.isIdentifier(target)) {
+            if (includedNames && !includedNames.has(target.text)) return;
+            addBinding(target.text, property === null ? source : { base: source, name: property });
+            return;
+          }
+          if (ts.isArrayLiteralExpression(target) && ts.isArrayLiteralExpression(source)) {
+            for (let index = 0; index < target.elements.length; index += 1) {
+              const element = target.elements[index];
+              const value = source.elements[index];
+              if (!element || !value || ts.isSpreadElement(element) || ts.isSpreadElement(value)) continue;
+              recordPattern(element, source, String(index));
+            }
+            return;
+          }
+          if (!ts.isObjectLiteralExpression(target)) return;
+          for (const element of target.properties) {
+            if (ts.isShorthandPropertyAssignment(element)) {
+              recordPattern(element.name, source, element.name.text);
+            } else if (ts.isPropertyAssignment(element) && element.name) {
+              const name = ts.isIdentifier(element.name) || ts.isStringLiteral(element.name)
+                ? element.name.text : null;
+              if (name !== null) recordPattern(element.initializer, source, name);
+            }
+          }
+        };
+        recordPattern(left, expression.right);
       }
       const name = propertyName(left);
       if (!name || !ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return;
@@ -339,31 +372,89 @@ function createLocalModuleResolver(files) {
         if (propertyName === 'value') addExport(key.text, property.initializer);
       }
     };
+    const recordObjectAssign = expression => {
+      if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression) ||
+        expression.expression.name.text !== 'assign' ||
+        !ts.isIdentifier(expression.expression.expression) || expression.expression.expression.text !== 'Object' ||
+        module.declaredBindings.has('Object')) return;
+      const target = expression.arguments[0];
+      if (!target || !isExportObjectExpression(target)) return;
+      for (const source of expression.arguments.slice(1)) {
+        const object = unwrap(source);
+        if (!ts.isObjectLiteralExpression(object)) continue;
+        for (const property of object.properties) {
+          if (!property.name || (!ts.isPropertyAssignment(property) &&
+            !ts.isShorthandPropertyAssignment(property))) continue;
+          const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+            ts.isNumericLiteral(property.name) ? property.name.text : null;
+          if (name === null) continue;
+          addExport(name, ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer);
+        }
+      }
+    };
+    const scannedCallables = new Set();
     const scanCallableModuleWrites = callable => {
+      if (scannedCallables.has(callable)) return;
+      scannedCallables.add(callable);
+      const hasBindingName = (binding, name) => {
+        if (ts.isIdentifier(binding)) return binding.text === name;
+        if (ts.isObjectBindingPattern(binding) || ts.isArrayBindingPattern(binding)) {
+          return binding.elements.some(element => ts.isBindingElement(element) &&
+            hasBindingName(element.name, name));
+        }
+        return false;
+      };
+      const blockDeclares = (block, name) => block.statements.some(statement => {
+        if (ts.isVariableStatement(statement) &&
+          (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0) {
+          return statement.declarationList.declarations.some(declaration => hasBindingName(declaration.name, name));
+        }
+        return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+          statement.name?.text === name;
+      });
+      const hasVarDeclaration = (functionLike, name) => {
+        let found = false;
+        const visit = child => {
+          if (found || child !== functionLike.body && ts.isFunctionLike(child)) return;
+          if (ts.isVariableDeclaration(child) && hasBindingName(child.name, name) &&
+            (child.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+            found = true;
+            return;
+          }
+          ts.forEachChild(child, visit);
+        };
+        if (functionLike.body) visit(functionLike.body);
+        return found;
+      };
       const hasLocalBinding = (functionLike, assignment, name) => {
-        if (functionLike.parameters?.some(parameter =>
-          ts.isIdentifier(parameter.name) && parameter.name.text === name)) return true;
         let current = assignment.parent;
-        while (current && current !== functionLike) {
-          if (ts.isBlock(current) && current.statements.some(statement => ts.isVariableStatement(statement) &&
-            (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
-            statement.declarationList.declarations.some(declaration =>
-              ts.isIdentifier(declaration.name) && declaration.name.text === name))) return true;
+        while (current && !ts.isSourceFile(current)) {
+          if (ts.isBlock(current) && blockDeclares(current, name)) return true;
+          if ((ts.isForStatement(current) || ts.isForInStatement(current) || ts.isForOfStatement(current)) &&
+            ts.isVariableDeclarationList(current.initializer) &&
+            current.initializer.declarations.some(declaration => hasBindingName(declaration.name, name))) return true;
           if (ts.isCatchClause(current) && current.variableDeclaration &&
-            ts.isIdentifier(current.variableDeclaration.name) && current.variableDeclaration.name.text === name) return true;
+            hasBindingName(current.variableDeclaration.name, name)) return true;
+          if (ts.isFunctionLike(current)) {
+            if (ts.isFunctionExpression(current) && current.name?.text === name || current.parameters?.some(parameter =>
+              hasBindingName(parameter.name, name)) || hasVarDeclaration(current, name)) return true;
+          }
+          if ((ts.isClassDeclaration(current) || ts.isClassExpression(current)) && current.name?.text === name) return true;
           current = current.parent;
         }
-        let hasFunctionScopedDeclaration = false;
-        const inspectDeclarations = child => {
-          if (child !== functionLike.body && ts.isFunctionLike(child)) return;
-          if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name &&
-            (child.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
-            hasFunctionScopedDeclaration = true;
-          }
-          ts.forEachChild(child, inspectDeclarations);
-        };
-        if (functionLike.body) inspectDeclarations(functionLike.body);
-        return hasFunctionScopedDeclaration;
+        return false;
+      };
+      const assignmentNames = pattern => {
+        const target = unwrap(pattern);
+        if (ts.isIdentifier(target)) return [target.text];
+        if (ts.isArrayLiteralExpression(target)) return target.elements.flatMap(element =>
+          ts.isOmittedExpression(element) || ts.isSpreadElement(element) ? [] : assignmentNames(element));
+        if (ts.isObjectLiteralExpression(target)) return target.properties.flatMap(property => {
+          if (ts.isShorthandPropertyAssignment(property)) return [property.name.text];
+          if (ts.isPropertyAssignment(property)) return assignmentNames(property.initializer);
+          return [];
+        });
+        return [];
       };
       const visit = child => {
         if (child !== callable && ts.isFunctionLike(child)) {
@@ -371,9 +462,9 @@ function createLocalModuleResolver(files) {
           return;
         }
         if (ts.isBinaryExpression(child)) {
-          const left = unwrap(child.left);
-          if (ts.isIdentifier(left) && module.declaredBindings.has(left.text) &&
-            !hasLocalBinding(callable, child, left.text)) recordAssignment(child);
+          const names = assignmentNames(child.left).filter(name =>
+            module.declaredBindings.has(name) && !hasLocalBinding(callable, child, name));
+          if (names.length) recordAssignment(child, new Set(names));
         }
         ts.forEachChild(child, visit);
       };
@@ -388,7 +479,10 @@ function createLocalModuleResolver(files) {
         return;
       }
       if (ts.isBinaryExpression(node)) recordAssignment(node);
-      if (ts.isCallExpression(node)) recordDefineProperty(node);
+      if (ts.isCallExpression(node)) {
+        recordDefineProperty(node);
+        recordObjectAssign(node);
+      }
       ts.forEachChild(node, scanModuleLevel);
     };
 
@@ -443,6 +537,11 @@ function createLocalModuleResolver(files) {
       if (ts.isExpressionStatement(statement)) {
         const expression = unwrap(statement.expression);
         if (ts.isBinaryExpression(expression)) recordExportExpression(expression);
+      }
+    }
+    for (const statement of sourceFile.statements) {
+      if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) {
+        scanCallableModuleWrites(statement);
       }
     }
     scanModuleLevel(sourceFile);
@@ -605,20 +704,83 @@ function createLocalModuleResolver(files) {
     return result;
   };
 
-  const callableParameterBindings = (callable, argumentsList, callerPath) => {
+  const undefinedState = (expression, currentPath, visited = new Set()) => {
+    const node = unwrap(expression);
+    if (!node || visited.has(node)) return null;
+    const seen = new Set(visited).add(node);
+    if (ts.isVoidExpression(node)) return true;
+    if (ts.isIdentifier(node)) {
+      const module = currentPath && scanModule(currentPath);
+      if (node.text === 'undefined' && !module?.declaredBindings.has(node.text)) return true;
+      const bindings = module?.bindings.get(node.text) || [];
+      if (!bindings.length) return module?.declaredBindings.has(node.text) ? true : null;
+      const states = bindings.map(binding => undefinedState(binding, currentPath, seen));
+      if (states.every(state => state === true)) return true;
+      if (states.every(state => state === false)) return false;
+      return null;
+    }
+    if (ts.isConditionalExpression(node)) {
+      const branches = [undefinedState(node.whenTrue, currentPath, seen),
+        undefinedState(node.whenFalse, currentPath, seen)];
+      if (branches.every(state => state === true)) return true;
+      if (branches.every(state => state === false)) return false;
+      return null;
+    }
+    if (node.kind === ts.SyntaxKind.NullKeyword || ts.isNumericLiteral(node) ||
+      ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isObjectLiteralExpression(node) ||
+      ts.isArrayLiteralExpression(node) || ts.isClassExpression(node) || ts.isNewExpression(node)) return false;
+    return null;
+  };
+  const mayBeUndefined = (expression, currentPath, property = null, visited = new Set()) => {
+    const node = unwrap(expression);
+    if (!node || visited.has(node)) return true;
+    const seen = new Set(visited).add(node);
+    if (property !== null) {
+      if (ts.isObjectLiteralExpression(node)) {
+        for (const element of node.properties) {
+          if (ts.isSpreadAssignment(element)) return true;
+          if (!element.name || (!ts.isPropertyAssignment(element) &&
+            !ts.isShorthandPropertyAssignment(element))) continue;
+          const name = ts.isIdentifier(element.name) || ts.isStringLiteral(element.name)
+            ? element.name.text : null;
+          if (name !== property) continue;
+          const value = ts.isShorthandPropertyAssignment(element) ? element.name : element.initializer;
+          return undefinedState(value, currentPath) !== false;
+        }
+        return true;
+      }
+      if (ts.isArrayLiteralExpression(node)) {
+        const index = Number(property);
+        const element = Number.isInteger(index) && index >= 0 ? node.elements[index] : undefined;
+        return !element || ts.isSpreadElement(element) || undefinedState(element, currentPath) !== false;
+      }
+      if (ts.isIdentifier(node)) {
+        const module = currentPath && scanModule(currentPath);
+        const bindings = module?.bindings.get(node.text) || [];
+        return !bindings.length || bindings.some(binding => mayBeUndefined(binding, currentPath, property, seen));
+      }
+      return true;
+    }
+    return undefinedState(node, currentPath) !== false;
+  };
+
+  const callableParameterBindings = (callable, argumentsList, callerPath, callablePath = callerPath) => {
     const bindings = new Map();
     for (let index = 0; index < (callable.parameters || []).length; index += 1) {
       const parameter = callable.parameters[index];
       const suppliedArgument = argumentsList === null ? undefined : argumentsList?.[index];
-      const suppliedNode = unwrap(suppliedArgument);
-      const explicitUndefined = Boolean(suppliedNode) &&
-        (ts.isIdentifier(suppliedNode) && suppliedNode.text === 'undefined' ||
-          ts.isVoidExpression(suppliedNode) && ts.isNumericLiteral(unwrap(suppliedNode.expression)) &&
-          Number(unwrap(suppliedNode.expression).text) === 0);
-      const argument = suppliedArgument === undefined || explicitUndefined ? parameter.initializer : suppliedArgument;
-      if (!argument) continue;
+      const explicitUndefined = suppliedArgument !== undefined &&
+        undefinedState(suppliedArgument, callerPath) === true;
+      const argument = suppliedArgument === undefined || explicitUndefined
+        ? parameter.initializer : suppliedArgument;
+      const argumentPath = suppliedArgument === undefined || explicitUndefined ? callablePath : callerPath;
+      const fallback = suppliedArgument !== undefined && !explicitUndefined && parameter.initializer &&
+        mayBeUndefined(suppliedArgument, callerPath) ? parameter.initializer : null;
+      if (!argument && !ts.isObjectBindingPattern(parameter.name) && !ts.isArrayBindingPattern(parameter.name)) continue;
       if (ts.isIdentifier(parameter.name)) {
-        bindings.set(parameter.name.text, { expression: argument, currentPath: callerPath });
+        bindings.set(parameter.name.text, { expression: argument, currentPath: argumentPath,
+          fallback, fallbackPath: callablePath });
         continue;
       }
       if (ts.isObjectBindingPattern(parameter.name)) {
@@ -626,7 +788,25 @@ function createLocalModuleResolver(files) {
           if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
           const property = element.propertyName && (ts.isIdentifier(element.propertyName) ||
             ts.isStringLiteral(element.propertyName)) ? element.propertyName.text : element.name.text;
-          bindings.set(element.name.text, { expression: argument, name: property, currentPath: callerPath });
+          const usesParameterDefault = fallback && mayBeUndefined(argument, argumentPath, property);
+          const usesElementDefault = element.initializer && mayBeUndefined(argument, argumentPath, property);
+          bindings.set(element.name.text, { expression: argument, name: property, currentPath: argumentPath,
+            parameterFallback: usesParameterDefault ? fallback : null,
+            parameterFallbackPath: callablePath,
+            fallback: usesElementDefault ? element.initializer : null, fallbackPath: callablePath });
+        }
+      }
+      if (ts.isArrayBindingPattern(parameter.name)) {
+        for (let elementIndex = 0; elementIndex < parameter.name.elements.length; elementIndex += 1) {
+          const element = parameter.name.elements[elementIndex];
+          if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+          const property = String(elementIndex);
+          const usesParameterDefault = fallback && mayBeUndefined(argument, argumentPath, property);
+          const usesElementDefault = element.initializer && mayBeUndefined(argument, argumentPath, property);
+          bindings.set(element.name.text, { expression: argument, name: property, currentPath: argumentPath,
+            parameterFallback: usesParameterDefault ? fallback : null,
+            parameterFallbackPath: callablePath,
+            fallback: usesElementDefault ? element.initializer : null, fallbackPath: callablePath });
         }
       }
     }
@@ -634,6 +814,66 @@ function createLocalModuleResolver(files) {
   };
 
   const localBindingSources = (node, name) => {
+    const hasBindingName = binding => {
+      if (ts.isIdentifier(binding)) return binding.text === name;
+      if (ts.isObjectBindingPattern(binding) || ts.isArrayBindingPattern(binding)) {
+        return binding.elements.some(element => ts.isBindingElement(element) && hasBindingName(element.name));
+      }
+      return false;
+    };
+    const blockDeclares = block => block.statements.some(statement => {
+      if (ts.isVariableStatement(statement) &&
+        (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0) {
+        return statement.declarationList.declarations.some(declaration => hasBindingName(declaration.name));
+      }
+      return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+        statement.name?.text === name;
+    });
+    const loopDeclares = statement =>
+      (ts.isForStatement(statement) || ts.isForInStatement(statement) || ts.isForOfStatement(statement)) &&
+      statement.initializer && ts.isVariableDeclarationList(statement.initializer) &&
+      statement.initializer.declarations.some(declaration => hasBindingName(declaration.name));
+    const callableShadows = callable => {
+      if (ts.isFunctionExpression(callable) && callable.name?.text === name ||
+        callable.parameters?.some(parameter => hasBindingName(parameter.name))) return true;
+      let found = false;
+      const inspect = child => {
+        if (found || child !== callable.body && ts.isFunctionLike(child)) return;
+        if (ts.isVariableDeclaration(child) && hasBindingName(child.name) &&
+          (child.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(child, inspect);
+      };
+      if (callable.body) inspect(callable.body);
+      return found;
+    };
+    const callableName = callable => {
+      if (ts.isFunctionDeclaration(callable)) return callable.name?.text || null;
+      if (ts.isFunctionExpression(callable) && callable.name) return callable.name.text;
+      const declaration = callable.parent;
+      return ts.isVariableDeclaration(declaration) && ts.isIdentifier(declaration.name)
+        ? declaration.name.text : null;
+    };
+    const calledBeforeUse = callable => {
+      if (ts.isCallExpression(callable.parent) && callable.parent.expression === callable &&
+        callable.parent.end <= node.pos) return true;
+      const name = callableName(callable);
+      if (!name || !functionScope.body) return false;
+      let found = false;
+      const inspect = child => {
+        if (found || child !== functionScope.body && ts.isFunctionLike(child)) return;
+        if (ts.isCallExpression(child) && ts.isIdentifier(child.expression) &&
+          child.expression.text === name && child.end <= node.pos) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(child, inspect);
+      };
+      inspect(functionScope.body);
+      return found;
+    };
     let current = node.parent;
     let functionScope = null;
     while (current && !ts.isSourceFile(current)) {
@@ -655,16 +895,15 @@ function createLocalModuleResolver(files) {
       const sources = [];
       let found = false;
       const collect = child => {
-        if (child !== scope && (ts.isFunctionLike(child) ||
-          ts.isClassDeclaration(child) || ts.isClassExpression(child))) return;
-        if (child !== scope && ts.isBlock(child)) {
-          const shadowsBinding = child.statements.some(statement => ts.isVariableStatement(statement) &&
-            (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
-            statement.declarationList.declarations.some(declaration =>
-              ts.isIdentifier(declaration.name) && declaration.name.text === name));
-          if (shadowsBinding) return;
+        if (child !== scope && ts.isFunctionLike(child) &&
+          (callableShadows(child) || !calledBeforeUse(child))) return;
+        if (child !== scope && (ts.isClassDeclaration(child) || ts.isClassExpression(child))) return;
+        if (child !== scope && (ts.isBlock(child) && blockDeclares(child) ||
+          ts.isCatchClause(child) && child.variableDeclaration && hasBindingName(child.variableDeclaration.name) ||
+          loopDeclares(child))) {
+          return;
         }
-        if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name) {
+        if (ts.isVariableDeclaration(child) && hasBindingName(child.name)) {
           found = true;
           if (child.initializer) sources.push(child.initializer);
         }
@@ -682,7 +921,7 @@ function createLocalModuleResolver(files) {
       collect(scope);
       if (scope === functionScope.body) {
         for (const parameter of functionScope.parameters || []) {
-          if (!ts.isIdentifier(parameter.name) || parameter.name.text !== name) continue;
+          if (!hasBindingName(parameter.name)) continue;
           found = true;
           if (parameter.initializer) sources.push(parameter.initializer);
         }
@@ -724,10 +963,25 @@ function createLocalModuleResolver(files) {
     if (ts.isIdentifier(node)) {
       const parameter = parameterBindings.get(node.text);
       if (parameter) {
+        const result = new Set();
         if (parameter.name) {
-          return evaluateProperty(parameter.expression, parameter.name, parameter.currentPath, seen, bindingOverrides);
+          for (const atom of evaluateProperty(parameter.expression, parameter.name, parameter.currentPath,
+            seen, bindingOverrides)) result.add(atom);
+          if (parameter.parameterFallback) {
+            for (const atom of evaluateProperty(parameter.parameterFallback, parameter.name,
+              parameter.parameterFallbackPath, seen, bindingOverrides)) result.add(atom);
+          }
+        } else {
+          for (const atom of evaluate(parameter.expression, parameter.currentPath, seen,
+            parameter.bindings || new Map(), bindingOverrides)) result.add(atom);
         }
-        return evaluate(parameter.expression, parameter.currentPath, seen, parameter.bindings || new Map(), bindingOverrides);
+        if (parameter.fallback) {
+          for (const atom of evaluate(parameter.fallback, parameter.fallbackPath || currentPath,
+            seen, parameterBindings, bindingOverrides)) {
+            result.add(atom);
+          }
+        }
+        return result;
       }
       const localBinding = localBindingSources(node, node.text);
       if (localBinding) {
@@ -788,7 +1042,7 @@ function createLocalModuleResolver(files) {
         }
         if (!atom || !atom.callable) continue;
         const callablePath = atom.modulePath || currentPath;
-        const nestedBindings = callableParameterBindings(atom.callable, node.arguments || [], currentPath);
+        const nestedBindings = callableParameterBindings(atom.callable, node.arguments || [], currentPath, callablePath);
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
           for (const returnAtom of evaluate(returnExpression, callablePath, seen, nestedBindings)) result.add(returnAtom);
         }
@@ -959,7 +1213,7 @@ function createLocalModuleResolver(files) {
       for (const atom of atoms || []) {
         if (!atom || !atom.callable) continue;
         const callablePath = atom.modulePath || callerPath;
-        const parameterBindings = callableParameterBindings(atom.callable, argumentsList, callerPath);
+        const parameterBindings = callableParameterBindings(atom.callable, argumentsList, callerPath, callablePath);
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
           for (const returnAtom of evaluate(returnExpression, callablePath, visited, parameterBindings)) result.add(returnAtom);
         }
