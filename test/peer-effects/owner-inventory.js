@@ -64,118 +64,172 @@ function enclosingOwner(node) {
 
 function callSites(sourceFile) {
   const sites = [];
-  const scopes = [new Map()];
-
-  const declare = (name, canonical = null, tracked = false) => {
-    scopes[scopes.length - 1].set(name, { canonical, tracked });
+  const sourcePath = path.resolve(sourceFile.fileName);
+  const compilerOptions = {
+    allowJs: true,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest
   };
-  const lookup = name => {
-    for (let index = scopes.length - 1; index >= 0; index -= 1) {
-      const binding = scopes[index].get(name);
-      if (binding) return binding;
+  const host = ts.createCompilerHost(compilerOptions);
+  const defaultGetSourceFile = host.getSourceFile.bind(host);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    path.resolve(fileName) === sourcePath
+      ? sourceFile
+      : defaultGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  host.fileExists = fileName => path.resolve(fileName) === sourcePath;
+  host.readFile = fileName => path.resolve(fileName) === sourcePath ? sourceFile.text : undefined;
+  const program = ts.createProgram([sourcePath], compilerOptions, host);
+  const checker = program.getTypeChecker();
+  const symbolAt = node => {
+    if (!node) return null;
+    if (ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node) {
+      return checker.getShorthandAssignmentValueSymbol(node.parent);
     }
-    return null;
+    return checker.getSymbolAtLocation(node);
   };
-  const canonicalForExpression = expression => {
+  const bindingHistoryBySymbol = new Map();
+  const recordBinding = (identifier, position, expression = null, canonical = null) => {
+    const symbol = symbolAt(identifier);
+    if (!symbol) return;
+    const entries = bindingHistoryBySymbol.get(symbol) || [];
+    entries.push({ position, expression, canonical, tracked: Boolean(expression || canonical) });
+    entries.sort((left, right) => left.position - right.position);
+    bindingHistoryBySymbol.set(symbol, entries);
+  };
+  const bindingAt = (identifier, position) => {
+    let binding = null;
+    for (const candidate of bindingHistoryBySymbol.get(symbolAt(identifier)) || []) {
+      if (candidate.position < position) binding = candidate;
+    }
+    return binding;
+  };
+  const collectBindings = node => {
+    if (ts.isImportSpecifier(node)) {
+      recordBinding(node.name, -Infinity, null, (node.propertyName || node.name).text);
+    } else if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && ts.isIdentifier(node.name)) {
+      recordBinding(node.name, node.getStart(sourceFile), node.initializer || null);
+    } else if (ts.isBindingElement(node) && ts.isIdentifier(node.name)) {
+      const property = node.propertyName || node.name;
+      recordBinding(node.name, node.getStart(sourceFile), node.initializer || null,
+        ts.isIdentifier(property) ? property.text : null);
+    } else if (ts.isFunctionDeclaration(node) && node.name) {
+      recordBinding(node.name, -Infinity);
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left)) {
+      recordBinding(node.left, node.getStart(sourceFile), node.right);
+    }
+    ts.forEachChild(node, collectBindings);
+  };
+  collectBindings(sourceFile);
+
+  const canonicalForExpression = (expression, position = expression?.getStart(sourceFile), resolving = new Set()) => {
     if (!expression) return null;
-    if (ts.isIdentifier(expression)) return lookup(expression.text)?.canonical ?? expression.text;
+    if (ts.isIdentifier(expression)) {
+      const symbol = symbolAt(expression);
+      if (!symbol || !symbol.declarations?.length) return expression.text;
+      const binding = bindingAt(expression, position);
+      if (!binding || resolving.has(binding)) return null;
+      if (!binding.expression) return binding.canonical;
+      const next = new Set(resolving);
+      next.add(binding);
+      return canonicalForExpression(binding.expression, binding.position, next);
+    }
     if (ts.isPropertyAccessExpression(expression)) {
-      const object = canonicalForExpression(expression.expression);
+      const object = canonicalForExpression(expression.expression, position, resolving);
       return object ? `${object}.${expression.name.text}` : null;
     }
     if (ts.isElementAccessExpression(expression)) {
-      const object = canonicalForExpression(expression.expression);
+      const object = canonicalForExpression(expression.expression, position, resolving);
       const argument = expression.argumentExpression;
       if (object === 'globalThis' && argument && ts.isStringLiteral(argument)) return argument.text;
       return null;
     }
     return null;
   };
-  const aliasValue = expression => {
-    if (!expression) return { canonical: null, tracked: false };
-    if (ts.isIdentifier(expression)) {
-      const binding = lookup(expression.text);
-      return { canonical: binding?.canonical ?? expression.text, tracked: true };
+  const objectHistoryBySymbol = new Map();
+  const objectHistoryAt = (symbol, position) => {
+    let history = null;
+    for (const candidate of objectHistoryBySymbol.get(symbol) || []) {
+      if (candidate.position < position) history = candidate.history;
     }
-    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
-      return { canonical: canonicalForExpression(expression), tracked: true };
-    }
-    return { canonical: null, tracked: false };
+    return history;
   };
-  const declarePattern = (pattern, value = null) => {
-    if (ts.isIdentifier(pattern)) {
-      declare(pattern.text, value?.canonical ?? null, value?.tracked ?? false);
-      return;
+  const associateObjectHistory = (symbol, position, history) => {
+    if (!symbol || !history) return;
+    const entries = objectHistoryBySymbol.get(symbol) || [];
+    entries.push({ position, history });
+    entries.sort((left, right) => left.position - right.position);
+    objectHistoryBySymbol.set(symbol, entries);
+  };
+  const objectPropertiesAt = (history, position) => {
+    let properties = null;
+    for (const candidate of history?.entries || []) {
+      if (candidate.position < position) properties = candidate.properties;
     }
-    if (ts.isObjectBindingPattern(pattern)) {
-      for (const element of pattern.elements) {
-        if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-        const property = element.propertyName || element.name;
-        declare(element.name.text, ts.isIdentifier(property) ? property.text : null, true);
+    return properties;
+  };
+  const recordObjectProperties = (history, position, properties) => {
+    if (!history) return;
+    history.entries.push({ position, properties });
+    history.entries.sort((left, right) => left.position - right.position);
+  };
+  const objectPropertyAt = (receiver, property, position) => {
+    const history = objectHistoryAt(symbolAt(receiver), position);
+    return objectPropertiesAt(history, position)?.get(property) || null;
+  };
+  const collectObjectLiterals = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+        node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+      const properties = new Map();
+      for (const property of node.initializer.properties) {
+        if (ts.isPropertyAssignment(property)) {
+          const propertyName = property.name && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name))
+            ? property.name.text
+            : null;
+          if (propertyName) properties.set(propertyName, property.initializer);
+        } else if (ts.isShorthandPropertyAssignment(property)) {
+          properties.set(property.name.text, property.name);
+        }
+      }
+      const history = { entries: [] };
+      recordObjectProperties(history, node.getStart(sourceFile), properties);
+      associateObjectHistory(symbolAt(node.name), node.getStart(sourceFile), history);
+    }
+    ts.forEachChild(node, collectObjectLiterals);
+  };
+  const collectObjectAliases = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+        node.initializer && ts.isIdentifier(node.initializer)) {
+      const history = objectHistoryAt(symbolAt(node.initializer), node.getStart(sourceFile));
+      associateObjectHistory(symbolAt(node.name), node.getStart(sourceFile), history);
+    }
+    ts.forEachChild(node, collectObjectAliases);
+  };
+  const collectObjectPropertyWrites = node => {
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
+      const receiver = node.left.expression;
+      const argument = ts.isElementAccessExpression(node.left) ? node.left.argumentExpression : null;
+      const property = ts.isPropertyAccessExpression(node.left)
+        ? node.left.name.text
+        : argument && ts.isStringLiteral(argument) ? argument.text : null;
+      if (ts.isIdentifier(receiver) && property) {
+        const history = objectHistoryAt(symbolAt(receiver), node.getStart(sourceFile));
+        const previous = objectPropertiesAt(history, node.getStart(sourceFile));
+        if (previous) {
+          const properties = new Map(previous);
+          properties.set(property, node.right);
+          recordObjectProperties(history, node.getStart(sourceFile), properties);
+        }
       }
     }
+    ts.forEachChild(node, collectObjectPropertyWrites);
   };
-  const visitParameters = parameters => {
-    for (const parameter of parameters) declarePattern(parameter.name);
-  };
-  const objectPropertyInitializers = new Map();
+  collectObjectLiterals(sourceFile);
+  collectObjectAliases(sourceFile);
+  collectObjectPropertyWrites(sourceFile);
   const visit = node => {
-    if (ts.isImportDeclaration(node) && node.importClause?.namedBindings &&
-        ts.isNamedImports(node.importClause.namedBindings)) {
-      for (const element of node.importClause.namedBindings.elements) {
-        declare(element.name.text, (element.propertyName || element.name).text, true);
-      }
-      return;
-    }
-    if (ts.isVariableDeclaration(node)) {
-      let value = null;
-      if (node.initializer &&
-          ts.isCallExpression(node.initializer) &&
-          ts.isIdentifier(node.initializer.expression) &&
-          node.initializer.expression.text === 'require' &&
-          ts.isObjectBindingPattern(node.name) &&
-          node.initializer.arguments[0] && ts.isStringLiteral(node.initializer.arguments[0])) {
-        value = { canonical: null, tracked: true };
-        for (const element of node.name.elements) {
-          if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-          const property = element.propertyName || element.name;
-          declare(element.name.text, ts.isIdentifier(property) ? property.text : null, true);
-        }
-      } else {
-        value = aliasValue(node.initializer);
-        declarePattern(node.name, value);
-      }
-      if (node.initializer) visit(node.initializer);
-      return;
-    }
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      if (ts.isIdentifier(node.left)) {
-        const value = aliasValue(node.right);
-        const binding = lookup(node.left.text);
-        if (binding) {
-          binding.canonical = value.canonical;
-          binding.tracked = value.tracked;
-        } else {
-          declare(node.left.text, value.canonical, value.tracked);
-        }
-      }
-      visit(node.right);
-      return;
-    }
-    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
-      if (ts.isFunctionDeclaration(node) && node.name) declare(node.name.text, null, false);
-      scopes.push(new Map());
-      visitParameters(node.parameters);
-      if (node.body) visit(node.body);
-      scopes.pop();
-      return;
-    }
-    if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) {
-      scopes.push(new Map());
-      for (const statement of node.statements) visit(statement);
-      scopes.pop();
-      return;
-    }
     if (ts.isCallExpression(node)) {
       const expression = node.expression;
       let canonical = null;
@@ -183,8 +237,8 @@ function callSites(sourceFile) {
       let indirect = false;
       if (ts.isIdentifier(expression)) {
         name = expression.text;
-        const binding = lookup(name);
-        canonical = binding ? binding.canonical : name;
+        const binding = bindingAt(expression, node.getStart(sourceFile));
+        canonical = canonicalForExpression(expression);
         indirect = Boolean(binding?.tracked);
       } else if (ts.isPropertyAccessExpression(expression)) {
         name = expression.name.text;
@@ -193,13 +247,9 @@ function callSites(sourceFile) {
           indirect = true;
         } else {
           const receiver = expression.expression;
-          const candidates = ts.isIdentifier(receiver) ? objectPropertyInitializers.get(receiver.text) : null;
-          let initializer = null;
-          if (candidates) {
-            for (const candidate of candidates) {
-              if (candidate.position < node.getStart(sourceFile)) initializer = candidate.properties.get(name) || null;
-            }
-          }
+          const initializer = ts.isIdentifier(receiver)
+            ? objectPropertyAt(receiver, name, node.getStart(sourceFile))
+            : null;
           if (initializer && ts.isIdentifier(initializer)) {
             canonical = canonicalForExpression(initializer);
             indirect = true;
@@ -208,9 +258,21 @@ function callSites(sourceFile) {
           }
         }
       } else if (ts.isElementAccessExpression(expression)) {
-        indirect = true;
-        name = expression.getText(sourceFile);
-        canonical = canonicalForExpression(expression);
+        const receiver = expression.expression;
+        const argument = expression.argumentExpression;
+        const property = argument && ts.isStringLiteral(argument) ? argument.text : null;
+        const initializer = property && ts.isIdentifier(receiver)
+          ? objectPropertyAt(receiver, property, node.getStart(sourceFile))
+          : null;
+        if (initializer && ts.isIdentifier(initializer)) {
+          name = property;
+          canonical = canonicalForExpression(initializer);
+          indirect = true;
+        } else {
+          indirect = true;
+          name = expression.getText(sourceFile);
+          canonical = canonicalForExpression(expression);
+        }
       }
       if (name) {
         sites.push({
@@ -225,37 +287,6 @@ function callSites(sourceFile) {
     ts.forEachChild(node, visit);
   };
 
-  const collectObjectPropertyInitializers = node => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
-      const properties = new Map();
-      for (const property of node.initializer.properties) {
-        if (ts.isPropertyAssignment(property)) {
-          const propertyName = property.name && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name))
-            ? property.name.text
-            : null;
-          if (propertyName) properties.set(propertyName, property.initializer);
-        } else if (ts.isShorthandPropertyAssignment(property)) {
-          properties.set(property.name.text, property.name);
-        }
-      }
-      const entries = objectPropertyInitializers.get(node.name.text) || [];
-      entries.push({ position: node.getStart(sourceFile), properties });
-      objectPropertyInitializers.set(node.name.text, entries);
-    }
-    ts.forEachChild(node, collectObjectPropertyInitializers);
-  };
-  collectObjectPropertyInitializers(sourceFile);
-
-  // Imports are hoisted, so aliases used by earlier-looking declarations still
-  // resolve to their lexical binding rather than to a name-global map.
-  for (const statement of sourceFile.statements) {
-    if (ts.isImportDeclaration(statement) && statement.importClause?.namedBindings &&
-        ts.isNamedImports(statement.importClause.namedBindings)) {
-      for (const element of statement.importClause.namedBindings.elements) {
-        declare(element.name.text, (element.propertyName || element.name).text, true);
-      }
-    }
-  }
   for (const statement of sourceFile.statements) visit(statement);
   return sites;
 }

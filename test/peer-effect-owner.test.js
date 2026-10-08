@@ -489,6 +489,10 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
 
   const ordinaryAlias = { ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\nconst ordinarySource = JSON.stringify; const ordinaryAlias = ordinarySource; ordinaryAlias({});\n` };
   assert.deepEqual(ownerViolations(ordinaryAlias), [], 'ordinary local aliases are not transport effects');
+  const ordinaryObjectAlias = { ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\nconst ordinaryTransport = { send: JSON.stringify }; const ordinaryAlias = ordinaryTransport; ordinaryAlias.send({});\n` };
+  assert.deepEqual(ownerViolations(ordinaryObjectAlias), [], 'ordinary object methods are not transport effects');
+  const ordinaryObjectShadow = { ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\nconst transportShadow = { send: JSON.stringify }; { const transportShadow = { send: JSON.stringify }; transportShadow.send({}); } transportShadow.send({});\n` };
+  assert.deepEqual(ownerViolations(ordinaryObjectShadow), [], 'same-name ordinary object shadows are not transport effects');
 
   const mutants = [
     ['second fetch inside channel loader', 'src/peer/server.js',
@@ -535,7 +539,19 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
       "      loadChannels: async signal => { await fetch.call(globalThis, 'https://example.invalid/extra');"],
     ['aliased extra send', 'src/direct-post.ts',
       'const sent = await sendDiscordMessage({',
-      "const send = sendDiscordMessage; await send({});\n      const sent = await sendDiscordMessage({"]
+      "const send = sendDiscordMessage; await send({});\n      const sent = await sendDiscordMessage({"],
+    ['object receiver alias extra send', 'src/direct-post.ts',
+      'const sent = await sendDiscordMessage({',
+      'const transport = { send: sendDiscordMessage }; const t = transport; await t.send({});\n      const sent = await sendDiscordMessage({'],
+    ['assigned object transport extra send', 'src/direct-post.ts',
+      'const sent = await sendDiscordMessage({',
+      'const transport = {}; transport.send = sendDiscordMessage; await transport.send({});\n      const sent = await sendDiscordMessage({'],
+    ['computed object transport extra send', 'src/direct-post.ts',
+      'const sent = await sendDiscordMessage({',
+      'const transport = { send: sendDiscordMessage }; await transport["send"]({});\n      const sent = await sendDiscordMessage({'],
+    ['nested same-name object shadow extra send', 'src/direct-post.ts',
+      'const sent = await sendDiscordMessage({',
+      'const transportShadow = { send: sendDiscordMessage }; { const transportShadow = { send: JSON.stringify }; transportShadow.send({}); } transportShadow.send({});\n      const sent = await sendDiscordMessage({']
   ];
   const results = [];
   for (const [name, file, needle, replacement] of mutants) {
@@ -562,6 +578,49 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
       `Issue 131 owner mutant results\n\n${results.join('\n')}\n\nregistration: both suites appear once in package.json scripts.test\n`);
   } finally {
     if (!configuredScratch) fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('stored transport property values retain their defining lexical bindings', () => {
+  const sources = realSources();
+  assert.deepEqual(ownerViolations(sources), []);
+  const cases = [
+    ['dot initializer shadow', 'const transport = { send: sendDiscordMessage }; { const sendDiscordMessage = JSON.stringify; transport.send({}); }', true],
+    ['bracket initializer shadow', 'const transport = { send: sendDiscordMessage }; { const sendDiscordMessage = JSON.stringify; transport["send"]({}); }', true],
+    ['aliased initializer shadow', 'const transport = { send: sendDiscordMessage }; const alias = transport; { const sendDiscordMessage = JSON.stringify; alias.send({}); }', true],
+    ['assigned initializer shadow', 'const transport = {}; transport.send = sendDiscordMessage; { const sendDiscordMessage = JSON.stringify; transport.send({}); }', true],
+    ['captured transport before reassignment', 'let helper = sendDiscordMessage; const transport = { send: helper }; helper = JSON.stringify; transport.send({});', true],
+    ['ordinary inner helper', '{ const sendDiscordMessage = JSON.stringify; const transport = { send: sendDiscordMessage }; transport.send({}); }', false],
+    ['captured ordinary helper before reassignment', 'let helper = JSON.stringify; const transport = { send: helper }; helper = sendDiscordMessage; transport.send({});', false],
+    ['var receiver remains function scoped', 'function extra() { var transport = { send: JSON.stringify }; { var transport = { send: sendDiscordMessage }; } transport.send({}); }', true],
+    ['ordinary var receiver remains function scoped', 'function extra() { var transport = { send: sendDiscordMessage }; { var transport = { send: JSON.stringify }; } transport.send({}); }', false]
+  ];
+  for (const [name, snippet, refused] of cases) {
+    const violations = ownerViolations({
+      ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\n${snippet}\n`
+    });
+    if (refused) assert.notDeepEqual(violations, [], name);
+    else assert.deepEqual(violations, [], name);
+  }
+});
+
+test('transport inventory visits function, arrow and binding parameter defaults', () => {
+  const sources = realSources();
+  assert.deepEqual(ownerViolations(sources), []);
+  const cases = [
+    ['function default', 'const transport = { send: sendDiscordMessage }; function extra(value = transport.send({})) {}', true],
+    ['arrow default', 'const transport = { send: sendDiscordMessage }; const extra = (value = transport["send"]({})) => {};', true],
+    ['binding default', 'const transport = { send: sendDiscordMessage }; function extra({ value = transport.send({}) } = {}) {}', true],
+    ['nested binding default', 'const transport = { send: sendDiscordMessage }; const extra = ({ nested: { value = transport.send({}) } = {} } = {}) => {};', true],
+    ['ordinary function default', 'const transport = { send: JSON.stringify }; function extra(value = transport.send({})) {}', false],
+    ['ordinary parameter helper shadow', 'function extra(sendDiscordMessage = JSON.stringify, value = sendDiscordMessage({})) {}', false]
+  ];
+  for (const [name, snippet, refused] of cases) {
+    const violations = ownerViolations({
+      ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\n${snippet}\n`
+    });
+    if (refused) assert.notDeepEqual(violations, [], name);
+    else assert.deepEqual(violations, [], name);
   }
 });
 
