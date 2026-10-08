@@ -642,3 +642,71 @@ test('imported calls receiving probe-bearing arguments are refused', () => {
 test('arithmetic signal assignments are refused when their result is unresolved', () => {
   expectUnsupported({ 'use.js': 'let signal = 1; signal -= 1; process.kill(pid, signal);' });
 });
+
+test('conditional process probe aliases honor statically known branches', () => {
+  expectOrdinary({
+    'use.js': 'const ordinary = () => true; const probe = true ? ordinary : process.kill; probe(1, 0);'
+  });
+  expectOrdinary({
+    'use.js': 'const ordinary = () => true; const probe = false ? process.kill : ordinary; probe(1, 0);'
+  });
+  expectOrdinary({
+    'use.js': 'const enabled = false; const ordinary = () => true; const probe = enabled ? process.kill : ordinary; probe(1, 0);'
+  });
+  expectProbe({
+    'use.js': 'const probe = unresolved ? ordinary : process.kill; probe(1, 0);'
+  });
+});
+
+test('assignment destructuring defaults resolve only when applied', () => {
+  expectProbe({
+    'use.js': 'let probe; ({ probe = process.kill } = {}); probe(1, 0);'
+  });
+  expectProbe({
+    'use.js': 'let probe; ({ probe = process.kill } = { probe: undefined }); probe(1, 0);'
+  });
+  expectOrdinary({
+    'use.js': 'let probe; ({ probe = process.kill } = { probe: () => true }); probe(1, 0);'
+  });
+  expectProbe({
+    'use.js': 'let probe; ([probe = process.kill] = []); probe(1, 0);'
+  });
+});
+
+test('constructed instances include inherited base constructors', () => {
+  expectProbe({
+    'use.js': 'class Base { constructor() { this.probe = process.kill; } } class Child extends Base {} new Child().probe(1, 0);'
+  });
+});
+
+test('dynamic process imports retain default process identity', () => {
+  expectProbe({
+    'use.js': "void (async pid => { (await import('node:process')).default.kill(pid, 0); })(1);"
+  });
+});
+
+test('Object.freeze preserves probe-bearing object values', () => {
+  expectProbe({
+    'use.js': 'const deps = Object.freeze({ probe: process.kill }); deps.probe(1, 0);'
+  });
+  expectProbe({
+    'use.js': 'const values = { probe: process.kill }; const deps = Object.freeze(values); deps.probe(1, 0);'
+  });
+  expectOrdinary({
+    'use.js': 'const Object = { freeze: value => ({ probe: () => true }) }; const deps = Object.freeze({ probe: process.kill }); deps.probe(1, 0);'
+  });
+});
+
+test('CommonJS .js top-level this resolves to module.exports', () => {
+  expectProbe({
+    'producer.js': "'use strict'; this.probe = process.kill;",
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});
+
+test('defineProperty exports accept finite identifier keys', () => {
+  expectProbe({
+    'producer.js': "const key = 'probe'; Object.defineProperty(module.exports, key, { value: process.kill });",
+    'use.js': "require('./producer.js').probe(1, 0);"
+  });
+});

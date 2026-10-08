@@ -36,6 +36,7 @@ const PRESERVED_PROBES = new Map([
 // argument of a probe invocation.
 const PID_PROBE = 'pid-probe';
 const PROCESS_OBJECT = 'process-object';
+const PROCESS_NAMESPACE = 'process-module-namespace';
 const LEGACY_OWNER = 'legacy-owner';
 const GLOBAL_OBJECT = 'global-object';
 const UNDEFINED_VALUE = 'undefined-value';
@@ -234,11 +235,30 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return symbol ? new Set([symbol]) : new Set();
   };
   const instanceConstructorSymbols = (node, visited = new Set()) => {
+    const constructorHierarchy = symbol => {
+      const constructors = new Set();
+      const visit = (current, seen = new Set()) => {
+        if (!current || seen.has(current)) return;
+        constructors.add(current);
+        const next = new Set(seen).add(current);
+        for (const declaration of current.declarations || []) {
+          if (!ts.isClassDeclaration(declaration) && !ts.isClassExpression(declaration)) continue;
+          for (const heritage of declaration.heritageClauses || []) {
+            if (heritage.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+            for (const base of heritage.types) {
+              visit(checker.getSymbolAtLocation(base.expression), next);
+            }
+          }
+        }
+      };
+      visit(symbol);
+      return constructors;
+    };
     const target = node && (ts.isParenthesizedExpression(node) ? node.expression : node);
     if (!target) return new Set();
     if (ts.isNewExpression(target)) {
       const symbol = checker.getSymbolAtLocation(target.expression);
-      return symbol ? new Set([symbol]) : new Set();
+      return constructorHierarchy(symbol);
     }
     if (!ts.isIdentifier(target)) return new Set();
     const symbol = checker.getSymbolAtLocation(target);
@@ -246,8 +266,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     const seen = new Set(visited).add(symbol);
     const result = new Set();
     const directDeclaration = symbol.valueDeclaration || symbol.declarations?.[0];
-    if (directDeclaration && (ts.isFunctionDeclaration(directDeclaration) ||
-      ts.isClassDeclaration(directDeclaration))) return new Set([symbol]);
+    if (directDeclaration && ts.isClassDeclaration(directDeclaration)) return constructorHierarchy(symbol);
+    if (directDeclaration && ts.isFunctionDeclaration(directDeclaration)) return new Set([symbol]);
     const declaration = symbolDeclaration(symbol);
     if (declaration && (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) &&
       declaration.initializer) {
@@ -468,6 +488,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
             : null;
         const recordPattern = (pattern, source) => {
           const target = ts.isParenthesizedExpression(pattern) ? pattern.expression : pattern;
+          if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+            if (source) {
+              recordPattern(target.left, source);
+              if (valueMayBeUndefined(source)) recordPattern(target.left, target.right);
+            } else {
+              recordPattern(target.left, target.right);
+            }
+            return;
+          }
           if (ts.isIdentifier(target)) {
             const symbol = ts.isShorthandPropertyAssignment(target.parent) && target.parent.name === target
               ? checker.getShorthandAssignmentValueSymbol(target.parent)
@@ -483,7 +512,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
                 : ts.isShorthandPropertyAssignment(property) ? property.name : null;
               if (!nestedTarget) continue;
               const nestedSource = propertyValue(source, name);
+              const defaultValue = ts.isShorthandPropertyAssignment(property)
+                ? property.objectAssignmentInitializer : null;
               if (nestedSource) recordPattern(nestedTarget, nestedSource);
+              if (defaultValue && (!nestedSource || valueMayBeUndefined(nestedSource))) {
+                recordPattern(nestedTarget, defaultValue);
+              } else if (!nestedSource && ts.isBinaryExpression(nestedTarget) &&
+                nestedTarget.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+                recordPattern(nestedTarget, null);
+              }
             }
             return;
           }
@@ -491,8 +528,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
             for (let index = 0; index < target.elements.length; index += 1) {
               const element = target.elements[index];
               const value = source.elements[index];
-              if (!element || !value || ts.isSpreadElement(element) || ts.isSpreadElement(value)) continue;
-              recordPattern(element, value);
+              if (!element || ts.isSpreadElement(element) || value && ts.isSpreadElement(value)) continue;
+              if (value) recordPattern(element, value);
+              else if (ts.isBinaryExpression(element) &&
+                element.operatorToken.kind === ts.SyntaxKind.EqualsToken) recordPattern(element, null);
             }
           }
         };
@@ -1175,10 +1214,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (ts.isNumericLiteral(node)) return new Set([Number(node.text)]);
     if (ts.isStringLiteral(node)) return new Set([node.text]);
     if (ts.isNoSubstitutionTemplateLiteral(node)) return new Set([node.text]);
-    // Branching and short-circuit expressions contribute a value union, not an
-    // evaluation: any possible probe/zero branch is kept. This stays a bounded
-    // structural walk rather than an interpreter.
+    // Unresolved conditions retain both branches; known conditions keep only the reachable value.
     if (ts.isConditionalExpression(node)) {
+      const condition = staticTruthiness(node.condition, seen);
+      if (condition === true) return resolveSet(node.whenTrue, seen);
+      if (condition === false) return resolveSet(node.whenFalse, seen);
       const union = resolveSet(node.whenTrue, seen);
       for (const atom of resolveSet(node.whenFalse, seen)) union.add(atom);
       return union;
@@ -1228,6 +1268,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const receiver = resolveSet(node.expression, seen);
       const result = new Set();
       for (const name of names) {
+        if (name === 'default' && hasAtom(receiver, PROCESS_NAMESPACE)) result.add(PROCESS_OBJECT);
         if (name === 'process' && hasAtom(receiver, GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
         for (const atom of receiver) {
           if (moduleResolver?.resolveProperty) {
@@ -1330,7 +1371,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword &&
         ts.isStringLiteral(node.arguments[0])) {
         const moduleName = node.arguments[0].text;
-        if (moduleName === 'node:process' || moduleName === 'process') return new Set([PROCESS_OBJECT]);
+        if (moduleName === 'node:process' || moduleName === 'process') {
+          return new Set([PROCESS_OBJECT, PROCESS_NAMESPACE]);
+        }
         if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName);
       }
       if (ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
@@ -1341,6 +1384,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
             return new Set([PROCESS_OBJECT]);
           }
           if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName.text);
+        }
+      }
+      if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'freeze' &&
+        ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
+        node.arguments[0]) {
+        const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression.expression));
+        if (!objectDeclaration || isAmbientDeclaration(objectDeclaration)) {
+          const objectLiteralValue = (value, visited = new Set()) => {
+            const transparent = transparentExpression(value);
+            const source = transparent || value;
+            if (ts.isObjectLiteralExpression(source)) {
+              return { objectLiteral: source, modulePath: virtualPath };
+            }
+            if (!ts.isIdentifier(source)) return null;
+            const symbol = checker.getSymbolAtLocation(source);
+            if (!symbol || visited.has(symbol)) return null;
+            const declaration = symbolDeclaration(symbol);
+            if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return null;
+            return objectLiteralValue(declaration.initializer, new Set(visited).add(symbol));
+          };
+          const frozenObject = objectLiteralValue(node.arguments[0]);
+          if (frozenObject) return new Set([frozenObject]);
+          return resolveSet(node.arguments[0], seen);
         }
       }
       // `probe.bind(...)` yields a bound probe; a later invocation of that

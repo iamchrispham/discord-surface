@@ -132,7 +132,8 @@ function createLocalModuleResolver(files) {
           return module.currentExportObject;
         }
       }
-      if (resolvedPath.endsWith('.cjs') && node.kind === ts.SyntaxKind.ThisKeyword) {
+      if ((resolvedPath.endsWith('.cjs') || resolvedPath.endsWith('.js')) &&
+        node.kind === ts.SyntaxKind.ThisKeyword) {
         let parent = node.parent;
         while (parent && !ts.isSourceFile(parent)) {
           if (ts.isClassDeclaration(parent) || ts.isClassExpression(parent) ||
@@ -419,17 +420,18 @@ function createLocalModuleResolver(files) {
         module.declaredBindings.has('Object')) return;
       const [target, key, descriptor] = expression.arguments;
       if (!target || !key || !descriptor || !isExportObjectExpression(target) ||
-        (!ts.isStringLiteral(key) && !ts.isNoSubstitutionTemplateLiteral(key)) ||
         !ts.isObjectLiteralExpression(descriptor)) return;
+      const exportName = staticPropertyValue(key, resolvedPath);
+      if (exportName === null) return;
       for (const property of descriptor.properties) {
         if (!property.name) continue;
         const propertyName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
           ? property.name.text : null;
         if (propertyName === 'value' && ts.isPropertyAssignment(property)) {
-          addExport(key.text, property.initializer);
+          addExport(String(exportName), property.initializer);
         } else if (propertyName === 'get') {
           const getter = ts.isPropertyAssignment(property) ? property.initializer : property;
-          for (const expression of callableReturnExpressions(getter)) addExport(key.text, expression);
+          for (const expression of callableReturnExpressions(getter)) addExport(String(exportName), expression);
         }
       }
     };
