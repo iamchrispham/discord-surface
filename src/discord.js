@@ -592,7 +592,8 @@ class DiscordGateway {
       if (signal?.aborted || this.stopping || !channel) return null;
       const permission = this.historyPermission(channel, { requireSend: true });
       return permission.known ? permission.allowed : null;
-    } catch {
+    } catch (error) {
+      if (error?.code === 10003) return false;
       return null;
     } finally {
       if (timeout) clearTimeout(timeout);

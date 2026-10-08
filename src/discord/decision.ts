@@ -371,8 +371,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   function authorizationTransition(interactionId: string, outcome: DecisionAuthorizationOutcome): { outcome: DecisionAuthorizationOutcome | null; click: DecisionClick | null } {
-    let transition: { click?: DecisionClick | null } | null = null;
-    try { transition = state.recordDecisionAuthorizationOutcome(interactionId, outcome) as { click?: DecisionClick | null }; } catch {}
+    const transition = state.recordDecisionAuthorizationOutcome(interactionId, outcome) as { click?: DecisionClick | null };
     const click = transition?.click || state.getDecisionClick(interactionId);
     return { outcome: click?.authorizationOutcome || null, click };
   }
