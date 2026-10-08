@@ -18,6 +18,10 @@ const {
 test('handoff scheduler owner preserves exact bodies, dependencies, facade shape and inventory', () => {
   assert.equal(exactOwnerContract(), true);
   const gateway = fs.readFileSync(GATEWAY_PATH, 'utf8');
+  const owner = fs.readFileSync(OWNER_PATH, 'utf8');
+  const asCrlf = text => text.replace(/\r\n?/g, '\n').replace(/\n/g, '\r\n');
+  assert.equal(exactOwnerContract({ gatewayText: asCrlf(gateway), ownerText: asCrlf(owner) }), true,
+    'CRLF source changed the normalized owner contract');
   const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
   assert.equal(packageJson.scripts.test.split('test/gateway-handoff-scheduler-owner.test.js').length - 1, 1);
   for (const [methodName, access] of [
@@ -74,7 +78,9 @@ test('public scheduler inventory pins source owners and rejects only new schedul
   assert.deepEqual(assertSchedulerCallsiteInventory(), EXPECTED_SCHEDULER_CALLSITES);
   const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-scheduler-inventory-'));
   const expected = [
+    { file: 'bound.js', owner: 'boundSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'bracket.ts', owner: 'bracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+    { file: 'capture.js', owner: 'captureSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'dot.js', owner: 'dotSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'forwarded.cjs', owner: 'forwardedSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'grouped.js', owner: 'groupedSite', scheduler: 'scheduleDeferredHandoffRecovery' },
@@ -83,8 +89,12 @@ test('public scheduler inventory pins source owners and rejects only new schedul
   ];
 
   try {
+    fs.writeFileSync(path.join(sourceRoot, 'bound.js'),
+      'function boundSite(gateway) { return gateway.scheduleDeferredHandoffRecovery.bind(gateway); }\n');
     fs.writeFileSync(path.join(sourceRoot, 'bracket.ts'),
       "function bracketSite(gateway: any) { gateway['schedulePendingHandoffRecoveryPoll'](); }\n");
+    fs.writeFileSync(path.join(sourceRoot, 'capture.js'),
+      'function captureSite(gateway) { const schedule = gateway?.scheduleDeferredHandoffRecovery; return schedule; }\n');
     fs.writeFileSync(path.join(sourceRoot, 'dot.js'),
       "function dotSite(gateway) { gateway.scheduleDeferredHandoffRecovery('dot'); }\n");
     fs.writeFileSync(path.join(sourceRoot, 'forwarded.cjs'),

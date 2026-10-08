@@ -29,16 +29,6 @@ function schedulerAccessName(node) {
   return null;
 }
 
-function schedulerCallsiteName(node) {
-  const expression = unwrapParentheses(node);
-  const directCall = schedulerAccessName(expression);
-  if (directCall) return directCall;
-  if (ts.isPropertyAccessExpression(expression) && ['apply', 'call'].includes(expression.name.text)) {
-    return schedulerAccessName(expression.expression);
-  }
-  return null;
-}
-
 function enclosingSchedulerOwner(node, source) {
   let current = node.parent;
   let fallback = null;
@@ -89,8 +79,8 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, scriptKind);
     assert.deepEqual(source.parseDiagnostics, [], `${filePath}: parse diagnostics`);
     function visit(node) {
-      if (ts.isCallExpression(node)) {
-        const scheduler = schedulerCallsiteName(node.expression);
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        const scheduler = schedulerAccessName(node);
         if (scheduler) {
           inventory.push({
             file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),

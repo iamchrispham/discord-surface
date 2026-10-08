@@ -117,9 +117,13 @@ function classStateInventory(sourceText) {
   return violations;
 }
 
-function exactOwnerContract() {
-  const { source: gatewaySource } = readParsed(GATEWAY_PATH);
-  const { text: ownerText, source: ownerSource } = readParsed(OWNER_PATH);
+function exactOwnerContract(sourceOverrides = {}) {
+  const gatewaySourceText = sourceOverrides.gatewayText ?? readParsed(GATEWAY_PATH).text;
+  const ownerSourceText = sourceOverrides.ownerText ?? readParsed(OWNER_PATH).text;
+  const gatewayText = gatewaySourceText.replace(/\r\n?/g, '\n');
+  const ownerText = ownerSourceText.replace(/\r\n?/g, '\n');
+  const gatewaySource = sourceFile(GATEWAY_PATH, gatewayText);
+  const ownerSource = sourceFile(OWNER_PATH, ownerText);
   const gatewayMethods = Object.keys(METHOD_HASHES);
   const topLevel = ownerSource.statements;
   if (topLevel.length !== 3 || !ts.isExpressionStatement(topLevel[0]) ||
