@@ -362,45 +362,54 @@ const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCa
 };
 
 const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set(), allowNestedCalls = false) => {
-  let parenDepth = 0;
-  let braceDepth = 0;
-  let bracketDepth = 0;
-  for (let index = openingIndex + 1; index < closingIndex; index += 1) {
-    const value = tokens[index].value;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
-      && value === '...' && tokens[index + 1]?.value === '{') {
-      const spreadEnd = pairs.get(index + 1);
-      if (spreadEnd !== undefined
-        && objectHasTopLevelStateGap(tokens, index + 1, spreadEnd, pairs, aliases, allowNestedCalls)) return true;
-    }
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
-      && value === '...' && tokens[index + 1]?.type === 'identifier'
-      && aliases.has(tokens[index + 1].value)) return true;
-    const computedKey = value === '[' && tokens[index + 2]?.value === ']';
-    const propertyName = computedKey
-      ? staticPropertyName(tokens[index + 1])
-      : staticPropertyName(tokens[index]);
-    const colonIndex = computedKey ? index + 3 : index + 1;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
-      && propertyName !== null && OUTCOME_NAMES.has(propertyName)) {
-      if (tokens[colonIndex]?.value === ':') {
-        const valueStart = colonIndex + 1;
-        const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
-        if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls)) return true;
-      } else if (tokens[index].type === 'identifier'
-        && aliases.has(propertyName)
-        && [',', '}'].includes(tokens[index + 1]?.value)) {
-        return true;
+  return Array.from(objectOutcomeGapProperties(
+    tokens,
+    openingIndex,
+    closingIndex,
+    pairs,
+    aliases,
+    allowNestedCalls
+  ).values()).some(Boolean);
+};
+
+const objectOutcomeGapProperties = (tokens, openingIndex, closingIndex, pairs, aliases, allowNestedCalls) => {
+  const properties = new Map();
+  for (const [propertyStart, propertyEnd] of topLevelSegments(tokens, openingIndex + 1, closingIndex)) {
+    if (propertyStart >= propertyEnd) continue;
+    if (tokens[propertyStart].value === '...') {
+      const spreadStart = propertyStart + 1;
+      const spreadEnd = pairs.get(spreadStart);
+      if (tokens[spreadStart]?.value === '{' && spreadEnd === propertyEnd - 1) {
+        for (const [name, hasGap] of objectOutcomeGapProperties(
+          tokens,
+          spreadStart,
+          spreadEnd,
+          pairs,
+          aliases,
+          allowNestedCalls
+        )) properties.set(name, hasGap);
+      } else if (tokens[spreadStart]?.type === 'identifier' && aliases.has(tokens[spreadStart].value)) {
+        properties.set('*', true);
       }
+      continue;
     }
-    if (value === '(') parenDepth += 1;
-    else if (value === ')') parenDepth -= 1;
-    else if (value === '{') braceDepth += 1;
-    else if (value === '}') braceDepth -= 1;
-    else if (value === '[') bracketDepth += 1;
-    else if (value === ']') bracketDepth -= 1;
+    const computedKey = tokens[propertyStart].value === '[' && tokens[propertyStart + 2]?.value === ']';
+    const propertyName = computedKey
+      ? staticPropertyName(tokens[propertyStart + 1])
+      : staticPropertyName(tokens[propertyStart]);
+    if (propertyName === null || !OUTCOME_NAMES.has(propertyName)) continue;
+    const colonIndex = computedKey ? propertyStart + 3 : propertyStart + 1;
+    if (tokens[colonIndex]?.value === ':') {
+      const valueStart = colonIndex + 1;
+      const valueEnd = findDelimitedEnd(tokens, valueStart, propertyEnd, '}');
+      properties.set(propertyName, valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls));
+    } else if (tokens[propertyStart].type === 'identifier'
+      && aliases.has(propertyName)
+      && propertyStart + 1 === propertyEnd) {
+      properties.set(propertyName, true);
+    }
   }
-  return false;
+  return properties;
 };
 
 const conditionalExpressionArms = (tokens, start, end) => {
@@ -1560,7 +1569,9 @@ const isScheduledCallback = (tokens, pairs, range) => {
   let calleeIndex = callOpening - 1;
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
-  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)) return 'discarded';
+  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
+    || (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new')
+    || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
   return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value)
     ? 'outcome'
     : false;
@@ -2197,6 +2208,14 @@ const visibleBoundaryWriterAliasesAt = (
   for (const name of visibleNames) {
     const binding = resolveVisibleBinding(lexicalBindings, name, limit, lexicalScopes, useScope);
     if (!binding) continue;
+    const destructuredWriterName = binding.propertyPath?.join('.');
+    const destructuredStateArgument = destructuredWriterName
+      ? boundaryWriterStateArgument(destructuredWriterName)
+      : undefined;
+    if (destructuredStateArgument !== undefined) {
+      aliases.set(name, destructuredStateArgument);
+      continue;
+    }
     const assignment = assignments
       .filter(candidate => candidate.name === name
         && candidate.bindingIndex === binding.index
@@ -2512,6 +2531,34 @@ test('deadline policy inventory inspects secondary promise continuation callback
   assert.deepEqual(offenders, ['discord/deadline-rejected-promise-gap.js:1']);
 });
 
+test('deadline policy inventory inspects persistent writes in finally callbacks', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-finally-boundary-writer.js',
+      source: 'if (deadlineReached) return Promise.resolve().finally(() => state.markIntakeBoundary(id, READINESS.GAP, detail));'
+    },
+    {
+      relative: 'discord/deadline-finally-boundary-writer-safe.js',
+      source: 'if (deadlineReached) return Promise.resolve().finally(() => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail));'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-finally-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory inspects synchronous Promise executor writes', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-promise-executor-boundary-writer.js',
+      source: 'if (deadlineReached) return new Promise(resolve => { state.markIntakeBoundary(id, READINESS.GAP, detail); resolve(); });'
+    },
+    {
+      relative: 'discord/deadline-promise-executor-boundary-writer-safe.js',
+      source: 'if (deadlineReached) return new Promise(resolve => { state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); resolve(); });'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-promise-executor-boundary-writer.js:1']);
+});
+
 test('deadline policy inventory recognizes static computed outcome keys', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/deadline-computed-outcome-key.js',
@@ -2545,6 +2592,20 @@ test('deadline policy inventory recognizes boundary writers invoked through appl
     source: 'if (deadlineReached) state.markIntakeBoundary.apply(state, [id, READINESS.GAP, detail]);'
   }]);
   assert.deepEqual(offenders, ['discord/deadline-apply-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory recognizes renamed destructured boundary writers', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-destructured-boundary-writer.js',
+      source: 'const { markIntakeBoundary: mark } = state; if (deadlineReached) mark.call(state, id, READINESS.GAP, detail);'
+    },
+    {
+      relative: 'discord/deadline-destructured-boundary-writer-safe.js',
+      source: 'const { markIntakeBoundary: mark } = state; if (deadlineReached) mark.call(state, id, READINESS.UNAVAILABLE, detail);'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-destructured-boundary-writer.js:1']);
 });
 
 test('deadline policy inventory inspects braceless immediately invoked functions', () => {
@@ -3080,9 +3141,20 @@ test('deadline policy inventory inspects statically analyzable object spreads', 
     {
       relative: 'discord/deadline-spread-ready.js',
       source: 'if (deadlineReached) return { ...{ state: READINESS.READY } };'
+    },
+    {
+      relative: 'discord/deadline-spread-gap-overridden.js',
+      source: 'if (deadlineReached) return { ...{ state: READINESS.GAP }, state: READINESS.UNAVAILABLE };'
+    },
+    {
+      relative: 'discord/deadline-spread-gap-overrides.js',
+      source: 'if (deadlineReached) return { ...{ state: READINESS.UNAVAILABLE }, state: READINESS.GAP };'
     }
   ]);
-  assert.deepEqual(offenders, ['discord/deadline-spread-gap.js:1']);
+  assert.deepEqual(offenders, [
+    'discord/deadline-spread-gap.js:1',
+    'discord/deadline-spread-gap-overrides.js:1'
+  ]);
 });
 
 test('deadline policy inventory follows deadline throws into local catch handlers', () => {
