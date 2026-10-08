@@ -14,6 +14,14 @@ function nearestScope(node) {
   return current;
 }
 
+function nearestVarScope(node) {
+  let current = node.parent;
+  while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) {
+    current = current.parent;
+  }
+  return current;
+}
+
 function collectBindings(sourceFile) {
   const bindings = [];
   const addPattern = (pattern, declaration, scope) => {
@@ -29,7 +37,12 @@ function collectBindings(sourceFile) {
   };
   const visit = node => {
     if (ts.isVariableDeclaration(node)) {
-      addPattern(node.name, node, nearestScope(node));
+      const declarationList = node.parent;
+      const scope = ts.isVariableDeclarationList(declarationList) &&
+        !(declarationList.flags & ts.NodeFlags.BlockScoped)
+        ? nearestVarScope(node)
+        : nearestScope(node);
+      addPattern(node.name, node, scope);
     } else if (ts.isFunctionDeclaration(node) && node.name) {
       addPattern(node.name, node, nearestScope(node));
     } else if (ts.isFunctionExpression(node) && node.name) {
@@ -128,16 +141,17 @@ function countIdentifierReferences(sourceFile, name) {
         ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
         node.initializer.arguments.length === 1 && ts.isStringLiteralLike(node.initializer.arguments[0])) {
       if (ts.isIdentifier(node.name)) {
-        const declaration = bindings.find(binding => binding.name === node.name.text &&
-          binding.scope === sourceFile)?.declaration || node.name;
-        imports.push({ declaration, name: node.name.text, scope: sourceFile, namespace: true });
+        const local = bindings.find(binding => binding.name === node.name.text &&
+          binding.declaration === node);
+        if (local) imports.push({ declaration: local.declaration, name: local.name,
+          scope: local.scope, namespace: true });
       } else if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
           if (!ts.isIdentifier(element.name)) continue;
-          const declaration = bindings.find(binding => binding.name === element.name.text &&
-            binding.scope === sourceFile)?.declaration || element.name;
-          imports.push({ declaration, name: element.name.text, scope: sourceFile,
-            importedName: element.propertyName?.text || element.name.text });
+          const local = bindings.find(binding => binding.name === element.name.text &&
+            isAncestor(node, binding.declaration));
+          if (local) imports.push({ declaration: local.declaration, name: local.name,
+            scope: local.scope, importedName: element.propertyName?.text || element.name.text });
         }
       }
     }

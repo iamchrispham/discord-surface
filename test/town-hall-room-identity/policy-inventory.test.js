@@ -14,21 +14,53 @@ function createSourceFile(file, text) {
     ts.getScriptKindFromFileName(file));
 }
 
-function isRoomField(node) {
+function finiteStringValues(expression, bindings, seen = new Set()) {
+  const value = unwrapPolicyExpression(expression);
+  if (!value) return null;
+  if (ts.isStringLiteralLike(value)) return [value.text];
+  if (ts.isArrayLiteralExpression(value)) {
+    const values = value.elements.map(element =>
+      ts.isStringLiteralLike(element) ? element.text : null);
+    return values.every(item => item !== null) ? values : null;
+  }
+  if (!ts.isIdentifier(value)) return null;
+  const declaration = resolveBinding(value, bindings);
+  if (!declaration || seen.has(declaration) || !ts.isVariableDeclaration(declaration)) return null;
+  seen.add(declaration);
+  if (declaration.initializer) {
+    const declarationList = declaration.parent;
+    if (ts.isVariableDeclarationList(declarationList) &&
+        !(declarationList.flags & ts.NodeFlags.Const)) return null;
+    return finiteStringValues(declaration.initializer, bindings, seen);
+  }
+  const declarationList = declaration.parent;
+  const loop = declarationList && ts.isVariableDeclarationList(declarationList)
+    ? declarationList.parent
+    : null;
+  if (loop && ts.isForOfStatement(loop) && loop.initializer === declarationList &&
+      (declarationList.flags & ts.NodeFlags.Const)) {
+    return finiteStringValues(loop.expression, bindings, seen);
+  }
+  return null;
+}
+
+function isRoomField(node, bindings = null) {
   if (!node) return false;
   let object;
-  let key;
+  let keys;
   if (ts.isPropertyAccessExpression(node)) {
     object = node.expression;
-    key = node.name.text;
+    keys = [node.name.text];
   } else if (ts.isElementAccessExpression(node) && node.argumentExpression &&
-      ts.isStringLiteralLike(node.argumentExpression)) {
+      (ts.isStringLiteralLike(node.argumentExpression) || ts.isIdentifier(node.argumentExpression))) {
     object = node.expression;
-    key = node.argumentExpression.text;
+    keys = finiteStringValues(node.argumentExpression,
+      bindings || collectBindings(node.getSourceFile()));
   } else {
     return false;
   }
-  return ['guildId', 'channelId'].includes(key) && ts.isIdentifier(object);
+  return Boolean(keys?.some(key => ['guildId', 'channelId'].includes(key)) &&
+    ts.isIdentifier(object));
 }
 
 function isNamedRoomField(node) {
@@ -362,13 +394,18 @@ function hasDestructuredRoomParameter(subject, scope) {
   if (!ts.isIdentifier(subject) || !ts.isFunctionLike(scope)) return false;
   return scope.parameters.some(parameter => {
     if (!ts.isObjectBindingPattern(parameter.name)) return false;
-    return parameter.name.elements.some(element => {
-      if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name) ||
-          element.name.text !== subject.text) return false;
+    const containsRoomField = (pattern, roomContext, root = false) => pattern.elements.some(element => {
+      if (!ts.isBindingElement(element)) return false;
       const key = element.propertyName || element.name;
-      return (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) &&
-        ['guildId', 'channelId'].includes(key.text);
+      const keyText = ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : null;
+      if (ts.isIdentifier(element.name) && element.name.text === subject.text &&
+          (root || roomContext) && ['guildId', 'channelId'].includes(keyText)) return true;
+      if (!ts.isObjectBindingPattern(element.name)) return false;
+      const nestedRoomContext = roomContext ||
+        /^(?:room|townHall|townHallRoom)$/i.test(keyText || '');
+      return nestedRoomContext && containsRoomField(element.name, nestedRoomContext);
     });
+    return containsRoomField(parameter.name, false, true);
   });
 }
 
@@ -389,7 +426,7 @@ function roomFieldSubject(node, sourceFile, bindings) {
   if (!townHallContext) return false;
   return isNamedRoomField(subject) ||
     hasRoomFieldAlias(scope, subject, sourceFile, bindings) ||
-    isRoomField(subject) ||
+    isRoomField(subject, bindings) ||
     hasDestructuredRoomParameter(subject, scope) ||
     hasBoundAlias(scope, subject, sourceFile, bindings, isRoomField) ||
     hasRoomKeyAlias(scope, subject, sourceFile, bindings) ||
@@ -432,7 +469,7 @@ function resolveStringValue(expression, bindings, seen = new Set(), resolveImpor
   const binding = resolveBinding(value, bindings);
   if (!binding) return resolveImport ? resolveImport(value, seen) : null;
   if (seen.has(binding)) return null;
-  if (!binding.initializer) return resolveImport ? resolveImport(value, seen) : null;
+  if (!binding.initializer) return null;
   seen.add(binding);
   return resolveStringValue(binding.initializer, bindings, seen, resolveImport);
 }
@@ -786,6 +823,12 @@ function roomDigitPolicies(records) {
           info.exports.set(target, node.right.text);
         } else if (target && regexExpression(node.right)) {
           indexCommonJsRegex(target, node.right);
+        } else if (target === 'default' && ts.isCallExpression(node.right) &&
+            ts.isIdentifier(node.right.expression) && node.right.expression.text === 'require' &&
+            node.right.arguments.length === 1 && ts.isStringLiteralLike(node.right.arguments[0])) {
+          const specifier = node.right.arguments[0].text;
+          info.exports.set('default', { kind: 'reexport', specifier, imported: 'default' });
+          if (!info.starExports.includes(specifier)) info.starExports.push(specifier);
         } else if (target === 'default' && ts.isObjectLiteralExpression(node.right)) {
           for (const property of node.right.properties) {
             if (ts.isShorthandPropertyAssignment(property)) {
@@ -1048,8 +1091,12 @@ function roomDigitPolicies(records) {
   for (const info of infos) {
     const visit = node => {
       if (ts.isCallExpression(node)) {
-        const fn = resolveFunction(info, node.expression);
-        if (fn) fn.calls.push({ info, args: node.arguments, node });
+        const callMethod = ts.isPropertyAccessExpression(node.expression) &&
+          node.expression.name.text === 'call';
+        const callReceiver = callMethod ? resolveFunction(info, node.expression.expression) : null;
+        const fn = callReceiver || resolveFunction(info, node.expression);
+        const args = callReceiver ? node.arguments.slice(1) : node.arguments;
+        if (fn) fn.calls.push({ info, args, node });
       }
       ts.forEachChild(node, visit);
     };
@@ -1166,6 +1213,38 @@ function roomDigitPolicies(records) {
         ts.forEachChild(current, visitObject);
       };
       visitObject(info.ast);
+    }
+    let classProperty = node.parent;
+    while (classProperty &&
+        (ts.isParenthesizedExpression(classProperty) || ts.isAsExpression(classProperty) ||
+          ts.isTypeAssertionExpression(classProperty) || ts.isNonNullExpression(classProperty) ||
+          (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(classProperty)))) {
+      classProperty = classProperty.parent;
+    }
+    classProperty = classProperty && ts.isPropertyDeclaration(classProperty) &&
+      isAncestor(classProperty.initializer, node) ? classProperty : null;
+    const classDeclaration = classProperty?.parent && ts.isClassDeclaration(classProperty.parent)
+      ? classProperty.parent
+      : null;
+    if (classProperty && classDeclaration?.name && ts.isIdentifier(classDeclaration.name) &&
+        classProperty.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) &&
+        (ts.isIdentifier(classProperty.name) || ts.isStringLiteralLike(classProperty.name))) {
+      const ownerName = classDeclaration.name.text;
+      const propertyName = classProperty.name.text;
+      const classBindings = collectBindings(info.ast);
+      const visitClass = current => {
+        if (ts.isIdentifier(current) && current.text === ownerName && current !== classDeclaration.name &&
+            resolveBinding(current, classBindings) === classDeclaration) {
+          const member = current.parent;
+          if ((ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member)) &&
+              member.expression === current && policyPropertyKey(member) === propertyName) {
+            const input = regexInput(member);
+            if (input) inputs.push(input);
+          }
+        }
+        ts.forEachChild(current, visitClass);
+      };
+      visitClass(info.ast);
     }
     let declaration = node.parent;
     while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
@@ -1434,7 +1513,7 @@ function roomDigitPolicies(records) {
           const inputScope = enclosingFunction(input) || info.ast;
           const roomContext = isTownHallContext(inputScope, info.ast, legacyBindings);
           if (isNeutralRoomPolicy(inputScope)) return false;
-          if (roomContext && (expressionIsRoomField(input, info) || isRoomField(input))) return true;
+          if (roomContext && (expressionIsRoomField(input, info) || isRoomField(input, legacyBindings))) return true;
           const binding = ts.isIdentifier(input) && findBinding(info, input.text, input);
           return Boolean(!roomContext && hasContextualParameterCall(binding));
         };
@@ -2215,6 +2294,31 @@ test('room policy inventory records only town-hall room validators', () => {
     importedRegexStringHelper,
     importedRegexStringNegativeConsumer,
   ]), expectedPolicies);
+  const importedRegexStringAliasConsumer = {
+    file: 'peer/imported-room-regex-source-alias-consumer.ts',
+    text: String.raw`import { ROOM_ID_SOURCE } from './imported-room-regex-source';
+    const LOCAL_ROOM_ID_SOURCE = ROOM_ID_SOURCE;
+    function validateRoom(room) { return new RegExp(LOCAL_ROOM_ID_SOURCE).test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexStringHelper,
+    importedRegexStringAliasConsumer,
+  ]), {
+    ...expectedPolicies,
+    [importedRegexStringAliasConsumer.file]: 1,
+  });
+  const importedRegexStringAliasNegativeConsumer = {
+    file: 'peer/imported-room-regex-source-alias-negative-consumer.ts',
+    text: String.raw`import { ROOM_ID_SOURCE } from './imported-room-regex-source';
+    const LOCAL_ROOM_ID_SOURCE = ROOM_ID_SOURCE;
+    function inspectRoom(room) { return new RegExp(LOCAL_ROOM_ID_SOURCE).test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexStringHelper,
+    importedRegexStringAliasNegativeConsumer,
+  ]), expectedPolicies);
   const unicodeDecimalRoom = {
     file: 'peer/unicode-decimal-room.ts',
     text: String.raw`function validateTownHallRoom(room) {
@@ -2836,6 +2940,183 @@ test('room policy inventory records only town-hall room validators', () => {
     true,
   );
   assert.equal(countIdentifierReferences(namespaceShadowReferenceFixture, 'isTownHallRoom'), 1);
+  const runtimeCjsVoiceConsumer = {
+    file: 'peer/runtime-cjs-voice-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./runtime-room-helper.cjs');
+    function validateVoiceRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    runtimeCtsHelper,
+    runtimeCjsVoiceConsumer,
+  ]), expectedPolicies);
+  const runtimeMjsVoiceConsumer = {
+    file: 'peer/runtime-mjs-voice-consumer.mjs',
+    text: String.raw`import { validateGuildId } from './runtime-mts-helper.mjs';
+    function validateVoiceRoom(room) { return validateGuildId(room.channelId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    runtimeMtsHelper,
+    runtimeMjsVoiceConsumer,
+  ]), expectedPolicies);
+  const staticClassRoomPatterns = {
+    file: 'peer/static-class-room-patterns.ts',
+    text: String.raw`class TownHallPatterns {
+      static ROOM_ID = /^\d{1,21}$/;
+    }
+    function validateTownHallRoom(room) { return TownHallPatterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, staticClassRoomPatterns]), {
+    ...expectedPolicies,
+    [staticClassRoomPatterns.file]: 1,
+  });
+  const staticClassOrdinaryInput = {
+    file: 'peer/static-class-ordinary-input.ts',
+    text: String.raw`class Patterns { static ROOM_ID = /^\d{1,21}$/; }
+    function inspectRoom(room) { return Patterns.ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, staticClassOrdinaryInput]), expectedPolicies);
+  const nestedRoomParameter = {
+    file: 'peer/nested-room-parameter.ts',
+    text: String.raw`function validateTownHallRoom({ room: { guildId } }) {
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, nestedRoomParameter]), {
+    ...expectedPolicies,
+    [nestedRoomParameter.file]: 1,
+  });
+  const nestedOrdinaryParameter = {
+    file: 'peer/nested-ordinary-parameter.ts',
+    text: String.raw`function inspectRoom({ user: { guildId } }) {
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, nestedOrdinaryParameter]), expectedPolicies);
+  const computedRoomKeys = {
+    file: 'peer/computed-room-keys.ts',
+    text: String.raw`const ROOM_KEYS = ['guildId', 'channelId'] as const;
+    function validateTownHallRoom(room) {
+      for (const key of ROOM_KEYS) if (!/^\d{1,21}$/.test(room[key])) return false;
+      return true;
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, computedRoomKeys]), {
+    ...expectedPolicies,
+    [computedRoomKeys.file]: 1,
+  });
+  const computedOrdinaryKey = {
+    file: 'peer/computed-ordinary-key.ts',
+    text: String.raw`function inspectRoom(room) {
+      for (const key of ['name']) if (!/^\d{1,21}$/.test(room[key])) return false;
+      return true;
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, computedOrdinaryKey]), expectedPolicies);
+  const commonJsBarrelHelper = {
+    file: 'peer/commonjs-barrel-room-helper.cts',
+    text: String.raw`export function validateGuildId(value) { return /^\d{1,20}$/.test(value); }`,
+  };
+  const commonJsBarrel = {
+    file: 'peer/commonjs-barrel.cjs',
+    text: String.raw`module.exports = require('./commonjs-barrel-room-helper.cjs');`,
+  };
+  const commonJsBarrelConsumer = {
+    file: 'peer/commonjs-barrel-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./commonjs-barrel.cjs');
+    function validateTownHallRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsBarrelHelper,
+    commonJsBarrel,
+    commonJsBarrelConsumer,
+  ]), {
+    ...expectedPolicies,
+    [commonJsBarrelHelper.file]: 1,
+  });
+  const commonJsBarrelVoiceConsumer = {
+    file: 'peer/commonjs-barrel-voice-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./commonjs-barrel.cjs');
+    function validateVoiceRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsBarrelHelper,
+    commonJsBarrel,
+    commonJsBarrelVoiceConsumer,
+  ]), expectedPolicies);
+  const callHelperRoom = {
+    file: 'peer/call-helper-room.ts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    function validateTownHallRoom(room) { return validateGuildId.call(null, room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, callHelperRoom]), {
+    ...expectedPolicies,
+    [callHelperRoom.file]: 1,
+  });
+  const callHelperVoice = {
+    file: 'peer/call-helper-voice.ts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    function validateVoiceRoom(room) { return validateGuildId.call(null, room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, callHelperVoice]), expectedPolicies);
+  const defaultObjectShadowConsumer = {
+    file: 'peer/default-object-room-regex-shadow-consumer.ts',
+    text: "import patterns from './default-object-room-regex'; function inspectRoom(patterns, room) { return patterns.ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    defaultObjectRegexHelper,
+    defaultObjectShadowConsumer,
+  ]), expectedPolicies);
+  const importedRegexStringShadowConsumer = {
+    file: 'peer/imported-room-regex-source-shadow-consumer.ts',
+    text: "import { ROOM_ID_SOURCE } from './imported-room-regex-source'; function inspectRoom(ROOM_ID_SOURCE, room) { return new RegExp(ROOM_ID_SOURCE).test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexStringHelper,
+    importedRegexStringShadowConsumer,
+  ]), expectedPolicies);
+  const hoistedVarReferenceFixture = ts.createSourceFile(
+    'peer/hoisted-var-reference-fixture.ts',
+    String.raw`export function isTownHallRoom(room) { return room; }
+    function localGuard(room) { return room; }
+    function check(value) { { var isTownHallRoom = localGuard; } return isTownHallRoom(value); }
+    isTownHallRoom({});`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(hoistedVarReferenceFixture, 'isTownHallRoom'), 1);
+  const nestedCommonJsReferenceFixture = ts.createSourceFile(
+    'peer/nested-commonjs-reference-fixture.cjs',
+    String.raw`function check(value) {
+      const { isTownHallRoom: roomGuard } = require('./town-hall-plan');
+      return roomGuard(value);
+    }`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(nestedCommonJsReferenceFixture, 'isTownHallRoom'), 1);
+  const nestedCommonJsShadowFixture = ts.createSourceFile(
+    'peer/nested-commonjs-shadow-fixture.cjs',
+    String.raw`const plan = require('./town-hall-plan');
+    function check(plan) { return plan.isTownHallRoom({}); }`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(nestedCommonJsShadowFixture, 'isTownHallRoom'), 0);
+  const importEqualsShadowReferenceFixture = ts.createSourceFile(
+    'peer/import-equals-shadow-reference-fixture.cts',
+    String.raw`import plan = require('./town-hall-plan.cjs');
+    function shadow(plan) { return plan.isTownHallRoom({}); }
+    plan.isTownHallRoom({});`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(importEqualsShadowReferenceFixture, 'isTownHallRoom'), 1);
   const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
     ? { ...record, text: record.text + inline.text } : record);
   assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);
