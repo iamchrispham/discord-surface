@@ -431,9 +431,7 @@ export async function sendInteractionFollowup(
     const retryAfterMs = status === 429 ? await readRetryAfterMs(response, deadline) : null;
     try {
       await Promise.race([cancelBody(response), deadline]);
-    } catch (error) {
-      if (status !== 429) throw error;
-    }
+    } catch {}
     return response?.ok === true
       ? { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) }
       : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,

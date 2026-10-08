@@ -230,6 +230,11 @@ function bindingInput(value: DecisionBinding | null): DecisionBindingInput | nul
   return { ...value, provider: value.provider, readiness: value.readiness as Readiness };
 }
 
+function savedBindingIsActive(click: DecisionClick, state: DecisionConsumerState): boolean {
+  const current = state.getBinding(click.channelId);
+  return current?.active === true && current.generation === click.binding.generation;
+}
+
 function transportOutcome(value: unknown): DecisionTransportOutcome {
   return Object.values(DECISION_TRANSPORT_OUTCOMES).includes(value as DecisionTransportOutcome)
     ? value as DecisionTransportOutcome
@@ -384,7 +389,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   function authorizationTransition(interactionId: string, outcome: DecisionAuthorizationOutcome): { outcome: DecisionAuthorizationOutcome | null; click: DecisionClick | null } {
-    const transition = state.recordDecisionAuthorizationOutcome(interactionId, outcome) as { click?: DecisionClick | null };
+    const current = state.getDecisionClick(interactionId);
+    const nextOutcome = outcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED && current && !savedBindingIsActive(current, state)
+      ? DECISION_AUTHORIZATION_OUTCOMES.DENIED
+      : outcome;
+    const transition = state.recordDecisionAuthorizationOutcome(interactionId, nextOutcome) as { click?: DecisionClick | null };
     const click = transition?.click || state.getDecisionClick(interactionId);
     return { outcome: click?.authorizationOutcome || null, click };
   }
@@ -852,7 +861,18 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         if (state.listDecisionPendingWork().some(click => click.interactionId === pendingClick.interactionId)) remaining.push(pendingClick);
         continue;
       }
-      if (!bindingInput(state.getBinding(pendingClick.channelId))) {
+      const activeBinding = state.getBinding(pendingClick.channelId);
+      if (pendingClick.authorizationOutcome === null &&
+        (!activeBinding || activeBinding.active !== true || activeBinding.generation !== pendingClick.binding.generation)) {
+        const transition = authorizationTransition(pendingClick.interactionId, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
+        if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          await deliverRejection(transition.click || pendingClick, signal);
+        }
+        const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
+        if (unresolved) remaining.push(unresolved);
+        continue;
+      }
+      if (!bindingInput(activeBinding)) {
         remaining.push(pendingClick);
         continue;
       }

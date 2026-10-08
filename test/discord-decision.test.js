@@ -873,6 +873,108 @@ test('decision recovery defers an unknown-authorization wake until an external p
   assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
 
+test('decision recovery refuses a pending click after its binding is replaced', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = 'recovery-replaced-binding';
+  const savedBinding = f.state.getBinding('channel');
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: savedBinding,
+    applicationId: 'application',
+    token: 'recovery-replaced-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  const authorizationOutcomes = [];
+  const recordAuthorizationOutcome = f.state.recordDecisionAuthorizationOutcome.bind(f.state);
+  f.state.recordDecisionAuthorizationOutcome = (id, outcome) => {
+    authorizationOutcomes.push(outcome);
+    return recordAuthorizationOutcome(id, outcome);
+  };
+  f.gateway.authorizeDecisionInteraction = async () => null;
+  await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+
+  const getBinding = f.state.getBinding.bind(f.state);
+  f.state.getBinding = channelId => {
+    const binding = getBinding(channelId);
+    return binding && channelId === 'channel' ? { ...binding, generation: binding.generation + 1 } : binding;
+  };
+  let authorizationCalls = 0;
+  f.gateway.authorizeDecisionInteraction = async () => {
+    authorizationCalls += 1;
+    return true;
+  };
+
+  await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+
+  assert.equal(authorizationCalls, 0);
+  assert.deepEqual(authorizationOutcomes, ['denied']);
+  assert.equal(f.state.getDecisionClick(interactionId), null);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('decision recovery rechecks binding generation after authorization awaits', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = 'recovery-binding-retired-during-authorization';
+  const savedBinding = f.state.getBinding('channel');
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: savedBinding,
+    applicationId: 'application',
+    token: 'recovery-retired-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  const authorizationOutcomes = [];
+  const recordAuthorizationOutcome = f.state.recordDecisionAuthorizationOutcome.bind(f.state);
+  f.state.recordDecisionAuthorizationOutcome = (id, outcome) => {
+    authorizationOutcomes.push(outcome);
+    return recordAuthorizationOutcome(id, outcome);
+  };
+
+  let resolveAuthorization;
+  let enteredAuthorization;
+  const authorizationEntered = new Promise(resolve => { enteredAuthorization = resolve; });
+  f.gateway.authorizeDecisionInteraction = async () => {
+    enteredAuthorization();
+    return await new Promise(resolve => { resolveAuthorization = resolve; });
+  };
+  const recovering = f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+  await authorizationEntered;
+
+  const getBinding = f.state.getBinding.bind(f.state);
+  f.state.getBinding = channelId => {
+    const binding = getBinding(channelId);
+    return binding && channelId === 'channel' ? { ...binding, generation: binding.generation + 1 } : binding;
+  };
+  resolveAuthorization(true);
+  await recovering;
+
+  assert.deepEqual(authorizationOutcomes, ['denied']);
+  assert.equal(f.state.getDecisionClick(interactionId), null);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
 test('generic recovery waits for an active decision pass without a materialized projection', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
@@ -1753,6 +1855,27 @@ test('rejection followup keeps a received rate limit when metadata cleanup times
   assert.equal(result.outcome, 'rate_limited');
   assert.equal(result.statusCode, 429);
   assert.equal(result.retryAfterMs, undefined);
+});
+
+test('rejection followup preserves known statuses when body cleanup times out', { timeout: 30000 }, async t => {
+  const interaction = { applicationId: 'application', token: 'transport-timeout-token' };
+
+  for (const response of [
+    { ok: true, status: 204, expected: 'sent' },
+    { ok: false, status: 400, expected: 'rejected' }
+  ]) {
+    const result = await sendInteractionFollowup(interaction, {
+      timeoutMs: 20,
+      fetchImpl: async () => ({
+        ok: response.ok,
+        status: response.status,
+        body: { cancel() { return new Promise(() => {}); } }
+      })
+    });
+
+    assert.equal(result.outcome, response.expected);
+    assert.equal(result.statusCode, response.status);
+  }
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {
