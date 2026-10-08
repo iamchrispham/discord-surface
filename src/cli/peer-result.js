@@ -5,7 +5,7 @@ function createPeerResultCommand({ required, openState, print, resolveCurrentCla
   return async function peerResult(args, dependencies = {}) {
     const provider = required(args, 'provider');
     const correlationId = required(args, 'correlation-id');
-    const { state } = openState(args);
+    const { state } = openState(args, { readOnly: true, requireCurrentSchema: true });
     let hadBodyFailure = false;
     try {
       const result = await createPeerService({

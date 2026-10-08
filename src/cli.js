@@ -154,9 +154,9 @@ function resolveCourierRoute(state, args) {
   return { routeId };
 }
 
-function openState(args) {
+function openState(args, options) {
   const paths = pathsFor(args);
-  return { paths, state: new SurfaceState(paths.db) };
+  return { paths, state: new SurfaceState(paths.db, options) };
 }
 
 function print(value) {

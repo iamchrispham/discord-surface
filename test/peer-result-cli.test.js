@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { DatabaseSync } = require('node:sqlite');
 const { fixture, addRecipient } = require('./fixtures/peer-fixture');
 const { SurfaceState } = require('../src/state');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
@@ -75,7 +76,7 @@ test('public CLI refuses another caller correlation and cannot select a native U
   const other = invoke(f, [], OTHER);
   assert.equal(other.status, 1);
   assert.equal(other.stdout, '');
-  const override = invoke(f, ['--native-id', NATIVE], OTHER);
+  const override = invoke(f, ['--native-id', OTHER]);
   assert.equal(override.status, 1);
   assert.equal(override.stdout, '');
   assert.deepEqual(f.state.listReceipts(), before);
@@ -95,11 +96,60 @@ test('public CLI refuses absent or conflicting native invocation identity', t =>
 test('public CLI rejects unknown and repeated flags before opening a database', t => {
   const f = prepared(t);
   const untouched = path.join(path.dirname(f.db), 'unopened.sqlite');
-  for (const flags of [['--typo', 'value'], ['--provider', 'claude']]) {
+  const marker = path.join(path.dirname(f.db), 'state-opened');
+  const preload = path.join(path.dirname(f.db), 'track-state-open.cjs');
+  fs.writeFileSync(preload, `
+    const fs = require('node:fs');
+    const state = require(${JSON.stringify(require.resolve('../src/state'))});
+    const Original = state.SurfaceState;
+    state.SurfaceState = class extends Original {
+      constructor(...args) {
+        fs.writeFileSync(${JSON.stringify(marker)}, 'opened');
+        super(...args);
+      }
+    };
+  `);
+  for (const flags of [['--typo', 'value'], ['--provider', 'claude'], ['--native-id', NATIVE]]) {
+    fs.rmSync(marker, { force: true });
     const result = runCli(f, ['peer-result', '--provider', 'codex', '--db', untouched,
-      '--correlation-id', f.request.id, ...flags]);
+      '--correlation-id', f.request.id, ...flags], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+    assert.equal(result.status, 1);
+    assert.equal(fs.existsSync(marker), false, 'invalid flags reached state open');
+    assert.equal(fs.existsSync(untouched), false);
+  }
+});
+
+test('public CLI refuses missing state without creating a directory or database', t => {
+  const f = prepared(t);
+  const untouched = path.join(path.dirname(f.db), 'missing-state');
+  for (const input of [
+    { provider: 'wrong', correlation: f.request.id, identity: NATIVE },
+    { provider: 'codex', correlation: 'bad id!', identity: NATIVE },
+    { provider: 'codex', correlation: f.request.id, identity: '' },
+    { provider: 'codex', correlation: f.request.id, identity: NATIVE }
+  ]) {
+    const result = runCli(f, ['peer-result', '--provider', input.provider,
+      '--state-dir', untouched, '--correlation-id', input.correlation],
+      { CODEX_THREAD_ID: input.identity, CODEX_SESSION_ID: input.identity });
     assert.equal(result.status, 1);
     assert.equal(fs.existsSync(untouched), false);
+  }
+});
+
+test('public CLI refuses older state without migrating it', t => {
+  const f = prepared(t);
+  f.state.db.prepare("UPDATE meta SET value='1.7' WHERE key='schema'").run();
+  f.state.close();
+  const before = fs.readFileSync(f.db);
+  const result = invoke(f);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.deepEqual(fs.readFileSync(f.db), before);
+  const inspection = new DatabaseSync(f.db, { readOnly: true });
+  try {
+    assert.equal(inspection.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.7');
+  } finally {
+    inspection.close();
   }
 });
 
@@ -111,7 +161,7 @@ function commandHarness(f, extras = {}) {
       if (typeof args[key] !== 'string' || !args[key]) throw new Error('missing argument');
       return args[key];
     },
-    openState() { opened = new SurfaceState(f.db); return { state: opened }; },
+    openState(_args, options) { opened = new SurfaceState(f.db, options); return { state: opened }; },
     print(value) { printed.push(value); },
     ...extras
   });
