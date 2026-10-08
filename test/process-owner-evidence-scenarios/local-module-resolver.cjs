@@ -75,6 +75,7 @@ function createLocalModuleResolver(files) {
     const text = require('node:fs').readFileSync(resolvedPath, 'utf8');
     const kind = resolvedPath.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
     const sourceFile = ts.createSourceFile(resolvedPath, text, ts.ScriptTarget.Latest, true, kind);
+    const initialExportObject = {};
     const module = {
       path: resolvedPath,
       bindings: new Map(),
@@ -86,7 +87,10 @@ function createLocalModuleResolver(files) {
       exportEquals: null,
       exportEqualsCandidates: [],
       wildcardExports: [],
-      exportAliases: new Set(['exports'])
+      exportAliases: new Map([['exports', initialExportObject]]),
+      initialExportObject,
+      currentExportObject: initialExportObject,
+      exportExpressionObjects: new WeakMap()
     };
     modules.set(resolvedPath, module);
 
@@ -113,24 +117,52 @@ function createLocalModuleResolver(files) {
       module.exportEqualsCandidates.push(expression);
       addDefaultExport(expression);
     };
-    const isExportObjectExpression = expression => {
+    const exportObjectIdentity = expression => {
       const node = unwrap(expression);
-      if (!node) return false;
-      if (ts.isIdentifier(node)) return module.exportAliases.has(node.text);
+      if (!node) return null;
+      if (ts.isIdentifier(node)) return module.exportAliases.get(node.text) || null;
       if (ts.isPropertyAccessExpression(node)) {
-        return node.name.text === 'exports' && ts.isIdentifier(node.expression) &&
-          node.expression.text === 'module';
+        if (node.name.text === 'exports' && ts.isIdentifier(node.expression) &&
+          node.expression.text === 'module') return module.currentExportObject;
       }
       if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression)) {
         const name = unwrap(node.argumentExpression);
-        return node.expression.text === 'module' &&
-          (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) && name.text === 'exports';
+        if (node.expression.text === 'module' &&
+          (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) && name.text === 'exports') {
+          return module.currentExportObject;
+        }
       }
-      return false;
+      if (resolvedPath.endsWith('.cjs') && node.kind === ts.SyntaxKind.ThisKeyword) {
+        let parent = node.parent;
+        while (parent && !ts.isSourceFile(parent)) {
+          if (ts.isClassDeclaration(parent) || ts.isClassExpression(parent) ||
+            ts.isFunctionDeclaration(parent) || ts.isFunctionExpression(parent) ||
+            ts.isMethodDeclaration(parent) || ts.isGetAccessorDeclaration(parent) ||
+            ts.isSetAccessorDeclaration(parent) || ts.isConstructorDeclaration(parent)) return null;
+          parent = parent.parent;
+        }
+        return module.initialExportObject;
+      }
+      if (ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node) ||
+        ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
+        ts.isClassExpression(node)) {
+        let identity = module.exportExpressionObjects.get(node);
+        if (!identity) {
+          identity = {};
+          module.exportExpressionObjects.set(node, identity);
+        }
+        return identity;
+      }
+      return null;
+    };
+    const isExportObjectExpression = expression => {
+      const identity = exportObjectIdentity(expression);
+      return Boolean(identity && identity === module.currentExportObject);
     };
     const recordExportAlias = (name, expression) => {
       if (!name) return;
-      if (isExportObjectExpression(expression)) module.exportAliases.add(name);
+      const identity = exportObjectIdentity(expression);
+      if (identity) module.exportAliases.set(name, identity);
       else module.exportAliases.delete(name);
     };
     const recordVariable = (declaration, exported = false) => {
@@ -345,6 +377,13 @@ function createLocalModuleResolver(files) {
       if (ts.isElementAccessExpression(left) && name === 'exports' && ts.isIdentifier(left.expression) &&
         left.expression.text === 'module') {
         addExportEquals(assignmentValue(expression.right));
+      }
+      const replacesModuleExports = ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
+        ts.isIdentifier(left.expression) && left.expression.text === 'module' ||
+        ts.isElementAccessExpression(left) && name === 'exports' && ts.isIdentifier(left.expression) &&
+        left.expression.text === 'module';
+      if (replacesModuleExports) {
+        module.currentExportObject = exportObjectIdentity(assignmentValue(expression.right)) || {};
       }
     };
     const recordExportExpression = expression => {

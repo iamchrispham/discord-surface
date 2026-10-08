@@ -421,6 +421,55 @@ test('finite array callbacks classify direct process.kill probes', () => {
   expectOrdinary({ 'use.js': '[, pid].forEach(process.kill);' });
 });
 
+test('finite array callbacks resolve statically computed method names', () => {
+  expectProbe({ 'use.js': "[pid]['map'](process.kill);" });
+  expectProbe({ 'use.js': "const method = 'map'; [pid][method](process.kill);" });
+});
+
+test('local defineProperty writes retain probe values', () => {
+  expectProbe({
+    'use.js': "const object = {}; Object.defineProperty(object, 'probe', { value: process.kill }); object.probe(pid, 0);"
+  });
+  expectOrdinary({
+    'use.js': "const object = {}; Object.defineProperty(object, 'probe', { value: () => true }); object.probe(pid, 0);"
+  });
+  expectOrdinary({
+    'use.js': "function run(Object, pid) { const object = {}; Object.defineProperty(object, 'probe', { value: process.kill }); object.probe(pid, 0); }"
+  });
+});
+
+test('process.nextTick aliases forward probe callbacks', () => {
+  expectProbe({ 'use.js': 'const { nextTick: next } = process; next(process.kill, pid, 0);' });
+});
+
+test('shadowed require does not identify Node timer callbacks', () => {
+  expectOrdinary({
+    'use.js': "function run(pid) { const require = () => ({ setImmediate() {} }); const timers = require('node:timers'); timers.setImmediate(process.kill, pid, 0); }"
+  });
+});
+
+test('process properties retain probe values through object spreads', () => {
+  expectProbe({ 'use.js': 'const proc = { ...process }; proc.kill(pid, 0);' });
+});
+
+test('top-level CommonJS this exports resolve across files', () => {
+  expectProbe({
+    'producer.cjs': "'use strict'; this.probe = process.kill;",
+    'use.js': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+});
+
+test('detached CommonJS exports are not resolved as live exports', () => {
+  expectOrdinary({
+    'producer.cjs': 'module.exports = { probe: () => true }; exports.probe = process.kill;',
+    'use.cjs': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+  expectProbe({
+    'producer.cjs': 'module.exports = { probe: () => true }; module.exports = exports; exports.probe = process.kill;',
+    'use.js': "const probe = require('./producer.cjs').probe; probe(1, 0);"
+  });
+});
+
 test('Array.from classifies bounded mapper invocations', () => {
   expectProbe({ 'use.js': 'Array.from([pid], process.kill);' });
   expectOrdinary({ 'use.js': 'Array.from([], process.kill);' });
