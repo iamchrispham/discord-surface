@@ -147,9 +147,9 @@ function createNetworkTrap(f) {
           dns.setServers(['127.0.0.1:9']);
           dns.resolveCaa('trap.invalid', () => {});
         },
-        'dns.resolveTlsa': () => {
+        'dns.resolve4': () => {
           dns.setServers(['127.0.0.1:9']);
-          dns.resolveTlsa('trap.invalid', () => {});
+          dns.resolve4('trap.invalid', () => {});
         },
         'dns.setServers': () => {
           dns.setServers(['127.0.0.1:9']);
@@ -469,7 +469,7 @@ test('network trap covers shared transport boundaries and control probes', t => 
     const probes = [
       'fetch', 'http.get', 'socket.connect', 'socket.prototype.connect',
       'dns.lookup', 'dns.promises.lookup', 'http2.connect', 'dns.resolver',
-      'dns.promises.resolver', 'dns.resolveCaa', 'dns.resolveTlsa',
+      'dns.promises.resolver', 'dns.resolveCaa', 'dns.resolve4',
       'dns.setServers', 'dns.promises.setServers', 'datagram.send', 'tcp.raw',
       'child_process.spawn', 'child_process.spawnSync'
     ];
