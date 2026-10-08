@@ -578,4 +578,4 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   return count;
 }
 
-module.exports = { countIdentifierReferences, commonJsExportAssignment };
+module.exports = { isScope, countIdentifierReferences, commonJsExportAssignment };

@@ -54,6 +54,7 @@ const {
   unwrapPolicyExpression,
   policyPropertyKey,
   roomDigitPolicies: roomDigitPoliciesBase,
+  roomDigitPolicyDefinitions,
 } = require('./policy-inventory-analysis');
 let roomDigitPolicies = roomDigitPoliciesBase;
 
@@ -253,6 +254,30 @@ test('room policy inventory records only town-hall room validators', () => {
   };
   const expectedPolicies = { 'peer/town-hall-plan.ts': 2 };
   assert.deepEqual(roomDigitPolicies(records), expectedPolicies);
+  const expectedDefinitions = {
+    'peer/town-hall-plan.ts': [
+      { kind: 'literal', pattern: '^\\d{1,20}$', flags: '' },
+      { kind: 'literal', pattern: '^\\d{1,20}$', flags: '' },
+    ],
+  };
+  assert.deepEqual(roomDigitPolicyDefinitions(records), expectedDefinitions);
+  const planRecord = records.find(record => record.file === 'peer/town-hall-plan.ts');
+  const originalExpression = String.raw`/^\d{1,20}$/`;
+  const divergentExpression = String.raw`/^[+\d]{1,20}$/`;
+  const changedPlanText = planRecord.text.replace(originalExpression, divergentExpression);
+  assert.notEqual(changedPlanText, planRecord.text);
+  const changedPolicyRecords = records.map(record => record === planRecord
+    ? { ...record, text: changedPlanText }
+    : record);
+  assert.deepEqual(roomDigitPoliciesBase(changedPolicyRecords), expectedPolicies);
+  assert.notDeepEqual(roomDigitPolicyDefinitions(changedPolicyRecords), expectedDefinitions);
+  const flaggedExpression = String.raw`/^\d{1,20}$/i`;
+  const flaggedPlanText = planRecord.text.replace(originalExpression, flaggedExpression);
+  const flaggedPolicyRecords = records.map(record => record === planRecord
+    ? { ...record, text: flaggedPlanText }
+    : record);
+  assert.deepEqual(roomDigitPoliciesBase(flaggedPolicyRecords), expectedPolicies);
+  assert.notDeepEqual(roomDigitPolicyDefinitions(flaggedPolicyRecords), expectedDefinitions);
   const commonJsHelper = {
     file: 'peer/commonjs-room-helper.js',
     text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }

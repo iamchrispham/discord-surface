@@ -2,6 +2,107 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { roomDigitPolicies } = require('./policy-inventory-analysis');
 
+test('switch case bindings stay inside their lexical scope', () => {
+  const consumer = {
+    file: 'peer/switch-case-room-policy.ts',
+    text: String.raw`function validateTownHallRoom(room, kind) {
+      switch (kind) {
+        case 0: let pattern = '^x$'; break;
+      }
+      const pattern = '^\\d{1,21}$';
+      return RegExp(pattern).test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+});
+
+test('whole-room regex helpers follow contextual ESM and CJS calls', () => {
+  const esmHelper = {
+    file: 'peer/whole-room-esm-helper.mts',
+    text: String.raw`export function checkIds(room) {
+      return /^\d{1,21}$/.test(room.guildId);
+    }`,
+  };
+  const esmConsumer = {
+    file: 'peer/whole-room-esm-consumer.mjs',
+    text: String.raw`import { checkIds } from './whole-room-esm-helper.mjs';
+    export function validateTownHallRoom(room) { return checkIds(room); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([esmHelper, esmConsumer]), { [esmHelper.file]: 1 });
+
+  const esmNameHelper = {
+    file: 'peer/whole-room-esm-name-helper.mts',
+    text: String.raw`export function checkName(room) {
+      return /^\d{1,21}$/.test(room.name);
+    }`,
+  };
+  const esmNameConsumer = {
+    file: 'peer/whole-room-esm-name-consumer.mjs',
+    text: String.raw`import { checkName } from './whole-room-esm-name-helper.mjs';
+    export function validateTownHallRoom(room) { return checkName(room); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([esmNameHelper, esmNameConsumer]), {});
+
+  const cjsHelper = {
+    file: 'peer/whole-room-cjs-helper.cts',
+    text: String.raw`function checkIds(room) {
+      return /^\d{1,21}$/.test(room.channelId);
+    }
+    module.exports = checkIds;`,
+  };
+  const cjsConsumer = {
+    file: 'peer/whole-room-cjs-consumer.cjs',
+    text: String.raw`const checkIds = require('./whole-room-cjs-helper.cjs');
+    function validateTownHallRoom(room) { return checkIds(room); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([cjsHelper, cjsConsumer]), { [cjsHelper.file]: 1 });
+
+  const nonRoomConsumer = {
+    file: 'peer/whole-room-cjs-message-consumer.cjs',
+    text: String.raw`const checkIds = require('./whole-room-cjs-helper.cjs');
+    function validateMessage(room) { return checkIds(room); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([cjsHelper, nonRoomConsumer]), {});
+});
+
+test('array bindings without sources stay unknown and initialized arrays retain aliases', () => {
+  const parameter = {
+    file: 'peer/uninitialized-array-parameter.ts',
+    text: String.raw`function ordinary([name, value]) { void name; void value; }`,
+  };
+  const caught = {
+    file: 'peer/uninitialized-array-catch.ts',
+    text: String.raw`try { throw []; } catch ([name, value]) { void name; void value; }`,
+  };
+  const iteration = {
+    file: 'peer/uninitialized-array-iteration.ts',
+    text: String.raw`function ordinary(entries) {
+      for (const [name, value] of entries) { void name; void value; }
+    }`,
+  };
+  const unknownRoomField = {
+    file: 'peer/uninitialized-array-room-source.ts',
+    text: String.raw`function validateTownHallRoom(entries) {
+      for (const [name, value] of entries) {
+        if (/^\d{1,21}$/.test(value)) return true;
+      }
+      return false;
+    }`,
+  };
+  for (const record of [parameter, caught, iteration, unknownRoomField]) {
+    assert.deepEqual(roomDigitPolicies([record]), {});
+  }
+
+  const initialized = {
+    file: 'peer/initialized-array-room-fields.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const [guildId] = [room.guildId];
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([initialized]), { [initialized.file]: 1 });
+});
+
 test('runtime CJS and MJS imports resolve to their TypeScript source files', () => {
   const ctsPattern = {
     file: 'peer/runtime-cjs-pattern.cts',

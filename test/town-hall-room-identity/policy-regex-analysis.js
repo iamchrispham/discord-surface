@@ -445,6 +445,31 @@ function createPolicyRegexAnalysis({
     return inputs;
   };
 
+  const policyDefinition = (node, info, pattern) => {
+    if (ts.isRegularExpressionLiteral(node)) {
+      const closingSlash = node.text.lastIndexOf('/');
+      return {
+        kind: 'literal',
+        pattern: node.text.slice(1, closingSlash),
+        flags: node.text.slice(closingSlash + 1),
+      };
+    }
+    const flagsNode = node.arguments[1];
+    const flags = flagsNode
+      ? resolveStringValue(
+        flagsNode,
+        collectBindings(info.ast),
+        new Set(),
+        (identifier, visited) => resolveImportedString(info, identifier, visited),
+      )
+      : '';
+    return {
+      kind: 'constructor',
+      pattern,
+      flags: flags === null ? `source:${flagsNode.getText()}` : flags,
+    };
+  };
+
   const resolveRegexValue = (info, expression, name, seen = new Set()) => {
     const value = unwrapPolicyExpression(expression);
     if (!value) return null;
@@ -453,7 +478,13 @@ function createPolicyRegexAnalysis({
       while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
         declaration = declaration.parent;
       }
-      return { info, name, declaration: declaration || value, pattern: value.text };
+      return {
+        info,
+        name,
+        declaration: declaration || value,
+        pattern: value.text,
+        definition: policyDefinition(value, info, value.text),
+      };
     }
     if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
         ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
@@ -462,7 +493,13 @@ function createPolicyRegexAnalysis({
       while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
         declaration = declaration.parent;
       }
-      return { info, name, declaration: declaration || value, pattern: value.arguments[0].text };
+      return {
+        info,
+        name,
+        declaration: declaration || value,
+        pattern: value.arguments[0].text,
+        definition: policyDefinition(value, info, value.arguments[0].text),
+      };
     }
     if (ts.isIdentifier(value)) {
       const binding = findBinding(info, value.text, value);

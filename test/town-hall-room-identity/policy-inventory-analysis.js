@@ -1,8 +1,11 @@
 const path = require('node:path');
 const ts = require('typescript');
+const {
+  isScope: isLexicalScope,
+  commonJsExportAssignment,
+} = require('./policy-reference-analysis');
 const { createPolicyModuleGraph } = require('./policy-module-resolution');
 const { borrowedStringInput, createPolicyRegexAnalysis } = require('./policy-regex-analysis');
-const { commonJsExportAssignment } = require('./policy-reference-analysis');
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
 function createSourceFile(file, text) {
@@ -153,12 +156,6 @@ function enclosingFunction(node) {
     current = current.parent;
   }
   return null;
-}
-
-function isLexicalScope(node) {
-  return Boolean(node) && (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node) ||
-    ts.isFunctionLike(node) || ts.isCatchClause(node) || ts.isForStatement(node) ||
-    ts.isForInStatement(node) || ts.isForOfStatement(node));
 }
 
 function nearestLexicalScope(node) {
@@ -537,7 +534,27 @@ function resolveStringValue(expression, bindings, seen = new Set(), resolveImpor
   return resolveStringValue(binding.initializer, bindings, seen, resolveImport);
 }
 
-function legacyRoomDigitPolicies(records, resolveImport = null) {
+function roomPolicyDefinition(node, pattern, bindings, resolveImport = null) {
+  if (ts.isRegularExpressionLiteral(node)) {
+    const closingSlash = node.text.lastIndexOf('/');
+    return {
+      kind: 'literal',
+      pattern: node.text.slice(1, closingSlash),
+      flags: node.text.slice(closingSlash + 1),
+    };
+  }
+  const flagsNode = node.arguments?.[1];
+  const flags = flagsNode
+    ? resolveStringValue(flagsNode, bindings, new Set(), resolveImport)
+    : '';
+  return {
+    kind: 'constructor',
+    pattern,
+    flags: flags === null ? `source:${flagsNode.getText()}` : flags,
+  };
+}
+
+function legacyRoomDigitPolicies(records, resolveImport = null, recordDefinition = null) {
   const sites = {};
   for (const { file, text } of records) {
     const ast = createSourceFile(file, text);
@@ -557,6 +574,12 @@ function legacyRoomDigitPolicies(records, resolveImport = null) {
           isSplitRoomDigitPolicy(node, ast, pattern, bindings));
       if (roomPolicy) {
         sites[file] = (sites[file] || 0) + 1;
+        if (recordDefinition) {
+          const stringResolver = resolveImport
+            ? (identifier, seen) => resolveImport(file, identifier, seen)
+            : null;
+          recordDefinition(file, roomPolicyDefinition(node, pattern, bindings, stringResolver));
+        }
       }
       ts.forEachChild(node, visit);
     };
@@ -582,7 +605,13 @@ function policyPropertyKey(node) {
   return null;
 }
 
-function roomDigitPolicies(records) {
+function roomDigitPolicies(records, options = {}) {
+  const recordDefinition = (file, definition) => {
+    if (!options.definitions) return;
+    const definitions = options.definitions[file] || [];
+    definitions.push(definition);
+    options.definitions[file] = definitions;
+  };
   const infos = records.map(({ file, text }) => ({
     file,
     ast: createSourceFile(file, text),
@@ -618,7 +647,7 @@ function roomDigitPolicies(records) {
         }
       }
     }
-    if (ts.isArrayBindingPattern(pattern) && ts.isArrayLiteralExpression(source)) {
+    if (ts.isArrayBindingPattern(pattern) && source && ts.isArrayLiteralExpression(source)) {
       for (let index = 0; index < pattern.elements.length; index += 1) {
         const element = pattern.elements[index];
         const sourceElement = source.elements[index];
@@ -1100,14 +1129,17 @@ function roomDigitPolicies(records) {
     }
     return false;
   };
-  const hasContextualParameterCall = (binding) => {
+  const hasContextualParameterCall = (binding, wholeRoomArgument = false) => {
     if (!binding || binding.kind !== 'parameter') return false;
     return bindingCalls(binding, binding.ownerInfo).some(call => {
       const caller = call.node && enclosingFunction(call.node);
       const callerBinding = caller && functionBinding(caller);
       const callerName = callerBinding ? bindingName(callerBinding) : null;
-      return isTownHallContextName(callerName, call.info.ast) &&
-        call.args[binding.index] && expressionIsRoomField(call.args[binding.index], call.info);
+      const argument = call.args[binding.index];
+      const contextualInput = wholeRoomArgument
+        ? objectIsRoom(argument, call.info)
+        : expressionIsRoomField(argument, call.info);
+      return isTownHallContextName(callerName, call.info.ast) && argument && contextualInput;
     });
   };
   const regexAnalysis = createPolicyRegexAnalysis({
@@ -1151,7 +1183,7 @@ function roomDigitPolicies(records) {
   const sites = legacyRoomDigitPolicies(records, (file, identifier, seen) => {
     const info = byFile.get(file);
     return info ? resolveImportedString(info, identifier, seen) : null;
-  });
+  }, recordDefinition);
   for (const info of infos) {
     const legacyBindings = collectBindings(info.ast);
     const visit = node => {
@@ -1174,10 +1206,24 @@ function roomDigitPolicies(records) {
           if (isNeutralRoomPolicy(inputScope)) return false;
           if (roomContext && (expressionIsRoomField(input, info) || isRoomField(input, legacyBindings))) return true;
           const binding = ts.isIdentifier(input) && findBinding(info, input.text, input);
-          return Boolean(!roomContext && hasContextualParameterCall(binding));
+          const roomFieldReceiver = (ts.isPropertyAccessExpression(input) ||
+            ts.isElementAccessExpression(input)) && ['guildId', 'channelId'].includes(policyPropertyKey(input))
+            ? unwrapPolicyExpression(input.expression)
+            : null;
+          const roomObjectBinding = roomFieldReceiver && ts.isIdentifier(roomFieldReceiver)
+            ? findBinding(info, roomFieldReceiver.text, roomFieldReceiver)
+            : null;
+          return Boolean(!roomContext && (hasContextualParameterCall(binding) ||
+            hasContextualParameterCall(roomObjectBinding, true)));
         };
         if (!legacyPolicy && regexInputs(node, info).some(isRoomInput)) {
           sites[info.file] = (sites[info.file] || 0) + 1;
+          recordDefinition(info.file, roomPolicyDefinition(
+            node,
+            pattern,
+            legacyBindings,
+            (identifier, seen) => resolveImportedString(info, identifier, seen),
+          ));
         }
       }
       ts.forEachChild(node, visit);
@@ -1203,6 +1249,11 @@ function roomDigitPolicies(records) {
     }
     if (!countedRegexExports.has(key)) {
       sites[resolved.info.file] = (sites[resolved.info.file] || 0) + 1;
+      recordDefinition(resolved.info.file, resolved.definition || {
+        kind: 'resolved',
+        pattern: resolved.pattern,
+        flags: '',
+      });
       countedRegexExports.add(key);
     }
   };
@@ -1245,6 +1296,16 @@ function roomDigitPolicies(records) {
   return sites;
 }
 
+function roomDigitPolicyDefinitions(records) {
+  const definitions = {};
+  roomDigitPolicies(records, { definitions });
+  return Object.fromEntries(Object.keys(definitions).sort().map(file => [
+    file,
+    definitions[file].sort((left, right) =>
+      JSON.stringify(left).localeCompare(JSON.stringify(right))),
+  ]));
+}
+
 module.exports = {
   createSourceFile,
   finiteStringValues,
@@ -1285,6 +1346,7 @@ module.exports = {
   isTownHallRoomOwner,
   isSplitRoomDigitPolicy,
   hasAsciiDigitPattern,
+  roomDigitPolicyDefinitions,
   resolveStringValue,
   legacyRoomDigitPolicies,
   unwrapPolicyExpression,
