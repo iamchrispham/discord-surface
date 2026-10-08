@@ -62,6 +62,18 @@ test('cross-file array destructuring preserves finite exported elements', () => 
   });
 });
 
+test('right-associative CommonJS exports resolve their final assigned value', () => {
+  for (const producer of [
+    'module.exports = exports = process.kill;',
+    'exports = module.exports = process.kill;'
+  ]) {
+    expectProbe({
+      'producer.js': producer,
+      'use.js': "require('./producer.js')(1, 0);"
+    });
+  }
+});
+
 test('CommonJS branch exports retain both syntactic assignment orders', () => {
   for (const source of [
     'if (flag) module.exports = process.kill; else module.exports = () => true;',
@@ -189,6 +201,18 @@ test('imported callable bodies with probe arguments are conservatively refused',
   });
   assert.deepEqual(result.kills, []);
   assert.deepEqual(result.violations, ['unsupported process probe use.js:null']);
+  for (const callable of [
+    'export function invoke(probe, pid) { probe(pid, 0); return () => true; }',
+    'export function invoke(probe, pid) { probe(pid, 0); return probe; }',
+    'export function invoke(probe, pid) { probe(pid, 0); return process; }',
+    'export function invoke(probe, pid) { probe.call(null, pid, 0); return probe; }',
+    'export function invoke(probe, pid) { probe(pid, 0); return 1; }'
+  ]) {
+    expectUnsupported({
+      'producer.js': callable,
+      'use.js': "import { invoke } from './producer.js'; invoke(process.kill, 1);"
+    });
+  }
   expectOrdinary({
     'producer.js': 'export function invoke(probe, pid) { probe(pid, 0); }',
     'use.js': "import { invoke } from './producer.js'; invoke(() => true, 1);"
@@ -199,6 +223,31 @@ test('imported callable bodies with probe arguments are conservatively refused',
   });
   assert.deepEqual(identityResult.kills, ['use.js\u0000newProbe']);
   assert.deepEqual(identityResult.violations, ['unclassified process probe use.js:newProbe']);
+});
+
+test('unreachable local writes and short-circuited CommonJS writes stay ordinary', () => {
+  expectOrdinary({
+    'producer.js': 'export let probe = () => true; function install() { probe = process.kill; }',
+    'use.js': "import { probe } from './producer.js'; probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.js': 'export let probe = () => true; function abandoned() { install(); } function install() { probe = process.kill; }',
+    'use.js': "import { probe } from './producer.js'; probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.js': 'export let probe = () => true; export function install() { const abandoned = () => { probe = process.kill; }; }',
+    'use.js': "import { install, probe } from './producer.js'; install(); probe(1, 0);"
+  });
+  for (const [initial, operator] of [
+    ['() => true', '||='],
+    ['() => true', '??='],
+    ['false', '&&=']
+  ]) {
+    expectOrdinary({
+      'producer.js': `exports.probe = ${initial}; exports.probe ${operator} process.kill;`,
+      'use.js': "require('./producer.js').probe(1, 0);"
+    });
+  }
 });
 
 test('callable module writes and logical assignments retain only reachable probe sources', () => {
@@ -333,6 +382,28 @@ test('Object.assign writes to CommonJS exports retain named probes', () => {
   });
 });
 
+test('imported object methods resolve returned process probes', () => {
+  expectProbe({
+    'producer.js': 'export const api = { getProbe() { return process.kill; } };',
+    'use.js': "import { api } from './producer.js'; api.getProbe()(1, 0);"
+  });
+});
+
+test('imported TypeScript parameter properties resolve defaults and constructor arguments', () => {
+  expectProbe({
+    'producer.ts': 'export class Check { constructor(public probe = process.kill) {} }',
+    'use.js': "import { Check } from './producer'; new Check().probe(1, 0);"
+  });
+  expectProbe({
+    'producer.ts': 'export class Check { constructor(public probe = () => true) {} }',
+    'use.js': "import { Check } from './producer'; new Check(process.kill).probe(1, 0);"
+  });
+  expectOrdinary({
+    'producer.ts': 'export class Check { constructor(public probe = process.kill) {} }',
+    'use.js': "import { Check } from './producer'; new Check(() => true).probe(1, 0);"
+  });
+});
+
 test('namespace-import destructuring resolves named probe properties', () => {
   expectProbe({
     'producer.js': 'export const probe = process.kill;',
@@ -348,6 +419,23 @@ test('finite array callbacks classify direct process.kill probes', () => {
   expectProbe({ 'use.js': '[pid].forEach(process.kill);' });
   expectOrdinary({ 'use.js': '[pid].forEach(() => true);' });
   expectOrdinary({ 'use.js': '[, pid].forEach(process.kill);' });
+});
+
+test('Array.from classifies bounded mapper invocations', () => {
+  expectProbe({ 'use.js': 'Array.from([pid], process.kill);' });
+  expectOrdinary({ 'use.js': 'Array.from([], process.kill);' });
+  expectUnsupported({ 'use.js': 'Array.from(values, process.kill);' });
+});
+
+test('nested object and array parameter bindings project probe origins', () => {
+  for (const source of [
+    'function invoke({ nested: { probe } }, pid) { probe(pid, 0); } invoke({ nested: { probe: process.kill } }, 1);',
+    'function invoke([[probe]], pid) { probe(pid, 0); } invoke([[process.kill]], 1);'
+  ]) {
+    const result = inventoryFiles({ 'use.js': source });
+    assert.deepEqual(result.kills, ['use.js\u0000invoke']);
+    assert.deepEqual(result.violations, ['unclassified process probe use.js:invoke']);
+  }
 });
 
 test('literal dynamic imports of process retain probe origins', () => {

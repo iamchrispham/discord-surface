@@ -513,31 +513,66 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
     return ts.isIdentifier(binding.name) ? binding.name.text : null;
   };
-  const indexParameterBinding = (name, argument, parameter, restArguments = null, invocation = null) => {
+  const projectBindingArgument = (argument, path) => {
+    let source = argument;
+    for (const property of path) {
+      const node = ts.isParenthesizedExpression(source) ? source.expression : source;
+      if (ts.isArrayLiteralExpression(node) && typeof property === 'number') {
+        const element = node.elements[property];
+        if (element && !ts.isSpreadElement(element) && !ts.isOmittedExpression(element)) {
+          source = element;
+          continue;
+        }
+      }
+      if (ts.isObjectLiteralExpression(node) && typeof property === 'string') {
+        const member = node.properties.find(candidate => {
+          if (!candidate.name) return false;
+          const name = ts.isIdentifier(candidate.name) || ts.isStringLiteral(candidate.name) ||
+            ts.isNumericLiteral(candidate.name) ? candidate.name.text : null;
+          return name === property;
+        });
+        if (member && ts.isPropertyAssignment(member)) {
+          source = member.initializer;
+          continue;
+        }
+        if (member && ts.isShorthandPropertyAssignment(member)) {
+          source = member.name;
+          continue;
+        }
+      }
+      source = ts.factory.createElementAccessExpression(
+        source,
+        typeof property === 'number'
+          ? ts.factory.createNumericLiteral(property)
+          : ts.factory.createStringLiteral(property)
+      );
+    }
+    return source;
+  };
+  const indexParameterBinding = (name, argument, parameter, restArguments = null, invocation = null, path = []) => {
     if (ts.isIdentifier(name)) {
       if (parameter?.dotDotDotToken) {
         recordRestParameterArguments(checker.getSymbolAtLocation(name), restArguments || [], invocation);
       } else if (argument) {
-        recordParameterArgument(checker.getSymbolAtLocation(name), argument, null, invocation);
+        const source = projectBindingArgument(argument, path);
+        recordParameterArgument(checker.getSymbolAtLocation(name), source, null, invocation);
       }
       return;
     }
     if (ts.isArrayBindingPattern(name)) {
-      if (!ts.isArrayLiteralExpression(argument)) return;
       for (let index = 0; index < name.elements.length; index += 1) {
         const binding = name.elements[index];
-        const source = argument.elements[index];
-        if (ts.isBindingElement(binding) && ts.isIdentifier(binding.name) && source && !ts.isSpreadElement(source)) {
-          recordParameterArgument(checker.getSymbolAtLocation(binding.name), source, null, invocation);
-        }
+        if (!ts.isBindingElement(binding) || binding.dotDotDotToken || !binding.name) continue;
+        indexParameterBinding(binding.name, argument, parameter, restArguments, invocation, [...path, index]);
       }
       return;
     }
     if (!ts.isObjectBindingPattern(name)) return;
     for (const binding of name.elements) {
-      if (!ts.isBindingElement(binding) || !ts.isIdentifier(binding.name)) continue;
+      if (!ts.isBindingElement(binding) || binding.dotDotDotToken || !binding.name) continue;
       const propertyName = bindingPropertyName(binding);
-      recordParameterArgument(checker.getSymbolAtLocation(binding.name), argument, propertyName, invocation);
+      if (propertyName === null) continue;
+      indexParameterBinding(binding.name, argument, parameter, restArguments, invocation, [...path, propertyName]);
     }
   };
   const invocationWrapperName = callee => {
@@ -1186,7 +1221,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
 
     if (ts.isNewExpression(node)) {
       const constructors = resolveSet(node.expression, seen);
-      return moduleResolver?.resolveNew ? moduleResolver.resolveNew(constructors) : empty;
+      return moduleResolver?.resolveNew
+        ? moduleResolver.resolveNew(constructors, node.arguments || [], virtualPath) : empty;
     }
 
     if (ts.isCallExpression(node)) {
@@ -1897,12 +1933,42 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return false;
   };
 
+  const callableReturnsOnlyParameter = (callable, parameterIndex) => {
+    const parameter = callable?.parameters?.[parameterIndex];
+    if (!parameter || !ts.isIdentifier(parameter.name) || !callable.body) return false;
+    const expression = ts.isBlock(callable.body)
+      ? callable.body.statements.length === 1 && ts.isReturnStatement(callable.body.statements[0])
+        ? callable.body.statements[0].expression : null
+      : callable.body;
+    return Boolean(expression && ts.isIdentifier(expression) &&
+      checker.getSymbolAtLocation(expression) === checker.getSymbolAtLocation(parameter.name));
+  };
+  const importedCallableReturnsOnlyProbeArgument = (callables, args) => {
+    if (!args) return false;
+    const probeIndexes = args.flatMap((argument, index) => argumentMayCarryProbe(argument) ? [index] : []);
+    return probeIndexes.length === 1 && callables.length > 0 &&
+      callables.every(callable => callableReturnsOnlyParameter(callable.callable, probeIndexes[0]));
+  };
+
   const visit = node => {
     if (ts.isNewExpression(node)) {
-      const importedClass = [...staticValue(node.expression)].some(atom => atom?.classDeclaration);
+      const classAtoms = [...staticValue(node.expression)].filter(atom => atom?.classDeclaration);
+      const importedClass = classAtoms.length > 0;
       const argumentsList = expandCallArguments(node.arguments);
       const hasProbeArgument = argumentsList?.some(argument => hasAtom(staticValue(argument), PID_PROBE));
-      if (importedClass && (argumentsList === null || hasProbeArgument)) {
+      const probeArgumentsAreProperties = argumentsList !== null && classAtoms.length > 0 &&
+        argumentsList.every((argument, index) => {
+          if (!argumentMayCarryProbe(argument)) return true;
+          return classAtoms.every(atom => {
+            const constructor = atom.classDeclaration.members.find(member => ts.isConstructorDeclaration(member));
+            const parameter = constructor?.parameters[index];
+            return parameter?.modifiers?.some(modifier => [
+              ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.PrivateKeyword,
+              ts.SyntaxKind.ReadonlyKeyword
+            ].includes(modifier.kind)) || false;
+          });
+        });
+      if (importedClass && (argumentsList === null || hasProbeArgument && !probeArgumentsAreProperties)) {
         violations.push(`unsupported process probe ${fileName}:${generatedOwner || enclosingOwner(node)}`);
       }
     }
@@ -1913,6 +1979,26 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const expandedArguments = expandCallArguments(node.arguments);
       const callArguments = expandedArguments || [];
       if (isForwardingCallbackApi(callee)) indexForwardedCallback(node, owner);
+      const isArrayFrom = ts.isPropertyAccessExpression(callee) &&
+        ts.isIdentifier(callee.expression) && callee.expression.text === 'Array' && callee.name.text === 'from' &&
+        !checker.getSymbolAtLocation(callee.expression)?.declarations?.some(declaration =>
+          declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration));
+      if (isArrayFrom && node.arguments.length > 1) {
+        const mapper = callArguments[1] || node.arguments[1];
+        const mapperAtoms = mapper ? staticValue(mapper) : new Set();
+        const directProbeMapper = hasAtom(mapperAtoms, PID_PROBE);
+        const indirectProbeMapper = [BOUND_PROBE, ...INVOCATION_METHODS].some(atom => hasAtom(mapperAtoms, atom));
+        if (directProbeMapper || indirectProbeMapper) {
+          const input = callArguments[0] || node.arguments[0];
+          const elements = input ? literalArrayElements(input) : null;
+          if (expandedArguments === null || !elements) {
+            violations.push(`unsupported process probe ${fileName}:${owner}`);
+          } else if (elements.length > 0) {
+            if (directProbeMapper) kills.push({ file: fileName, owner });
+            if (indirectProbeMapper) violations.push(`unsupported process probe ${fileName}:${owner}`);
+          }
+        }
+      }
       const arrayCallbackMethod = ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
       const arrayCallback = callArguments[0] || node.arguments[0];
       if (arrayCallbackMethod && (finiteArrayCallbackMethods.has(arrayCallbackMethod) ||
@@ -1983,10 +2069,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       } else if (!method) {
         const resolved = staticValue(callee);
-        const importedCallable = [...resolved].some(atom =>
+        const importedCallables = [...resolved].filter(atom =>
           atom?.callable && atom.modulePath && atom.modulePath !== virtualPath);
+        const importedCallable = importedCallables.length > 0;
         const probeBearingArguments = node.arguments.some(argument => argumentMayCarryProbe(argument));
-        if (importedCallable && probeBearingArguments && staticValue(node).size === 0) {
+        if (importedCallable && probeBearingArguments &&
+          !importedCallableReturnsOnlyProbeArgument(importedCallables, expandedArguments)) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         const isBind = calleeNames.has('bind');

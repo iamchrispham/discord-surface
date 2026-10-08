@@ -274,6 +274,20 @@ function createLocalModuleResolver(files) {
         !module.declaredBindings.has('process')) return false;
       return null;
     };
+    const exportPropertyState = (left, classify) => {
+      if (!ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return null;
+      if (!isExportObjectExpression(left.expression)) return null;
+      const name = propertyName(left, identifier => staticPropertyValue(identifier, resolvedPath));
+      if (!name) return null;
+      const states = (module.exports.get(String(name)) || []).map(value => classify(value));
+      return states.length && states.every(state => state === states[0]) ? states[0] : null;
+    };
+    const assignmentValue = value => {
+      let current = unwrap(value);
+      while (ts.isBinaryExpression(current) &&
+        current.operatorToken.kind === ts.SyntaxKind.EqualsToken) current = unwrap(current.right);
+      return current;
+    };
     const recordAssignment = (expression, includedNames = null) => {
       if (!ts.isBinaryExpression(expression)) return;
       const operator = expression.operatorToken.kind;
@@ -281,11 +295,13 @@ function createLocalModuleResolver(files) {
         ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken].includes(operator);
       if (operator !== ts.SyntaxKind.EqualsToken && !logicalOperator) return;
       const left = unwrap(expression.left);
+      const nullishness = staticNullishness(left) ?? exportPropertyState(left, staticNullishness);
+      const truthiness = staticTruthiness(left) ?? exportPropertyState(left, staticTruthiness);
+      if (operator === ts.SyntaxKind.QuestionQuestionEqualsToken && nullishness === false ||
+        operator === ts.SyntaxKind.BarBarEqualsToken && truthiness === true ||
+        operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken && truthiness === false) return;
       if (ts.isIdentifier(left)) {
         if (includedNames && !includedNames.has(left.text)) return;
-        if (operator === ts.SyntaxKind.QuestionQuestionEqualsToken && staticNullishness(left) === false) return;
-        if (operator === ts.SyntaxKind.BarBarEqualsToken && staticTruthiness(left) === true) return;
-        if (operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken && staticTruthiness(left) === false) return;
         addBinding(left.text, expression.right);
         recordExportAlias(left.text, expression.right);
       } else if (ts.isArrayLiteralExpression(left) || ts.isObjectLiteralExpression(left)) {
@@ -321,14 +337,14 @@ function createLocalModuleResolver(files) {
       const name = propertyName(left, identifier => staticPropertyValue(identifier, resolvedPath));
       if (!name || !ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return;
       const receiver = left.expression;
-      if (isExportObjectExpression(receiver)) addExport(name, expression.right);
+      if (isExportObjectExpression(receiver)) addExport(name, assignmentValue(expression.right));
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
-        addExportEquals(expression.right);
+        addExportEquals(assignmentValue(expression.right));
       }
       if (ts.isElementAccessExpression(left) && name === 'exports' && ts.isIdentifier(left.expression) &&
         left.expression.text === 'module') {
-        addExportEquals(expression.right);
+        addExportEquals(assignmentValue(expression.right));
       }
     };
     const recordExportExpression = expression => {
@@ -338,7 +354,7 @@ function createLocalModuleResolver(files) {
       const left = unwrap(expression.left);
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
-        addExportEquals(expression.right);
+        addExportEquals(assignmentValue(expression.right));
         if (ts.isObjectLiteralExpression(expression.right)) {
           for (const property of expression.right.properties) {
             if (!property.name || (!ts.isPropertyAssignment(property) &&
@@ -394,6 +410,36 @@ function createLocalModuleResolver(files) {
       }
     };
     const scannedCallables = new Set();
+    const callableBindingName = callable => {
+      if (callable.name && ts.isIdentifier(callable.name)) return callable.name.text;
+      const parent = callable.parent;
+      if ((ts.isVariableDeclaration(parent) || ts.isPropertyAssignment(parent) ||
+        ts.isPropertyDeclaration(parent)) && ts.isIdentifier(parent.name)) return parent.name.text;
+      return null;
+    };
+    const callableIsReferencedWithin = (candidate, scope) => {
+      const name = callableBindingName(candidate);
+      if (!name) return true;
+      let referenced = false;
+      const visitReference = node => {
+        if (referenced || node === candidate || node !== scope && ts.isFunctionLike(node)) return;
+        if (ts.isIdentifier(node) && node.text === name) {
+          const parent = node.parent;
+          const isDeclaration = parent && parent.name === node && (
+            ts.isFunctionDeclaration(parent) || ts.isClassDeclaration(parent) ||
+            ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)
+          );
+          const isPropertyName = ts.isPropertyAccessExpression(parent) && parent.name === node;
+          if (!isDeclaration && !isPropertyName) {
+            referenced = true;
+            return;
+          }
+        }
+        ts.forEachChild(node, visitReference);
+      };
+      visitReference(scope.body || scope);
+      return referenced;
+    };
     const scanCallableModuleWrites = callable => {
       if (scannedCallables.has(callable)) return;
       scannedCallables.add(callable);
@@ -459,7 +505,8 @@ function createLocalModuleResolver(files) {
       };
       const visit = child => {
         if (child !== callable && ts.isFunctionLike(child)) {
-          scanCallableModuleWrites(child);
+          const isClassMember = ts.isClassDeclaration(callable) || ts.isClassExpression(callable);
+          if (isClassMember || callableIsReferencedWithin(child, callable)) scanCallableModuleWrites(child);
           return;
         }
         if (ts.isBinaryExpression(child)) {
@@ -473,9 +520,9 @@ function createLocalModuleResolver(files) {
       else if (ts.isClassDeclaration(callable) || ts.isClassExpression(callable)) visit(callable);
     };
     const scanModuleLevel = node => {
-      if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
-        ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
-        ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) return;
+      if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
+        ts.isClassExpression(node)) {
         scanCallableModuleWrites(node);
         return;
       }
@@ -542,11 +589,53 @@ function createLocalModuleResolver(files) {
         if (ts.isBinaryExpression(expression)) recordExportExpression(expression);
       }
     }
+    const callableDeclarations = new Map();
+    const reachableCallables = new Set();
+    const pendingCallables = [];
+    const addReachableCallable = callable => {
+      if (!callable || reachableCallables.has(callable)) return;
+      reachableCallables.add(callable);
+      pendingCallables.push(callable);
+    };
     for (const statement of sourceFile.statements) {
-      if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) {
-        scanCallableModuleWrites(statement);
+      if (!ts.isFunctionDeclaration(statement) && !ts.isClassDeclaration(statement)) continue;
+      if (statement.name) {
+        const existing = callableDeclarations.get(statement.name.text) || [];
+        existing.push(statement);
+        callableDeclarations.set(statement.name.text, existing);
       }
+      const isExported = statement.modifiers?.some(modifier =>
+        modifier.kind === ts.SyntaxKind.ExportKeyword || modifier.kind === ts.SyntaxKind.DefaultKeyword) || false;
+      if (isExported) addReachableCallable(statement);
     }
+    const includeCallableReferences = root => {
+      const visit = node => {
+        if (node !== root && (ts.isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node))) {
+          const isClassMember = (ts.isClassDeclaration(root) || ts.isClassExpression(root)) &&
+            (node.parent === root || node.parent.parent === root && ts.isPropertyDeclaration(node.parent));
+          if (!isClassMember) return;
+        }
+        if (ts.isIdentifier(node)) {
+          const parent = node.parent;
+          const isDeclaration = parent && parent.name === node && (
+            ts.isFunctionDeclaration(parent) || ts.isClassDeclaration(parent) ||
+            ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)
+          );
+          const isPropertyName = ts.isPropertyAccessExpression(parent) && parent.name === node;
+          if (!isDeclaration && !isPropertyName) {
+            for (const callable of callableDeclarations.get(node.text) || []) addReachableCallable(callable);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(root);
+    };
+    for (const statement of sourceFile.statements) {
+      if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) continue;
+      includeCallableReferences(statement);
+    }
+    while (pendingCallables.length) includeCallableReferences(pendingCallables.shift());
+    for (const callable of reachableCallables) scanCallableModuleWrites(callable);
     scanModuleLevel(sourceFile);
     return module;
   };
@@ -563,14 +652,19 @@ function createLocalModuleResolver(files) {
           continue;
         }
         const getter = ts.isGetAccessorDeclaration(property);
+        const method = ts.isMethodDeclaration(property);
         if (!property.name || (!ts.isPropertyAssignment(property) &&
-          !ts.isShorthandPropertyAssignment(property) && !getter)) continue;
+          !ts.isShorthandPropertyAssignment(property) && !getter && !method)) continue;
         const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
           ? property.name.text
           : ts.isComputedPropertyName(property.name)
             ? staticPropertyValue(property.name.expression, currentPath, seen)
             : null;
         if (key !== name) continue;
+        if (method) {
+          result.add({ callable: property, modulePath: currentPath });
+          continue;
+        }
         if (getter) {
           const statements = property.body?.statements || [];
           if (statements.length === 1 && ts.isReturnStatement(statements[0]) && statements[0].expression) {
@@ -677,6 +771,7 @@ function createLocalModuleResolver(files) {
     const declaration = atom.classDeclaration;
     const seen = new Set(visited).add(declaration);
     const expressions = classPropertyExpressions(declaration, name, !atom.instance);
+    let hasParameterProperty = false;
     for (const expression of expressions) {
       if (ts.isGetAccessorDeclaration(expression)) {
         for (const returnExpression of callableReturnExpressions(expression)) {
@@ -688,7 +783,30 @@ function createLocalModuleResolver(files) {
         for (const nested of evaluate(expression, atom.modulePath || currentPath, seen)) result.add(nested);
       }
     }
-    if (expressions.length) return result;
+    if (atom.instance) {
+      const constructor = declaration.members.find(member => ts.isConstructorDeclaration(member));
+      for (const parameter of constructor?.parameters || []) {
+        if (!ts.isIdentifier(parameter.name) || parameter.name.text !== String(name)) continue;
+        const isParameterProperty = parameter.modifiers?.some(modifier => [
+          ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.PrivateKeyword,
+          ts.SyntaxKind.ReadonlyKeyword
+        ].includes(modifier.kind)) || false;
+        if (!isParameterProperty) continue;
+        hasParameterProperty = true;
+        const binding = atom.constructorBindings?.get(parameter.name.text);
+        const value = binding?.expression || parameter.initializer;
+        const valuePath = binding?.expression ? binding.currentPath : atom.modulePath || currentPath;
+        if (value) {
+          for (const nested of evaluate(value, valuePath, seen)) result.add(nested);
+        }
+        if (binding?.fallback) {
+          for (const nested of evaluate(binding.fallback, binding.fallbackPath || atom.modulePath || currentPath, seen)) {
+            result.add(nested);
+          }
+        }
+      }
+    }
+    if (expressions.length || hasParameterProperty) return result;
     for (const heritage of declaration.heritageClauses || []) {
       if (heritage.token !== ts.SyntaxKind.ExtendsKeyword) continue;
       for (const type of heritage.types) {
@@ -732,14 +850,21 @@ function createLocalModuleResolver(files) {
     return result;
   };
 
-  const resolveNew = atoms => {
+  const resolveNew = (atoms, argumentsList = [], callerPath = null) => {
     const result = new Set();
     for (const atom of atoms || []) {
-      if (atom?.classDeclaration) result.add({
-        classDeclaration: atom.classDeclaration,
-        modulePath: atom.modulePath,
-        instance: true
-      });
+      if (atom?.classDeclaration) {
+        const classPath = atom.modulePath || callerPath;
+        const constructor = atom.classDeclaration.members.find(member => ts.isConstructorDeclaration(member));
+        result.add({
+          classDeclaration: atom.classDeclaration,
+          modulePath: atom.modulePath,
+          instance: true,
+          constructorBindings: constructor
+            ? callableParameterBindings(constructor, argumentsList || [], callerPath, classPath)
+            : new Map()
+        });
+      }
     }
     return result;
   };
@@ -1071,7 +1196,9 @@ function createLocalModuleResolver(files) {
       }
       return result;
     }
-    if (ts.isNewExpression(node)) return resolveNew(evaluate(node.expression, currentPath, seen, parameterBindings));
+    if (ts.isNewExpression(node)) return resolveNew(
+      evaluate(node.expression, currentPath, seen, parameterBindings), node.arguments || [], currentPath
+    );
     if (ts.isCallExpression(node)) {
       const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
