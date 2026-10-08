@@ -10,6 +10,8 @@ import type {
   CourierSource
 } from './types';
 
+export class CourierPromptLimitError extends Error {}
+
 function sourceFor(message: CourierMessage): CourierSource {
   if (message.watcherNotice) {
     const provenance = message.watcherNoticeProvenance;
@@ -64,7 +66,7 @@ export function payloadHash(message: CourierMessage, input: CourierDispatchInput
   return crypto.createHash('sha256').update(JSON.stringify(payloadBody(message, input))).digest('hex');
 }
 
-export function attemptKey(message: CourierMessage, route: CourierRoute, hash: string): string {
+export function attemptKey(message: CourierMessage, route: CourierRoute, hash: string, predecessorAttemptId: string | null = null): string {
   const watcherSource = message.watcherNotice ? sourceFor(message) : null;
   return JSON.stringify({
     messageId: message.id,
@@ -74,7 +76,8 @@ export function attemptKey(message: CourierMessage, route: CourierRoute, hash: s
     sourceKind: watcherSource?.kind || (message.agentMessage ? COURIER_SOURCE_KINDS.AGENT : COURIER_SOURCE_KINDS.HUMAN),
     source: watcherSource || message.agentMessage?.source || { authorId: message.authorId, channelId: message.deliveryChannelId },
     target: message.agentMessage?.target || null,
-    destination: sourceDestination(message)
+    destination: sourceDestination(message),
+    ...(predecessorAttemptId ? { predecessorAttemptId } : {})
   });
 }
 
@@ -93,7 +96,8 @@ export function createEnvelope(
   route: CourierRoute,
   id: string,
   hash: string,
-  input: CourierDispatchInput
+  input: CourierDispatchInput,
+  predecessorAttemptId: string | null = null
 ): CourierEnvelope {
   if (message.agentMessage && ![KINDS.REQUEST, KINDS.RESULT].includes(message.agentMessage.kind)) {
     throw new Error('courier packet kind is unsupported');
@@ -102,6 +106,10 @@ export function createEnvelope(
     throw new Error('courier forwarded prompt is missing');
   }
   const source = sourceFor(message);
+  const prompt = predecessorAttemptId
+    ? `${input.prompt}\n\n[discord-courier-delivery-attempt:${id}]`
+    : input.prompt;
+  if (prompt.length > 100000) throw new CourierPromptLimitError('courier forwarded prompt exceeds 100000 characters');
   const body = {
     type: ENVELOPE_TYPE,
     attemptId: id,
@@ -122,8 +130,9 @@ export function createEnvelope(
     packet: message.agentMessage ? { ...message.agentMessage } : null,
     wire: message.content,
     payloadHash: hash,
-    prompt: input.prompt,
-    observerCursor: input.observerCursor ? { ...input.observerCursor } : null
+    prompt,
+    observerCursor: input.observerCursor ? { ...input.observerCursor } : null,
+    ...(predecessorAttemptId ? { predecessorAttemptId } : {})
   } satisfies CourierEnvelope;
   return deepFreeze(body);
 }
