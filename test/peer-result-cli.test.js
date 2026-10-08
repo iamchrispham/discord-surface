@@ -81,34 +81,54 @@ function createNetworkTrap(f) {
       owner.prototype[methodName] = blocked(label);
     };
     patchBindingMethod('tcp_wrap', 'TCP', 'connect', 'tcp_wrap.TCP.connect');
+    patchBindingMethod('tcp_wrap', 'TCP', 'connect6', 'tcp_wrap.TCP.connect6');
     const udpPrototype = process.binding('udp_wrap').UDP.prototype;
     for (const methodName of Object.getOwnPropertyNames(udpPrototype)) {
       if (/^(bind|connect|send)/.test(methodName) && typeof udpPrototype[methodName] === 'function') {
         udpPrototype[methodName] = blocked('udp_wrap.UDP.' + methodName);
       }
     }
-    const channelPrototype = process.binding('cares_wrap').ChannelWrap.prototype;
+    const caresWrap = process.binding('cares_wrap');
+    caresWrap.getaddrinfo = blocked('cares_wrap.getaddrinfo');
+    caresWrap.getnameinfo = blocked('cares_wrap.getnameinfo');
+    const channelPrototype = caresWrap.ChannelWrap.prototype;
+    const channelConfigurationMethods = new Set([
+      'constructor', 'getServers', 'setServers', 'setLocalAddress', 'cancel'
+    ]);
     for (const methodName of Object.getOwnPropertyNames(channelPrototype)) {
-      if (methodName.startsWith('query') && typeof channelPrototype[methodName] === 'function') {
+      if (!channelConfigurationMethods.has(methodName) && typeof channelPrototype[methodName] === 'function') {
         channelPrototype[methodName] = blocked('cares_wrap.ChannelWrap.' + methodName);
       }
     }
 
     const dns = require('node:dns');
-    dns.lookup = blocked('node:dns.lookup');
-    dns.promises.lookup = blocked('node:dns.promises.lookup');
 
     const processWrap = process.binding('process_wrap');
+    const addPreload = existingOptions => existingOptions.includes(preload)
+      ? existingOptions
+      : [existingOptions, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' ');
     const addNetworkTrap = options => {
       const childOptions = options || {};
       const envPairs = Array.isArray(childOptions.envPairs) ? childOptions.envPairs : [];
       const existing = envPairs.find(pair => pair.startsWith('NODE_OPTIONS='));
       const existingOptions = existing ? existing.slice('NODE_OPTIONS='.length) : '';
-      const nextOptions = existingOptions.includes(preload)
-        ? existingOptions
-        : [existingOptions, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' ');
+      const nextOptions = addPreload(existingOptions);
       return { ...childOptions,
         envPairs: [...envPairs.filter(pair => !pair.startsWith('NODE_OPTIONS=')), 'NODE_OPTIONS=' + nextOptions] };
+    };
+    const workerThreads = require('node:worker_threads');
+    const OriginalWorker = workerThreads.Worker;
+    workerThreads.Worker = class extends OriginalWorker {
+      constructor(filename, options = {}) {
+        const inheritedEnv = options.env === undefined ? process.env : options.env;
+        const workerOptions = { ...options };
+        if (inheritedEnv !== workerThreads.SHARE_ENV) {
+          const env = { ...inheritedEnv };
+          env.NODE_OPTIONS = addPreload(env.NODE_OPTIONS || '');
+          workerOptions.env = env;
+        }
+        super(filename, workerOptions);
+      }
     };
     const processSpawn = processWrap.Process.prototype.spawn;
     processWrap.Process.prototype.spawn = function(options) {
@@ -130,8 +150,14 @@ function createNetworkTrap(f) {
           const socket = new net.Socket();
           Object.getPrototypeOf(socket).connect.call(socket, 9, '127.0.0.1');
         },
+        'socket.connect6': () => net.connect(9, '::1'),
         'dns.lookup': () => dns.lookup('localhost', () => {}),
         'dns.promises.lookup': () => dns.promises.lookup('localhost'),
+        'dns.reverse': () => {
+          dns.setServers(['127.0.0.1:9']);
+          dns.reverse('192.0.2.1', () => {});
+        },
+        'dns.lookupService': () => dns.lookupService('192.0.2.1', 80, () => {}),
         'http2.connect': () => require('node:http2').connect('http://127.0.0.1:9'),
         'dns.resolver': () => {
           const resolver = new dns.Resolver();
@@ -176,7 +202,13 @@ function createNetworkTrap(f) {
           child.on('exit', () => {});
         },
         'child_process.spawnSync': () => require('node:child_process').spawnSync(process.execPath,
-          ['-e', "require('node:net').connect(9, '127.0.0.1')"], { env: {} })
+          ['-e', "require('node:net').connect(9, '127.0.0.1')"], { env: {} }),
+        'worker.env.empty': () => {
+          const worker = new workerThreads.Worker(
+            "require('node:net').connect(9, '127.0.0.1')", { eval: true, env: {} });
+          worker.on('error', () => {});
+          worker.on('exit', () => {});
+        }
       };
       const action = probeActions[probe];
       if (!action) throw new Error('NETWORK_TRAP_UNKNOWN_PROBE:' + probe);
@@ -471,7 +503,8 @@ test('network trap covers shared transport boundaries and control probes', t => 
       'dns.lookup', 'dns.promises.lookup', 'http2.connect', 'dns.resolver',
       'dns.promises.resolver', 'dns.resolveCaa', 'dns.resolve4',
       'dns.setServers', 'dns.promises.setServers', 'datagram.send', 'tcp.raw',
-      'child_process.spawn', 'child_process.spawnSync'
+      'child_process.spawn', 'child_process.spawnSync', 'socket.connect6',
+      'dns.reverse', 'dns.lookupService', 'worker.env.empty'
     ];
     for (const probe of probes) {
       fs.rmSync(trap.marker, { force: true });
