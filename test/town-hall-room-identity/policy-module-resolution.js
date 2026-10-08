@@ -126,7 +126,9 @@ function createPolicyModuleGraph({
       return info.functions.get(expression.text) || resolveImported(info, expression.text);
     }
     if ((ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
-        (ts.isIdentifier(expression.expression) || ts.isNewExpression(expression.expression) ||
+        (ts.isIdentifier(expression.expression) ||
+          expression.expression.kind === ts.SyntaxKind.ThisKeyword ||
+          ts.isNewExpression(expression.expression) ||
           (ts.isCallExpression(expression.expression) && ts.isIdentifier(expression.expression.expression)))) {
       const property = policyPropertyKey(expression);
       if (!property) return null;
@@ -153,6 +155,23 @@ function createPolicyModuleGraph({
           .sort((left, right) =>
             scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
         if (localMethod) return localMethod;
+      }
+      if (expression.expression.kind === ts.SyntaxKind.ThisKeyword) {
+        let enclosing = expression.expression.parent;
+        while (enclosing && !ts.isFunctionLike(enclosing)) enclosing = enclosing.parent;
+        const owner = info.functionDefs.find(candidate => candidate.node === enclosing &&
+          candidate.ownerDeclaration);
+        const ownerName = owner?.ownerDeclaration?.name?.text;
+        if (owner && ownerName) {
+          const localMethods = info.objectMethods.get(`${ownerName}.${property}`) || [];
+          const localMethod = localMethods
+            .filter(method => method.ownerDeclaration === owner.ownerDeclaration &&
+              method.instance === owner.instance)
+            .sort((left, right) =>
+              Number(Boolean(right.node.body)) - Number(Boolean(left.node.body)) ||
+              scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
+          if (localMethod) return localMethod;
+        }
       }
       if (receiverName) {
         const key = receiverName + '.' + property;

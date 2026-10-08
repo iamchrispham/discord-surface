@@ -74,6 +74,50 @@ function createPolicyRegexAnalysis({
       }
     };
     collectMatcherInputs(node);
+    const defaultParameter = node.parent;
+    if (defaultParameter && ts.isParameter(defaultParameter) && defaultParameter.initializer &&
+        isAncestor(defaultParameter.initializer, node) && ts.isIdentifier(defaultParameter.name)) {
+      const matcher = info.functionDefs.find(candidate => candidate.node === defaultParameter.parent);
+      const patternBinding = findBinding(info, defaultParameter.name.text, defaultParameter.name);
+      if (matcher?.node.body && patternBinding) {
+        const patternIndex = matcher.node.parameters.indexOf(defaultParameter);
+        const inputParameterIndexes = new Set();
+        const directInputs = [];
+        const visitMatcher = candidate => {
+          if (ts.isIdentifier(candidate) && candidate.text === defaultParameter.name.text &&
+              findBinding(info, candidate.text, candidate) === patternBinding) {
+            const input = regexInput(candidate);
+            if (input) {
+              const inputBinding = ts.isIdentifier(input)
+                ? findBinding(info, input.text, input)
+                : null;
+              const inputIndex = matcher.node.parameters.findIndex(parameter =>
+                ts.isIdentifier(parameter.name) && inputBinding &&
+                findBinding(info, parameter.name.text, parameter.name) === inputBinding);
+              if (inputIndex >= 0) inputParameterIndexes.add(inputIndex);
+              else directInputs.push(input);
+            }
+          }
+          ts.forEachChild(candidate, visitMatcher);
+        };
+        visitMatcher(matcher.node.body);
+        const visitCalls = candidate => {
+          if (ts.isCallExpression(candidate) &&
+              !candidate.arguments.some(argument => ts.isSpreadElement(argument))) {
+            const resolved = resolveFunction(info, candidate.expression);
+            if (resolved?.info === info && resolved.node === matcher.node &&
+                candidate.arguments.length <= patternIndex) {
+              for (const inputIndex of inputParameterIndexes) {
+                if (candidate.arguments[inputIndex]) inputs.push(candidate.arguments[inputIndex]);
+              }
+              inputs.push(...directInputs);
+            }
+          }
+          ts.forEachChild(candidate, visitCalls);
+        };
+        visitCalls(info.ast);
+      }
+    }
     const factoryScope = enclosingFunction(node);
     const factory = info.functionDefs.find(candidate => candidate.node === factoryScope);
     let returnedByFactory = false;

@@ -510,6 +510,7 @@ test('instance regex fields follow direct and local constructor receivers', () =
       function validateTownHallRoom(room) { return new Patterns().ROOM_ID.test(room.name); }`,
   };
   assert.deepEqual(roomDigitPolicies([ordinary]), {});
+
 });
 
 test('static regex getters follow direct return values without executing code', () => {
@@ -651,4 +652,122 @@ test('room identifier origin survives trim and toString calls', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([negativeConsumer]), {});
+});
+
+test('for-of room fields retain every finite iterable source', () => {
+  const consumer = {
+    file: 'peer/for-of-room-policy.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      for (const value of [room.name, room.guildId, room.channelId]) {
+        if (/^\d{1,21}$/.test(value)) return true;
+      }
+      return false;
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/for-of-room-policy-ordinary.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      for (const value of [room.name]) {
+        if (/^\d{1,21}$/.test(value)) return true;
+      }
+      return false;
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinary]), {});
+});
+
+test('default regex parameters apply only when the call omits that argument', () => {
+  const consumer = {
+    file: 'peer/default-room-pattern.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room) { return matches(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/default-room-pattern-ordinary.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room) { return matches(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinary]), {});
+
+  const explicitPattern = {
+    file: 'peer/default-room-pattern-explicit.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,22}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room) {
+      return matches(room.guildId, /^\d{1,21}$/);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([explicitPattern]), { [explicitPattern.file]: 1 });
+});
+
+test('native RegExp constructor aliases retain lexical shadowing', () => {
+  const consumer = {
+    file: 'peer/native-regexp-alias.ts',
+    text: String.raw`const NativeRegExp = RegExp;
+    function validateTownHallRoom(room) {
+      return new NativeRegExp('^\\d{1,21}$').test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+
+  const shadowed = {
+    file: 'peer/native-regexp-alias-shadowed.ts',
+    text: String.raw`function validateTownHallRoom(room, RegExp) {
+      const NativeRegExp = RegExp;
+      return new NativeRegExp('^\\d{1,21}$').test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([shadowed]), {});
+});
+
+test('same-owner this helpers retain room identity and reject ordinary data', () => {
+  const classValidator = {
+    file: 'peer/this-class-room-policy.ts',
+    text: String.raw`class ClassRoomValidator {
+      checkId(value) { return /^\d{1,22}$/.test(value); }
+      validateTownHallRoom(room) { return this.checkId(room.guildId); }
+    }`,
+  };
+  const objectValidator = {
+    file: 'peer/this-object-room-policy.ts',
+    text: String.raw`const ObjectRoomValidator = {
+      checkId(value) { return /^\d{1,22}$/.test(value); },
+      validateTownHallRoom(room) { return this.checkId(room.channelId); },
+    };`,
+  };
+  const ordinary = {
+    file: 'peer/this-room-policy-ordinary.ts',
+    text: String.raw`class OrdinaryRoomValidator {
+      checkId(value) { return /^\d{1,22}$/.test(value); }
+      validateTownHallRoom(room) { return this.checkId(room.name); }
+    }`,
+  };
+  const differentOwner = {
+    file: 'peer/this-room-policy-different-owner.ts',
+    text: String.raw`class IdHelper {
+      checkId(value) { return /^\d{1,22}$/.test(value); }
+    }
+    class RoomValidator {
+      validateTownHallRoom(room) { return this.checkId(room.guildId); }
+    }`,
+  };
+
+  assert.deepEqual(roomDigitPolicies([
+    classValidator,
+    objectValidator,
+    ordinary,
+    differentOwner,
+  ]), {
+    [classValidator.file]: 1,
+    [objectValidator.file]: 1,
+  });
 });

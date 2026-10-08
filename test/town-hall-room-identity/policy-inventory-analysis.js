@@ -13,6 +13,18 @@ function createSourceFile(file, text) {
     ts.getScriptKindFromFileName(file));
 }
 
+function isNativeRegExpConstructor(expression, bindings, seen = new Set()) {
+  const value = unwrapPolicyExpression(expression);
+  if (!value || !ts.isIdentifier(value)) return false;
+  const binding = resolveBinding(value, bindings);
+  if (!binding) return value.text === 'RegExp';
+  if (seen.has(binding) || !ts.isVariableDeclaration(binding) ||
+      !ts.isVariableDeclarationList(binding.parent) ||
+      !(binding.parent.flags & ts.NodeFlags.Const) || !binding.initializer) return false;
+  seen.add(binding);
+  return isNativeRegExpConstructor(binding.initializer, bindings, seen);
+}
+
 function finiteStringValues(expression, bindings, seen = new Set()) {
   const value = unwrapPolicyExpression(expression);
   if (!value) return null;
@@ -563,9 +575,7 @@ function legacyRoomDigitPolicies(records, resolveImport = null, recordDefinition
       let pattern = null;
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
-          ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
-          !resolveBinding(node.expression, bindings) &&
-          node.arguments?.length) {
+          isNativeRegExpConstructor(node.expression, bindings) && node.arguments?.length) {
         pattern = resolveStringValue(node.arguments[0], bindings, new Set(),
           resolveImport ? (identifier, seen) => resolveImport(file, identifier, seen) : null);
       }
@@ -662,9 +672,18 @@ function roomDigitPolicies(records, options = {}) {
     const visit = node => {
       if (ts.isVariableDeclaration(node) && !ts.isCatchClause(node.parent)) {
         const scope = variableDeclarationScope(node);
+        const declarationList = node.parent;
+        const loop = ts.isVariableDeclarationList(declarationList) ? declarationList.parent : null;
+        const iterableSources = ts.isIdentifier(node.name) && !node.initializer &&
+          loop && ts.isForOfStatement(loop) && loop.initializer === declarationList &&
+          (declarationList.flags & ts.NodeFlags.Const) && ts.isArrayLiteralExpression(loop.expression)
+          ? loop.expression.elements.filter(element =>
+            !ts.isOmittedExpression(element) && !ts.isSpreadElement(element))
+          : undefined;
         addPatternBindings(node.name, node.initializer || null, info, {
           declaration: node,
           scope,
+          ...(iterableSources ? { iterableSources } : {}),
         });
         if (ts.isIdentifier(node.name) && node.initializer &&
             (ts.isFunctionExpression(node.initializer) || ts.isArrowFunction(node.initializer))) {
@@ -918,7 +937,7 @@ function roomDigitPolicies(records, options = {}) {
       const value = unwrapPolicyExpression(expression);
       if (ts.isRegularExpressionLiteral(value)) return { node: value, pattern: value.text };
       if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
-          ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
+          isNativeRegExpConstructor(value.expression, regexBindings) &&
           value.arguments?.length) {
         const pattern = resolveStringValue(value.arguments[0], regexBindings);
         if (pattern !== null) return { node: value, pattern };
@@ -1117,6 +1136,10 @@ function roomDigitPolicies(records, options = {}) {
     if (binding.kind === 'value' && binding.source) {
       return expressionIsRoomField(binding.source, info, seen);
     }
+    if (binding.kind === 'value' && binding.iterableSources?.length) {
+      return binding.iterableSources.some(source =>
+        expressionIsRoomField(source, info, new Set(seen)));
+    }
     if ((binding.kind === 'field' || binding.kind === 'parameter-field') &&
         ['guildId', 'channelId'].includes(binding.key)) {
       if (binding.kind === 'field') return objectIsRoom(binding.source, info, new Set(seen));
@@ -1134,7 +1157,8 @@ function roomDigitPolicies(records, options = {}) {
     return bindingCalls(binding, binding.ownerInfo).some(call => {
       const caller = call.node && enclosingFunction(call.node);
       const callerBinding = caller && functionBinding(caller);
-      const callerName = callerBinding ? bindingName(callerBinding) : null;
+      const callerDefinition = caller && call.info.functionDefs.find(candidate => candidate.node === caller);
+      const callerName = (callerBinding && bindingName(callerBinding)) || callerDefinition?.name || null;
       const argument = call.args[binding.index];
       const contextualInput = wholeRoomArgument
         ? objectIsRoom(argument, call.info)
@@ -1190,9 +1214,7 @@ function roomDigitPolicies(records, options = {}) {
       let pattern = null;
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
-          ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
-          !resolveBinding(node.expression, legacyBindings) &&
-          node.arguments?.length) {
+          isNativeRegExpConstructor(node.expression, legacyBindings) && node.arguments?.length) {
         pattern = resolveStringValue(node.arguments[0], legacyBindings, new Set(),
           (identifier, seen) => resolveImportedString(info, identifier, seen));
       }
