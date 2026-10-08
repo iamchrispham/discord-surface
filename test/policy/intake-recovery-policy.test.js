@@ -1492,7 +1492,67 @@ const assignmentTargetAt = (tokens, index, end, pairs) => {
   return name === null ? null : { equalsIndex, name };
 };
 
-const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
+const staticArrayIndexAt = token => {
+  const value = token?.type === 'number' ? token.value : staticPropertyName(token);
+  return value !== null && value !== undefined && /^\d+$/.test(String(value))
+    ? Number(value)
+    : null;
+};
+
+const staticArrayElementRangeAt = (tokens, start, end, pairs, useIndex) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  let arrayStart;
+  let elementIndex;
+  let bindingIndex;
+  if (tokens[expression.start]?.value === '[') {
+    arrayStart = expression.start;
+    const arrayClosing = pairs.get(arrayStart);
+    const indexOpening = arrayClosing + 1;
+    const indexClosing = pairs.get(indexOpening);
+    const staticIndex = staticArrayIndexAt(tokens[indexOpening + 1]);
+    if (arrayClosing === undefined || tokens[indexOpening]?.value !== '['
+      || indexClosing !== indexOpening + 2 || indexClosing !== expression.end - 1
+      || staticIndex === null) return null;
+    elementIndex = staticIndex;
+    const element = topLevelSegments(tokens, arrayStart + 1, arrayClosing)[elementIndex];
+    return element ? { ...element, bindingIndex: `inline:${arrayStart}`, elementIndex } : null;
+  }
+
+  if (expression.end - expression.start !== 4
+    || tokens[expression.start]?.type !== 'identifier'
+    || tokens[expression.start + 1]?.value !== '['
+    || pairs.get(expression.start + 1) !== expression.end - 1) return null;
+  const staticIndex = staticArrayIndexAt(tokens[expression.start + 2]);
+  if (staticIndex === null) return null;
+  elementIndex = staticIndex;
+
+  const name = tokens[expression.start].value;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  for (let candidate = useIndex - 1; candidate >= 0; candidate -= 1) {
+    if (tokens[candidate]?.value !== name || tokens[candidate - 1]?.value !== 'const'
+      || tokens[candidate + 1]?.value !== '=') continue;
+    const declarationScope = lexicalScopePath(lexicalScopes, candidate);
+    if (isLexicallyVisible(declarationScope, useScope)) {
+      bindingIndex = candidate;
+      break;
+    }
+  }
+  if (bindingIndex === undefined) return null;
+
+  arrayStart = bindingIndex + 2;
+  const arrayEnd = trimExpressionRange(
+    tokens,
+    arrayStart,
+    findAssignmentValueEnd(tokens, arrayStart, tokens.length),
+    pairs
+  ).end;
+  if (tokens[arrayStart]?.value !== '[' || pairs.get(arrayStart) !== arrayEnd - 1) return null;
+  const element = topLevelSegments(tokens, arrayStart + 1, arrayEnd - 1)[elementIndex];
+  return element ? { ...element, bindingIndex, elementIndex } : null;
+};
+
+const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), resolvingArrays = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
   const projectedValue = parenthesizedObjectMemberValueRangeAt(
@@ -1501,25 +1561,40 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
     expression.end,
     pairs
   );
-  if (projectedValue) return valueHasGapOutcome(tokens, projectedValue[0], projectedValue[1], pairs, aliases);
+  if (projectedValue) return valueHasGapOutcome(tokens, projectedValue[0], projectedValue[1], pairs, aliases, resolvingArrays);
   const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
   if (commaSegments.length > 1) {
     const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
-    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases);
+    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays);
   }
   const assignmentIndex = topLevelToken(tokens, expression.start, expression.end, '=');
   if (assignmentIndex >= 0) {
     const outcomeValueStart = outcomeAssignmentValueStart(tokens, expression.start);
     if (outcomeValueStart === null || outcomeValueStart <= assignmentIndex) return false;
-    return valueHasGapOutcome(tokens, outcomeValueStart, expression.end, pairs, aliases);
+    return valueHasGapOutcome(tokens, outcomeValueStart, expression.end, pairs, aliases, resolvingArrays);
   }
   if (tokens[expression.start]?.value === 'await') {
-    return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases);
+    return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases, resolvingArrays);
   }
   if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
   if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
   const memberName = staticMemberExpressionName(tokens, expression.start, expression.end, pairs);
   if (memberName !== null && aliases.has(memberName)) return true;
+  const arrayElement = staticArrayElementRangeAt(tokens, expression.start, expression.end, pairs, expression.start);
+  if (arrayElement) {
+    const resolutionKey = `${arrayElement.bindingIndex}:${arrayElement.elementIndex}`;
+    if (resolvingArrays.has(resolutionKey)) return false;
+    const nextResolvingArrays = new Set(resolvingArrays);
+    nextResolvingArrays.add(resolutionKey);
+    return valueHasGapOutcome(
+      tokens,
+      arrayElement[0],
+      arrayElement[1],
+      pairs,
+      aliases,
+      nextResolvingArrays
+    );
+  }
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
   if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
 
@@ -1535,7 +1610,7 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
     || tokens[wrapperOpening]?.value !== '(') return false;
   const wrapperClosing = pairs.get(wrapperOpening);
   if (wrapperClosing !== expression.end - 1) return false;
-  return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases);
+  return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases, resolvingArrays);
 };
 
 const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRanges, aliases) => {
@@ -1704,7 +1779,16 @@ const boundaryWriterCallHasGapAt = (tokens, index, end, pairs, aliases, writerAl
   );
 };
 
-const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases, writerAliases = new Map()) => {
+const hasBoundaryWriterGap = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  aliases,
+  writerAliases = new Map(),
+  skipScheduledOutcomeValues = false
+) => {
   const knownWriterAliases = new Map(writerAliases);
   const nestedFunctionStarts = new Map(functionRanges
     .filter(range => range.start >= start && range.opening < end)
@@ -1716,7 +1800,7 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
       if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
-        if (callbackKind !== 'discarded'
+        if (!skipScheduledOutcomeValues && callbackKind !== 'discarded'
           && nestedFunction.expression
           && valueHasGapOutcome(tokens, bodyStart, bodyEnd, pairs, aliases)) return true;
         if (hasBoundaryWriterGap(
@@ -1928,7 +2012,206 @@ const localFunctionWasReassigned = (tokens, name, start, end) => {
   return false;
 };
 
-const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
+const callbackParameterNameAt = (tokens, range, pairs) => {
+  let parameterOpening;
+  let parameterClosing;
+  if (tokens[range.start]?.value === 'function') {
+    parameterOpening = range.start + 1;
+    while (parameterOpening < range.opening && tokens[parameterOpening]?.value !== '(') {
+      parameterOpening += 1;
+    }
+    parameterClosing = pairs.get(parameterOpening);
+  } else {
+    parameterClosing = range.start - 1;
+    if (tokens[parameterClosing]?.value === ')') parameterOpening = pairs.get(parameterClosing);
+    else return tokens[parameterClosing]?.type === 'identifier' ? tokens[parameterClosing].value : null;
+  }
+  if (parameterOpening === undefined || parameterClosing === undefined) return null;
+  const firstParameter = topLevelSegments(tokens, parameterOpening + 1, parameterClosing)[0];
+  return firstParameter && firstParameter[1] - firstParameter[0] === 1
+    && tokens[firstParameter[0]]?.type === 'identifier'
+    ? tokens[firstParameter[0]].value
+    : null;
+};
+
+const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  let expressionEnd = expression.end;
+  while (expressionEnd > expression.start && tokens[expressionEnd - 1]?.value === ';') expressionEnd -= 1;
+  const resolveOpening = expression.start + 3;
+  if (tokens[expression.start]?.value !== 'Promise'
+    || tokens[expression.start + 1]?.value !== '.'
+    || tokens[expression.start + 2]?.value !== 'resolve'
+    || tokens[resolveOpening]?.value !== '(') return null;
+  const resolveClosing = pairs.get(resolveOpening);
+  if (resolveClosing === undefined || resolveClosing >= expression.end) return null;
+  const initialArguments = topLevelSegments(tokens, resolveOpening + 1, resolveClosing);
+  let fulfillmentHasGap = initialArguments.length > 0
+    && valueHasGapOutcome(tokens, initialArguments[0][0], initialArguments[0][1], pairs, aliases);
+  let cursor = resolveClosing + 1;
+  let handlerCount = 0;
+
+  while (cursor < expressionEnd) {
+    const separator = tokens[cursor]?.value;
+    const methodIndex = cursor + 1;
+    const callOpening = cursor + 2;
+    if (!['.', '?.'].includes(separator)
+      || tokens[methodIndex]?.value !== 'then'
+      || tokens[callOpening]?.value !== '(') break;
+    const callClosing = pairs.get(callOpening);
+    if (callClosing === undefined || callClosing >= expressionEnd) return null;
+    const handlerArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+    const fulfillmentHandler = handlerArguments[0];
+    if (fulfillmentHandler) {
+      const handlerExpression = trimExpressionRange(
+        tokens,
+        fulfillmentHandler[0],
+        fulfillmentHandler[1],
+        pairs
+      );
+      const handlerRange = functionRanges
+        .filter(range => range.start >= handlerExpression.start && range.closing < handlerExpression.end)
+        .filter(range => isScheduledCallback(tokens, pairs, range) === 'outcome')
+        .filter(range => !functionRanges.some(parent => parent !== range
+          && parent.start >= handlerExpression.start
+          && parent.start < range.start
+          && parent.closing > range.closing
+          && parent.closing < handlerExpression.end))
+        .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+
+      if (!handlerRange) {
+        const identityHandler = handlerExpression.end - handlerExpression.start === 1
+          && ['undefined', 'null'].includes(tokens[handlerExpression.start]?.value);
+        if (!identityHandler) return null;
+      } else {
+        const handlerAliases = new Set(aliases);
+        const parameterName = callbackParameterNameAt(tokens, handlerRange, pairs);
+        if (fulfillmentHasGap && parameterName) handlerAliases.add(parameterName);
+        const bodyStart = handlerRange.expression ? handlerRange.bodyStart : handlerRange.opening + 1;
+        const bodyEnd = handlerRange.expression ? handlerRange.bodyEnd : handlerRange.closing;
+        fulfillmentHasGap = handlerRange.expression
+          ? valueHasGapOutsideNestedFunctions(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            functionRanges,
+            handlerAliases
+          )
+          : hasGapOutcome(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            handlerRange.opening,
+            pairs,
+            functionRanges,
+            handlerAliases
+          );
+      }
+    }
+    handlerCount += 1;
+    cursor = callClosing + 1;
+  }
+
+  return handlerCount > 0 ? { start: expression.start, end: cursor, hasGap: fulfillmentHasGap } : null;
+};
+
+const promiseThenChainGapOutcome = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  const chain = promiseThenChainAt(
+    tokens,
+    expression.start,
+    expression.end,
+    pairs,
+    functionRanges,
+    aliases
+  );
+  if (!chain) return null;
+  for (let index = chain.end; index < expression.end; index += 1) {
+    if (tokens[index]?.value !== ';') return null;
+  }
+  return chain.hasGap;
+};
+
+const localFunctionCallHasGapOutcome = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  knownLocalFunctions,
+  aliases,
+  writerAliases,
+  resolvingFunctions
+) => {
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.'
+      || tokens[index + 1]?.value !== '(') continue;
+    const name = tokens[index].value;
+    const localFunction = knownLocalFunctions.get(name);
+    if (!localFunction || localFunction.closing >= index
+      || tokens[localFunction.start - 1]?.value === 'async'
+      || resolvingFunctions.has(localFunction)
+      || localFunctionWasReassigned(tokens, name, localFunction.closing + 1, index)) continue;
+
+    const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
+    const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+    const nextResolvingFunctions = new Set(resolvingFunctions);
+    nextResolvingFunctions.add(localFunction);
+    const callbackHasGap = localFunction.expression
+      ? valueHasGapOutsideNestedFunctions(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        pairs,
+        functionRanges,
+        aliases
+      ) || localFunctionCallHasGapOutcome(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        pairs,
+        functionRanges,
+        knownLocalFunctions,
+        aliases,
+        writerAliases,
+        nextResolvingFunctions
+      )
+      : hasGapOutcome(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        localFunction.opening,
+        pairs,
+        functionRanges,
+        aliases,
+        writerAliases,
+        nextResolvingFunctions
+      );
+    if (callbackHasGap || hasBoundaryWriterGap(
+      tokens,
+      callbackStart,
+      callbackEnd,
+      pairs,
+      functionRanges,
+      aliases,
+      writerAliases
+    )) return true;
+  }
+  return false;
+};
+
+const hasGapOutcome = (
+  tokens,
+  start,
+  end,
+  opening,
+  pairs,
+  functionRanges,
+  aliases = new Set(),
+  writerAliases = new Map(),
+  resolvingFunctions = new Set()
+) => {
   const knownAliases = new Set(aliases);
   const knownWriterAliases = new Map(writerAliases);
   const knownLocalFunctions = new Map();
@@ -2017,7 +2300,8 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
             pairs,
             functionRanges,
             knownAliases,
-            knownWriterAliases
+            knownWriterAliases,
+            resolvingFunctions
           );
         if (callbackHasGap || hasBoundaryWriterGap(
           tokens,
@@ -2026,22 +2310,43 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
           pairs,
           functionRanges,
           knownAliases,
-          knownWriterAliases
+          knownWriterAliases,
+          resolvingFunctions
         )) return true;
       }
     }
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (!returnIsOverriddenByFinally(tokens, index, end, pairs, functionRanges)
-        && valueHasGapOutsideNestedFunctions(
+      const returnIsEffective = !returnIsOverriddenByFinally(tokens, index, end, pairs, functionRanges);
+      const promiseChainGap = promiseThenChainGapOutcome(
         tokens,
         expressionStart,
         statementEnd,
         pairs,
         functionRanges,
         knownAliases
-      )) return true;
+      );
+      if (returnIsEffective && promiseChainGap === true) return true;
+      if (returnIsEffective && promiseChainGap === null
+        && (valueHasGapOutsideNestedFunctions(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases
+      ) || localFunctionCallHasGapOutcome(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownLocalFunctions,
+        knownAliases,
+        knownWriterAliases,
+        resolvingFunctions
+      ))) return true;
       if (hasBoundaryWriterGap(
         tokens,
         expressionStart,
@@ -2049,8 +2354,13 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         pairs,
         functionRanges,
         knownAliases,
-        knownWriterAliases
+        knownWriterAliases,
+        promiseChainGap !== null
       )) return true;
+      if (promiseChainGap !== null) {
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
       for (const callback of functionRanges) {
         if (callback.start < expressionStart || callback.closing >= statementEnd) continue;
         const callbackKind = isScheduledCallback(tokens, pairs, callback);
@@ -2075,7 +2385,8 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
           pairs,
           functionRanges,
           knownAliases,
-          knownWriterAliases
+          knownWriterAliases,
+          resolvingFunctions
         )) return true;
       }
       index = Math.max(index, statementEnd - 1);
@@ -2673,34 +2984,58 @@ const deadlineDecisionHasGapOutcome = (
   lexicalScopes,
   lexicalBindings,
   assignments
-) => [decision, ...(decision.continuations || [])].some(range => {
-  const knownAliases = visibleGapAliasesAt(
-    tokens,
-    range.start,
-    pairs,
-    lexicalScopes,
-    functionRanges
-  );
-  const knownWriterAliases = visibleBoundaryWriterAliasesAt(
-    tokens,
-    range.start,
-    pairs,
-    lexicalScopes,
-    lexicalBindings,
-    assignments
-  );
-  const outcome = hasGapOutcome(
-    tokens,
-    range.start,
-    range.end,
-    range.opening,
-    pairs,
-    functionRanges,
-    knownAliases,
-    knownWriterAliases
-  );
-  return outcome;
-});
+) => {
+  return [decision, ...(decision.continuations || [])].some(range => {
+    const knownAliases = visibleGapAliasesAt(
+      tokens,
+      range.start,
+      pairs,
+      lexicalScopes,
+      functionRanges
+    );
+    const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+      tokens,
+      range.start,
+      pairs,
+      lexicalScopes,
+      lexicalBindings,
+      assignments
+    );
+    if (tokens[range.start]?.value === 'return') {
+      const statementEnd = findStatementEnd(tokens, range.start + 1, tokens.length);
+      const promiseChain = promiseThenChainAt(
+        tokens,
+        range.start + 1,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases
+      );
+      if (promiseChain && promiseChain.start === range.start + 1) {
+        return promiseChain.hasGap || hasBoundaryWriterGap(
+          tokens,
+          promiseChain.start,
+          promiseChain.end,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases,
+          true
+        );
+      }
+    }
+    return hasGapOutcome(
+      tokens,
+      range.start,
+      range.end,
+      range.opening,
+      pairs,
+      functionRanges,
+      knownAliases,
+      knownWriterAliases
+    );
+  });
+};
 
 const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
   const tokens = tokenizeSource(source);
@@ -2945,9 +3280,64 @@ test('deadline policy inventory inspects braced callbacks in returned promises',
     {
       relative: 'discord/deadline-returned-promise-ready.js',
       source: 'if (deadlineReached) return Promise.resolve().then(() => { return READINESS.READY; });'
+    },
+    {
+      relative: 'discord/deadline-promise-gap-overridden.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP).then(() => READINESS.UNAVAILABLE);'
+    },
+    {
+      relative: 'discord/deadline-promise-gap-preserved.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP).then(value => value);'
+    },
+    {
+      relative: 'discord/deadline-promise-gap-write-preserved.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => { state.markIntakeBoundary(id, READINESS.GAP, detail); return READINESS.UNAVAILABLE; }).then(() => READINESS.UNAVAILABLE);'
     }
   ]);
-  assert.deepEqual(offenders, ['discord/deadline-returned-promise-gap.js:1']);
+  assert.deepEqual(offenders, [
+    'discord/deadline-returned-promise-gap.js:1',
+    'discord/deadline-promise-gap-preserved.js:1',
+    'discord/deadline-promise-gap-write-preserved.js:1'
+  ]);
+});
+
+test('deadline policy inventory resolves statically indexed outcome arrays', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-inline-indexed-array-gap.js',
+      source: 'if (deadlineReached) return [READINESS.UNAVAILABLE, READINESS.GAP][1];'
+    },
+    {
+      relative: 'discord/deadline-inline-indexed-array-unavailable.js',
+      source: 'if (deadlineReached) return [READINESS.GAP, READINESS.UNAVAILABLE][1];'
+    },
+    {
+      relative: 'discord/deadline-indexed-array-gap.js',
+      source: 'const outcomes = [READINESS.UNAVAILABLE, READINESS.GAP]; if (deadlineReached) return outcomes[1];'
+    },
+    {
+      relative: 'discord/deadline-indexed-array-unavailable.js',
+      source: 'const outcomes = [READINESS.GAP, READINESS.UNAVAILABLE]; if (deadlineReached) return outcomes[1];'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-inline-indexed-array-gap.js:1',
+    'discord/deadline-indexed-array-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory follows synchronous local helper return values', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-local-helper-gap.js',
+      source: 'function gap() { return READINESS.GAP; } if (deadlineReached) return gap();'
+    },
+    {
+      relative: 'discord/deadline-local-helper-unavailable.js',
+      source: 'function unavailable() { return READINESS.UNAVAILABLE; } if (deadlineReached) return unavailable();'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-local-helper-gap.js:1']);
 });
 
 test('deadline policy inventory respects abrupt finally overrides of gap returns', () => {
