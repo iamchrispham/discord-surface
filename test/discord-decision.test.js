@@ -1006,6 +1006,43 @@ test('duplicate denial honors in-memory Retry-After through channel recovery', {
   assert.ok(recoveryCalls[1].options.delayMs > 0);
   assert.ok(recoveryCalls[1].options.delayMs <= 500);
   assert.equal(recoveryCalls[1].options.decisionId, interactionId);
+
+  const fullRecovery = await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.equal(rejectionCalls, 1);
+  assert.equal(fullRecovery.some(click => click.interactionId === interactionId), true);
+  assert.equal(recoveryCalls.length, 3);
+  assert.ok(recoveryCalls[2].options.delayMs > 0);
+  assert.ok(recoveryCalls[2].options.delayMs <= 500);
+});
+
+test('scheduled rejection retry does not restart a repeated rate-limit loop', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const recoveryCalls = [];
+  f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+    recoveryCalls.push({ channelIds: channelIds ? [...channelIds] : null, options });
+    return null;
+  };
+  f.gateway.authorizeDecisionInteraction = async () => false;
+  let rejectionCalls = 0;
+  f.gateway.sendInteractionRejection = async () => {
+    rejectionCalls += 1;
+    return { outcome: 'rate_limited', retryAfterMs: 25 };
+  };
+  const interactionId = 'bounded-rate-limited-rejection';
+
+  await f.gateway.handleInteraction(
+    component(f.presentation, interactionId, 0),
+    new AbortController().signal
+  );
+  assert.equal(rejectionCalls, 1);
+  assert.equal(recoveryCalls.length, 1);
+
+  await new Promise(resolve => setTimeout(resolve, 40));
+  await f.gateway.decisionConsumer.recover(new AbortController().signal, new Set(['channel']));
+
+  assert.equal(rejectionCalls, 2);
+  assert.equal(recoveryCalls.length, 1);
+  assert.equal(f.state.listDecisionPendingWork().some(click => click.interactionId === interactionId), true);
 });
 
 test('persisted denial wins an authorization race and prevents native dispatch', { timeout: 30000 }, async t => {

@@ -450,8 +450,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const retryDelayMs = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
       ? decisionRecoveryDelayMs(result.retryAfterMs)
       : DECISION_RECOVERY_DEFAULT_DELAY_MS;
+    const retryFirstRateLimit = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED &&
+      click.rejectionOutcome !== DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED;
     const retryFirstUnknown = outcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.rejectionOutcome === null;
-    const scheduleRetry = (outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED || retryFirstUnknown) && !signal?.aborted;
+    const scheduleRetry = (retryFirstRateLimit || retryFirstUnknown) && !signal?.aborted;
     try { state.recordDecisionRejectionOutcome(click.interactionId, outcome); } catch {}
     if (scheduleRetry) {
       scheduleRecovery(new Set([click.channelId]), {
@@ -817,7 +819,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     for (let pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
       const retryDeadline = decisionRecoveryDeadlines.get(pendingClick.interactionId);
-      const enforceRetryDeadline = channelIds !== null;
+      const enforceRetryDeadline = pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED || channelIds !== null;
       if (!enforceRetryDeadline && retryDeadline !== undefined) {
         decisionRecoveryDeadlines.delete(pendingClick.interactionId);
       }
