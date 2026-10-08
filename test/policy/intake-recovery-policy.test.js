@@ -281,7 +281,7 @@ const isGapValueAt = (tokens, index) => {
   if (!token) return false;
   if ((token.type === 'string' || token.type === 'template') && token.value === 'gap') return true;
   return (token.value === 'READINESS' || token.value === 'THREAD_STATES')
-    && ((tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'GAP')
+    && ((['.', '?.'].includes(tokens[index + 1]?.value) && tokens[index + 2]?.value === 'GAP')
       || isGapEnumElementAt(tokens, index));
 };
 
@@ -514,6 +514,81 @@ const findControlledStatementEnd = (tokens, start, end, pairs, includeElse = tru
   return findStatementEnd(tokens, start, end);
 };
 
+const statementAlwaysAbrupt = (tokens, start, end, pairs) => {
+  if (start >= end) return false;
+  if (['return', 'throw'].includes(tokens[start]?.value)) return true;
+  if (tokens[start]?.value === '{') {
+    const closing = pairs.get(start);
+    return closing !== undefined && blockAlwaysAbrupt(tokens, start + 1, closing, pairs);
+  }
+  if (tokens[start]?.value !== 'if' || tokens[start + 1]?.value !== '(') return false;
+  const conditionEnd = pairs.get(start + 1);
+  if (conditionEnd === undefined) return false;
+  const consequentStart = conditionEnd + 1;
+  const consequentEnd = findControlledStatementEnd(tokens, consequentStart, end, pairs, false);
+  if (!statementAlwaysAbrupt(tokens, consequentStart, consequentEnd, pairs)
+    || tokens[consequentEnd]?.value !== 'else') return false;
+  const alternateStart = consequentEnd + 1;
+  const alternateEnd = findControlledStatementEnd(tokens, alternateStart, end, pairs, false);
+  return statementAlwaysAbrupt(tokens, alternateStart, alternateEnd, pairs);
+};
+
+const blockAlwaysAbrupt = (tokens, start, end, pairs) => {
+  let index = start;
+  while (index < end) {
+    if (tokens[index].value === ';') {
+      index += 1;
+      continue;
+    }
+    const statementEnd = findControlledStatementEnd(tokens, index, end, pairs, false);
+    if (statementAlwaysAbrupt(tokens, index, statementEnd, pairs)) return true;
+    if (statementEnd <= index) return false;
+    index = statementEnd;
+  }
+  return false;
+};
+
+const returnIsOverriddenByFinally = (tokens, returnIndex, end, pairs, functionRanges) => {
+  for (let tryIndex = 0; tryIndex < returnIndex; tryIndex += 1) {
+    if (tokens[tryIndex].value !== 'try') continue;
+    const tryOpening = tryIndex + 1;
+    const tryClosing = pairs.get(tryOpening);
+    if (tokens[tryOpening]?.value !== '{' || tryClosing === undefined) continue;
+
+    let completionStart = tryClosing + 1;
+    let catchOpening;
+    let catchClosing;
+    if (tokens[completionStart]?.value === 'catch') {
+      let catchBody = completionStart + 1;
+      if (tokens[catchBody]?.value === '(') {
+        const catchParametersEnd = pairs.get(catchBody);
+        if (catchParametersEnd === undefined) continue;
+        catchBody = catchParametersEnd + 1;
+      }
+      if (tokens[catchBody]?.value !== '{') continue;
+      catchOpening = catchBody;
+      catchClosing = pairs.get(catchOpening);
+      if (catchClosing === undefined) continue;
+      completionStart = catchClosing + 1;
+    }
+    if (tokens[completionStart]?.value !== 'finally') continue;
+    const finallyOpening = completionStart + 1;
+    const finallyClosing = pairs.get(finallyOpening);
+    if (tokens[finallyOpening]?.value !== '{' || finallyClosing === undefined || finallyClosing >= end) continue;
+
+    const returnsFromTry = tryOpening < returnIndex && returnIndex < tryClosing;
+    const returnsFromCatch = catchOpening !== undefined
+      && catchOpening < returnIndex && returnIndex < catchClosing;
+    if (!returnsFromTry && !returnsFromCatch) continue;
+    const exitsFromNestedFunction = functionRanges.some(range => (
+      tryOpening < range.opening && range.opening < returnIndex && returnIndex < range.closing
+    ));
+    if (exitsFromNestedFunction) continue;
+    if (blockAlwaysAbrupt(tokens, finallyOpening + 1, finallyClosing, pairs)) return true;
+  }
+  return false;
+};
+
 const findFunctionRanges = (tokens, pairs) => {
   const ranges = [];
   const classBodies = [];
@@ -537,6 +612,12 @@ const findFunctionRanges = (tokens, pairs) => {
       opening < parameterOpening && parameterOpening < closing
     ));
   };
+  const isObjectMethod = parameterOpening => {
+    const methodName = tokens[parameterOpening - 1];
+    return methodName?.type === 'identifier'
+      && !controlHeaders.has(methodName.value)
+      && ['{', ','].includes(tokens[parameterOpening - 2]?.value);
+  };
   for (let opening = 0; opening < tokens.length; opening += 1) {
     if (tokens[opening].value !== '{') continue;
     const closing = pairs.get(opening);
@@ -557,7 +638,7 @@ const findFunctionRanges = (tokens, pairs) => {
       }
       start -= 1;
     }
-    if (isClassMethod(parameterOpening)) {
+    if (isClassMethod(parameterOpening) || isObjectMethod(parameterOpening)) {
       ranges.push({ start: parameterOpening - 1, opening, closing });
     }
   }
@@ -1698,7 +1779,8 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (valueHasGapOutsideNestedFunctions(
+      if (!returnIsOverriddenByFinally(tokens, index, end, pairs, functionRanges)
+        && valueHasGapOutsideNestedFunctions(
         tokens,
         expressionStart,
         statementEnd,
@@ -2592,6 +2674,20 @@ test('deadline policy inventory unwraps awaited gap outcomes', () => {
   assert.deepEqual(offenders, ['discord/deadline-awaited-gap.js:1']);
 });
 
+test('deadline policy inventory recognizes optional-chain gap constants', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-optional-chain-gap.js',
+      source: "const READINESS = { GAP: 'gap', UNAVAILABLE: 'unavailable' }; if (deadlineReached) return READINESS?.GAP;"
+    },
+    {
+      relative: 'discord/deadline-optional-chain-unavailable.js',
+      source: "const READINESS = { GAP: 'gap', UNAVAILABLE: 'unavailable' }; if (deadlineReached) return READINESS?.UNAVAILABLE;"
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-optional-chain-gap.js:1']);
+});
+
 test('deadline policy inventory inspects braced callbacks in returned promises', () => {
   const offenders = findDeadlineGapOffenders([
     {
@@ -2604,6 +2700,44 @@ test('deadline policy inventory inspects braced callbacks in returned promises',
     }
   ]);
   assert.deepEqual(offenders, ['discord/deadline-returned-promise-gap.js:1']);
+});
+
+test('deadline policy inventory respects abrupt finally overrides of gap returns', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-finally-return-unavailable.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; try { return READINESS.GAP; } finally { return READINESS.UNAVAILABLE; } }'
+    },
+    {
+      relative: 'discord/deadline-finally-throw.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; try { return READINESS.GAP; } finally { throw new Error(); } }'
+    },
+    {
+      relative: 'discord/deadline-finally-conditional-return.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; try { return READINESS.GAP; } finally { if (preserve) return READINESS.UNAVAILABLE; } }'
+    },
+    {
+      relative: 'discord/deadline-finally-gap.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; try { return READINESS.UNAVAILABLE; } finally { return READINESS.GAP; } }'
+    },
+    {
+      relative: 'discord/deadline-finally-writer.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; try { return READINESS.GAP; } finally { state.markIntakeBoundary(id, READINESS.GAP, detail); return READINESS.UNAVAILABLE; } }'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-finally-conditional-return.js:1',
+    'discord/deadline-finally-gap.js:1',
+    'discord/deadline-finally-writer.js:1'
+  ]);
+});
+
+test('deadline policy inventory scopes object methods before resolving deadline aliases', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-object-method-shadow.js',
+    source: 'function readiness(deadlineReached) { const expired = deadlineReached; if (!deadlineReached) return READINESS.READY; return { classify(expired) { if (expired) return READINESS.GAP; } }; }'
+  }]);
+  assert.deepEqual(offenders, []);
 });
 
 test('deadline policy inventory inspects secondary promise continuation callbacks', () => {
