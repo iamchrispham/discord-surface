@@ -78,6 +78,10 @@ test('public scheduler inventory pins source owners and rejects only new schedul
   assert.deepEqual(assertSchedulerCallsiteInventory(), EXPECTED_SCHEDULER_CALLSITES);
   const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-scheduler-inventory-'));
   const expected = [
+    { file: 'assignment.js', owner: 'assignmentAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'assignment.js', owner: 'assignmentComputedAliasSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'assignment.js', owner: 'assignmentShorthandSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'assignment.js', owner: 'assignmentStringAliasSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'bound.js', owner: 'boundSite', scheduler: 'scheduleDeferredHandoffRecovery' },
     { file: 'bracket.ts', owner: 'bracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
     { file: 'capture.js', owner: 'captureSite', scheduler: 'scheduleDeferredHandoffRecovery' },
@@ -91,6 +95,14 @@ test('public scheduler inventory pins source owners and rejects only new schedul
   ];
 
   try {
+    fs.writeFileSync(path.join(sourceRoot, 'assignment.js'),
+      'function assignmentAliasSite(gateway) { let schedule; ({ scheduleDeferredHandoffRecovery: schedule } = gateway); return schedule; }\n' +
+      "function assignmentComputedAliasSite(gateway) { let schedule; ({ ['scheduleDeferredHandoffRecovery']: schedule } = gateway); return schedule; }\n" +
+      'function assignmentShorthandSite(gateway) { let scheduleDeferredHandoffRecovery; ({ scheduleDeferredHandoffRecovery } = gateway); return scheduleDeferredHandoffRecovery; }\n' +
+      'function assignmentStringAliasSite(gateway) { let schedule; ({ "schedulePendingHandoffRecoveryPoll": schedule } = gateway); return schedule; }\n' +
+      'function ordinaryObjectSite(gateway) { return { scheduleDeferredHandoffRecovery: gateway }; }\n' +
+      'function unrelatedAssignmentSite(gateway) { let value; ({ unrelated: value } = gateway); return value; }\n' +
+      'function restAssignmentSite(gateway) { let scheduleDeferredHandoffRecovery; ({ ...scheduleDeferredHandoffRecovery } = gateway); return scheduleDeferredHandoffRecovery; }\n');
     fs.writeFileSync(path.join(sourceRoot, 'bound.js'),
       'function boundSite(gateway) { return gateway.scheduleDeferredHandoffRecovery.bind(gateway); }\n');
     fs.writeFileSync(path.join(sourceRoot, 'bracket.ts'),

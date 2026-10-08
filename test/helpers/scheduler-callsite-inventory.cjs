@@ -29,15 +29,48 @@ function schedulerAccessName(node) {
   return null;
 }
 
-function schedulerBindingName(node) {
-  if (!ts.isBindingElement(node) || node.dotDotDotToken || !ts.isObjectBindingPattern(node.parent)) return null;
-  const key = node.propertyName ?? node.name;
+function schedulerLiteralKeyName(key) {
   if (ts.isIdentifier(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression) &&
     SCHEDULER_METHODS.has(key.expression.text)) {
     return key.expression.text;
   }
+  return null;
+}
+
+function schedulerBindingName(node) {
+  if (!ts.isBindingElement(node) || node.dotDotDotToken || !ts.isObjectBindingPattern(node.parent)) return null;
+  return schedulerLiteralKeyName(node.propertyName ?? node.name);
+}
+
+function isDestructuringAssignmentObject(node) {
+  let current = node;
+  while (current.parent) {
+    const parent = current.parent;
+    if (ts.isParenthesizedExpression(parent)) {
+      current = parent;
+      continue;
+    }
+    if (ts.isPropertyAssignment(parent) && parent.initializer === current &&
+      ts.isObjectLiteralExpression(parent.parent)) {
+      current = parent.parent;
+      continue;
+    }
+    if (ts.isArrayLiteralExpression(parent)) {
+      current = parent;
+      continue;
+    }
+    if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      unwrapParentheses(parent.left) === unwrapParentheses(current)) return true;
+    return false;
+  }
+  return false;
+}
+
+function schedulerAssignmentName(node) {
+  if (ts.isPropertyAssignment(node)) return schedulerLiteralKeyName(node.name);
+  if (ts.isShorthandPropertyAssignment(node)) return schedulerLiteralKeyName(node.name);
   return null;
 }
 
@@ -92,8 +125,14 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
     assert.deepEqual(source.parseDiagnostics, [], `${filePath}: parse diagnostics`);
     function visit(node) {
       const isObjectBindingElement = ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent);
-      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || isObjectBindingElement) {
-        const scheduler = isObjectBindingElement ? schedulerBindingName(node) : schedulerAccessName(node);
+      const isObjectAssignmentElement = (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) &&
+        ts.isObjectLiteralExpression(node.parent) && isDestructuringAssignmentObject(node.parent);
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) ||
+        isObjectBindingElement || isObjectAssignmentElement) {
+        let scheduler;
+        if (isObjectBindingElement) scheduler = schedulerBindingName(node);
+        else if (isObjectAssignmentElement) scheduler = schedulerAssignmentName(node);
+        else scheduler = schedulerAccessName(node);
         if (scheduler) {
           inventory.push({
             file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),
