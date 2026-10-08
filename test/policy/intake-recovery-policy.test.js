@@ -1405,6 +1405,54 @@ const destructuredValueHasGapOutcome = (tokens, start, end, propertyPath, pairs)
     && isReadinessVocabulary(tokens[expression.start].value);
 };
 
+const staticMemberExpressionName = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end || tokens[expression.start]?.type !== 'identifier') return null;
+  const parts = [tokens[expression.start].value];
+  let cursor = expression.start + 1;
+  while (cursor < expression.end) {
+    if (tokens[cursor]?.value === '.' && tokens[cursor + 1]?.type === 'identifier') {
+      parts.push(tokens[cursor + 1].value);
+      cursor += 2;
+      continue;
+    }
+    if (tokens[cursor]?.value === '[') {
+      const closing = pairs.get(cursor);
+      if (closing !== cursor + 2 || closing >= expression.end) return null;
+      if (!['string', 'number'].includes(tokens[cursor + 1]?.type)) return null;
+      const propertyName = staticPropertyName(tokens[cursor + 1]);
+      if (propertyName === null || propertyName === undefined) return null;
+      parts.push(String(propertyName));
+      cursor = closing + 1;
+      continue;
+    }
+    return null;
+  }
+  return parts.length === 1 ? parts[0] : JSON.stringify(parts);
+};
+
+const assignmentTargetAt = (tokens, index, end, pairs) => {
+  if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.') return null;
+  let equalsIndex = index + 1;
+  while (equalsIndex < end) {
+    if (tokens[equalsIndex]?.value === '.' && tokens[equalsIndex + 1]?.type === 'identifier') {
+      equalsIndex += 2;
+      continue;
+    }
+    if (tokens[equalsIndex]?.value === '[') {
+      const closing = pairs.get(equalsIndex);
+      if (closing === undefined || closing >= end || !['string', 'number'].includes(tokens[equalsIndex + 1]?.type)
+        || staticPropertyName(tokens[equalsIndex + 1]) === null) return null;
+      equalsIndex = closing + 1;
+      continue;
+    }
+    break;
+  }
+  if (tokens[equalsIndex]?.value !== '=') return null;
+  const name = staticMemberExpressionName(tokens, index, equalsIndex, pairs);
+  return name === null ? null : { equalsIndex, name };
+};
+
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
@@ -1413,11 +1461,19 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
     const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
     return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases);
   }
+  const assignmentIndex = topLevelToken(tokens, expression.start, expression.end, '=');
+  if (assignmentIndex >= 0) {
+    const outcomeValueStart = outcomeAssignmentValueStart(tokens, expression.start);
+    if (outcomeValueStart === null || outcomeValueStart <= assignmentIndex) return false;
+    return valueHasGapOutcome(tokens, outcomeValueStart, expression.end, pairs, aliases);
+  }
   if (tokens[expression.start]?.value === 'await') {
     return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases);
   }
   if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
   if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
+  const memberName = staticMemberExpressionName(tokens, expression.start, expression.end, pairs);
+  if (memberName !== null && aliases.has(memberName)) return true;
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
   if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
 
@@ -1671,9 +1727,29 @@ const isScheduledCallback = (tokens, pairs, range) => {
   }
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
     || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
-  return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value)
-    ? 'outcome'
-    : false;
+  if (!['then', 'catch'].includes(callee) || !['.', '?.'].includes(tokens[calleeIndex - 1]?.value)) return false;
+  return promiseHandlerIsUnreachable(tokens, range, callee, calleeIndex, callOpening, callClosing, pairs)
+    ? 'discarded'
+    : 'outcome';
+};
+
+const promiseHandlerIsUnreachable = (tokens, range, callee, calleeIndex, callOpening, callClosing, pairs) => {
+  const receiverEnd = calleeIndex - 2;
+  if (tokens[receiverEnd]?.value !== ')') return false;
+  const settledOpening = pairs.get(receiverEnd);
+  if (settledOpening === undefined) return false;
+  const settledMethodIndex = settledOpening - 1;
+  const settledMethod = tokens[settledMethodIndex]?.value;
+  if (!['resolve', 'reject'].includes(settledMethod)
+    || tokens[settledMethodIndex - 1]?.value !== '.'
+    || tokens[settledMethodIndex - 2]?.value !== 'Promise') return false;
+
+  const callbackArgumentIndex = topLevelSegments(tokens, callOpening + 1, callClosing)
+    .findIndex(([argumentStart, argumentEnd]) => range.start >= argumentStart && range.start < argumentEnd);
+  if (callbackArgumentIndex < 0) return false;
+  if (callee === 'catch') return settledMethod === 'resolve' && callbackArgumentIndex === 0;
+  if (settledMethod === 'resolve') return callbackArgumentIndex === 1;
+  return callbackArgumentIndex === 0;
 };
 
 const promiseExecutorHasGapResolution = (tokens, range, bodyStart, bodyEnd, pairs, aliases) => {
@@ -1716,15 +1792,70 @@ const promiseExecutorHasGapResolution = (tokens, range, bodyStart, bodyEnd, pair
   return false;
 };
 
+const localFunctionBindingNameAt = (tokens, range, pairs) => {
+  let syntaxStart = range.start;
+  if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
+  if (tokens[syntaxStart]?.value === '=>') {
+    const parameterEnd = syntaxStart - 1;
+    syntaxStart = tokens[parameterEnd]?.value === ')'
+      ? pairs.get(parameterEnd) ?? parameterEnd
+      : parameterEnd;
+  }
+  for (let cursor = syntaxStart - 1; cursor >= Math.max(0, syntaxStart - 4); cursor -= 1) {
+    if (tokens[cursor]?.value === '=') {
+      const binding = tokens[cursor - 1];
+      return binding?.type === 'identifier' && ['const', 'let', 'var'].includes(tokens[cursor - 2]?.value)
+        ? binding.value
+        : null;
+    }
+    if ([';', '{', '}', ','].includes(tokens[cursor]?.value)) break;
+  }
+  const functionIndex = tokens[range.start]?.value === 'async' ? range.start + 1 : range.start;
+  return tokens[functionIndex]?.value === 'function' && tokens[functionIndex + 1]?.type === 'identifier'
+    ? tokens[functionIndex + 1].value
+    : null;
+};
+
+const functionParentOpening = (range, functionRanges) => functionRanges
+  .filter(candidate => candidate !== range
+    && candidate.start < range.start
+    && candidate.closing > range.closing)
+  .sort((left, right) => (left.closing - left.start) - (right.closing - right.start))[0]?.opening ?? null;
+
+const functionScopeOpeningAt = (position, functionRanges) => functionRanges
+  .filter(range => range.opening < position && range.closing >= position)
+  .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0]?.opening ?? null;
+
+const localFunctionWasReassigned = (tokens, name, start, end) => {
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    if (['=', '+=', '-=', '++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value)) return true;
+  }
+  return false;
+};
+
 const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
   const knownAliases = new Set(aliases);
   const knownWriterAliases = new Map(writerAliases);
+  const knownLocalFunctions = new Map();
+  const localFunctionScope = functionScopeOpeningAt(start, functionRanges);
+  for (const candidate of functionRanges) {
+    if (candidate.start >= start || candidate.closing >= start
+      || functionParentOpening(candidate, functionRanges) !== localFunctionScope) continue;
+    const bindingName = localFunctionBindingNameAt(tokens, candidate, pairs);
+    if (bindingName !== null) knownLocalFunctions.set(bindingName, candidate);
+  }
   const nestedFunctionStarts = new Map(functionRanges
     .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
     .map(range => [range.start, range]));
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
+      const bindingName = localFunctionBindingNameAt(tokens, nestedFunction, pairs);
+      if (bindingName !== null && functionParentOpening(nestedFunction, functionRanges) === localFunctionScope) {
+        knownLocalFunctions.set(bindingName, nestedFunction);
+      }
       const callbackKind = isScheduledCallback(tokens, pairs, nestedFunction);
       if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
@@ -1776,6 +1907,36 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       continue;
     }
     const token = tokens[index];
+    if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
+      && tokens[index + 1]?.value === '(') {
+      const localFunction = knownLocalFunctions.get(token.value);
+      if (localFunction && localFunction.closing < index
+        && !localFunctionWasReassigned(tokens, token.value, localFunction.closing + 1, index)) {
+        const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
+        const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+        const callbackHasGap = localFunction.expression
+          ? valueHasGapOutsideNestedFunctions(tokens, callbackStart, callbackEnd, pairs, functionRanges, knownAliases)
+          : hasGapOutcome(
+            tokens,
+            callbackStart,
+            callbackEnd,
+            localFunction.opening,
+            pairs,
+            functionRanges,
+            knownAliases,
+            knownWriterAliases
+          );
+        if (callbackHasGap || hasBoundaryWriterGap(
+          tokens,
+          callbackStart,
+          callbackEnd,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases
+        )) return true;
+      }
+    }
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
@@ -1852,16 +2013,17 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         continue;
       }
     }
-    if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
-      && tokens[index + 1]?.value === '=') {
-      const statementEnd = findStatementEnd(tokens, index + 2, end);
-      const assignedGap = valueHasGapOutcome(tokens, index + 2, statementEnd, pairs, knownAliases);
-      if (assignedGap) knownAliases.add(token.value);
-      else knownAliases.delete(token.value);
-      const stateArgument = boundBoundaryWriterStateArgument(tokens, index + 2, statementEnd, pairs);
-      if (stateArgument === undefined) knownWriterAliases.delete(token.value);
-      else knownWriterAliases.set(token.value, stateArgument);
-      if (assignedGap && OUTCOME_NAMES.has(token.value)) return true;
+    const assignmentTarget = assignmentTargetAt(tokens, index, end, pairs);
+    if (assignmentTarget) {
+      const assignmentValueStart = assignmentTarget.equalsIndex + 1;
+      const statementEnd = findStatementEnd(tokens, assignmentValueStart, end);
+      const assignedGap = valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases);
+      if (assignedGap) knownAliases.add(assignmentTarget.name);
+      else knownAliases.delete(assignmentTarget.name);
+      const stateArgument = boundBoundaryWriterStateArgument(tokens, assignmentValueStart, statementEnd, pairs);
+      if (stateArgument === undefined) knownWriterAliases.delete(assignmentTarget.name);
+      else knownWriterAliases.set(assignmentTarget.name, stateArgument);
+      if (assignedGap && OUTCOME_NAMES.has(assignmentTarget.name)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -4049,14 +4211,41 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const promiseCallback = `if (deadlineReached) Promise.resolve().then(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
     const microtaskCallback = `if (deadlineReached) queueMicrotask(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
     const unscheduledCallback = `const callback = () => state.markIntakeBoundary(id, READINESS.GAP, detail); if (deadlineReached) callback();`;
+    const declaredCallback = `function wait() { function writeBoundary() { state.markIntakeBoundary(id, READINESS.GAP, detail); } if (deadlineReached) writeBoundary(); }`;
     regressionAssert.equal(offendersFor(promiseCallback).length, 1);
     regressionAssert.equal(offendersFor(microtaskCallback).length, 1);
-    regressionAssert.equal(offendersFor(unscheduledCallback).length, 0);
+    regressionAssert.equal(offendersFor(unscheduledCallback).length, 1);
+    regressionAssert.equal(offendersFor(declaredCallback).length, 1);
   });
 
   regressionTest('deadline policy inventory inspects rejected promise catch callbacks', () => {
     const rejectedPromiseCallback = `function wait() { if (deadlineReached) return Promise.reject().catch(() => READINESS.GAP); }`;
     regressionAssert.equal(offendersFor(rejectedPromiseCallback).length, 1);
+  });
+
+  regressionTest('deadline policy inventory ignores unreachable settled-promise handlers', () => {
+    const rejectedFulfillment = `function wait() { if (deadlineReached) return Promise.reject(error).then(() => READINESS.GAP); }`;
+    const resolvedRejection = `function wait() { if (deadlineReached) return Promise.resolve(READINESS.READY).catch(() => READINESS.GAP); }`;
+    const reachableFulfillment = `function wait() { if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP); }`;
+    regressionAssert.equal(offendersFor(rejectedFulfillment).length, 0);
+    regressionAssert.equal(offendersFor(resolvedRejection).length, 0);
+    regressionAssert.equal(offendersFor(reachableFulfillment).length, 1);
+  });
+
+  regressionTest('deadline policy inventory ignores metadata-only gap assignments', () => {
+    const bracedMetadata = `if (deadlineReached) { metadata.reason = READINESS.GAP; }`;
+    const unbracedMetadata = `if (deadlineReached) metadata.reason = READINESS.GAP;`;
+    const actualOutcome = `if (deadlineReached) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(bracedMetadata).length, 0);
+    regressionAssert.equal(offendersFor(unbracedMetadata).length, 0);
+    regressionAssert.equal(offendersFor(actualOutcome).length, 1);
+  });
+
+  regressionTest('deadline policy inventory tracks gap aliases in local object members', () => {
+    const returnedMember = `function wait() { if (deadlineReached) { const box = {}; box.next = READINESS.GAP; return box.next; } }`;
+    const persistedMember = `function wait() { if (deadlineReached) { const box = {}; box.next = READINESS.GAP; state.markIntakeBoundary(id, box.next, detail); } }`;
+    regressionAssert.equal(offendersFor(returnedMember).length, 1);
+    regressionAssert.equal(offendersFor(persistedMember).length, 1);
   });
 
   regressionTest('deadline policy inventory follows timer-scheduled boundary writers', () => {
