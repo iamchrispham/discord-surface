@@ -830,7 +830,7 @@ const switchArmHasAbruptCompletion = (tokens, start, end, pairs, functionRanges)
     const value = tokens[index].value;
     if (braceDepth <= 1 && !controlledBlocks.includes(true) && parenDepth === 0 && bracketDepth === 0
       && ['break', 'continue', 'return', 'throw'].includes(value)
-      && isDirectSwitchAbruptCompletion(tokens, index, start, pairs)) return true;
+      && isDirectSwitchAbruptCompletion(tokens, index, start, pairs)) return value;
     if (value === '{') {
       let isControlled = ['else', 'do'].includes(tokens[index - 1]?.value);
       if (tokens[index - 1]?.value === ')') {
@@ -908,7 +908,22 @@ const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNe
   for (let index = bodyPosition; index < labels.length; index += 1) {
     const next = labels[index + 1];
     const armEnd = next?.index ?? best.closing;
-    if (switchArmHasAbruptCompletion(tokens, labels[index].start, armEnd, pairs, functionRanges)) {
+    const abruptCompletion = switchArmHasAbruptCompletion(
+      tokens,
+      labels[index].start,
+      armEnd,
+      pairs,
+      functionRanges
+    );
+    if (abruptCompletion === 'break') {
+      const afterSwitch = best.closing + 1;
+      return {
+        start: afterSwitch,
+        end: findFallthroughScopeEnd(tokens, afterSwitch, pairs, functionRanges),
+        opening: best.opening
+      };
+    }
+    if (abruptCompletion) {
       end = armEnd;
       break;
     }
@@ -1406,6 +1421,20 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         knownAliases,
         knownWriterAliases
       )) return true;
+      for (const callback of functionRanges) {
+        if (callback.expression || callback.start < expressionStart || callback.closing >= statementEnd
+          || !isScheduledCallback(tokens, pairs, callback)) continue;
+        if (hasGapOutcome(
+          tokens,
+          callback.opening + 1,
+          callback.closing,
+          callback.opening,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases
+        )) return true;
+      }
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -1968,7 +1997,11 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     if (!isDeadlineTriggerAt(tokens, index)) continue;
     const alias = findAssignedAlias(tokens, index);
     if (alias) {
-      const aliasNegated = tokens[alias.index + 2]?.value === '!';
+      let aliasNegationCount = 0;
+      for (let negationIndex = alias.index + 2; tokens[negationIndex]?.value === '!'; negationIndex += 1) {
+        aliasNegationCount += 1;
+      }
+      const aliasNegated = aliasNegationCount % 2 === 1;
       deadlineAliases.push({
         ...alias,
         negated: aliasNegated,
@@ -2186,6 +2219,20 @@ test('deadline policy inventory unwraps awaited gap outcomes', () => {
   assert.deepEqual(offenders, ['discord/deadline-awaited-gap.js:1']);
 });
 
+test('deadline policy inventory inspects braced callbacks in returned promises', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-returned-promise-gap.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => { return READINESS.GAP; });'
+    },
+    {
+      relative: 'discord/deadline-returned-promise-ready.js',
+      source: 'if (deadlineReached) return Promise.resolve().then(() => { return READINESS.READY; });'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-returned-promise-gap.js:1']);
+});
+
 test('deadline policy inventory recognizes static computed outcome keys', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/deadline-computed-outcome-key.js',
@@ -2378,6 +2425,24 @@ test('deadline policy inventory propagates negation through chained aliases', ()
     }
   ]);
   assert.deepEqual(offenders, ['discord/deadline-double-negated-alias.js:1']);
+});
+
+test('deadline policy inventory counts all negations in direct aliases', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-even-negated-alias.js',
+      source: 'const expired = !!deadlineReached; if (expired) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-odd-negated-alias.js',
+      source: 'const active = !deadlineReached; if (active) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-triple-negated-alias.js',
+      source: 'const active = !!!deadlineReached; if (active) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-even-negated-alias.js:1']);
 });
 
 test('deadline policy inventory ignores passive deadline metadata and types', () => {
@@ -3083,6 +3148,32 @@ test('deadline policy inventory follows switch fall-through after nonempty arms'
     ].join('\n')
   }]);
   assert.deepEqual(offenders, ['discord/switch-fallthrough-gap.js:2']);
+});
+
+test('deadline policy inventory follows selected switch breaks after the switch', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/switch-break-gap.js',
+      source: [
+        'switch (deadlineReached) {',
+        '  case true: break;',
+        '  case false: return READINESS.READY;',
+        '}',
+        'return READINESS.GAP;'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/switch-break-ready.js',
+      source: [
+        'switch (deadlineReached) {',
+        '  case true: break;',
+        '  case false: return READINESS.READY;',
+        '}',
+        'return READINESS.READY;'
+      ].join('\n')
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/switch-break-gap.js:1']);
 });
 
 test('deadline policy inventory recognizes member-qualified deadline operands', () => {
