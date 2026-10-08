@@ -93,6 +93,18 @@ function classStateInventory(sourceText) {
           if (ts.isPropertyAccessExpression(bodyNode) && ts.isThis(bodyNode.expression) &&
             HANDOFF_STATE_FIELDS.has(bodyNode.name.text)) accessesSchedulerState = true;
           if (ts.isElementAccessExpression(bodyNode) && ts.isThis(bodyNode.expression)) accessesSchedulerState = true;
+          if (ts.isVariableDeclaration(bodyNode) && ts.isObjectBindingPattern(bodyNode.name) &&
+            ts.isThis(bodyNode.initializer) && bodyNode.name.elements.some(element => {
+              const propertyName = element.propertyName;
+              if (propertyName && ts.isComputedPropertyName(propertyName)) {
+                const expression = propertyName.expression;
+                return (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) &&
+                  HANDOFF_STATE_FIELDS.has(expression.text);
+              }
+              const fieldName = propertyName || element.name;
+              return (ts.isIdentifier(fieldName) || ts.isStringLiteral(fieldName)) &&
+                HANDOFF_STATE_FIELDS.has(fieldName.text);
+            })) accessesSchedulerState = true;
           if (ts.isIdentifier(bodyNode) && ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].includes(bodyNode.text)) {
             timerOwners.push(memberName);
           }

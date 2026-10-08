@@ -46,6 +46,38 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
     '  privateHandoffSchedulerTick() { this.pendingHandoffRecoveryPollTimer = setTimeout(() => {}, 1); }\n\n  scheduleDeferredHandoffRecovery(channelId) {'
   );
   assert.notDeepEqual(classStateInventory(inventoryMutant), [], 'new class-local timer owner escaped inventory');
+  const destructuredStateMembers = [
+    ['deferred shorthand', 'privateDeferredStateReader() { const { deferredHandoffRecoveryChannels } = this; return deferredHandoffRecoveryChannels; }'],
+    ['deferred alias', 'privateDeferredStateAliasReader() { const { deferredHandoffRecoveryChannels: channels } = this; return channels; }'],
+    ['pending shorthand', 'privatePendingStateReader() { const { pendingHandoffRecoveryPollTimer } = this; return pendingHandoffRecoveryPollTimer; }'],
+    ['direct state property', 'privateDirectStateReader() { return this.deferredHandoffRecoveryChannels; }']
+  ];
+  for (const [label, member] of destructuredStateMembers) {
+    const memberName = member.slice(0, member.indexOf('('));
+    const source = gateway.replace(
+      '  scheduleDeferredHandoffRecovery(channelId) {',
+      `  ${member}\n\n  scheduleDeferredHandoffRecovery(channelId) {`
+    );
+    assert.notEqual(source, gateway);
+    assert.deepEqual(classStateInventory(source), [memberName], `${label}: new class member escaped state ownership inventory`);
+  }
+  for (const [label, member] of [
+    ['ordinary this field', 'privateOrdinaryStateReader() { const { gatewayName } = this; return gatewayName; }'],
+    ['other-object scheduler field', 'privateOtherObjectStateReader(other) { const { deferredHandoffRecoveryChannels } = other; return deferredHandoffRecoveryChannels; }']
+  ]) {
+    const source = gateway.replace(
+      '  scheduleDeferredHandoffRecovery(channelId) {',
+      `  ${member}\n\n  scheduleDeferredHandoffRecovery(channelId) {`
+    );
+    assert.notEqual(source, gateway);
+    assert.deepEqual(classStateInventory(source), [], `${label}: unrelated read was treated as Gateway scheduler state`);
+  }
+  const constructorDestructure = gateway.replace(
+    '    this.deferredHandoffRecoveryTimer = null;',
+    '    const { deferredHandoffRecoveryTimer } = this;\n    this.deferredHandoffRecoveryTimer = null;'
+  );
+  assert.notEqual(constructorDestructure, gateway);
+  assert.deepEqual(classStateInventory(constructorDestructure), [], 'constructor state initialization lost its owner exception');
   const extraOwnerSite = gateway.replace(
     '  scheduleDeferredHandoffRecovery(channelId) {',
     '  privateHandoffSchedulerTick() { return handoffSchedulerHandlers.scheduleDeferredHandoffRecovery.apply(this, arguments); }\n\n  scheduleDeferredHandoffRecovery(channelId) {'
