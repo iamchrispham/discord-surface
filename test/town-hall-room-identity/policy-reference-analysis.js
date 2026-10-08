@@ -416,8 +416,7 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
       sourceFiles,
     ));
   const namespaceAliases = [];
-  let count = 0;
-  const visit = node => {
+  const collectNamespaceAliases = node => {
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer && ts.isIdentifier(node.initializer) &&
         namespaces.some(binding =>
@@ -432,6 +431,11 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
         if (alias) namespaceAliases.push(alias);
       }
     }
+    ts.forEachChild(node, collectNamespaceAliases);
+  };
+  collectNamespaceAliases(sourceFile);
+  let count = 0;
+  const visit = node => {
     if (ts.isIdentifier(node) && isSemanticIdentifierReference(node)) {
       const targetReference = target && node.text === target.name &&
         node !== target.declaration.name &&
