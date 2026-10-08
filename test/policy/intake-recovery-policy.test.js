@@ -327,7 +327,12 @@ const gapValueEnd = (tokens, index) => {
 const isComparisonOperand = (tokens, index, start, end) => {
   let left = index - 1;
   while (left >= start && (tokens[left]?.value === '.' || tokens[left]?.type === 'identifier')) left -= 1;
-  if (left >= start && COMPARISON_OPERATORS.has(tokens[left]?.value)) return true;
+  if (left >= start && COMPARISON_OPERATORS.has(tokens[left]?.value)
+    && !(tokens[left]?.value === '>'
+      && tokens[left - 1]?.type === 'identifier'
+      && tokens[left - 2]?.value === '<'
+      && ['return', '=', '(', '[', '{', ',', ':', '=>', '?', '&&', '||', '??', 'throw']
+        .includes(tokens[left - 3]?.value))) return true;
   let right = gapValueEnd(tokens, index);
   while (right < end && (tokens[right]?.value === '.' || tokens[right]?.type === 'identifier')) right += 1;
   return right < end && COMPARISON_OPERATORS.has(tokens[right]?.value);
@@ -514,8 +519,25 @@ const objectOutcomeGapProperties = (tokens, openingIndex, closingIndex, pairs, a
           aliases,
           allowNestedCalls
         )) properties.set(name, hasGap);
-      } else if (tokens[spreadStart]?.type === 'identifier' && aliases.has(tokens[spreadStart].value)) {
-        properties.set('*', true);
+      } else if (tokens[spreadStart]?.type === 'identifier') {
+        const objectRange = staticObjectInitializerRangeAt(
+          tokens,
+          tokens[spreadStart].value,
+          openingIndex,
+          pairs
+        );
+        if (objectRange) {
+          for (const [name, hasGap] of objectOutcomeGapProperties(
+            tokens,
+            objectRange.start,
+            objectRange.end - 1,
+            pairs,
+            aliases,
+            allowNestedCalls
+          )) properties.set(name, hasGap);
+        } else if (aliases.has(tokens[spreadStart].value)) {
+          properties.set('*', true);
+        }
       }
       continue;
     }
@@ -1700,6 +1722,42 @@ const staticArrayElementRangeAt = (tokens, start, end, pairs, useIndex) => {
   return element ? { ...element, bindingIndex, elementIndex } : null;
 };
 
+const staticObjectInitializerRangeAt = (tokens, name, useIndex, pairs) => {
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  for (let candidate = useIndex - 1; candidate >= 0; candidate -= 1) {
+    if (tokens[candidate]?.value !== name || tokens[candidate - 1]?.value !== 'const'
+      || tokens[candidate + 1]?.value !== '=') continue;
+    const declarationScope = lexicalScopePath(lexicalScopes, candidate);
+    if (!isLexicallyVisible(declarationScope, useScope)) continue;
+    const objectStart = candidate + 2;
+    const objectEnd = trimExpressionRange(
+      tokens,
+      objectStart,
+      findAssignmentValueEnd(tokens, objectStart, tokens.length),
+      pairs
+    ).end;
+    if (tokens[objectStart]?.value !== '{' || pairs.get(objectStart) !== objectEnd - 1) continue;
+    const isMutatedBeforeUse = tokens.slice(candidate + 1, useIndex).some((token, offset) => {
+      const index = candidate + 1 + offset;
+      if (token.value !== name || tokens[index - 1]?.value === '.') return false;
+      const memberStart = index + 1;
+      if (tokens[memberStart]?.value === '.') {
+        return tokens[memberStart + 2]?.value === '=';
+      }
+      if (tokens[memberStart]?.value === '[') {
+        const memberEnd = pairs.get(memberStart);
+        return memberEnd !== undefined && ['=', '+=', '-=', '||=', '&&=', '??=']
+          .includes(tokens[memberEnd + 1]?.value);
+      }
+      return false;
+    });
+    if (isMutatedBeforeUse) return null;
+    return { start: objectStart, end: objectEnd, bindingIndex: candidate };
+  }
+  return null;
+};
+
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set(), resolvingArrays = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
@@ -2216,21 +2274,127 @@ const functionParameterNamesAt = (tokens, range, pairs) => functionParameterDesc
 
 const callbackParameterNameAt = (tokens, range, pairs) => functionParameterNamesAt(tokens, range, pairs)[0] ?? null;
 
+const promiseHandlerOutcomesAt = (
+  tokens,
+  handler,
+  inputHasGap,
+  pairs,
+  functionRanges,
+  aliases,
+  callbackKind = 'outcome'
+) => {
+  const handlerExpression = trimExpressionRange(tokens, handler[0], handler[1], pairs);
+  const identityHandler = handlerExpression.end - handlerExpression.start === 1
+    && ['undefined', 'null'].includes(tokens[handlerExpression.start]?.value);
+  if (identityHandler) {
+    return {
+      canFulfill: true,
+      fulfillmentHasGap: inputHasGap,
+      canReject: false,
+      rejectionHasGap: false
+    };
+  }
+
+  const handlerRange = functionRanges
+    .filter(range => range.start >= handlerExpression.start && range.closing < handlerExpression.end)
+    .filter(range => isScheduledCallback(tokens, pairs, range) === callbackKind)
+    .filter(range => !functionRanges.some(parent => parent !== range
+      && parent.start >= handlerExpression.start
+      && parent.start < range.start
+      && parent.closing > range.closing
+      && parent.closing < handlerExpression.end))
+    .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+  if (!handlerRange) return null;
+
+  const handlerAliases = new Set(aliases);
+  const parameterName = callbackParameterNameAt(tokens, handlerRange, pairs);
+  if (inputHasGap && parameterName) handlerAliases.add(parameterName);
+  const bodyStart = handlerRange.expression ? handlerRange.bodyStart : handlerRange.opening + 1;
+  let bodyEnd = handlerRange.expression ? handlerRange.bodyEnd : handlerRange.closing;
+  while (bodyEnd > bodyStart && tokens[bodyEnd - 1]?.value === ';') bodyEnd -= 1;
+  const startsWithThrow = !handlerRange.expression && tokens[bodyStart]?.value === 'throw';
+  const returnedValueStart = !handlerRange.expression && tokens[bodyStart]?.value === 'return'
+    ? bodyStart + 1
+    : bodyStart;
+  const rejectedCallOpening = returnedValueStart + 3;
+  const startsWithPromiseReject = tokens[returnedValueStart]?.value === 'Promise'
+    && tokens[returnedValueStart + 1]?.value === '.'
+    && tokens[returnedValueStart + 2]?.value === 'reject'
+    && tokens[rejectedCallOpening]?.value === '(';
+  const alwaysRejects = startsWithThrow
+    || (startsWithPromiseReject
+      && pairs.get(rejectedCallOpening) === bodyEnd - 1);
+  const nestedRanges = functionRanges.filter(range => range !== handlerRange
+    && range.start >= bodyStart
+    && range.closing < bodyEnd);
+  let canReject = false;
+  let rejectionHasGap = false;
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    if (nestedRanges.some(range => range.start <= index && range.closing >= index)) continue;
+    if (tokens[index]?.value === 'throw') {
+      canReject = true;
+      rejectionHasGap ||= valueHasGapOutcome(
+        tokens,
+        index + 1,
+        gapValueEnd(tokens, index + 1),
+        pairs,
+        handlerAliases
+      );
+    }
+    const rejectCall = tokens[index]?.value === 'Promise'
+      && tokens[index + 1]?.value === '.'
+      && tokens[index + 2]?.value === 'reject'
+      && tokens[index + 3]?.value === '(';
+    if (!rejectCall) continue;
+    const rejectClosing = pairs.get(index + 3);
+    if (rejectClosing === undefined || rejectClosing >= bodyEnd) continue;
+    const rejectArguments = topLevelSegments(tokens, index + 4, rejectClosing);
+    canReject = true;
+    rejectionHasGap ||= rejectArguments.length > 0
+      && valueHasGapOutcome(tokens, rejectArguments[0][0], rejectArguments[0][1], pairs, handlerAliases);
+  }
+  const canFulfill = !alwaysRejects;
+  const fulfillmentHasGap = canFulfill && (handlerRange.expression
+    ? valueHasGapOutsideNestedFunctions(
+      tokens,
+      bodyStart,
+      bodyEnd,
+      pairs,
+      functionRanges,
+      handlerAliases
+    )
+    : hasGapOutcome(
+      tokens,
+      bodyStart,
+      bodyEnd,
+      handlerRange.opening,
+      pairs,
+      functionRanges,
+      handlerAliases
+    ));
+  return { canFulfill, fulfillmentHasGap, canReject, rejectionHasGap };
+};
+
 const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   let expressionEnd = expression.end;
   while (expressionEnd > expression.start && tokens[expressionEnd - 1]?.value === ';') expressionEnd -= 1;
-  const resolveOpening = expression.start + 3;
+  const startMethod = tokens[expression.start + 2]?.value;
+  const opening = expression.start + 3;
   if (tokens[expression.start]?.value !== 'Promise'
     || tokens[expression.start + 1]?.value !== '.'
-    || tokens[expression.start + 2]?.value !== 'resolve'
-    || tokens[resolveOpening]?.value !== '(') return null;
-  const resolveClosing = pairs.get(resolveOpening);
-  if (resolveClosing === undefined || resolveClosing >= expression.end) return null;
-  const initialArguments = topLevelSegments(tokens, resolveOpening + 1, resolveClosing);
-  let fulfillmentHasGap = initialArguments.length > 0
+    || !['resolve', 'reject'].includes(startMethod)
+    || tokens[opening]?.value !== '(') return null;
+  const closing = pairs.get(opening);
+  if (closing === undefined || closing >= expression.end) return null;
+  const initialArguments = topLevelSegments(tokens, opening + 1, closing);
+  const initialHasGap = initialArguments.length > 0
     && valueHasGapOutcome(tokens, initialArguments[0][0], initialArguments[0][1], pairs, aliases);
-  let cursor = resolveClosing + 1;
+  let fulfillmentPossible = startMethod === 'resolve';
+  let rejectionPossible = startMethod === 'reject';
+  let fulfillmentHasGap = fulfillmentPossible && initialHasGap;
+  let rejectionHasGap = rejectionPossible && initialHasGap;
+  let cursor = closing + 1;
   let handlerCount = 0;
 
   while (cursor < expressionEnd) {
@@ -2239,117 +2403,104 @@ const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) 
     const callOpening = cursor + 2;
     const method = tokens[methodIndex]?.value;
     if (!['.', '?.'].includes(separator)
-      || !['then', 'finally'].includes(method)
+      || !['then', 'catch', 'finally'].includes(method)
       || tokens[callOpening]?.value !== '(') break;
     const callClosing = pairs.get(callOpening);
     if (callClosing === undefined || callClosing >= expressionEnd) return null;
     const handlerArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+
     if (method === 'finally') {
-      const callbackArgument = handlerArguments[0];
-      if (callbackArgument && callbackArgument[0] < callbackArgument[1]) {
-        const callbackExpression = trimExpressionRange(
-          tokens,
-          callbackArgument[0],
-          callbackArgument[1],
-          pairs
-        );
-        const callbackRange = functionRanges
-          .filter(range => range.start >= callbackExpression.start
-            && range.closing < callbackExpression.end)
-          .filter(range => isScheduledCallback(tokens, pairs, range) === 'discarded')
-          .filter(range => !functionRanges.some(parent => parent !== range
-            && parent.start >= callbackExpression.start
-            && parent.start < range.start
-            && parent.closing > range.closing
-            && parent.closing < callbackExpression.end))
-          .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+      const callback = handlerArguments[0];
+      if (callback && callback[0] < callback[1]) {
+        const callbackExpression = trimExpressionRange(tokens, callback[0], callback[1], pairs);
         const ignoredCallback = callbackExpression.end - callbackExpression.start === 1
           && ['undefined', 'null'].includes(tokens[callbackExpression.start]?.value);
-        if (!callbackRange && !ignoredCallback) return null;
-
-        if (callbackRange) {
-          const bodyStart = callbackRange.expression
-            ? callbackRange.bodyStart
-            : callbackRange.opening + 1;
-          let bodyEnd = callbackRange.expression ? callbackRange.bodyEnd : callbackRange.closing;
-          while (bodyEnd > bodyStart && tokens[bodyEnd - 1]?.value === ';') bodyEnd -= 1;
-          const alwaysThrows = !callbackRange.expression
-            && tokens[bodyStart]?.value === 'throw';
-          let returnedValueStart = bodyStart;
-          if (!callbackRange.expression) {
-            if (tokens[bodyStart]?.value === 'return') {
-              returnedValueStart += 1;
-            } else {
-              returnedValueStart = -1;
-            }
+        if (!ignoredCallback) {
+          const outcomes = promiseHandlerOutcomesAt(
+            tokens,
+            callback,
+            false,
+            pairs,
+            functionRanges,
+            aliases,
+            'discarded'
+          );
+          if (!outcomes) return null;
+          const hadSettlement = fulfillmentPossible || rejectionPossible;
+          if (!outcomes.canFulfill) {
+            fulfillmentPossible = false;
+            fulfillmentHasGap = false;
+            rejectionPossible = hadSettlement && outcomes.canReject;
+            rejectionHasGap = outcomes.rejectionHasGap;
+          } else if (outcomes.canReject) {
+            rejectionPossible ||= hadSettlement;
+            rejectionHasGap ||= outcomes.rejectionHasGap;
           }
-          if (tokens[returnedValueStart]?.value === 'await') returnedValueStart += 1;
-          const rejectedCallOpening = returnedValueStart + 3;
-          const alwaysRejects = tokens[returnedValueStart]?.value === 'Promise'
-            && tokens[returnedValueStart + 1]?.value === '.'
-            && tokens[returnedValueStart + 2]?.value === 'reject'
-            && tokens[rejectedCallOpening]?.value === '('
-            && pairs.get(rejectedCallOpening) === bodyEnd - 1;
-          if (alwaysThrows || alwaysRejects) fulfillmentHasGap = false;
         }
       }
-      handlerCount += 1;
-      cursor = callClosing + 1;
-      continue;
-    }
-    const fulfillmentHandler = handlerArguments[0];
-    if (fulfillmentHandler && fulfillmentHandler[0] < fulfillmentHandler[1]) {
-      const handlerExpression = trimExpressionRange(
-        tokens,
-        fulfillmentHandler[0],
-        fulfillmentHandler[1],
-        pairs
-      );
-      const handlerRange = functionRanges
-        .filter(range => range.start >= handlerExpression.start && range.closing < handlerExpression.end)
-        .filter(range => isScheduledCallback(tokens, pairs, range) === 'outcome')
-        .filter(range => !functionRanges.some(parent => parent !== range
-          && parent.start >= handlerExpression.start
-          && parent.start < range.start
-          && parent.closing > range.closing
-          && parent.closing < handlerExpression.end))
-        .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+    } else {
+      const fulfillmentHandler = method === 'catch' ? null : handlerArguments[0];
+      const rejectionHandler = method === 'catch' ? handlerArguments[0] : handlerArguments[1];
+      let nextFulfillmentPossible = false;
+      let nextRejectionPossible = false;
+      let nextFulfillmentHasGap = false;
+      let nextRejectionHasGap = false;
 
-      if (!handlerRange) {
-        const identityHandler = handlerExpression.end - handlerExpression.start === 1
-          && ['undefined', 'null'].includes(tokens[handlerExpression.start]?.value);
-        if (!identityHandler) return null;
-      } else {
-        const handlerAliases = new Set(aliases);
-        const parameterName = callbackParameterNameAt(tokens, handlerRange, pairs);
-        if (fulfillmentHasGap && parameterName) handlerAliases.add(parameterName);
-        const bodyStart = handlerRange.expression ? handlerRange.bodyStart : handlerRange.opening + 1;
-        const bodyEnd = handlerRange.expression ? handlerRange.bodyEnd : handlerRange.closing;
-        fulfillmentHasGap = handlerRange.expression
-          ? valueHasGapOutsideNestedFunctions(
+      if (fulfillmentPossible) {
+        if (fulfillmentHandler && fulfillmentHandler[0] < fulfillmentHandler[1]) {
+          const outcomes = promiseHandlerOutcomesAt(
             tokens,
-            bodyStart,
-            bodyEnd,
+            fulfillmentHandler,
+            fulfillmentHasGap,
             pairs,
             functionRanges,
-            handlerAliases
-          )
-          : hasGapOutcome(
-            tokens,
-            bodyStart,
-            bodyEnd,
-            handlerRange.opening,
-            pairs,
-            functionRanges,
-            handlerAliases
+            aliases
           );
+          if (!outcomes) return null;
+          nextFulfillmentPossible ||= outcomes.canFulfill;
+          nextFulfillmentHasGap ||= outcomes.fulfillmentHasGap;
+          nextRejectionPossible ||= outcomes.canReject;
+          nextRejectionHasGap ||= outcomes.rejectionHasGap;
+        } else {
+          nextFulfillmentPossible = true;
+          nextFulfillmentHasGap = fulfillmentHasGap;
+        }
       }
+
+      if (rejectionPossible) {
+        if (rejectionHandler && rejectionHandler[0] < rejectionHandler[1]) {
+          const outcomes = promiseHandlerOutcomesAt(
+            tokens,
+            rejectionHandler,
+            rejectionHasGap,
+            pairs,
+            functionRanges,
+            aliases
+          );
+          if (!outcomes) return null;
+          nextFulfillmentPossible ||= outcomes.canFulfill;
+          nextFulfillmentHasGap ||= outcomes.fulfillmentHasGap;
+          nextRejectionPossible ||= outcomes.canReject;
+          nextRejectionHasGap ||= outcomes.rejectionHasGap;
+        } else {
+          nextRejectionPossible = true;
+          nextRejectionHasGap = rejectionHasGap;
+        }
+      }
+
+      fulfillmentPossible = nextFulfillmentPossible;
+      rejectionPossible = nextRejectionPossible;
+      fulfillmentHasGap = nextFulfillmentHasGap;
+      rejectionHasGap = nextRejectionHasGap;
     }
+
     handlerCount += 1;
     cursor = callClosing + 1;
   }
 
-  return handlerCount > 0 ? { start: expression.start, end: cursor, hasGap: fulfillmentHasGap } : null;
+  return handlerCount > 0
+    ? { start: expression.start, end: cursor, hasGap: fulfillmentHasGap || rejectionHasGap }
+    : null;
 };
 
 const promiseThenChainGapOutcome = (tokens, start, end, pairs, functionRanges, aliases) => {
@@ -2509,6 +2660,8 @@ const hasGapOutcome = (
 ) => {
   const knownAliases = new Set(aliases);
   const knownWriterAliases = new Map(writerAliases);
+  const knownBooleanAliases = new Map();
+  const localAssignments = findIdentifierAssignments(tokens, findLexicalScopes(tokens, pairs));
   const knownLocalFunctions = new Map();
   const localFunctionScope = functionScopeOpeningAt(start, functionRanges);
   for (const candidate of functionRanges) {
@@ -2578,6 +2731,57 @@ const hasGapOutcome = (
       continue;
     }
     const token = tokens[index];
+    if (token.value === 'if' && tokens[index + 1]?.value === '(') {
+      const conditionClosing = pairs.get(index + 1);
+      const condition = conditionClosing === undefined
+        ? null
+        : staticBooleanValueAt(tokens, index + 2, conditionClosing, pairs, knownBooleanAliases);
+      const bodyStart = conditionClosing === undefined ? -1 : conditionClosing + 1;
+      const bodyClosing = tokens[bodyStart]?.value === '{' ? pairs.get(bodyStart) : undefined;
+      const bodyEnd = bodyClosing === undefined
+        ? findStatementEnd(tokens, bodyStart, end)
+        : bodyClosing + 1;
+      if (bodyEnd > bodyStart && condition === false) {
+        index = bodyEnd - 1;
+        continue;
+      }
+      if (bodyEnd > bodyStart && condition === true && tokens[bodyEnd]?.value === 'else') {
+        const elseStart = bodyEnd + 1;
+        const elseClosing = tokens[elseStart]?.value === '{' ? pairs.get(elseStart) : undefined;
+        const elseEnd = elseClosing === undefined
+          ? findStatementEnd(tokens, elseStart, end)
+          : elseClosing + 1;
+        if (elseEnd > elseStart) {
+          index = elseEnd - 1;
+          continue;
+        }
+      }
+    }
+    if (token.type === 'identifier' && tokens[index + 1]?.value === '=') {
+      const assignment = localAssignments.find(candidate => candidate.index === index);
+      if (assignment) {
+        const assignmentValue = staticBooleanValueAt(
+          tokens,
+          assignment.equalsIndex + 1,
+          findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, end),
+          pairs,
+          knownBooleanAliases
+        );
+        const conditionalScopes = assignment.scope
+          .filter(scope => isConditionalBlockScopeAt(tokens, scope));
+        const unconditionalInSelectedBlock = opening !== null
+          && conditionalScopes.includes(opening)
+          && conditionalScopes.every(scope => scope === opening)
+          && ![')', 'else'].includes(tokens[assignment.index - 1]?.value);
+        if (unconditionalInSelectedBlock) {
+          if (assignmentValue === null) knownBooleanAliases.delete(assignment.name);
+          else knownBooleanAliases.set(assignment.name, assignmentValue);
+        } else if (knownBooleanAliases.has(assignment.name)
+          && assignmentValue !== knownBooleanAliases.get(assignment.name)) {
+          knownBooleanAliases.delete(assignment.name);
+        }
+      }
+    }
     if (token.value === 'throw') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const hasHandler = caughtThrowHandlerEnd(tokens, index, pairs) !== null
@@ -2773,6 +2977,22 @@ const hasGapOutcome = (
   );
 };
 
+const staticBooleanValueAt = (tokens, start, end, pairs, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return null;
+  if (tokens[expression.start]?.value === '!') {
+    const value = staticBooleanValueAt(tokens, expression.start + 1, expression.end, pairs, aliases);
+    return value === null ? null : !value;
+  }
+  if (expression.end - expression.start !== 1) return null;
+  const token = tokens[expression.start];
+  if (token.value === 'true') return true;
+  if (token.value === 'false') return false;
+  return token.type === 'identifier' && aliases.has(token.value)
+    ? aliases.get(token.value)
+    : null;
+};
+
 const DEADLINE_PREDICATE_NAMES = new Set(['isDeadlineReached']);
 
 const isDeadlineTriggerAt = (tokens, index, isDeadlineTimestampAlias = () => false) => {
@@ -2954,6 +3174,32 @@ const isConditionalAssignment = (tokens, pairs, assignment) => {
     || followsConditionalHeader(opening - 1));
 };
 
+const isConditionalBlockScopeAt = (tokens, openingIndex) => {
+  const conditionalControls = new Set(['if', 'for', 'while', 'switch', 'catch']);
+  const closingIndex = openingIndex - 1;
+  if (tokens[closingIndex]?.value === 'else' || tokens[closingIndex]?.value === '=>') return true;
+  if (tokens[closingIndex]?.value !== ')') return false;
+  let depth = 0;
+  for (let index = closingIndex; index >= 0; index -= 1) {
+    if (tokens[index].value === ')') depth += 1;
+    else if (tokens[index].value === '(') {
+      depth -= 1;
+      if (depth === 0) return conditionalControls.has(tokens[index - 1]?.value);
+    }
+  }
+  return false;
+};
+
+const assignmentIsConditionalAtUse = (tokens, pairs, assignment, index) => {
+  if (!isConditionalAssignment(tokens, pairs, assignment)) return false;
+  const conditionalScopes = (assignment.writeScope || assignment.scope)
+    .filter(opening => isConditionalBlockScopeAt(tokens, opening));
+  return conditionalScopes.length === 0 || !conditionalScopes.every(opening => {
+    const closing = pairs.get(opening);
+    return opening < index && closing > index;
+  });
+};
+
 const logicalAssignmentRhsSelection = (tokens, pairs, assignments, assignment) => {
   if (assignment.operator === '=') return true;
   if (!['||=', '&&=', '??='].includes(assignment.operator)) return null;
@@ -2987,7 +3233,7 @@ const resolveVisibleAssignments = (assignments, name, index, lexicalScopes, bind
     .sort((left, right) => left.index - right.index);
   let possibleAssignments = [];
   for (const assignment of visible) {
-    if (isConditionalAssignment(tokens, pairs, assignment)) possibleAssignments.push(assignment);
+    if (assignmentIsConditionalAtUse(tokens, pairs, assignment, index)) possibleAssignments.push(assignment);
     else possibleAssignments = [assignment];
   }
   return possibleAssignments;
@@ -3579,6 +3825,25 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     if (!isDeadlineTriggerAt(tokens, index, isDeadlineTimestampAliasAt)) continue;
     const alias = findAssignedAlias(tokens, index);
     if (alias) {
+      const aliasBinding = resolveVisibleBinding(
+        lexicalBindings,
+        alias.name,
+        alias.index + 1,
+        lexicalScopes
+      );
+      const activeAliasAssignments = aliasBinding
+        ? resolveVisibleAssignments(
+          assignments,
+          alias.name,
+          index,
+          lexicalScopes,
+          aliasBinding.index,
+          tokens,
+          pairs
+        )
+        : [];
+      if (activeAliasAssignments.length > 0
+        && !activeAliasAssignments.some(assignment => assignment.index === alias.index)) continue;
       let aliasNegationCount = 0;
       for (let negationIndex = alias.index + 2; tokens[negationIndex]?.value === '!'; negationIndex += 1) {
         aliasNegationCount += 1;
@@ -4130,10 +4395,17 @@ test('deadline policy inventory resolves named object spreads in outcomes', () =
     relative: 'discord/deadline-named-object-spread.js',
     source: [
       'const gap = { state: READINESS.GAP };',
-      'if (deadlineReached) return { ...gap };'
+      'const safe = { state: READINESS.UNAVAILABLE };',
+      'if (deadlineReached) return { ...gap };',
+      'if (deadlineReached) return { state: READINESS.GAP, ...safe };',
+      'if (deadlineReached) return { ...gap, state: READINESS.UNAVAILABLE };',
+      'if (deadlineReached) return { ...safe, state: READINESS.GAP };'
     ].join('\n')
   }]);
-  assert.deepEqual(offenders, ['discord/deadline-named-object-spread.js:2']);
+  assert.deepEqual(offenders, [
+    'discord/deadline-named-object-spread.js:3',
+    'discord/deadline-named-object-spread.js:6'
+  ]);
 });
 
 test('deadline policy inventory recognizes boundary writers invoked through call', () => {
@@ -5517,9 +5789,33 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const rejectedFulfillment = `function wait() { if (deadlineReached) return Promise.reject(error).then(() => READINESS.GAP); }`;
     const resolvedRejection = `function wait() { if (deadlineReached) return Promise.resolve(READINESS.READY).catch(() => READINESS.GAP); }`;
     const reachableFulfillment = `function wait() { if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP); }`;
+    const rejectedThenRecoveredToGap = 'function wait() { if (deadlineReached) return Promise.resolve().then(() => { throw new Error(); }).catch(() => READINESS.GAP); }';
+    const rejectedThenRecoveredSafely = 'function wait() { if (deadlineReached) return Promise.resolve().then(() => { throw new Error(); }).catch(() => READINESS.UNAVAILABLE); }';
+    const rejectedThenRecoveredByThen = 'function wait() { if (deadlineReached) return Promise.resolve().then(() => { throw new Error(); }).then(undefined, () => READINESS.GAP); }';
     regressionAssert.equal(offendersFor(rejectedFulfillment).length, 0);
     regressionAssert.equal(offendersFor(resolvedRejection).length, 0);
     regressionAssert.equal(offendersFor(reachableFulfillment).length, 1);
+    regressionAssert.equal(offendersFor(rejectedThenRecoveredToGap).length, 1);
+    regressionAssert.equal(offendersFor(rejectedThenRecoveredSafely).length, 0);
+    regressionAssert.equal(offendersFor(rejectedThenRecoveredByThen).length, 1);
+  });
+
+  regressionTest('deadline policy inventory distinguishes TypeScript assertions from comparisons', () => {
+    const offenders = findDeadlineGapOffenders([
+      {
+        relative: 'discord/deadline-angle-asserted-gap.ts',
+        source: 'function wait() { if (deadlineReached) return <Readiness>READINESS.GAP; }'
+      },
+      {
+        relative: 'discord/deadline-angle-asserted-safe.ts',
+        source: 'function wait() { if (deadlineReached) return <Readiness>READINESS.UNAVAILABLE; }'
+      },
+      {
+        relative: 'discord/deadline-angle-comparison-safe.ts',
+        source: 'function wait(readiness) { if (deadlineReached) return readiness > READINESS.GAP ? READINESS.READY : READINESS.UNAVAILABLE; }'
+      }
+    ]);
+    assert.deepEqual(offenders, ['discord/deadline-angle-asserted-gap.ts:1']);
   });
 
   regressionTest('deadline policy inventory ignores metadata-only gap assignments', () => {
@@ -5580,9 +5876,13 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const conditionalReset = `let expired = deadlineReached; if (reset) expired = false; if (expired) return READINESS.GAP;`;
     const conditionalBlockReset = `let expired = deadlineReached; if (reset) { audit(); expired = false; } if (expired) return READINESS.GAP;`;
     const unconditionalReset = `let expired = deadlineReached; expired = false; if (expired) return READINESS.GAP;`;
+    const selectedBranchReset = `let expired = deadlineReached; if (expired) { expired = false; if (expired) return READINESS.GAP; }`;
+    const selectedBranchOptionalReset = `let expired = deadlineReached; if (expired) { if (reset) { expired = false; } if (expired) return READINESS.GAP; }`;
     regressionAssert.equal(offendersFor(conditionalReset).length, 1);
     regressionAssert.equal(offendersFor(conditionalBlockReset).length, 1);
     regressionAssert.equal(offendersFor(unconditionalReset).length, 0);
+    regressionAssert.equal(offendersFor(selectedBranchReset).length, 0);
+    regressionAssert.equal(offendersFor(selectedBranchOptionalReset).length, 1);
   });
 
   regressionTest('deadline policy inventory ignores deadline names inside control-body regex literals', () => {
