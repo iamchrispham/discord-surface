@@ -2292,7 +2292,12 @@ const isScheduledCallback = (tokens, pairs, range) => {
     && isUnshadowedIdentifierAt(tokens, 'Promise', calleeIndex, pairs)) {
     return PROMISE_EXECUTOR_CALLBACK;
   }
+  const processNextTick = callee === 'nextTick'
+    && tokens[calleeIndex - 1]?.value === '.'
+    && tokens[calleeIndex - 2]?.value === 'process'
+    && isUnshadowedIdentifierAt(tokens, 'process', calleeIndex - 2, pairs);
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
+    || processNextTick
     || (EAGER_ARRAY_CALLBACK_METHODS.has(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))
     || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
   if (!['then', 'catch'].includes(callee) || !['.', '?.'].includes(tokens[calleeIndex - 1]?.value)) return false;
@@ -2392,11 +2397,20 @@ const localObjectMethodAt = (tokens, index, useIndex, pairs, functionRanges) => 
   const objectRange = staticObjectInitializerRangeAt(tokens, tokens[index - 2].value, useIndex, pairs);
   if (!objectRange) return null;
   const methodName = tokens[index].value;
-  const methodStart = topLevelSegments(tokens, objectRange.start + 1, objectRange.end - 1)
+  const method = topLevelSegments(tokens, objectRange.start + 1, objectRange.end - 1)
     .filter(([propertyStart]) => tokens[propertyStart]?.value === methodName)
-    .map(([propertyStart]) => propertyStart)
     .pop();
-  if (methodStart === undefined) return null;
+  if (!method) return null;
+  const [methodStart, methodEnd] = method;
+  const colon = topLevelToken(tokens, methodStart, methodEnd, ':');
+  if (colon >= 0) {
+    return functionRanges
+      .filter(range => range.start >= colon + 1
+        && range.start < methodEnd
+        && range.closing < methodEnd)
+      .sort((left, right) => left.start - right.start
+        || right.closing - left.closing)[0] ?? null;
+  }
   return functionRanges.find(range => range.start === methodStart
     && range.opening > objectRange.start
     && range.closing < objectRange.end
@@ -2554,6 +2568,109 @@ const functionParameterRangesAt = (tokens, range, pairs) => {
   return topLevelSegments(tokens, parameterOpening + 1, parameterClosing);
 };
 
+const topLevelSegmentsWithSlots = (tokens, start, end, pairs) => {
+  const segments = [];
+  let segmentStart = start;
+  for (let index = start; index < end; index += 1) {
+    const closing = pairs.get(index);
+    if (closing !== undefined && closing > index && closing < end) {
+      index = closing;
+      continue;
+    }
+    if (tokens[index]?.value === ',') {
+      segments.push([segmentStart, index]);
+      segmentStart = index + 1;
+    }
+  }
+  if (segmentStart < end || segments.length > 0) segments.push([segmentStart, end]);
+  return segments;
+};
+
+const parameterPatternBindingsAt = (tokens, start, end, pairs, path = []) => {
+  const pattern = trimExpressionRange(tokens, start, end, pairs);
+  const defaultIndex = topLevelToken(tokens, pattern.start, pattern.end, '=');
+  const patternEnd = defaultIndex < 0 ? pattern.end : defaultIndex;
+  if (patternEnd - pattern.start === 1 && tokens[pattern.start]?.type === 'identifier') {
+    return [{ name: tokens[pattern.start].value, path }];
+  }
+
+  if (tokens[pattern.start]?.value === '{'
+    && pairs.get(pattern.start) === patternEnd - 1) {
+    return topLevelSegmentsWithSlots(tokens, pattern.start + 1, patternEnd - 1, pairs)
+      .flatMap(([propertyStart, propertyEnd]) => {
+        if (propertyStart >= propertyEnd || tokens[propertyStart]?.value === '...') return [];
+        const propertyName = staticPropertyName(tokens[propertyStart]);
+        if (propertyName === null) return [];
+        const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+        const bindingStart = colon < 0 ? propertyStart : colon + 1;
+        const bindingEnd = colon < 0 ? propertyEnd : propertyEnd;
+        return parameterPatternBindingsAt(
+          tokens,
+          bindingStart,
+          bindingEnd,
+          pairs,
+          [...path, propertyName]
+        );
+      });
+  }
+
+  if (tokens[pattern.start]?.value === '['
+    && pairs.get(pattern.start) === patternEnd - 1) {
+    return topLevelSegmentsWithSlots(tokens, pattern.start + 1, patternEnd - 1, pairs)
+      .flatMap(([elementStart, elementEnd], elementIndex) => elementStart >= elementEnd
+        ? []
+        : parameterPatternBindingsAt(
+          tokens,
+          elementStart,
+          elementEnd,
+          pairs,
+          [...path, elementIndex]
+        ));
+  }
+  return [];
+};
+
+const argumentValueAtPath = (tokens, start, end, path, pairs) => {
+  let value = trimExpressionRange(tokens, start, end, pairs);
+  for (const segment of path) {
+    if (value.start >= value.end) return null;
+    if (typeof segment === 'number'
+      && tokens[value.start]?.value === '['
+      && pairs.get(value.start) === value.end - 1) {
+      const elements = topLevelSegmentsWithSlots(tokens, value.start + 1, value.end - 1, pairs);
+      const element = elements[segment];
+      if (!element || element[0] >= element[1]) return null;
+      value = trimExpressionRange(tokens, element[0], element[1], pairs);
+      continue;
+    }
+    if (typeof segment === 'string'
+      && tokens[value.start]?.value === '{'
+      && pairs.get(value.start) === value.end - 1) {
+      const property = topLevelSegmentsWithSlots(tokens, value.start + 1, value.end - 1, pairs)
+        .find(([propertyStart, propertyEnd]) => propertyStart < propertyEnd
+          && staticPropertyName(tokens[propertyStart]) === segment);
+      if (!property) return null;
+      const [propertyStart, propertyEnd] = property;
+      const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+      value = trimExpressionRange(
+        tokens,
+        colon < 0 ? propertyStart : colon + 1,
+        propertyEnd,
+        pairs
+      );
+      continue;
+    }
+    return null;
+  }
+  return value.start < value.end ? value : null;
+};
+
+const isAggregateLiteralAt = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  return ['{', '['].includes(tokens[expression.start]?.value)
+    && pairs.get(expression.start) === expression.end - 1;
+};
+
 const functionParameterDescriptorsAt = (tokens, range, pairs) => functionParameterRangesAt(
   tokens,
   range,
@@ -2563,8 +2680,11 @@ const functionParameterDescriptorsAt = (tokens, range, pairs) => functionParamet
   const bindingEnd = defaultIndex < 0 ? end : defaultIndex;
   return {
     name: bindingEnd - start === 1 && tokens[start]?.type === 'identifier' ? tokens[start].value : null,
+    bindings: parameterPatternBindingsAt(tokens, start, bindingEnd, pairs),
     defaultStart: defaultIndex < 0 ? null : defaultIndex + 1,
-    defaultEnd: defaultIndex < 0 ? null : end
+    defaultEnd: defaultIndex < 0 ? null : end,
+    patternStart: start,
+    patternEnd: bindingEnd
   };
 });
 
@@ -2818,6 +2938,180 @@ const promiseThenChainGapOutcome = (tokens, start, end, pairs, functionRanges, a
   return chain.hasGap;
 };
 
+const localFunctionInvocationAt = (
+  tokens,
+  index,
+  pairs,
+  functionRanges,
+  knownLocalFunctions
+) => {
+  const isObjectMethod = tokens[index - 1]?.value === '.';
+  const invokedThroughCallOrApply = tokens[index + 1]?.value === '.'
+    && ['call', 'apply'].includes(tokens[index + 2]?.value)
+    && tokens[index + 3]?.value === '(';
+  if (invokedThroughCallOrApply) {
+    const localFunction = isObjectMethod
+      ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
+      : localFunctionForCallAt(
+        tokens,
+        tokens[index].value,
+        index,
+        pairs,
+        functionRanges,
+        knownLocalFunctions
+      );
+    if (!localFunction) return null;
+    const callOpening = index + 3;
+    const callClosing = pairs.get(callOpening);
+    if (callClosing === undefined) return null;
+    const suppliedArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+    let argumentsList;
+    if (tokens[index + 2].value === 'call') {
+      argumentsList = suppliedArguments.slice(1);
+    } else {
+      const appliedArray = suppliedArguments[1];
+      if (!appliedArray) argumentsList = [];
+      else {
+        const array = trimExpressionRange(tokens, appliedArray[0], appliedArray[1], pairs);
+        argumentsList = tokens[array.start]?.value === '['
+          && pairs.get(array.start) === array.end - 1
+          ? topLevelSegmentsWithSlots(tokens, array.start + 1, array.end - 1, pairs)
+          : [];
+      }
+    }
+    return { localFunction, argumentsList, callClosing };
+  }
+
+  if (tokens[index + 1]?.value !== '(') return null;
+  const localFunction = isObjectMethod
+    ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
+    : localFunctionForCallAt(
+      tokens,
+      tokens[index].value,
+      index,
+      pairs,
+      functionRanges,
+      knownLocalFunctions
+    );
+  const callClosing = pairs.get(index + 1);
+  if (!localFunction || callClosing === undefined) return null;
+  return {
+    localFunction,
+    argumentsList: topLevelSegments(tokens, index + 2, callClosing),
+    callClosing
+  };
+};
+
+const returnedParameterPathAt = (tokens, start, end, parameters, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  const root = tokens[expression.start];
+  if (root?.type !== 'identifier') return null;
+  let parameterIndex = -1;
+  let parameterBinding;
+  for (let index = parameters.length - 1; index >= 0; index -= 1) {
+    const binding = parameters[index].bindings.find(candidate => candidate.name === root.value);
+    if (binding) {
+      parameterIndex = index;
+      parameterBinding = binding;
+      break;
+    }
+  }
+  if (!parameterBinding) return null;
+
+  const path = [...parameterBinding.path];
+  let cursor = expression.start + 1;
+  while (cursor < expression.end) {
+    if (['.', '?.'].includes(tokens[cursor]?.value)
+      && tokens[cursor + 1]?.type === 'identifier') {
+      path.push(tokens[cursor + 1].value);
+      cursor += 2;
+      continue;
+    }
+    if (tokens[cursor]?.value === '[') {
+      const closing = pairs.get(cursor);
+      if (closing !== cursor + 2) return null;
+      const property = tokens[cursor + 1];
+      if (property?.type === 'number') path.push(Number(property.value));
+      else if (property?.type === 'string') path.push(staticPropertyName(property));
+      else return null;
+      cursor = closing + 1;
+      continue;
+    }
+    return null;
+  }
+  return { parameterIndex, path };
+};
+
+const localParameterArgumentAt = (parameter, argumentsList, parameterIndex) => {
+  const supplied = argumentsList[parameterIndex];
+  if (supplied && supplied[0] < supplied[1]) return supplied;
+  return parameter.defaultStart === null
+    ? null
+    : [parameter.defaultStart, parameter.defaultEnd];
+};
+
+const parameterWasReassignedBefore = (tokens, name, start, end) => {
+  const assignmentOperators = new Set(['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??=']);
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    if (assignmentOperators.has(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value)) return true;
+  }
+  return false;
+};
+
+const localCallableReturnsGapOutcome = (
+  tokens,
+  localFunction,
+  parameters,
+  argumentsList,
+  pairs,
+  functionRanges,
+  aliases
+) => {
+  const bodyStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
+  const bodyEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+  const returns = [];
+  if (localFunction.expression) {
+    returns.push([bodyStart, bodyEnd]);
+  } else {
+    const nestedFunctions = new Map(functionRanges
+      .filter(range => range !== localFunction && range.start >= bodyStart && range.opening < bodyEnd)
+      .map(range => [range.start, range]));
+    for (let index = bodyStart; index < bodyEnd; index += 1) {
+      const nested = nestedFunctions.get(index);
+      if (nested) {
+        index = nested.closing;
+        continue;
+      }
+      if (tokens[index]?.value !== 'return') continue;
+      const statementEnd = findStatementEnd(tokens, index + 1, bodyEnd);
+      returns.push([index + 1, statementEnd]);
+      index = statementEnd - 1;
+    }
+  }
+
+  return returns.some(([start, end]) => {
+    const returnedPath = returnedParameterPathAt(tokens, start, end, parameters, pairs);
+    if (!returnedPath) return false;
+    const parameter = parameters[returnedPath.parameterIndex];
+    const bindingName = tokens[trimExpressionRange(tokens, start, end, pairs).start]?.value;
+    if (parameterWasReassignedBefore(tokens, bindingName, bodyStart, start)) return false;
+    const argument = localParameterArgumentAt(parameter, argumentsList, returnedPath.parameterIndex);
+    if (!argument) return false;
+    const value = argumentValueAtPath(
+      tokens,
+      argument[0],
+      argument[1],
+      returnedPath.path,
+      pairs
+    );
+    return value !== null
+      && valueHasGapOutcome(tokens, value.start, value.end, pairs, aliases, new Set(), true);
+  });
+};
+
 const localFunctionCallHasGapOutcome = (
   tokens,
   start,
@@ -2830,50 +3124,60 @@ const localFunctionCallHasGapOutcome = (
   resolvingFunctions
 ) => {
   for (let index = start; index < end; index += 1) {
-    if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.'
-      || tokens[index + 1]?.value !== '(') continue;
-    const name = tokens[index].value;
-    const localFunction = localFunctionForCallAt(
+    if (tokens[index]?.type !== 'identifier') continue;
+    const invocation = localFunctionInvocationAt(
       tokens,
-      name,
       index,
       pairs,
       functionRanges,
       knownLocalFunctions
     );
+    const localFunction = invocation?.localFunction;
     if (!localFunction || resolvingFunctions.has(localFunction)) continue;
 
     const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
     const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
-    const callOpening = index + 1;
-    const callClosing = pairs.get(callOpening);
-    if (callClosing === undefined) continue;
     const callAliases = new Set(aliases);
     const parameters = functionParameterDescriptorsAt(tokens, localFunction, pairs);
-    const callArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+    const callArguments = invocation.argumentsList;
     parameters.forEach((parameter, parameterIndex) => {
-      const parameterName = parameter.name;
-      if (parameterName === null) return;
-      const argument = callArguments[parameterIndex];
-      const argumentWasProvided = argument !== undefined && argument[0] < argument[1];
-      if (argumentWasProvided
-        && valueHasGapOutcome(tokens, argument[0], argument[1], pairs, aliases, new Set(), true)) {
-        callAliases.add(parameterName);
-      } else if (!argumentWasProvided && parameter.defaultStart !== null
-        && valueHasGapOutcome(
-          tokens,
-          parameter.defaultStart,
-          parameter.defaultEnd,
-          pairs,
-          aliases,
-          new Set(),
-          true
-        )) {
-        callAliases.add(parameterName);
-      } else {
-        callAliases.delete(parameterName);
+      const argument = localParameterArgumentAt(parameter, callArguments, parameterIndex);
+      if (!argument) {
+        parameter.bindings.forEach(binding => callAliases.delete(binding.name));
+        return;
       }
+      parameter.bindings.forEach(binding => {
+        const boundValue = argumentValueAtPath(
+          tokens,
+          argument[0],
+          argument[1],
+          binding.path,
+          pairs
+        );
+        const isScalarGap = boundValue !== null
+          && !isAggregateLiteralAt(tokens, boundValue.start, boundValue.end, pairs)
+          && valueHasGapOutcome(
+            tokens,
+            boundValue.start,
+            boundValue.end,
+            pairs,
+            aliases,
+            new Set(),
+            true
+          );
+        if (isScalarGap) callAliases.add(binding.name);
+        else callAliases.delete(binding.name);
+      });
     });
+    if (localCallableReturnsGapOutcome(
+      tokens,
+      localFunction,
+      parameters,
+      callArguments,
+      pairs,
+      functionRanges,
+      aliases
+    )) return true;
     const nextResolvingFunctions = new Set(resolvingFunctions);
     nextResolvingFunctions.add(localFunction);
     const callbackHasGap = localFunction.expression
@@ -6380,10 +6684,14 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
   regressionTest('deadline policy inventory follows scheduled boundary writers', () => {
     const promiseCallback = `if (deadlineReached) Promise.resolve().then(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
     const microtaskCallback = `if (deadlineReached) queueMicrotask(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
+    const nextTickCallback = `if (deadlineReached) process.nextTick(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
+    const safeNextTickCallback = `if (deadlineReached) process.nextTick(() => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail));`;
     const unscheduledCallback = `const callback = () => state.markIntakeBoundary(id, READINESS.GAP, detail); if (deadlineReached) callback();`;
     const declaredCallback = `function wait() { function writeBoundary() { state.markIntakeBoundary(id, READINESS.GAP, detail); } if (deadlineReached) writeBoundary(); }`;
     regressionAssert.equal(offendersFor(promiseCallback).length, 1);
     regressionAssert.equal(offendersFor(microtaskCallback).length, 1);
+    regressionAssert.equal(offendersFor(nextTickCallback).length, 1);
+    regressionAssert.equal(offendersFor(safeNextTickCallback).length, 0);
     regressionAssert.equal(offendersFor(unscheduledCallback).length, 1);
     regressionAssert.equal(offendersFor(declaredCallback).length, 1);
   });
@@ -6971,6 +7279,102 @@ test('deadline policy inventory follows local object method aliases', () => {
     }
   ]);
   assert.deepEqual(offenders, ['discord/deadline-object-method-alias-gap.js:1']);
+});
+
+test('deadline policy inventory follows local helper binding patterns', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-object-binding-gap.js',
+      source: 'function outcome({ state }) { return state; } if (deadlineReached) return outcome({ state: READINESS.GAP });'
+    },
+    {
+      relative: 'discord/deadline-object-binding-safe.js',
+      source: 'function outcome({ state }) { return state; } if (deadlineReached) return outcome({ state: READINESS.READY, other: READINESS.GAP });'
+    },
+    {
+      relative: 'discord/deadline-array-binding-gap.js',
+      source: 'function outcome([state]) { return state; } if (deadlineReached) return outcome([READINESS.GAP, READINESS.READY]);'
+    },
+    {
+      relative: 'discord/deadline-array-binding-safe.js',
+      source: 'function outcome([state]) { return state; } if (deadlineReached) return outcome([READINESS.READY, READINESS.GAP]);'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-object-binding-gap.js:1',
+    'discord/deadline-array-binding-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory follows local helpers invoked through call and apply', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-local-call-gap.js',
+      source: 'function outcome(state) { return state; } if (deadlineReached) return outcome.call(null, READINESS.GAP);'
+    },
+    {
+      relative: 'discord/deadline-local-call-safe.js',
+      source: 'function outcome(state) { return state; } if (deadlineReached) return outcome.call(null, READINESS.READY);'
+    },
+    {
+      relative: 'discord/deadline-local-apply-gap.js',
+      source: 'function outcome(state) { return state; } if (deadlineReached) return outcome.apply(null, [READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-apply-safe.js',
+      source: 'function outcome(state) { return state; } if (deadlineReached) return outcome.apply(null, [READINESS.READY, READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-apply-hole-safe.js',
+      source: 'function outcome(first) { return first; } if (deadlineReached) return outcome.apply(null, [, READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-call-constant-gap.js',
+      source: 'function outcome() { return READINESS.GAP; } if (deadlineReached) return outcome.call(null);'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-local-call-gap.js:1',
+    'discord/deadline-local-apply-gap.js:1',
+    'discord/deadline-local-call-constant-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory separates native Promise races from local methods', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-native-race-returned.js',
+      source: 'if (deadlineReached) return Promise.race([READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-native-race-discarded.js',
+      source: 'if (deadlineReached) Promise.race([READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-native-race-persisted.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, Promise.race([READINESS.GAP]), detail);'
+    },
+    {
+      relative: 'discord/deadline-local-race-returned.js',
+      source: 'const Promise = { race: values => values[0] }; if (deadlineReached) return Promise.race([READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-race-first-safe.js',
+      source: 'const Promise = { race: values => values[0] }; if (deadlineReached) return Promise.race([READINESS.READY, READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-race-non-gap.js',
+      source: 'const Promise = { race: () => READINESS.UNAVAILABLE }; if (deadlineReached) return Promise.race([READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-local-race-discarded.js',
+      source: 'const Promise = { race: values => values[0] }; if (deadlineReached) Promise.race([READINESS.GAP]);'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-native-race-returned.js:1',
+    'discord/deadline-local-race-returned.js:1'
+  ]);
 });
 
 test('deadline policy inventory waits for returned local outcome properties', () => {
