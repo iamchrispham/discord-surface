@@ -64,6 +64,7 @@ export const COURIER_RECOVERY_REASONS = Object.freeze({
   NATIVE_ACKNOWLEDGED: 'native_acknowledged',
   FORWARD_CLAIMED: 'forward_claimed',
   RETIRED: 'retired',
+  RETRY_CONFIRMATION_REQUIRED: 'retry_confirmation_required',
   NOT_SUBMITTED: 'not_submitted',
   UNKNOWN_MESSAGE: 'unknown_message',
   STALE_ATTEMPT: 'stale_attempt'
@@ -71,6 +72,11 @@ export const COURIER_RECOVERY_REASONS = Object.freeze({
 
 export const COURIER_RECOVERY_SOURCES = Object.freeze({
   COURIER_RECOVERY: 'courier-recovery'
+} as const);
+
+export const COURIER_RECOVERY_TRIGGERS = Object.freeze({
+  EXPLICIT: 'explicit',
+  PICKUP_DEADLINE: 'pickup-deadline'
 } as const);
 
 export const ENVELOPE_TYPE = 'discord-surface:courier:v1' as const;
