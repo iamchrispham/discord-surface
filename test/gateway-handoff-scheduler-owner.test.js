@@ -122,8 +122,26 @@ test('real strict owner keeps defaults in one place and reads option getters onc
 });
 
 
+test('scheduler regression suites stay in the explicit npm test runner', () => {
+  const packageJson = JSON.parse(require('node:fs').readFileSync(
+    require('node:path').resolve(__dirname, '..', 'package.json'), 'utf8'));
+  const registered = packageJson.scripts.test;
+  assert.equal(registered.split('test/helpers/handoff-scheduler-owner-static.test.js').length - 1, 1);
+  assert.equal(registered.split('test/helpers/handoff-scheduler-owner-analysis-regressions.test.js').length - 1, 1);
+});
+
+function withFrozenDateNow(callback) {
+  const originalDateNow = Date.now;
+  Date.now = () => 1_000_000;
+  try {
+    return callback();
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
 test('deferred scheduler replaces earlier timers, ignores stale callbacks and requeues separate sets through the facade', () => {
-  withFakeTimers(timers => {
+  withFakeTimers(timers => withFrozenDateNow(() => {
     const { DiscordGateway } = require(GATEWAY_PATH);
     const receiver = schedulerReceiver(DiscordGateway);
     const calls = [];
@@ -151,7 +169,7 @@ test('deferred scheduler replaces earlier timers, ignores stale callbacks and re
     assert.deepEqual([...receiver.deferredHandoffRecoveryChannels], ['ordinary-a']);
     assert.deepEqual([...receiver.pendingHandoffRecoveryChannels], ['pending-b']);
     assert.equal(timers.length, 3);
-  });
+  }));
 });
 
 

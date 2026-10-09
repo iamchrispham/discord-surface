@@ -124,6 +124,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
   }
 
   function receiverAliasEvents(member) {
+    const { indexFunctionInvocations } = require('./handoff-scheduler-owner-invocations.cjs');
     const events = new Map();
     const directCallsByBinding = new Map();
     let nextSequence = 0;
@@ -222,9 +223,20 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
         ts.isIdentifier(declaration.name)) return lexicalBinding(declaration.name);
       return null;
     }
+    let invocationIndex;
     function directInvocationCalls(functionNode) {
       const binding = functionBinding(functionNode);
-      return binding ? directCallsByBinding.get(binding) || [] : [];
+      const existing = binding ? directCallsByBinding.get(binding) || [] : [];
+      if (!invocationIndex) {
+        invocationIndex = indexFunctionInvocations(member, {
+          ts,
+          unwrapParentheses,
+          lexicalBinding,
+          executionScope,
+          isShadowed: (node, name) => scopeDeclaresTimerName(node, name)
+        });
+      }
+      return [...new Set([...existing, ...invocationIndex.callsFor(functionNode, binding)])];
     }
     function indexDirectInvocationCalls(node) {
       function visit(current) {
@@ -262,10 +274,28 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
         const conditional = isConditionallyExecuted(node);
         record(lexicalBinding(left), node.end, scope, value, conditional);
         if (scope !== member) {
-          const invocation = immediateInvocation(scope) || finiteArrayCallbackInvocation(scope);
-          if (invocation) {
+          const invocations = [...new Set([
+            ...directInvocationCalls(scope),
+            immediateInvocation(scope),
+            finiteArrayCallbackInvocation(scope)
+          ].filter(Boolean))];
+          for (const invocation of invocations) {
+            if (!ts.isCallExpression(invocation)) continue;
+            const callee = unwrapParentheses(invocation.expression);
+            const receiver = callee && (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee))
+              ? callee.expression
+              : null;
+            const method = callee && (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee))
+              ? (ts.isPropertyAccessExpression(callee) ? callee.name.text :
+                unwrapParentheses(callee.argumentExpression)?.text)
+              : null;
+            const invokedWithGatewayThis = ts.isCallExpression(invocation) && ['call', 'apply'].includes(method) &&
+              invocation.arguments.length > 0 &&
+              receiverIsGatewayThis(invocation.arguments[0], true);
+            const invocationValue = value ||
+              (unwrapParentheses(node.right)?.kind === ts.SyntaxKind.ThisKeyword && invokedWithGatewayThis && !!receiver);
             const callerScope = executionScope(invocation);
-            record(lexicalBinding(left), invocation.end, callerScope, value,
+            record(lexicalBinding(left), invocation.end, callerScope, invocationValue,
               conditional || isConditionallyExecuted(invocation), invocation.end);
           }
         }
@@ -283,9 +313,48 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
   function timerReference(expression) {
     return resolveTimerReference(expression, new Set());
   }
+  function constantPropertyName(expression, visitedBindings = new Set()) {
+    expression = unwrapParentheses(expression);
+    if (!expression) return null;
+    if (ts.isStringLiteralLike(expression)) return expression.text;
+    if (!ts.isIdentifier(expression)) return null;
+    const binding = lexicalBinding(expression);
+    if (!binding || visitedBindings.has(binding)) return null;
+    visitedBindings.add(binding);
+    const declaration = binding.parent;
+    const declarationList = declaration?.parent;
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer ||
+      !declarationList || !ts.isVariableDeclarationList(declarationList) ||
+      (declarationList.flags & ts.NodeFlags.Const) === 0) return null;
+    return constantPropertyName(declaration.initializer, visitedBindings);
+  }
+  function isNeverReassigned(binding) {
+    let reassigned = false;
+    function visit(current) {
+      if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(unwrapParentheses(current.left)) &&
+        lexicalBinding(unwrapParentheses(current.left)) === binding) reassigned = true;
+      if ((ts.isPrefixUnaryExpression(current) || ts.isPostfixUnaryExpression(current)) &&
+        [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(current.operator) &&
+        ts.isIdentifier(unwrapParentheses(current.operand)) &&
+        lexicalBinding(unwrapParentheses(current.operand)) === binding) reassigned = true;
+      ts.forEachChild(current, visit);
+    }
+    visit(source);
+    return !reassigned;
+  }
   function resolveTimerReference(expression, visitedBindings) {
     expression = unwrapParentheses(expression);
     if (!expression) return null;
+    if (ts.isCallExpression(expression)) {
+      const callee = unwrapParentheses(expression.expression);
+      if ((ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
+        (ts.isPropertyAccessExpression(callee) ? callee.name.text :
+          constantPropertyName(callee.argumentExpression)) === 'bind') {
+        return timerReference(callee.expression);
+      }
+      return null;
+    }
     if (ts.isIdentifier(expression)) {
       const binding = lexicalBinding(expression);
       const importedTimerName = nodeTimersFunctionBinding(binding);
@@ -296,7 +365,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
         const declarationList = declaration?.parent;
         if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer &&
           ts.isIdentifier(declaration.name) && declarationList && ts.isVariableDeclarationList(declarationList) &&
-          (declarationList.flags & ts.NodeFlags.Const) !== 0) {
+          ((declarationList.flags & ts.NodeFlags.Const) !== 0 || isNeverReassigned(binding))) {
           const aliasedTimer = resolveTimerReference(declaration.initializer, visitedBindings);
           if (aliasedTimer) return aliasedTimer;
         }
@@ -314,9 +383,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
     if (ts.isPropertyAccessExpression(expression)) {
       timerName = expression.name.text;
     } else {
-      const property = unwrapParentheses(expression.argumentExpression);
-      if (!property || (!ts.isStringLiteral(property) && !ts.isNoSubstitutionTemplateLiteral(property))) return null;
-      timerName = property.text;
+      timerName = constantPropertyName(expression.argumentExpression);
     }
     if (!timerApiNames.has(timerName)) return null;
     if (isNodeTimersRequire(receiver)) return timerName;
@@ -334,14 +401,28 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
     if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
       const forwardingName = ts.isPropertyAccessExpression(callee)
         ? callee.name.text
-        : unwrapParentheses(callee.argumentExpression)?.text;
-      if (["call", "apply"].includes(forwardingName)) return timerReference(callee.expression) !== null;
+        : constantPropertyName(callee.argumentExpression);
+      if (["call", "apply"].includes(forwardingName)) {
+        if (timerReference(callee.expression) !== null) return true;
+        const nested = unwrapParentheses(callee.expression);
+        if (forwardingName === 'call' && ts.isPropertyAccessExpression(nested) && nested.name.text === 'call' &&
+          timerReference(nested.expression) !== null && timerReference(node.arguments[0]) !== null) return true;
+        if (forwardingName === 'apply' && ts.isIdentifier(callee.expression) &&
+          callee.expression.text === 'Reflect' && node.arguments.length > 1 &&
+          timerReference(node.arguments[0]) !== null) {
+          for (let scope = callee.expression.parent; scope; scope = scope.parent) {
+            if (scopeDeclaresTimerName(scope, 'Reflect')) return false;
+          }
+          return true;
+        }
+        return false;
+      }
     }
     if (ts.isCallExpression(callee)) {
       const bindAccess = unwrapParentheses(callee.expression);
       if ((ts.isPropertyAccessExpression(bindAccess) || ts.isElementAccessExpression(bindAccess)) &&
         (ts.isPropertyAccessExpression(bindAccess) ? bindAccess.name.text :
-          unwrapParentheses(bindAccess.argumentExpression)?.text) === 'bind') {
+          constantPropertyName(bindAccess.argumentExpression)) === 'bind') {
         return timerReference(bindAccess.expression) !== null;
       }
     }
@@ -356,6 +437,13 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
           : member.name?.getText(source) || 'unnamed class member';
         const receiverAliases = receiverAliasEvents(member);
         let accessesSchedulerState = false;
+        const { hasGatewaySchedulerReflectiveWrite } = require('./handoff-scheduler-owner-state-writes.cjs');
+        function isUnshadowedGlobal(expression, name) {
+          for (let current = expression.parent; current; current = current.parent) {
+            if (scopeDeclaresTimerName(current, name)) return false;
+          }
+          return true;
+        }
         function scan(bodyNode, tracksGatewayThis = true) {
           const startsDynamicThisScope = ts.isClassDeclaration(bodyNode) || ts.isClassExpression(bodyNode) ||
             ts.isFunctionDeclaration(bodyNode) || ts.isFunctionExpression(bodyNode) ||
@@ -387,39 +475,15 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
             bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
             receiverAliases.receiverIsGatewayThis(bodyNode.right, tracksGatewayThisHere) &&
             assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
-          if (ts.isCallExpression(bodyNode) && bodyNode.arguments.length > 1) {
-            const callee = unwrapParentheses(bodyNode.expression);
-            let objectShadowed = false;
-            if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) &&
-              callee.expression.text === 'Object') {
-              for (let current = callee.expression.parent; current; current = current.parent) {
-                if (scopeDeclaresTimerName(current, 'Object')) {
-                  objectShadowed = true;
-                  break;
-                }
-              }
-            }
-            const isObjectAssign = ts.isPropertyAccessExpression(callee) &&
-              ts.isIdentifier(callee.expression) && callee.expression.text === 'Object' &&
-              callee.name.text === 'assign' && !objectShadowed;
-            if (isObjectAssign && receiverAliases.receiverIsGatewayThis(bodyNode.arguments[0], tracksGatewayThisHere)) {
-              for (const source of bodyNode.arguments.slice(1)) {
-                if (!ts.isObjectLiteralExpression(unwrapParentheses(source))) continue;
-                const properties = unwrapParentheses(source).properties;
-                if (properties.some(property => {
-                  if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) return false;
-                  let name = null;
-                  if (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) {
-                    name = property.name.text;
-                  } else if (ts.isComputedPropertyName(property.name)) {
-                    const key = unwrapParentheses(property.name.expression);
-                    if (ts.isStringLiteralLike(key)) name = key.text;
-                  }
-                  return HANDOFF_STATE_FIELDS.has(name);
-                })) accessesSchedulerState = true;
-              }
-            }
-          }
+          if (hasGatewaySchedulerReflectiveWrite(bodyNode, {
+            ts,
+            unwrapParentheses,
+            lexicalBinding,
+            receiverIsGatewayThis: receiverAliases.receiverIsGatewayThis,
+            isUnshadowedGlobal,
+            schedulerFields: HANDOFF_STATE_FIELDS,
+            tracksGatewayThis: tracksGatewayThisHere
+          })) accessesSchedulerState = true;
 
           ts.forEachChild(bodyNode, child => scan(child, tracksGatewayThisHere));
         }
