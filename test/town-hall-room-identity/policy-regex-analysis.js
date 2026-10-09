@@ -120,6 +120,21 @@ function createPolicyRegexAnalysis({
           ts.forEachChild(candidate, visitCalls);
         };
         visitCalls(info.ast);
+        for (const call of matcher.calls) {
+          const candidate = call.node;
+          if (candidate.getSourceFile() === info.ast || !ts.isCallExpression(candidate) ||
+              candidate.arguments.some(argument => ts.isSpreadElement(argument))) continue;
+          const callInfo = infos.find(candidateInfo => candidateInfo.ast === candidate.getSourceFile()) || info;
+          const defaultArgument = candidate.arguments[patternIndex];
+          const usesDefault = candidate.arguments.length <= patternIndex ||
+            (ts.isIdentifier(defaultArgument) && defaultArgument.text === 'undefined' &&
+              !findBinding(callInfo, 'undefined', defaultArgument));
+          if (!usesDefault) continue;
+          for (const inputIndex of inputParameterIndexes) {
+            if (candidate.arguments[inputIndex]) inputs.push(candidate.arguments[inputIndex]);
+          }
+          inputs.push(...directInputs);
+        }
       }
     }
     const factoryScope = enclosingFunction(node);
@@ -536,7 +551,10 @@ function createPolicyRegexAnalysis({
     }
     if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
         ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
-        value.arguments?.length && ts.isStringLiteralLike(value.arguments[0])) {
+        value.arguments?.length) {
+      const pattern = resolveStringValue(value.arguments[0], collectBindings(info.ast), new Set(),
+        (identifier, visited) => resolveImportedString(info, identifier, visited));
+      if (typeof pattern !== 'string') return null;
       let declaration = value.parent;
       while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
         declaration = declaration.parent;
@@ -545,8 +563,8 @@ function createPolicyRegexAnalysis({
         info,
         name,
         declaration: declaration || value,
-        pattern: value.arguments[0].text,
-        definition: policyDefinition(value, info, value.arguments[0].text),
+        pattern,
+        definition: policyDefinition(value, info, pattern),
       };
     }
     if (ts.isIdentifier(value)) {

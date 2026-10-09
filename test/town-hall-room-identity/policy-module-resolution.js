@@ -71,6 +71,29 @@ function createPolicyModuleGraph({
       binding.kind === 'value' && binding.source && ts.isIdentifier(binding.source));
     return alias ? resolveExportedFunction(info, alias.source.text, seen) : null;
   };
+  const resolveExportedMethod = (info, ownerName, methodName, seen = new Set()) => {
+    const marker = `${info.file}\u0000${ownerName}.${methodName}`;
+    if (seen.has(marker)) return null;
+    seen.add(marker);
+    const exported = info.exports.get(ownerName);
+    if (exported && typeof exported === 'object' && exported.kind === 'reexport') {
+      const target = resolveModule(info, exported.specifier);
+      return target
+        ? resolveExportedMethod(target, exported.imported, methodName, seen)
+        : null;
+    }
+    const localName = typeof exported === 'string' ? exported : ownerName;
+    const methods = info.objectMethods.get(`${localName}.${methodName}`) || [];
+    const method = methods
+      .filter(candidate => !candidate.instance)
+      .sort((left, right) =>
+        Number(Boolean(right.node.body)) - Number(Boolean(left.node.body)) ||
+        scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
+    if (method) return method;
+    const alias = info.bindings.find(binding => binding.name === localName &&
+      binding.kind === 'value' && binding.source && ts.isIdentifier(binding.source));
+    return alias ? resolveExportedMethod(info, alias.source.text, methodName, seen) : null;
+  };
   const resolveImported = (info, name) => {
     const imported = info.imports.get(name);
     if (!imported || imported.namespace) return null;
@@ -185,8 +208,12 @@ function createPolicyModuleGraph({
         const imported = info.imports.get(receiverName);
         const importBinding = receiverBinding?.kind;
         if (imported && (!receiverBinding || importBinding === 'namespace-import' ||
-            importBinding === 'commonjs-import' || imported.imported === 'default')) {
+            importBinding === 'commonjs-import' || importBinding === 'import' ||
+            imported.imported === 'default')) {
           const target = resolveModule(info, imported.specifier);
+          if (importBinding === 'import' && imported.imported !== 'default') {
+            return target ? resolveExportedMethod(target, imported.imported, property) : null;
+          }
           return target ? resolveExportedFunction(target, property) : null;
         }
       }

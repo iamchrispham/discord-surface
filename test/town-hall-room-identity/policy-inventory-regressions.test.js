@@ -742,6 +742,147 @@ test('default regex parameters apply only when the call omits that argument', ()
   assert.deepEqual(roomDigitPolicies([explicitUndefinedOrdinary]), {});
 });
 
+test('imported default regex helpers contribute room policies', () => {
+  const helper = {
+    file: 'peer/imported-default-room-policy.ts',
+    text: String.raw`export function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }`,
+  };
+  const consumer = {
+    file: 'peer/imported-default-room-consumer.ts',
+    text: String.raw`import { matches } from './imported-default-room-policy';
+    export function validateTownHallRoom(room) { return matches(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, consumer]), { [helper.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/imported-default-room-ordinary.ts',
+    text: String.raw`import { matches } from './imported-default-room-policy';
+    export function validateTownHallRoom(room) { return matches(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, ordinary]), {});
+});
+
+test('exported RegExp constructors resolve constant patterns', () => {
+  const helper = {
+    file: 'peer/exported-constant-room-regex.ts',
+    text: String.raw`const SOURCE = '^\\d{1,21}$';
+    export const ROOM_ID = new RegExp(SOURCE);`,
+  };
+  const consumer = {
+    file: 'peer/exported-constant-room-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './exported-constant-room-regex';
+    export function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, consumer]), { [helper.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/exported-constant-room-ordinary.ts',
+    text: String.raw`import { ROOM_ID } from './exported-constant-room-regex';
+    export function validateTownHallRoom(room) { return ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, ordinary]), {});
+});
+
+test('named imports resolve exported validator class and object methods', () => {
+  const classHelper = {
+    file: 'peer/exported-room-id-class.ts',
+    text: String.raw`export class RoomIds {
+      static valid(value) { return /^\d{1,21}$/.test(value); }
+    }`,
+  };
+  const classConsumer = {
+    file: 'peer/exported-room-id-class-consumer.ts',
+    text: String.raw`import { RoomIds } from './exported-room-id-class';
+    export function validateTownHallRoom(room) { return RoomIds.valid(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([classHelper, classConsumer]), { [classHelper.file]: 1 });
+
+  const objectHelper = {
+    file: 'peer/exported-room-id-object.ts',
+    text: String.raw`export const RoomIds = {
+      valid(value) { return /^\d{1,21}$/.test(value); }
+    };`,
+  };
+  const objectConsumer = {
+    file: 'peer/exported-room-id-object-consumer.ts',
+    text: String.raw`import { RoomIds } from './exported-room-id-object';
+    export function validateTownHallRoom(room) { return RoomIds.valid(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([objectHelper, objectConsumer]), { [objectHelper.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/exported-room-id-class-ordinary.ts',
+    text: String.raw`import { RoomIds } from './exported-room-id-class';
+    export function validateTownHallRoom(room) { return RoomIds.valid(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([classHelper, ordinary]), {});
+});
+
+test('constant descriptor keys identify room fields and reject unrelated keys', () => {
+  const roomField = {
+    file: 'peer/constant-room-descriptor-key.ts',
+    text: String.raw`export function isTownHallRoom(room) {
+      const key = 'guildId';
+      const descriptor = Object.getOwnPropertyDescriptor(room, key);
+      const guildId = descriptor.value;
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([roomField]), { [roomField.file]: 1 });
+
+  const ordinaryField = {
+    file: 'peer/constant-ordinary-descriptor-key.ts',
+    text: String.raw`export function isTownHallRoom(room) {
+      const key = 'name';
+      const descriptor = Object.getOwnPropertyDescriptor(room, key);
+      const name = descriptor.value;
+      return /^\d{1,21}$/.test(name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([ordinaryField]), {});
+});
+
+test('room property helper extraction respects lexical bindings', () => {
+  const importedHelper = {
+    file: 'peer/room-property-helper.ts',
+    text: String.raw`export function ownDataProperty(value, key) {
+      return Object.getOwnPropertyDescriptor(value, key)?.value;
+    }`,
+  };
+  const importedConsumer = {
+    file: 'peer/imported-room-property-consumer.ts',
+    text: String.raw`import { ownDataProperty } from './room-property-helper';
+    export function isTownHallRoom(room) {
+      const guildId = ownDataProperty(room, 'guildId');
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([importedHelper, importedConsumer]), {
+    [importedConsumer.file]: 1,
+  });
+
+  const parameterShadow = {
+    file: 'peer/room-property-parameter-shadow.ts',
+    text: String.raw`export function isTownHallRoom(room, ownDataProperty) {
+      const guildId = ownDataProperty(room, 'guildId');
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([parameterShadow]), {});
+
+  const localShadow = {
+    file: 'peer/room-property-local-shadow.ts',
+    text: String.raw`export function isTownHallRoom(room) {
+      const ownDataProperty = () => 'unrelated';
+      const guildId = ownDataProperty(room, 'guildId');
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([localShadow]), {});
+});
+
 test('finite Function.apply arrays propagate only room identifier fields', () => {
   const helper = {
     file: 'peer/apply-room-policy.ts',

@@ -313,18 +313,51 @@ function hasBoundAlias(scope, subject, sourceFile, bindings, matches) {
   return found;
 }
 
-function isRoomKeyLookup(node) {
-  return Boolean(node && ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
-    node.expression.text === 'ownDataProperty' && node.arguments.length === 2 &&
-    ts.isStringLiteralLike(node.arguments[1]) && ['guildId', 'channelId'].includes(node.arguments[1].text));
+function isRoomKeyLookup(node, bindings) {
+  if (!node || !ts.isCallExpression(node) || !ts.isIdentifier(node.expression) ||
+      node.expression.text !== 'ownDataProperty' || node.arguments.length !== 2) return false;
+  const sourceFile = node.getSourceFile();
+  const activeBindings = bindings || collectBindings(sourceFile);
+  const helper = resolveBinding(node.expression, activeBindings);
+  if (!helper) {
+    return sourceFile.statements.some(statement => {
+      if (!ts.isImportDeclaration(statement) ||
+          !statement.importClause?.namedBindings ||
+          !ts.isNamedImports(statement.importClause.namedBindings)) return false;
+      return statement.importClause.namedBindings.elements.some(specifier =>
+        specifier.name.text === 'ownDataProperty' &&
+        (specifier.propertyName?.text || specifier.name.text) === 'ownDataProperty');
+    });
+  }
+  let helperName = null;
+  if (ts.isImportSpecifier(helper)) helperName = helper.propertyName?.text || helper.name.text;
+  if (ts.isFunctionDeclaration(helper) || ts.isVariableDeclaration(helper)) {
+    helperName = helper.name?.text || null;
+  }
+  let moduleScoped = nearestLexicalScope(helper) === sourceFile;
+  if (ts.isImportSpecifier(helper)) {
+    const declaration = helper.parent.parent.parent;
+    moduleScoped = ts.isImportDeclaration(declaration) && declaration.parent === sourceFile;
+  }
+  if (helperName !== 'ownDataProperty' || !moduleScoped) return false;
+  if (ts.isVariableDeclaration(helper)) {
+    const initializer = unwrapPolicyExpression(helper.initializer);
+    if (!initializer || (!ts.isArrowFunction(initializer) && !ts.isFunctionExpression(initializer))) {
+      return false;
+    }
+  } else if (!ts.isFunctionDeclaration(helper) && !ts.isImportSpecifier(helper)) {
+    return false;
+  }
+  return true;
 }
 
-function isDescriptorRoomLookup(node) {
-  return Boolean(node && ts.isCallExpression(node) && node.arguments.length === 2 &&
-    ts.isPropertyAccessExpression(node.expression) &&
-    ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
-    node.expression.name.text === 'getOwnPropertyDescriptor' &&
-    ts.isStringLiteralLike(node.arguments[1]) && ['guildId', 'channelId'].includes(node.arguments[1].text));
+function isDescriptorRoomLookup(node, bindings) {
+  if (!node || !ts.isCallExpression(node) || node.arguments.length !== 2 ||
+      !ts.isPropertyAccessExpression(node.expression) ||
+      !ts.isIdentifier(node.expression.expression) || node.expression.expression.text !== 'Object' ||
+      node.expression.name.text !== 'getOwnPropertyDescriptor') return false;
+  const keys = finiteStringValues(node.arguments[1], bindings || collectBindings(node.getSourceFile()));
+  return Boolean(keys && keys.some(key => ['guildId', 'channelId'].includes(key)));
 }
 
 function hasRoomFieldAlias(scope, subject, sourceFile, bindings) {
@@ -332,7 +365,8 @@ function hasRoomFieldAlias(scope, subject, sourceFile, bindings) {
 }
 
 function hasRoomKeyAlias(scope, subject, sourceFile, bindings) {
-  return hasBoundAlias(scope, subject, sourceFile, bindings, isRoomKeyLookup);
+  return hasBoundAlias(scope, subject, sourceFile, bindings,
+    node => isRoomKeyLookup(node, bindings));
 }
 
 function hasDescriptorRoomAlias(scope, subject, sourceFile, bindings) {
@@ -344,7 +378,7 @@ function hasDescriptorRoomAlias(scope, subject, sourceFile, bindings) {
       !ts.isIdentifier(valueBinding.initializer.expression)) return false;
   const descriptorBinding = resolveBinding(valueBinding.initializer.expression, bindings);
   return Boolean(descriptorBinding && ts.isVariableDeclaration(descriptorBinding) &&
-    isDescriptorRoomLookup(unwrapPolicyExpression(descriptorBinding.initializer)));
+    isDescriptorRoomLookup(unwrapPolicyExpression(descriptorBinding.initializer), bindings));
 }
 
 function hasSplitRoomLengthBound(scope, subject, sourceFile) {
