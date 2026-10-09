@@ -22,6 +22,31 @@ export interface TownHallRoom {
   readonly channelId: string;
 }
 
+const UINT64_MAX = 18446744073709551615n;
+
+export function isTownHallRoom(value: unknown): value is TownHallRoom {
+  try {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const guildDescriptor = Object.getOwnPropertyDescriptor(value, 'guildId');
+    const channelDescriptor = Object.getOwnPropertyDescriptor(value, 'channelId');
+    if (!guildDescriptor || !channelDescriptor ||
+        !Object.hasOwn(guildDescriptor, 'value') || !Object.hasOwn(channelDescriptor, 'value')) {
+      return false;
+    }
+    const guildId = guildDescriptor.value;
+    const channelId = channelDescriptor.value;
+    const observableGuildId = (value as { guildId: unknown }).guildId;
+    const observableChannelId = (value as { channelId: unknown }).channelId;
+    return guildId === observableGuildId && channelId === observableChannelId &&
+      typeof guildId === 'string' && /^\d{1,20}$/.test(guildId) &&
+      BigInt(guildId) <= UINT64_MAX &&
+      typeof channelId === 'string' && /^\d{1,20}$/.test(channelId) &&
+      BigInt(channelId) <= UINT64_MAX;
+  } catch {
+    return false;
+  }
+}
+
 export interface TownHallRecipient {
   readonly target: TownHallAddress;
   readonly packetId: string;
@@ -61,7 +86,7 @@ function hasExactOwnKeys(value: object, keys: readonly string[]): boolean {
 
 function ownDataProperty(value: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (!descriptor || !('value' in descriptor)) throw invalid();
+  if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) throw invalid();
   return descriptor.value;
 }
 
@@ -85,11 +110,9 @@ function copyRoom(value: unknown): TownHallRoom {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid();
   const record = value as Record<string, unknown>;
   if (!hasExactOwnKeys(record, ROOM_KEYS)) throw invalid();
-  const guildId = ownDataProperty(record, 'guildId');
-  const channelId = ownDataProperty(record, 'channelId');
-  if (typeof guildId !== 'string' || !/^\d{1,20}$/.test(guildId) ||
-      typeof channelId !== 'string' || !/^\d{1,20}$/.test(channelId)) throw invalid();
-  return { guildId, channelId };
+  const room = { guildId: ownDataProperty(record, 'guildId'), channelId: ownDataProperty(record, 'channelId') };
+  if (!isTownHallRoom(room)) throw invalid();
+  return { guildId: room.guildId as string, channelId: room.channelId as string };
 }
 
 function copyBroadcastId(value: unknown): string {
@@ -127,7 +150,7 @@ export function planTownHallBroadcast(input: unknown): TownHallPlan {
   const targets: AgentAddress[] = [];
   for (let index = 0; index < recipients.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(recipients, String(index));
-    if (!descriptor || !('value' in descriptor)) throw invalid();
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) throw invalid();
     targets.push(copyAddress(descriptor.value));
   }
 
