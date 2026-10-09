@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { roomDigitPolicies } = require('./policy-inventory-analysis');
+const { roomDigitPolicies, roomDigitPolicyDefinitions } = require('./policy-inventory-analysis');
 
 test('switch case bindings stay inside their lexical scope', () => {
   const consumer = {
@@ -63,6 +63,211 @@ test('whole-room regex helpers follow contextual ESM and CJS calls', () => {
     function validateMessage(room) { return checkIds(room); }`,
   };
   assert.deepEqual(roomDigitPolicies([cjsHelper, nonRoomConsumer]), {});
+});
+
+test('forwarded calls retain known arguments and recognize default values', () => {
+  const helper = {
+    file: 'peer/forwarded-room-policy.ts',
+    text: String.raw`export function check(value) {
+      return /^\d{1,21}$/.test(value);
+    }
+    export function accepts(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }`,
+  };
+  const roomDigitResult = expression => {
+    const consumer = {
+      file: 'peer/forwarded-room-consumer.ts',
+      text: `import { accepts } from './forwarded-room-policy';
+        export function validateTownHallRoom(room, rest) { return ${expression}; }`,
+    };
+    return roomDigitPolicies([helper, consumer]);
+  };
+
+  for (const expression of [
+    'accepts(room.guildId, undefined)',
+    'accepts(room.guildId, (undefined))',
+    'accepts(room.guildId, void 0)',
+    'accepts(room.guildId, void 1)',
+    'accepts.call(null, room.guildId)',
+    'accepts.call(null, room.guildId, void 0, ...rest)',
+    'accepts.apply(null, [room.guildId])',
+    'accepts.apply(null, [room.guildId, void 0, ...rest])',
+  ]) {
+    assert.deepEqual(roomDigitResult(expression), { [helper.file]: 1 }, expression);
+  }
+
+  assert.deepEqual(roomDigitResult('accepts(room.name, void 1)'), {});
+  const shadowedUndefined = {
+    file: 'peer/shadowed-undefined-consumer.ts',
+    text: String.raw`import { accepts } from './forwarded-room-policy';
+      export function validateTownHallRoom(room, undefined) {
+        return accepts(room.guildId, undefined);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, shadowedUndefined]), {});
+
+  const partialSpread = {
+    file: 'peer/partial-spread-consumer.ts',
+    text: String.raw`import { check } from './forwarded-room-policy';
+      export function validateTownHallRoom(room, rest) {
+        return check(room.guildId, ...rest);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, partialSpread]), { [helper.file]: 1 });
+  const partialApplySpread = {
+    file: 'peer/partial-apply-consumer.ts',
+    text: String.raw`import { check } from './forwarded-room-policy';
+      export function validateTownHallRoom(room, rest) {
+        return check.apply(null, [room.guildId, ...rest]);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, partialApplySpread]), { [helper.file]: 1 });
+  const unrelatedSpread = {
+    file: 'peer/unrelated-spread-consumer.ts',
+    text: String.raw`import { check } from './forwarded-room-policy';
+      export function inspect(room, rest) { return check(room.name, ...rest); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, unrelatedSpread]), {});
+
+  const objectApply = {
+    file: 'peer/object-apply-method.ts',
+    text: String.raw`const rules = { apply(value) { return /^\d{1,21}$/.test(value); } };
+      function validateTownHallRoom(room) { return rules.apply(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([objectApply]), { [objectApply.file]: 1 });
+  const objectCall = {
+    file: 'peer/object-call-method.ts',
+    text: String.raw`const rules = { call(value) { return /^\d{1,21}$/.test(value); } };
+      function validateTownHallRoom(room) { return rules.call(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([objectCall]), { [objectCall.file]: 1 });
+});
+
+test('regex and string matcher apply calls propagate their inputs', () => {
+  const regexApply = {
+    file: 'peer/regexp-apply-room-policy.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return RegExp.prototype.test.apply(/^\d{1,21}$/, [room.guildId]);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([regexApply]), { [regexApply.file]: 1 });
+
+  const stringApply = {
+    file: 'peer/string-apply-room-policy.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return String.prototype.match.apply(room.guildId, [/^\d{1,21}$/]);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([stringApply]), { [stringApply.file]: 1 });
+
+  const unrelatedStringApply = {
+    file: 'peer/string-apply-unrelated.ts',
+    text: String.raw`function inspect(room) {
+      return String.prototype.match.apply(room.name, [/^\d{1,21}$/]);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([unrelatedStringApply]), {});
+});
+
+test('policy provenance follows stored factories, reassignment, and unshadowed modules', () => {
+  const factory = {
+    file: 'peer/stored-pattern-factory.ts',
+    text: String.raw`export function getPattern() { return /^\d{1,21}$/; }`,
+  };
+  const factoryConsumer = {
+    file: 'peer/stored-pattern-consumer.ts',
+    text: String.raw`import { getPattern } from './stored-pattern-factory';
+      export function validateTownHallRoom(room) {
+        const pattern = getPattern();
+        return pattern.test(room.guildId);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([factory, factoryConsumer]), { [factory.file]: 1 });
+
+  const reassignedSource = {
+    file: 'peer/reassigned-pattern-source.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      let source = '^\\d{1,20}$';
+      source = '^\\d{1,21}$';
+      return new RegExp(source).test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicyDefinitions([reassignedSource]), {
+    [reassignedSource.file]: [{ kind: 'constructor', pattern: '^\\d{1,21}$', flags: '' }],
+  });
+
+  const shadowedRegExp = {
+    file: 'peer/shadowed-regexp.ts',
+    text: String.raw`function RegExp(source) { return source; }
+      function validateTownHallRoom(room) {
+        return new RegExp('^\\d{1,21}$').test(room.guildId);
+      }`,
+  };
+  assert.deepEqual(roomDigitPolicies([shadowedRegExp]), {});
+
+  const tools = {
+    file: 'peer/named-tools.ts',
+    text: String.raw`export const tools = makeTools();
+      function makeTools() { return {}; }
+      export function verify(value) { return /^\d{1,21}$/.test(value); }`,
+  };
+  const toolsConsumer = {
+    file: 'peer/named-tools-consumer.ts',
+    text: String.raw`import { tools } from './named-tools';
+      export function validateTownHallRoom(room) { return tools.verify(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([tools, toolsConsumer]), {});
+
+  const patternModule = {
+    file: 'peer/canonical-pattern.cjs',
+    text: String.raw`exports.ROOM_ID = /^\d{1,20}$/;
+      function unrelated() {
+        const exports = {};
+        exports.ROOM_ID = /^\d{1,21}$/;
+      }`,
+  };
+  const patternConsumer = {
+    file: 'peer/canonical-pattern-consumer.cjs',
+    text: String.raw`const { ROOM_ID } = require('./canonical-pattern.cjs');
+      function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicyDefinitions([patternModule, patternConsumer]), {
+    [patternModule.file]: [{ kind: 'resolved', pattern: '/^\\d{1,20}$/', flags: '' }],
+  });
+
+  const boundRequireCases = [
+    String.raw`function validateTownHallRoom(room, require) {
+      const { ROOM_ID } = require('./canonical-pattern.cjs');
+      return ROOM_ID.test(room.guildId);
+    }`,
+    String.raw`const require = makeLoader();
+      const { ROOM_ID } = require('./canonical-pattern.cjs');
+      function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+    String.raw`const require = makeLoader();
+      const ROOM_ID = require('./canonical-pattern.cjs').ROOM_ID;
+      function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+    String.raw`const require = makeLoader();
+      const pattern = require('./canonical-pattern.cjs');
+      function validateTownHallRoom(room) { return pattern.ROOM_ID.test(room.guildId); }`,
+  ];
+  for (const [index, text] of boundRequireCases.entries()) {
+    assert.deepEqual(roomDigitPolicies([
+      patternModule,
+      { file: `peer/bound-require-${index}.cjs`, text },
+    ]), {});
+  }
+  const boundBarrel = {
+    file: 'peer/bound-require-barrel.cjs',
+    text: String.raw`const require = makeLoader();
+      module.exports = require('./canonical-pattern.cjs');`,
+  };
+  const boundBarrelConsumer = {
+    file: 'peer/bound-require-barrel-consumer.cjs',
+    text: String.raw`const pattern = require('./bound-require-barrel.cjs');
+      function validateTownHallRoom(room) { return pattern.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([patternModule, boundBarrel, boundBarrelConsumer]), {});
 });
 
 test('array bindings without sources stay unknown and initialized arrays retain aliases', () => {
@@ -881,6 +1086,39 @@ test('room property helper extraction respects lexical bindings', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([localShadow]), {});
+});
+
+test('room property aliases retain named helper provenance', () => {
+  const helper = {
+    file: 'peer/room-property-alias-helper.ts',
+    text: String.raw`export function ownDataProperty(value, key) {
+      return Object.getOwnPropertyDescriptor(value, key)?.value;
+    }`,
+  };
+  const aliasedImport = {
+    file: 'peer/aliased-room-property-consumer.ts',
+    text: String.raw`import { ownDataProperty as readRoomProperty } from './room-property-alias-helper';
+    export function isTownHallRoom(room) {
+      const guildId = readRoomProperty(room, 'guildId');
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, aliasedImport]), {
+    [aliasedImport.file]: 1,
+  });
+
+  const topLevelConstAlias = {
+    file: 'peer/const-room-property-consumer.ts',
+    text: String.raw`const ownDataProperty = (value, key) =>
+      Object.getOwnPropertyDescriptor(value, key)?.value;
+    function validateTownHallRoom(room) {
+      const guildId = ownDataProperty(room, 'guildId');
+      return /^\d{1,21}$/.test(guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([topLevelConstAlias]), {
+    [topLevelConstAlias.file]: 1,
+  });
 });
 
 test('finite Function.apply arrays propagate only room identifier fields', () => {

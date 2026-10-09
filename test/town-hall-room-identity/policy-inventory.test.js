@@ -1311,12 +1311,7 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
-  const guardedRoomKeyAlias = { file: 'peer/future-room.ts', text: String.raw`function ownDataProperty(value, key) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return undefined;
-    return descriptor.value;
-  }
-  function validateTownHallRoom(candidate) {
+  const guardedRoomKeyAlias = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
     const id = ownDataProperty(candidate, 'guildId');
     return /^\d{1,21}$/.test(id);
   }` };
@@ -1484,12 +1479,7 @@ test('room policy inventory records only town-hall room validators', () => {
     return isDigits(user.id);
   }` };
   assert.deepEqual(roomDigitPolicies([...records, shadowedBound]), expectedPolicies);
-  const emptyInitializer = { file: 'peer/town-hall-plan.ts', text: String.raw`function ownDataProperty(value, key) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return undefined;
-    return descriptor.value;
-  }
-  function isTownHallRoom(room) {
+  const emptyInitializer = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(room) {
     const id = ownDataProperty(room, 'guildId');
     function nested() { let id; return /^\d+$/.test(id); }
     return /^\d+$/.test(id);
@@ -1498,12 +1488,7 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/town-hall-plan.ts': 3
   });
-  const assignedAlias = { file: 'peer/town-hall-plan.ts', text: String.raw`function ownDataProperty(value, key) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return undefined;
-    return descriptor.value;
-  }
-  function isTownHallRoom(room) {
+  const assignedAlias = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(room) {
     let id;
     id = ownDataProperty(room, 'channelId');
     return /^\d+$/.test(id);

@@ -1,12 +1,31 @@
+const {
+  effectiveCallArguments,
+  isUndefinedExpression,
+} = require('./policy-expression-semantics');
+
 function borrowedStringInput(call, regexReference, ts) {
-  if (!ts.isCallExpression(call) || call.arguments[1] !== regexReference ||
-      !ts.isPropertyAccessExpression(call.expression) ||
-      call.expression.name.text !== 'call' ||
-      !ts.isPropertyAccessExpression(call.expression.expression) ||
-      !['search', 'match'].includes(call.expression.expression.name.text)) {
-    return null;
+  if (!ts.isCallExpression(call) ||
+      !(ts.isPropertyAccessExpression(call.expression) ||
+        ts.isElementAccessExpression(call.expression)) ||
+      !['call', 'apply'].includes(callPropertyName(call.expression, ts))) return null;
+  const method = call.expression.expression;
+  if (!(ts.isPropertyAccessExpression(method) || ts.isElementAccessExpression(method)) ||
+      !['search', 'match'].includes(callPropertyName(method, ts))) return null;
+  const invocation = effectiveCallArguments(call, {
+    isCallableReference: candidate => candidate === method,
+  });
+  return invocation.forwarded && invocation.args[0] === regexReference
+    ? call.arguments[0] || null
+    : null;
+}
+
+function callPropertyName(expression, ts) {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression) && expression.argumentExpression &&
+      ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
   }
-  return call.arguments[0] || null;
+  return null;
 }
 
 function createPolicyRegexAnalysis({
@@ -23,6 +42,7 @@ function createPolicyRegexAnalysis({
   hasContextualParameterCall,
   borrowedStringInput,
   regexInput,
+  isNativeRegExpConstructor,
   collectBindings,
   callPropertyName,
   isAncestor,
@@ -102,17 +122,21 @@ function createPolicyRegexAnalysis({
         };
         visitMatcher(matcher.node.body);
         const visitCalls = candidate => {
-          if (ts.isCallExpression(candidate) &&
-              !candidate.arguments.some(argument => ts.isSpreadElement(argument))) {
-            const resolved = resolveFunction(info, candidate.expression);
-            const defaultArgument = candidate.arguments[patternIndex];
-            const usesDefault = candidate.arguments.length <= patternIndex ||
-              (ts.isIdentifier(defaultArgument) && defaultArgument.text === 'undefined' &&
-                !findBinding(info, 'undefined', defaultArgument));
-            if (resolved?.info === info && resolved.node === matcher.node &&
-                usesDefault) {
+          if (ts.isCallExpression(candidate)) {
+            const invocation = effectiveCallArguments(candidate, {
+              resolveCallable: expression => resolveFunction(info, expression),
+              unwrapPolicyExpression,
+              isBound: identifier => Boolean(findBinding(info, 'undefined', identifier)),
+            });
+            const resolved = resolveFunction(info, invocation.target);
+            const defaultArgument = invocation.args[patternIndex];
+            const usesDefault = defaultArgument
+              ? isUndefinedExpression(defaultArgument, identifier =>
+                Boolean(findBinding(info, 'undefined', identifier)), unwrapPolicyExpression)
+              : invocation.complete && invocation.args.length <= patternIndex;
+            if (resolved?.info === info && resolved.node === matcher.node && usesDefault) {
               for (const inputIndex of inputParameterIndexes) {
-                if (candidate.arguments[inputIndex]) inputs.push(candidate.arguments[inputIndex]);
+                if (invocation.args[inputIndex]) inputs.push(invocation.args[inputIndex]);
               }
               inputs.push(...directInputs);
             }
@@ -121,17 +145,17 @@ function createPolicyRegexAnalysis({
         };
         visitCalls(info.ast);
         for (const call of matcher.calls) {
-          const candidate = call.node;
-          if (candidate.getSourceFile() === info.ast || !ts.isCallExpression(candidate) ||
-              candidate.arguments.some(argument => ts.isSpreadElement(argument))) continue;
-          const callInfo = infos.find(candidateInfo => candidateInfo.ast === candidate.getSourceFile()) || info;
-          const defaultArgument = candidate.arguments[patternIndex];
-          const usesDefault = candidate.arguments.length <= patternIndex ||
-            (ts.isIdentifier(defaultArgument) && defaultArgument.text === 'undefined' &&
-              !findBinding(callInfo, 'undefined', defaultArgument));
+          const callInfo = call.info ||
+            infos.find(candidateInfo => candidateInfo.ast === call.node.getSourceFile()) || info;
+          const args = call.args || [];
+          const defaultArgument = args[patternIndex];
+          const usesDefault = defaultArgument
+            ? isUndefinedExpression(defaultArgument, identifier =>
+              Boolean(findBinding(callInfo, 'undefined', identifier)), unwrapPolicyExpression)
+            : call.complete !== false && args.length <= patternIndex;
           if (!usesDefault) continue;
           for (const inputIndex of inputParameterIndexes) {
-            if (candidate.arguments[inputIndex]) inputs.push(candidate.arguments[inputIndex]);
+            if (args[inputIndex]) inputs.push(args[inputIndex]);
           }
           inputs.push(...directInputs);
         }
@@ -164,13 +188,15 @@ function createPolicyRegexAnalysis({
         const declaration = callNode.parent;
         if (ts.isVariableDeclaration(declaration) && declaration.initializer === callNode &&
             ts.isIdentifier(declaration.name)) {
-          const storedBinding = findBinding(info, declaration.name.text, declaration.name);
+          const callInfo = call.info ||
+            infos.find(candidateInfo => candidateInfo.ast === callNode.getSourceFile()) || info;
+          const storedBinding = findBinding(callInfo, declaration.name.text, declaration.name);
           const matcherScope = enclosingFunction(callNode);
           if (storedBinding && matcherScope?.body) {
             const findStoredMatcherInputs = candidate => {
               if ((ts.isPropertyAccessExpression(candidate) || ts.isElementAccessExpression(candidate)) &&
                   ts.isIdentifier(candidate.expression) &&
-                  findBinding(info, candidate.expression.text, candidate.expression) === storedBinding &&
+                  findBinding(callInfo, candidate.expression.text, candidate.expression) === storedBinding &&
                   ['test', 'exec'].includes(callPropertyName(candidate)) &&
                   ts.isCallExpression(candidate.parent) && candidate.parent.arguments[0]) {
                 inputs.push(candidate.parent.arguments[0]);
@@ -594,7 +620,7 @@ function createPolicyRegexAnalysis({
       };
     }
     if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
-        ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
+        isNativeRegExpConstructor(value.expression, collectBindings(info.ast)) &&
         value.arguments?.length) {
       const pattern = resolveStringValue(value.arguments[0], collectBindings(info.ast), new Set(),
         (identifier, visited) => resolveImportedString(info, identifier, visited));

@@ -5,6 +5,7 @@ const {
   commonJsExportAssignment,
 } = require('./policy-reference-analysis');
 const { createPolicyModuleGraph } = require('./policy-module-resolution');
+const { effectiveCallArguments } = require('./policy-expression-semantics');
 const { borrowedStringInput, createPolicyRegexAnalysis } = require('./policy-regex-analysis');
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
@@ -119,14 +120,19 @@ function regexInput(node) {
       return parent.expression.expression;
     }
     if (ts.isCallExpression(parent)) {
-      const input = borrowedStringInput(parent, current, ts);
+      const input = borrowedStringInput(parent, node, ts);
       if (input) return input;
     }
-    if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
-        ts.isPropertyAccessExpression(parent.expression) &&
-        parent.expression.name.text === 'call' &&
+    if (ts.isCallExpression(parent) &&
+        (ts.isPropertyAccessExpression(parent.expression) ||
+          ts.isElementAccessExpression(parent.expression)) &&
+        ['call', 'apply'].includes(callPropertyName(parent.expression)) &&
         ['test', 'exec'].includes(callPropertyName(parent.expression.expression))) {
-      return parent.arguments[1] || null;
+      const invocation = effectiveCallArguments(parent, {
+        isCallableReference: reference => reference === parent.expression.expression,
+        unwrapPolicyExpression,
+      });
+      if (invocation.forwarded) return invocation.args[0] || null;
     }
     current = parent;
   }
@@ -315,19 +321,13 @@ function hasBoundAlias(scope, subject, sourceFile, bindings, matches) {
 
 function isRoomKeyLookup(node, bindings) {
   if (!node || !ts.isCallExpression(node) || !ts.isIdentifier(node.expression) ||
-      node.expression.text !== 'ownDataProperty' || node.arguments.length !== 2) return false;
+      node.arguments.length !== 2) return false;
   const sourceFile = node.getSourceFile();
   const activeBindings = bindings || collectBindings(sourceFile);
   const helper = resolveBinding(node.expression, activeBindings);
   if (!helper) {
-    return sourceFile.statements.some(statement => {
-      if (!ts.isImportDeclaration(statement) ||
-          !statement.importClause?.namedBindings ||
-          !ts.isNamedImports(statement.importClause.namedBindings)) return false;
-      return statement.importClause.namedBindings.elements.some(specifier =>
-        specifier.name.text === 'ownDataProperty' &&
-        (specifier.propertyName?.text || specifier.name.text) === 'ownDataProperty');
-    });
+    return node.expression.text === 'ownDataProperty' ||
+      isImportedOwnDataProperty(sourceFile, node.expression.text);
   }
   let helperName = null;
   if (ts.isImportSpecifier(helper)) helperName = helper.propertyName?.text || helper.name.text;
@@ -338,17 +338,53 @@ function isRoomKeyLookup(node, bindings) {
   if (ts.isImportSpecifier(helper)) {
     const declaration = helper.parent.parent.parent;
     moduleScoped = ts.isImportDeclaration(declaration) && declaration.parent === sourceFile;
+    return helperName === 'ownDataProperty' && moduleScoped;
   }
-  if (helperName !== 'ownDataProperty' || !moduleScoped) return false;
+  if (!moduleScoped || helperName !== node.expression.text) return false;
+  if (ts.isFunctionDeclaration(helper)) return helperName === 'ownDataProperty';
   if (ts.isVariableDeclaration(helper)) {
+    if (!ts.isVariableDeclarationList(helper.parent) ||
+        !(helper.parent.flags & ts.NodeFlags.Const)) return false;
     const initializer = unwrapPolicyExpression(helper.initializer);
-    if (!initializer || (!ts.isArrowFunction(initializer) && !ts.isFunctionExpression(initializer))) {
-      return false;
+    if (initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))) {
+      return helperName === 'ownDataProperty';
     }
-  } else if (!ts.isFunctionDeclaration(helper) && !ts.isImportSpecifier(helper)) {
-    return false;
+    if (ts.isIdentifier(initializer)) {
+      const source = resolveBinding(initializer, activeBindings);
+      return isImportedOwnDataProperty(sourceFile, initializer.text) ||
+        Boolean(source && isRoomKeyReaderBinding(source, sourceFile, activeBindings));
+    }
   }
-  return true;
+  return false;
+}
+
+function isImportedOwnDataProperty(sourceFile, localName) {
+  return sourceFile.statements.some(statement => {
+    if (!ts.isImportDeclaration(statement) ||
+        !statement.importClause?.namedBindings ||
+        !ts.isNamedImports(statement.importClause.namedBindings)) return false;
+    return statement.importClause.namedBindings.elements.some(specifier =>
+      specifier.name.text === localName &&
+      (specifier.propertyName?.text || specifier.name.text) === 'ownDataProperty');
+  });
+}
+
+function isRoomKeyReaderBinding(binding, sourceFile, bindings, seen = new Set()) {
+  if (!binding || seen.has(binding)) return false;
+  seen.add(binding);
+  if (ts.isFunctionDeclaration(binding)) {
+    return binding.name?.text === 'ownDataProperty' && nearestLexicalScope(binding) === sourceFile;
+  }
+  if (!ts.isVariableDeclaration(binding) || !ts.isVariableDeclarationList(binding.parent) ||
+      !(binding.parent.flags & ts.NodeFlags.Const) ||
+      nearestLexicalScope(binding) !== sourceFile || !binding.initializer) return false;
+  const initializer = unwrapPolicyExpression(binding.initializer);
+  if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
+    return binding.name?.text === 'ownDataProperty';
+  }
+  if (!ts.isIdentifier(initializer)) return false;
+  if (isImportedOwnDataProperty(sourceFile, initializer.text)) return true;
+  return isRoomKeyReaderBinding(resolveBinding(initializer, bindings), sourceFile, bindings, seen);
 }
 
 function isDescriptorRoomLookup(node, bindings) {
@@ -574,10 +610,62 @@ function resolveStringValue(expression, bindings, seen = new Set(), resolveImpor
   if (!ts.isIdentifier(value)) return null;
   const binding = resolveBinding(value, bindings);
   if (!binding) return resolveImport ? resolveImport(value, seen) : null;
-  if (seen.has(binding)) return null;
-  if (!binding.initializer) return null;
+  if (seen.has(binding) || !ts.isVariableDeclaration(binding) ||
+      !ts.isVariableDeclarationList(binding.parent)) return null;
+  let initializer = binding.initializer;
+  if (!(binding.parent.flags & ts.NodeFlags.Const)) {
+    const scope = nearestLexicalScope(binding);
+    const writes = [];
+    let uncertainWrite = false;
+    const assignmentTargetsBinding = left => {
+      const target = unwrapPolicyExpression(left);
+      if (ts.isIdentifier(target)) return resolveBinding(target, bindings) === binding;
+      if (ts.isArrayLiteralExpression(target)) {
+        return target.elements.some(element => assignmentTargetsBinding(
+          ts.isSpreadElement(element) ? element.expression : element));
+      }
+      if (ts.isObjectLiteralExpression(target)) {
+        return target.properties.some(property => {
+          if (ts.isShorthandPropertyAssignment(property)) {
+            return resolveBinding(property.name, bindings) === binding;
+          }
+          if (ts.isPropertyAssignment(property)) return assignmentTargetsBinding(property.initializer);
+          if (ts.isSpreadAssignment(property)) return assignmentTargetsBinding(property.expression);
+          return false;
+        });
+      }
+      return false;
+    };
+    const visitWrites = candidate => {
+      if (ts.isBinaryExpression(candidate) &&
+          candidate.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+          candidate.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+          assignmentTargetsBinding(candidate.left) && candidate.getStart() < value.getStart()) {
+        if (candidate.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isExpressionStatement(candidate.parent) && candidate.parent.parent === scope) {
+          writes.push(candidate);
+        } else {
+          uncertainWrite = true;
+        }
+      }
+      if ((ts.isPrefixUnaryExpression(candidate) || ts.isPostfixUnaryExpression(candidate)) &&
+          (candidate.operator === ts.SyntaxKind.PlusPlusToken ||
+            candidate.operator === ts.SyntaxKind.MinusMinusToken) &&
+          ts.isIdentifier(candidate.operand) &&
+          resolveBinding(candidate.operand, bindings) === binding &&
+          candidate.getStart() < value.getStart()) {
+        uncertainWrite = true;
+      }
+      ts.forEachChild(candidate, visitWrites);
+    };
+    visitWrites(binding.getSourceFile());
+    if (uncertainWrite) return null;
+    writes.sort((left, right) => left.end - right.end);
+    initializer = writes[writes.length - 1]?.right || initializer;
+  }
+  if (!initializer) return null;
   seen.add(binding);
-  return resolveStringValue(binding.initializer, bindings, seen, resolveImport);
+  return resolveStringValue(initializer, bindings, seen, resolveImport);
 }
 
 function roomPolicyDefinition(node, pattern, bindings, resolveImport = null) {
@@ -851,6 +939,7 @@ function roomDigitPolicies(records, options = {}) {
     };
     importVisit(info.ast);
 
+    const regexBindings = collectBindings(info.ast);
     const commonJsImport = node => {
       if (
         ts.isImportEqualsDeclaration(node) &&
@@ -891,6 +980,7 @@ function roomDigitPolicies(records, options = {}) {
             ts.isCallExpression(initializer) &&
             ts.isIdentifier(initializer.expression) &&
             initializer.expression.text === 'require' &&
+            !resolveBinding(initializer.expression, regexBindings) &&
             initializer.arguments.length === 1 &&
             ts.isStringLiteralLike(initializer.arguments[0])
           ) {
@@ -902,6 +992,7 @@ function roomDigitPolicies(records, options = {}) {
             ts.isCallExpression(initializer.expression) &&
             ts.isIdentifier(initializer.expression.expression) &&
             initializer.expression.expression.text === 'require' &&
+            !resolveBinding(initializer.expression.expression, regexBindings) &&
             initializer.expression.arguments.length === 1 &&
             ts.isStringLiteralLike(initializer.expression.arguments[0])
           ) {
@@ -966,7 +1057,6 @@ function roomDigitPolicies(records, options = {}) {
       info.exports.set(exportName, fn);
       info.functionDefs.push(fn);
     };
-    const regexBindings = collectBindings(info.ast);
     const regexExpression = expression => {
       const value = unwrapPolicyExpression(expression);
       if (ts.isRegularExpressionLiteral(value)) return { node: value, pattern: value.text };
@@ -1214,6 +1304,7 @@ function roomDigitPolicies(records, options = {}) {
     hasContextualParameterCall,
     borrowedStringInput,
     regexInput,
+    isNativeRegExpConstructor,
     collectBindings,
     callPropertyName,
     isAncestor,
@@ -1363,9 +1454,11 @@ function roomDigitPolicies(records, options = {}) {
 
 function directRequireRegexInputs(consumer) {
   const inputs = [];
+  const bindings = collectBindings(consumer.ast);
   const visit = node => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
-        node.expression.text === 'require' && node.arguments.length === 1 &&
+        node.expression.text === 'require' && !resolveBinding(node.expression, bindings) &&
+        node.arguments.length === 1 &&
         ts.isStringLiteralLike(node.arguments[0])) {
       const member = node.parent;
       const matcher = member?.parent;

@@ -1,6 +1,7 @@
 'use strict';
 
 const ts = require('typescript');
+const { isSemanticIdentifierReference } = require('./policy-expression-semantics');
 
 function isScope(node) {
   return Boolean(node) && (ts.isSourceFile(node) || ts.isBlock(node) || ts.isCaseBlock(node) ||
@@ -95,6 +96,22 @@ function resolveBinding(reference, bindings) {
   return candidates[0]?.declaration || null;
 }
 
+function isRequireBinding(binding) {
+  const declaration = ts.isBindingElement(binding.declaration)
+    ? binding.declaration.parent.parent
+    : binding.declaration;
+  if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return false;
+  const initializer = declaration.initializer;
+  const requireCall = ts.isCallExpression(initializer)
+    ? initializer
+    : (ts.isPropertyAccessExpression(initializer) || ts.isElementAccessExpression(initializer)) &&
+        ts.isCallExpression(initializer.expression)
+      ? initializer.expression
+      : null;
+  return Boolean(requireCall && ts.isIdentifier(requireCall.expression) &&
+    requireCall.expression.text === 'require');
+}
+
 function resolveConstantString(expression, bindings, seen = new Set()) {
   if (ts.isStringLiteralLike(expression)) return expression.text;
   if (!ts.isIdentifier(expression)) return null;
@@ -104,40 +121,6 @@ function resolveConstantString(expression, bindings, seen = new Set()) {
       !(binding.parent.flags & ts.NodeFlags.Const) || !binding.initializer) return null;
   seen.add(binding);
   return resolveConstantString(binding.initializer, bindings, seen);
-}
-
-function isTypePosition(node) {
-  let current = node.parent;
-  while (current) {
-    if (ts.isTypeNode(current)) return true;
-    current = current.parent;
-  }
-  return false;
-}
-
-function isSemanticIdentifierReference(node) {
-  const parent = node.parent;
-  if (!parent) return true;
-  if (isTypePosition(node)) return false;
-  if (ts.isLabeledStatement(parent) && parent.label === node) return false;
-  if ((ts.isBreakStatement(parent) || ts.isContinueStatement(parent)) && parent.label === node) {
-    return false;
-  }
-  if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
-  if (ts.isQualifiedName(parent) && parent.right === node) return false;
-  if (ts.isBindingElement(parent) && (parent.propertyName === node || parent.name === node)) return false;
-  if ((ts.isImportSpecifier(parent) || ts.isNamespaceImport(parent) ||
-      ts.isImportClause(parent)) && parent.name === node) return false;
-  if (ts.isImportSpecifier(parent) && parent.propertyName === node) return false;
-  if ((ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent) ||
-      ts.isPropertySignature(parent) || ts.isMethodDeclaration(parent) ||
-      ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) ||
-      ts.isSetAccessorDeclaration(parent)) && parent.name === node) return false;
-  if ((ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent) ||
-      ts.isEnumDeclaration(parent) || ts.isModuleDeclaration(parent)) && parent.name === node) {
-    return false;
-  }
-  return true;
 }
 
 function sourcePath(sourceFile, sourceRoot, nodePath) {
@@ -184,20 +167,26 @@ function commonJsPropertyKey(expression) {
   return null;
 }
 
-function commonJsExportTarget(expression) {
+function isUnboundIdentifier(node, bindings) {
+  return !resolveBinding(node, bindings || collectBindings(node.getSourceFile()));
+}
+
+function commonJsExportTarget(expression, bindings) {
   const property = commonJsPropertyKey(expression);
   if (property === null) return null;
-  if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports') {
+  if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports' &&
+      isUnboundIdentifier(expression.expression, bindings)) {
     return property;
   }
   const object = expression.expression;
   if ((ts.isPropertyAccessExpression(object) || ts.isElementAccessExpression(object)) &&
       ts.isIdentifier(object.expression) && object.expression.text === 'module' &&
-      commonJsPropertyKey(object) === 'exports') {
+      commonJsPropertyKey(object) === 'exports' && isUnboundIdentifier(object.expression, bindings)) {
     return property;
   }
   if (ts.isIdentifier(expression.expression) &&
-      expression.expression.text === 'module' && property === 'exports') {
+      expression.expression.text === 'module' && property === 'exports' &&
+      isUnboundIdentifier(expression.expression, bindings)) {
     return 'default';
   }
   return null;
@@ -211,7 +200,7 @@ function commonJsExportIdentifier(expression) {
   return ts.isIdentifier(current) ? current : null;
 }
 
-function commonJsRequireReexport(expression) {
+function commonJsRequireReexport(expression, bindings) {
   let requireCall = expression;
   let importedName = 'default';
   if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
@@ -221,7 +210,8 @@ function commonJsRequireReexport(expression) {
   }
   if (!ts.isCallExpression(requireCall) || !ts.isIdentifier(requireCall.expression) ||
       requireCall.expression.text !== 'require' || requireCall.arguments.length !== 1 ||
-      !ts.isStringLiteralLike(requireCall.arguments[0])) {
+      !ts.isStringLiteralLike(requireCall.arguments[0]) ||
+      !isUnboundIdentifier(requireCall.expression, bindings)) {
     return null;
   }
   return {
@@ -234,13 +224,14 @@ function commonJsRequireReexport(expression) {
 function commonJsExportAssignment(node) {
   if (!ts.isBinaryExpression(node) ||
       node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return null;
-  const target = commonJsExportTarget(node.left);
+  const bindings = collectBindings(node.getSourceFile());
+  const target = commonJsExportTarget(node.left, bindings);
   if (target === null) return null;
   return {
     target,
     exportIdentifier: commonJsExportIdentifier(node.left),
     right: node.right,
-    reExport: commonJsRequireReexport(node.right),
+    reExport: commonJsRequireReexport(node.right, bindings),
   };
 }
 
@@ -508,8 +499,8 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   bindings.push(...imports);
   const candidates = bindings.filter(binding => binding.name === name && binding.scope === sourceFile);
   const importedNames = new Set(imports.map(binding => binding.name));
-  const localCandidates = candidates.filter(binding =>
-    !importedNames.has(binding.name) && !ts.isBindingElement(binding.declaration));
+  const localCandidates = candidates.filter(binding => !importedNames.has(binding.name) &&
+    !isRequireBinding(binding));
   const importedTarget = imports.find(binding => !binding.namespace &&
     isTownHallGuardExport(sourceFile, binding.specifier, binding.importedName, sourceFiles));
   const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&

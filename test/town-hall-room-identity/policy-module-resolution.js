@@ -1,3 +1,5 @@
+const { effectiveCallArguments } = require('./policy-expression-semantics');
+
 function createPolicyModuleGraph({
   ts,
   path,
@@ -232,24 +234,13 @@ function createPolicyModuleGraph({
   for (const info of infos) {
     const visit = node => {
       if (ts.isCallExpression(node)) {
-        const callMethodName = ts.isPropertyAccessExpression(node.expression)
-          ? node.expression.name.text
-          : null;
-        const callMethod = callMethodName === 'call' || callMethodName === 'apply';
-        const callReceiver = callMethod ? resolveFunction(info, node.expression.expression) : null;
-        const fn = callReceiver || resolveFunction(info, node.expression);
-        let args = node.arguments;
-        if (callReceiver && callMethodName === 'call') {
-          args = node.arguments.slice(1);
-        }
-        if (callReceiver && callMethodName === 'apply') {
-          const suppliedArguments = node.arguments[1];
-          args = suppliedArguments && ts.isArrayLiteralExpression(suppliedArguments) &&
-            !suppliedArguments.elements.some(element => ts.isSpreadElement(element))
-            ? suppliedArguments.elements
-            : [];
-        }
-        if (fn) fn.calls.push({ info, args, node });
+        const invocation = effectiveCallArguments(node, {
+          resolveCallable: receiver => resolveFunction(info, receiver),
+          unwrapPolicyExpression,
+          isBound: identifier => Boolean(findBinding(info, 'undefined', identifier)),
+        });
+        const fn = resolveFunction(info, invocation.target);
+        if (fn) fn.calls.push({ info, args: invocation.args, complete: invocation.complete, node });
       }
       ts.forEachChild(node, visit);
     };

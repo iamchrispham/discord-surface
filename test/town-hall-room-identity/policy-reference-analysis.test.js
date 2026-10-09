@@ -268,6 +268,29 @@ test('reference analysis follows default guard re-exports without matching other
   assert.equal(countIdentifierReferences(unrelatedConsumer, 'isTownHallRoom', [plan, unrelatedBarrel]), 0);
 });
 
+test('reference analysis ignores non-value identifier positions', () => {
+  const enumMember = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    enum Guards { isTownHallRoom }`);
+  assert.equal(countIdentifierReferences(enumMember, 'isTownHallRoom'), 0);
+
+  const exportAlias = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    const other = true;
+    export { other as isTownHallRoom };`);
+  assert.equal(countIdentifierReferences(exportAlias, 'isTownHallRoom'), 0);
+
+  const classExpression = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    const Guard = class isTownHallRoom {};`);
+  assert.equal(countIdentifierReferences(classExpression, 'isTownHallRoom'), 0);
+
+  const typeParameter = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    function generic<isTownHallRoom>() {}`);
+  assert.equal(countIdentifierReferences(typeParameter, 'isTownHallRoom'), 0);
+
+  const namespaceExport = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    export * as isTownHallRoom from './other';`);
+  assert.equal(countIdentifierReferences(namespaceExport, 'isTownHallRoom'), 0);
+});
+
 test('reference analysis ignores labels and jump targets', () => {
   const labels = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
     isTownHallRoom: while (true) {
@@ -296,4 +319,21 @@ test('reference analysis ignores locally bound CommonJS loaders', () => {
   const realLoader = source(String.raw`const { isTownHallRoom } = require('./town-hall-plan');
     isTownHallRoom(room);`);
   assert.equal(countIdentifierReferences(realLoader, 'isTownHallRoom'), 1);
+
+  const localPropertyLoader = source(String.raw`const require = loader;
+    const isTownHallRoom = require('./town-hall-plan').isTownHallRoom;
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(localPropertyLoader, 'isTownHallRoom'), 0);
+
+  const realPropertyLoader = source(String.raw`const isTownHallRoom = require('./town-hall-plan').isTownHallRoom;
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(realPropertyLoader, 'isTownHallRoom'), 1);
+
+  const localDestructuredGuard = source(String.raw`const { isTownHallRoom } = makeGuards();
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(localDestructuredGuard, 'isTownHallRoom'), 1);
+
+  const localGuardProperty = source(String.raw`const isTownHallRoom = makeGuards().isTownHallRoom;
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(localGuardProperty, 'isTownHallRoom'), 1);
 });
