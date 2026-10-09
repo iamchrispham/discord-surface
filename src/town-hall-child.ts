@@ -6,6 +6,7 @@ import {
   validAddress,
   type AgentProvider
 } from './agent-message';
+import { deriveTownHallJournalKey } from './state/town-hall-journal/key';
 
 const PREFIX = 'discord-tether:town-hall:v1:';
 const DOMAIN = 'discord-tether/town-hall-child/v1';
@@ -191,6 +192,7 @@ function snapshotPacket(packet: unknown): TownHallChildPacket {
   if (values.purpose !== TOWN_HALL_CHILD_CONTRACT.PURPOSE) throw invalid();
   if (typeof values.broadcastId !== 'string' || !BROADCAST_ID_PATTERN.test(values.broadcastId)) throw invalid();
   if (typeof values.journalKey !== 'string' || !HEX64_PATTERN.test(values.journalKey)) throw invalid();
+  if (values.journalKey !== deriveTownHallJournalKey(source, values.broadcastId)) throw invalid();
   if (typeof values.planFingerprint !== 'string' || !HEX64_PATTERN.test(values.planFingerprint)) throw invalid();
   if (typeof values.roomMessageId !== 'string' || !SNOWFLAKE_PATTERN.test(values.roomMessageId)) throw invalid();
   const text = snapshotText(values.text);

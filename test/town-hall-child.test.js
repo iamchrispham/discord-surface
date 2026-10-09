@@ -14,6 +14,7 @@ const {
   TOWN_HALL_CHILD_KINDS
 } = require('../src/town-hall-child.js');
 const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
+const { deriveTownHallJournalKey } = require('../dist/state/town-hall-journal/key');
 const {
   AGENT_MESSAGE_MAX_ENCODED_LENGTH,
   encodeAgentMessage,
@@ -45,7 +46,7 @@ const TARGET = Object.freeze({
   guildId: '100', channelId: '300', provider: 'claude', nativeId: TARGET_UUID, generation: 4
 });
 const ROOM = Object.freeze({ guildId: '100', channelId: '900' });
-const JOURNAL_KEY = 'b'.repeat(64);
+const JOURNAL_KEY = deriveTownHallJournalKey(SOURCE, 'broadcast-1');
 const PLAN_FINGERPRINT = 'c'.repeat(64);
 const ROOM_MESSAGE_ID = '12345678901234567890';
 
@@ -120,7 +121,7 @@ function childFromPlan(plan, index = 0, overrides = {}) {
     text: plan.text,
     purpose: 'town-hall-child/v1',
     broadcastId: plan.broadcastId,
-    journalKey: JOURNAL_KEY,
+    journalKey: deriveTownHallJournalKey(plan.source, plan.broadcastId),
     planFingerprint: plan.fingerprint,
     room: { ...plan.townHall },
     roomMessageId: ROOM_MESSAGE_ID,
@@ -263,6 +264,26 @@ test('planner-derived child round trips every signed field', () => {
   packet.text = 'mutated caller text';
   assert.equal(decoded.target.channelId, TARGET.channelId);
   assert.equal(decoded.text, 'child instruction text');
+});
+
+test('rejects journal keys derived for another source or broadcast', () => {
+  const packet = validPacket();
+  const unrelatedKeys = [
+    deriveTownHallJournalKey({ ...packet.source, nativeId: THIRD_UUID }, packet.broadcastId),
+    deriveTownHallJournalKey(packet.source, `${packet.broadcastId}-other`)
+  ];
+
+  for (const journalKey of unrelatedKeys) {
+    assert.match(journalKey, /^[0-9a-f]{64}$/);
+    assert.notEqual(journalKey, JOURNAL_KEY);
+    const unrelatedPacket = { ...packet, journalKey };
+
+    expectError(() => encodeTownHallChild(unrelatedPacket, TOKEN), PACKET_ERROR);
+    expectError(
+      () => decodeTownHallChild(signJson(unrelatedPacket), TOKEN, { ...TARGET }),
+      PACKET_ERROR
+    );
+  }
 });
 
 test('packet ID binds the frozen recipient identity', () => {
@@ -424,11 +445,12 @@ test('maximum NUL instruction fits exact attachment bound', () => {
     text,
     purpose: 'town-hall-child/v1',
     broadcastId: 'x'.repeat(128),
-    journalKey: 'b'.repeat(64),
+    journalKey: JOURNAL_KEY,
     planFingerprint: 'c'.repeat(64),
     room: { guildId: guild, channelId: roomChannel },
     roomMessageId: '1'.repeat(20)
   };
+  packet.journalKey = deriveTownHallJournalKey(packet.source, packet.broadcastId);
   packet.id = packetIdFor(packet);
 
   assert.equal(Buffer.byteLength(text, 'utf8'), 10000);
@@ -792,6 +814,7 @@ test('stale target addresses refuse without returning a packet', () => {
     ['generation', validPacket({ target: { ...TARGET, generation: TARGET.generation + 1 } })],
     ['guildId', validPacket({
       source: { ...SOURCE, guildId: '101' },
+      journalKey: deriveTownHallJournalKey({ ...SOURCE, guildId: '101' }, 'broadcast-1'),
       target: { ...TARGET, guildId: '101' },
       room: { ...ROOM, guildId: '101' }
     })]
