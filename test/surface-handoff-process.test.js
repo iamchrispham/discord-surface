@@ -281,6 +281,11 @@ case "$5" in
   *) exit 1 ;;
 esac
 `, { mode: 0o700 });
+  const identityReadback = spawnSync(lockScript, ['--repo', repo, '--vendor', 'codex', 'identity'], {
+    encoding: 'utf8', timeout: 5000
+  });
+  assert.equal(identityReadback.status, 0, identityReadback.error?.message || identityReadback.stderr || 'lock identity preparation failed');
+  assert.deepEqual(JSON.parse(identityReadback.stdout), identity);
   fs.writeFileSync(lockFile, '{}', { mode: 0o600 });
   fs.writeFileSync(beacon, 'beacon', { mode: 0o600 });
   const transcript = path.join(sessionRoot, `rollout-test-${successorNativeId}.jsonl`);
@@ -337,6 +342,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
       '--db', path.join(dir, 'state.sqlite')], {
       env: {
         ...process.env,
+        CONDUCTOR_WORKERS_DIR: workersDir,
         CONDUCTOR_LOCK_FILE: lockFile,
         CONDUCTOR_CODEX_SESSIONS_DIR: sessionRoot,
         DISCORD_SURFACE_GATE_CHILD_STARTED: childStarted,
