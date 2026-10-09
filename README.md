@@ -727,3 +727,20 @@ Keep the same dedupe key and content after an uncertain outcome. A changed owner
 or generation is not permission to replay. These tools do not establish CLI
 active-turn steering or repair native pickup. Installation, current-source tests,
 and an actual native correlated round trip remain separate qualification steps.
+
+### Peer result inspection from a native shell
+
+```sh
+discord-surface peer-result --provider codex --correlation-id request-key --state-dir /path/to/state
+```
+
+Use `--provider claude` from an existing Claude session. The command derives the
+current native caller and uses the same correlation and generation checks as
+`peer_result`. It needs neither a loaded peer MCP catalog nor a bot token file.
+Identity comes from the harness environment and its Claude session resolver.
+Caller scoping does not protect against a same-user process that sets those
+identity variables. The command accepts no `--native-id` flag.
+It reads local receipts without network requests, delivery retries, acknowledgment
+or completion. Missing state and older schemas are refused without creation or
+migration. Result text remains peer-provided data. A successful inspection
+does not prove native pickup, active-turn steering or MCP adoption.

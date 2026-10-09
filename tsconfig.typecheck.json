@@ -161,6 +161,7 @@
     "test/types/town-hall-publication-types.ts",
     "test/types/town-hall-publication-parts-types.ts",
     "src/state/thread-enrollment/contracts.ts",
-    "src/state/thread-enrollment/handlers.ts"
+    "src/state/thread-enrollment/handlers.ts",
+    "src/state/town-hall-publication/journal.ts"
   ]
 }
