@@ -140,6 +140,7 @@
     "src/state/courier-route/envelope.ts",
     "src/state/courier-route/forward.ts",
     "src/state/courier-route/recovery.ts",
+    "src/state/courier-route/retirement.ts",
     "src/state/courier-route/route.ts",
     "src/state/courier-route/types.ts",
     "src/state/decision/handlers.ts",
@@ -158,6 +159,9 @@
     "test/types/town-hall-publication-types.ts",
     "test/types/town-hall-publication-parts-types.ts",
     "src/town-hall-child.ts",
-    "test/types/town-hall-child-types.ts"
+    "test/types/town-hall-child-types.ts",
+    "src/state/thread-enrollment/contracts.ts",
+    "src/state/thread-enrollment/handlers.ts",
+    "src/state/town-hall-publication/journal.ts"
   ]
 }

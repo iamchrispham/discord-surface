@@ -652,3 +652,39 @@ export function validateAgentMessage(packet: unknown): void {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test("issue260 courier object alias", { todo: 'issue260 alias inventory' }, () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); const identity = rawCourier; if (identity.provider === target.provider && identity.nativeId === target.nativeId) throw Error(\"self\"); }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.throws(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
+
+test("issue260 parent object alias", { todo: 'issue260 alias inventory' }, () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); const parent = target; if (rawCourier.provider === parent.provider && rawCourier.nativeId === parent.nativeId) throw Error(\"self\"); }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.throws(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
+
+test("issue260 both object aliases", { todo: 'issue260 alias inventory' }, () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); const identity = rawCourier; const parent = target; if (identity.provider === parent.provider && identity.nativeId === parent.nativeId) throw Error(\"self\"); }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.throws(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
+
+test("issue260 direct courier comparator", () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); if (rawCourier.provider === target.provider && rawCourier.nativeId === target.nativeId) throw Error(\"self\"); }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.throws(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
+
+test("issue260 ordinary object comparison", () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); const identity = {provider: \"external\", nativeId: \"label\"}; const parent = {provider: \"other\", nativeId: \"label\"}; if (identity.provider === parent.provider) return false; }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.doesNotThrow(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
+
+test("issue260 delegation only", () => {
+  const source = parseSourceText('src/state/courier-route/route.ts', "export function routeInput(input: unknown) { const rawCourier = input.courier; const target = input.target; sameAgentSession(rawCourier, target); return sameAgentSession(rawCourier, target); }");
+  assert.equal(source.parseDiagnostics.length, 0);
+  assert.doesNotThrow(() => assertDelegatedSelfRefusal(source, 'routeInput'));
+});
