@@ -3,6 +3,7 @@ import type { Attachment } from '../attachments';
 import { WATCHER_NOTICE_PROVIDERS, watcherNoticePrompt, type WatcherNotice } from '../watcher-notice';
 import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from '../acknowledgment/pickup';
 import { KINDS } from '../agent-message';
+import { AGENT_PRESENTATIONS } from '../agent-presentation';
 import { ENVELOPE_TYPE, PROMPT_PREFIX } from '../state/courier-route/constants';
 import type { CourierDispatchEnvelope, NativeMessage } from '../native';
 import { normalizeReplyContext } from '../reply-context';
@@ -121,7 +122,8 @@ function agentResultInstruction(message: NativeMessage, completion: readonly str
   if (legacyParentRequest(message)) {
     return 'This request has no exact enrolled child route. Do not execute it, send a result, or complete it. Keep it open for route reconciliation.';
   }
-  if (!completion) return `Return one correlated result with agent-send --agent-reply-to ${agent.id}, then run agent-complete. Keep the request open if sending fails.`;
+  const replyCommand = `agent-send --agent-presentation ${AGENT_PRESENTATIONS.ATTACHMENT} --agent-reply-to ${agent.id}`;
+  if (!completion) return `Return one correlated result with ${replyCommand}, then run agent-complete. Keep the request open if sending fails.`;
   const flag = (name: string): string | undefined => {
     const index = completion.indexOf(name);
     return index < 0 ? undefined : completion[index + 1];
@@ -136,8 +138,9 @@ function agentResultInstruction(message: NativeMessage, completion: readonly str
     '--provider', message.provider, '--channel-id', message.channelId,
     '--agent-thread-id', message.agentRoute || agent.target.channelId, '--native-id', message.nativeId,
     '--generation', String(message.generation), '--text-file', textFile,
-    '--dedupe-key', `agent-result-${message.id}`, '--agent-reply-to', agent.id];
-  return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run agent-send --agent-reply-to ${agent.id} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. On duplicate=true for this request, do not repeat side effects. Run the packet's agent-complete command first; completed or duplicate ends this pickup. If no correlated result exists, inspect prior work and the result file. Resume only known unfinished work. For a completed result, reuse the exact agent-send argv and dedupe key. Complete only after sent or duplicate; unknown, failed, stale, or uncertain custody stays open for reconciliation. Do not post an ordinary Discord reply.`;
+    '--dedupe-key', `agent-result-${message.id}`, '--agent-reply-to', agent.id,
+    '--agent-presentation', AGENT_PRESENTATIONS.ATTACHMENT];
+  return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run ${replyCommand} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. On duplicate=true for this request, do not repeat side effects. Run the packet's agent-complete command first; completed or duplicate ends this pickup. If no correlated result exists, inspect prior work and the result file. Resume only known unfinished work. For a completed result, reuse the exact agent-send argv and dedupe key. Complete only after sent or duplicate; unknown, failed, stale, or uncertain custody stays open for reconciliation. Do not post an ordinary Discord reply.`;
 }
 
 export function messageRequest(message: NativeMessage, completion: readonly string[] | null | undefined = null): string {
