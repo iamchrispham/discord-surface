@@ -287,6 +287,7 @@ function createPolicyRegexAnalysis({
       };
       visitClass(info.ast);
     }
+    let assignedPropertyName = null;
     let declaration = node.parent;
     while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
       declaration = declaration.parent;
@@ -298,16 +299,39 @@ function createPolicyRegexAnalysis({
       while (assignment && !ts.isBinaryExpression(assignment) && assignment.parent) {
         assignment = assignment.parent;
       }
+      const memberTarget = assignment && ts.isBinaryExpression(assignment) &&
+        (ts.isPropertyAccessExpression(assignment.left) || ts.isElementAccessExpression(assignment.left));
+      let targetIdentifier = null;
+      if (assignment && ts.isBinaryExpression(assignment)) {
+        if (ts.isIdentifier(assignment.left)) targetIdentifier = assignment.left;
+        else if (memberTarget && ts.isIdentifier(assignment.left.expression)) {
+          targetIdentifier = assignment.left.expression;
+        }
+      }
       if (assignment && ts.isBinaryExpression(assignment) &&
           assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-          isAncestor(assignment.right, node) && ts.isIdentifier(assignment.left)) {
-        const binding = findBinding(info, assignment.left.text, assignment.left);
+          isAncestor(assignment.right, node) && targetIdentifier) {
+        const binding = findBinding(info, targetIdentifier.text, targetIdentifier);
         declaration = binding?.declaration && ts.isVariableDeclaration(binding.declaration) &&
           ts.isIdentifier(binding.declaration.name) ? binding.declaration : null;
+        if (memberTarget) assignedPropertyName = policyPropertyKey(assignment.left);
       }
     }
     if (!declaration) return inputs;
     const seenDeclarations = new Set();
+    const collectBoundMatcherInputs = binding => {
+      const matcherBindings = collectBindings(info.ast);
+      const visitMatcherCalls = current => {
+        if (ts.isIdentifier(current) &&
+            resolveBinding(current, matcherBindings) === binding.declaration &&
+            ts.isCallExpression(current.parent) && current.parent.expression === current &&
+            current.parent.arguments[0]) {
+          inputs.push(current.parent.arguments[0]);
+        }
+        ts.forEachChild(current, visitMatcherCalls);
+      };
+      visitMatcherCalls(info.ast);
+    };
     const collectBindingInputs = binding => {
       const bindingDeclaration = binding?.declaration;
       if (!bindingDeclaration || seenDeclarations.has(bindingDeclaration)) return;
@@ -320,6 +344,26 @@ function createPolicyRegexAnalysis({
             parent.expression === reference &&
             ['test', 'exec'].includes(callPropertyName(parent)) && ts.isCallExpression(parent.parent)) {
           if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
+        } else if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+            parent.expression === reference && ['test', 'exec'].includes(policyPropertyKey(parent)) &&
+            ts.isPropertyAccessExpression(parent.parent) && parent.parent.expression === parent &&
+            policyPropertyKey(parent.parent) === 'bind' && ts.isCallExpression(parent.parent.parent)) {
+          const boundMatcherCall = parent.parent.parent;
+          const matcherDeclaration = boundMatcherCall.parent;
+          if (ts.isVariableDeclaration(matcherDeclaration) &&
+              matcherDeclaration.initializer === boundMatcherCall &&
+              ts.isIdentifier(matcherDeclaration.name)) {
+            const matcherBinding = findBinding(info, matcherDeclaration.name.text, matcherDeclaration.name);
+            if (matcherBinding) collectBoundMatcherInputs(matcherBinding);
+          }
+        } else if (assignedPropertyName &&
+            (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+            parent.expression === reference && policyPropertyKey(parent) === assignedPropertyName &&
+            (ts.isPropertyAccessExpression(parent.parent) || ts.isElementAccessExpression(parent.parent)) &&
+            parent.parent.expression === parent &&
+            ['test', 'exec'].includes(policyPropertyKey(parent.parent)) &&
+            ts.isCallExpression(parent.parent.parent) && parent.parent.parent.arguments[0]) {
+          inputs.push(parent.parent.parent.arguments[0]);
         } else if (ts.isCallExpression(parent) && parent.arguments[0] === reference &&
             ['match', 'search'].includes(callPropertyName(parent.expression))) {
           inputs.push(parent.expression.expression);

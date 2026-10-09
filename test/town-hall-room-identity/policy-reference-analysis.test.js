@@ -28,6 +28,27 @@ test('reference analysis follows aliases and namespace members without shadows',
     plan.isTownHallRoom({});`);
   assert.equal(countIdentifierReferences(namespaced, 'isTownHallRoom'), 1);
 
+  const aliasedNamespace = source(String.raw`import * as plan from './town-hall-plan';
+    const roomPlan = plan;
+    roomPlan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(aliasedNamespace, 'isTownHallRoom'), 1);
+
+  const commonJsNamespaceAlias = source(String.raw`const plan = require('./town-hall-plan');
+    const roomPlan = plan;
+    roomPlan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(commonJsNamespaceAlias, 'isTownHallRoom'), 1);
+
+  const unrelatedNamespaceAlias = source(String.raw`import * as plan from './voice-room';
+    const roomPlan = plan;
+    roomPlan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(unrelatedNamespaceAlias, 'isTownHallRoom'), 0);
+
+  const shadowedNamespaceAlias = source(String.raw`import * as plan from './town-hall-plan';
+    const roomPlan = plan;
+    function shadow(roomPlan) { return roomPlan.isTownHallRoom({}); }
+    roomPlan.isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(shadowedNamespaceAlias, 'isTownHallRoom'), 1);
+
   const directCommonJs = source(String.raw`function check(room) {
     return require('./town-hall-plan').isTownHallRoom(room);
   }`);

@@ -524,11 +524,32 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
       sourceFiles,
     ));
   const namespaceAliases = [];
+  const namespaceObjectAliases = [];
   const collectNamespaceAliases = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+        node.initializer && ts.isIdentifier(node.initializer)) {
+      const sourceNamespace = namespaces.find(binding =>
+        resolveBinding(node.initializer, bindings) === binding.declaration);
+      const sourceAlias = namespaceObjectAliases.find(alias =>
+        resolveBinding(node.initializer, bindings) === alias.binding.declaration);
+      const namespace = sourceNamespace || sourceAlias?.namespace;
+      if (namespace) {
+        const aliasBinding = bindings.find(binding => binding.declaration === node);
+        if (aliasBinding) {
+          namespaceObjectAliases.push({
+            binding: aliasBinding,
+            namespace,
+            sourceReference: sourceAlias?.sourceReference || node.initializer,
+          });
+        }
+      }
+    }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
         node.initializer && ts.isIdentifier(node.initializer) &&
-        namespaces.some(binding =>
-          resolveBinding(node.initializer, bindings) === binding.declaration)) {
+        (namespaces.some(binding =>
+          resolveBinding(node.initializer, bindings) === binding.declaration) ||
+          namespaceObjectAliases.some(alias =>
+            resolveBinding(node.initializer, bindings) === alias.binding.declaration))) {
       for (const element of node.name.elements) {
         const property = element.propertyName || element.name;
         const propertyName = ts.isIdentifier(property) || ts.isStringLiteralLike(property)
@@ -562,6 +583,9 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
           ts.isAwaitExpression(importedNamespace)) {
         importedNamespace = importedNamespace.expression;
       }
+      const namespaceObjectAlias = namespaceObjectAliases.find(alias =>
+        resolveBinding(importedNamespace, bindings) === alias.binding.declaration);
+      if (namespaceObjectAlias) importedNamespace = namespaceObjectAlias.sourceReference;
       const directRequire = ts.isCallExpression(receiver) &&
         ts.isIdentifier(receiver.expression) && receiver.expression.text === 'require' &&
         receiver.arguments.length === 1 && ts.isStringLiteralLike(receiver.arguments[0]) &&
@@ -572,8 +596,9 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
         importedNamespace.arguments.length === 1 &&
         ts.isStringLiteralLike(importedNamespace.arguments[0]) &&
         isTownHallPlanModule(sourceFile, importedNamespace.arguments[0].text, property, sourceFiles);
-      const namespaceMember = ts.isIdentifier(receiver) &&
-        namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration);
+      const namespaceMember = ts.isIdentifier(importedNamespace) &&
+        namespaces.some(binding =>
+          resolveBinding(importedNamespace, bindings) === binding.declaration);
       if (property === name && (namespaceMember || directRequire || directImport)) {
         count += 1;
       }

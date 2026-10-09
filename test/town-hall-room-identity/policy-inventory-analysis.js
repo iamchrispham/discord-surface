@@ -1348,8 +1348,43 @@ function roomDigitPolicies(records, options = {}) {
         input,
       );
     }
+    for (const { specifier, importedName, input } of directRequireRegexInputs(consumer)) {
+      countImportedRegexPolicy(
+        consumer,
+        consumerBindings,
+        resolveModule(consumer, specifier),
+        importedName,
+        input,
+      );
+    }
   }
   return sites;
+}
+
+function directRequireRegexInputs(consumer) {
+  const inputs = [];
+  const visit = node => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+        node.expression.text === 'require' && node.arguments.length === 1 &&
+        ts.isStringLiteralLike(node.arguments[0])) {
+      const member = node.parent;
+      const matcher = member?.parent;
+      if ((ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member)) &&
+          member.expression === node && policyPropertyKey(member) &&
+          (ts.isPropertyAccessExpression(matcher) || ts.isElementAccessExpression(matcher)) &&
+          matcher.expression === member && ['test', 'exec'].includes(policyPropertyKey(matcher)) &&
+          ts.isCallExpression(matcher.parent) && matcher.parent.arguments[0]) {
+        inputs.push({
+          specifier: node.arguments[0].text,
+          importedName: policyPropertyKey(member),
+          input: matcher.parent.arguments[0],
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(consumer.ast);
+  return inputs;
 }
 
 function roomDigitPolicyDefinitions(records) {

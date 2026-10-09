@@ -824,6 +824,29 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/local-object-room-regex.ts': 1
   });
+  const assignedObjectRegex = {
+    file: 'peer/assigned-object-room-regex.ts',
+    text: String.raw`const patterns = {};
+    patterns.ROOM_ID = /^\d{1,21}$/;
+    function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, assignedObjectRegex]), {
+    ...expectedPolicies,
+    'peer/assigned-object-room-regex.ts': 1,
+  });
+  assert.deepEqual(roomDigitPolicyDefinitions([...records, assignedObjectRegex]), {
+    ...expectedDefinitions,
+    'peer/assigned-object-room-regex.ts': [
+      { kind: 'literal', pattern: '^\\d{1,21}$', flags: '' },
+    ],
+  });
+  const assignedObjectRegexNegative = {
+    file: 'peer/assigned-object-room-regex-negative.ts',
+    text: String.raw`const patterns = {};
+    patterns.ROOM_ID = /^\d{1,21}$/;
+    function inspectRoom(room) { return patterns.ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, assignedObjectRegexNegative]), expectedPolicies);
   const regexAlias = {
     file: 'peer/future-room.ts',
     text: 'function validateRoom(room) { const ROOM_ID = /^\\d{1,21}$/; const VALIDATOR = ROOM_ID; return VALIDATOR.test(room.guildId); }'
@@ -982,6 +1005,31 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/cjs-require-room-regex.cts': 1,
   });
+  const directRequireRegexHelper = {
+    file: 'peer/direct-require-room-regex.js',
+    text: String.raw`exports.ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const directRequireRegexConsumer = {
+    file: 'peer/direct-require-room-consumer.js',
+    text: "function validateTownHallRoom(room) { return require('./direct-require-room-regex').ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directRequireRegexHelper,
+    directRequireRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/direct-require-room-regex.js': 1,
+  });
+  const directRequireRegexNegativeConsumer = {
+    file: 'peer/direct-require-room-negative-consumer.js',
+    text: "function inspectRoom(room) { return require('./direct-require-room-regex').ROOM_ID.test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directRequireRegexHelper,
+    directRequireRegexNegativeConsumer,
+  ]), expectedPolicies);
   const cjsRequireRuntimeRegexNegativeConsumer = {
     file: 'peer/cjs-require-room-negative-consumer.cts',
     text: "const patterns = require('./cjs-require-room-regex.cjs'); function inspectRoom(room) { return patterns.ROOM_ID.test(room.name); }",
@@ -1053,6 +1101,27 @@ test('room policy inventory records only town-hall room validators', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([...records, boundRegexStringNegativeRoom]), expectedPolicies);
+  const boundTestMatcherRoom = {
+    file: 'peer/bound-test-matcher-room.ts',
+    text: String.raw`const ROOM_ID = /^\d{1,21}$/;
+    function validateTownHallRoom(room) {
+      const matches = ROOM_ID.test.bind(ROOM_ID);
+      return matches(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, boundTestMatcherRoom]), {
+    ...expectedPolicies,
+    'peer/bound-test-matcher-room.ts': 1,
+  });
+  const boundTestMatcherNegativeRoom = {
+    file: 'peer/bound-test-matcher-negative-room.ts',
+    text: String.raw`const ROOM_ID = /^\d{1,21}$/;
+    function inspectRoom(room) {
+      const matches = ROOM_ID.test.bind(ROOM_ID);
+      return matches(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, boundTestMatcherNegativeRoom]), expectedPolicies);
   const importedRegexStringHelper = {
     file: 'peer/imported-room-regex-source.ts',
     text: String.raw`export const ROOM_ID_SOURCE = '^\\d{1,21}$';`,
