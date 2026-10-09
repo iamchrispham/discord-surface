@@ -6,6 +6,14 @@ function canonicalNativeId(value) {
   return typeof value === 'string' ? value.toLowerCase() : value;
 }
 
+function sameCallerAddress(left, right) {
+  return left?.provider === right?.provider &&
+    left?.guildId === right?.guildId &&
+    left?.channelId === right?.channelId &&
+    canonicalNativeId(left?.nativeId) === canonicalNativeId(right?.nativeId) &&
+    left?.generation === right?.generation;
+}
+
 function abortError(signal) {
   return signal?.reason instanceof Error ? signal.reason : new Error('peer server is closing');
 }
@@ -19,6 +27,22 @@ function observeAbort(promise, signal) {
     signal.addEventListener('abort', onAbort, { once: true });
     Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
   });
+}
+
+function createCallerAssertion(state, provider, dependencies = {}, capturedCaller) {
+  const expected = Object.freeze({
+    provider: capturedCaller?.provider,
+    guildId: capturedCaller?.guildId,
+    channelId: capturedCaller?.channelId,
+    nativeId: canonicalNativeId(capturedCaller?.nativeId),
+    generation: capturedCaller?.generation
+  });
+  return async function assertCallerCurrent(signal) {
+    const current = await resolvePeerCaller(state, provider, dependencies, signal);
+    if (!sameCallerAddress(current, expected)) {
+      throw new Error('native caller must be revalidated: peer caller changed');
+    }
+  };
 }
 
 async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
@@ -63,4 +87,4 @@ async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
   return bindings[0];
 }
 
-module.exports = { resolvePeerCaller };
+module.exports = { resolvePeerCaller, createCallerAssertion, sameCallerAddress };

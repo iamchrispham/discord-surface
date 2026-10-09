@@ -129,6 +129,7 @@
     "src/state/town-hall-publication/context.ts",
     "src/state/thread-enrollment/contracts.ts",
     "src/state/thread-enrollment/handlers.ts",
+    "src/direct-post/transport-rejection.ts",
     "src/state/town-hall-publication/journal.ts"
   ]
 }

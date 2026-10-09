@@ -28,6 +28,68 @@ test('board refresh accepts Discord message REST shape without guild_id', async 
   assert.equal(JSON.parse(f.state.listReceipts().filter(row => row.kind === 'board-refresh-outcome').at(-1).detail).outcome, BOARD_OUTCOMES.APPLIED);
 });
 
+test('non-admitted board result checks readiness after a successful caller assertion', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const requestId = 'refresh-admission-readiness-race';
+  const inspectBoardRequest = f.state.inspectBoardRequest.bind(f.state);
+  const beginBoardRefresh = f.state.beginBoardRefresh.bind(f.state);
+  let inspected = false;
+  let initialLookupMissed = false;
+  let competingAdmission = null;
+  let admission = null;
+  let ready = true;
+  let assertedAfterAdmission = false;
+  f.state.inspectBoardRequest = (id, target) => {
+    const result = inspectBoardRequest(id, target);
+    if (id === requestId && !inspected) {
+      inspected = true;
+      initialLookupMissed = result == null;
+    }
+    return result;
+  };
+  f.state.beginBoardRefresh = (meta, revision) => {
+    competingAdmission = beginBoardRefresh(meta, revision);
+    assert.equal(competingAdmission.status, 'admitted');
+    f.state.recordBoardRefreshOutcome(meta.target, competingAdmission.attemptId, BOARD_OUTCOMES.APPLIED, {
+      observedContent: meta.content
+    });
+    admission = beginBoardRefresh(meta, revision);
+    return admission;
+  };
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, init });
+    if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse('old board');
+    throw new Error('board PATCH must not run for a non-admitted result');
+  };
+
+  const result = await refresh(f, 'new board', requestId, fetchImpl, {
+    bindingCurrent: () => ready,
+    assertCallerCurrent: async () => {
+      if (admission && admission.status !== 'admitted') {
+        assertedAfterAdmission = true;
+        ready = false;
+      }
+    }
+  });
+
+  assert.equal(initialLookupMissed, true);
+  assert.notEqual(admission.status, 'admitted');
+  assert.equal(assertedAfterAdmission, true);
+  assert.equal(result.status, BOARD_OUTCOMES.STALE);
+  assert.equal(calls.some(call => call.init.method === 'PATCH'), false);
+  const receipts = f.state.listReceipts();
+  const attempts = receipts.filter(row => row.kind === 'board-refresh-attempt' && JSON.parse(row.detail).requestId === requestId);
+  const outcomes = receipts.filter(row => row.kind === 'board-refresh-outcome' && JSON.parse(row.detail).requestId === requestId);
+  assert.equal(attempts.length, 1);
+  assert.equal(outcomes.length, 1);
+  assert.equal(JSON.parse(outcomes[0].detail).outcome, BOARD_OUTCOMES.APPLIED);
+  assert.equal(JSON.parse(outcomes[0].detail).observedContent, 'new board');
+});
+
 test('board refresh rejects untrusted channel and message identity before admission or PATCH', async () => {
   const cases = [
     {
