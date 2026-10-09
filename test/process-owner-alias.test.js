@@ -46,6 +46,102 @@ test("Object.create preserves bounded prototype probe properties", () => {
   runFixture("const api = Object.create({probe: () => true}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
 });
 
+test("descriptor aliases and computed source keys preserve probe identity", () => {
+  runFixture("const descriptor = {value: process.kill}; const api = {}; Object.defineProperty(api, 'probe', descriptor); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const descriptor = {value: () => true}; const api = {}; Object.defineProperty(api, 'probe', descriptor); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+  runFixture("const key = 'probe'; const api = {}; Object.assign(api, {[key]: process.kill}); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const key = 'probe'; const api = {}; Object.assign(api, {[key]: () => true}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+  runFixture("const api = Object.create(null, {probe: {value: process.kill}}); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const api = Object.create(null, {probe: {value: () => true}}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("builtin identities survive lexical aliases", () => {
+  runFixture("const freeze = Object.freeze; const api = freeze({probe: process.kill}); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const freeze = Object.freeze; const api = freeze({probe: () => true}); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+  runFixture("const each = Array.prototype.forEach; function newProbe(pid) { each.call([pid], process.kill); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const each = Array.prototype.forEach; function newProbe(pid) { each.call([pid], value => true); }", [], []);
+});
+
+test("process namespace defaults and receiver signals stay correlated", () => {
+  const namespaceDefault = inventoryFiles({
+    "consumer.mjs": "import * as proc from 'node:process'; function newProbe(pid) { proc.default.kill(pid, 0); }"
+  });
+  assert.equal(namespaceDefault.kills.length, 1);
+  assert.deepEqual(namespaceDefault.violations, ["unclassified process probe consumer.mjs:newProbe"]);
+
+  const namespaceBenign = inventoryFiles({
+    "consumer.mjs": "const proc = {default: {kill() {}}}; function newProbe(pid) { proc.default.kill(pid, 0); }"
+  });
+  assert.deepEqual(namespaceBenign.kills, []);
+  assert.deepEqual(namespaceBenign.violations, []);
+
+  const pairedSignals = inventoryFiles({
+    "private-alias.js": "function invoke(proc, signal) { proc.kill(1, signal); } invoke(process, 9); invoke({kill() {}}, 0);"
+  });
+  assert.deepEqual(pairedSignals.kills, []);
+  assert.deepEqual(pairedSignals.violations, []);
+
+  const processProbe = inventoryFiles({
+    "private-alias.js": "function invoke(proc, signal) { proc.kill(1, signal); } invoke(process, 0); invoke({kill() {}}, 9);"
+  });
+  assert.equal(processProbe.kills.length, 1);
+  assert.deepEqual(processProbe.violations, ["unclassified process probe private-alias.js:invoke"]);
+});
+
+test("returned object parameters and setter invocations retain their call arguments", () => {
+  runFixture("function make(probe) { return {probe}; } const api = make(process.kill); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function make(probe) { return {probe}; } const api = make(() => true); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+
+  const setterProbe = inventoryFiles({
+    "setter.js": "const api = {set probe(value) { value(1, 0); }}; api.probe = process.kill;"
+  });
+  assert.equal(setterProbe.kills.length, 1);
+  assert.equal(setterProbe.violations.length, 1);
+
+  const setterBenign = inventoryFiles({
+    "setter.js": "const api = {set probe(value) { void value; }}; api.probe = process.kill;"
+  });
+  assert.deepEqual(setterBenign.kills, []);
+  assert.deepEqual(setterBenign.violations, []);
+});
+
+test("resolver work stays bounded without reusing cyclic or pre-write results", () => {
+  const nestedFreeze = probe => {
+    let expression = `{probe: ${probe}}`;
+    for (let index = 0; index < 4; index += 1) expression = `Object.freeze(${expression})`;
+    return `const api = ${expression}; function newProbe(pid) { api.probe(pid, 0); }`;
+  };
+  const probe = inventoryFiles({"private-alias.js": nestedFreeze("process.kill")});
+  const benign = inventoryFiles({"private-alias.js": nestedFreeze("() => true")});
+  assert.equal(probe.kills.length, 1);
+  assert.deepEqual(probe.violations, ["unclassified process probe private-alias.js:newProbe"]);
+  assert.deepEqual(benign.kills, []);
+  assert.deepEqual(benign.violations, []);
+  assert.ok(probe.resolutionWork.cacheHits > 0);
+  assert.ok(probe.resolutionWork.resolveSetCalls < 10000, JSON.stringify(probe.resolutionWork));
+  assert.ok(benign.resolutionWork.resolveSetCalls < 10000, JSON.stringify(benign.resolutionWork));
+
+  const cyclic = inventoryFiles({
+    "cycle.js": "let first = second; let second = first; function newProbe(pid) { first(pid, 0); }"
+  });
+  assert.deepEqual(cyclic.kills, []);
+  assert.deepEqual(cyclic.violations, []);
+  assert.ok(cyclic.resolutionWork.cycleTruncations > 0);
+  assert.ok(cyclic.resolutionWork.cycleTruncatedResults > 0);
+
+  const writeAfterRead = inventoryFiles({
+    "write.js": "const api = {probe: () => true}; function newProbe(pid) { api.probe(pid, 0); } api.probe = process.kill;"
+  });
+  assert.equal(writeAfterRead.kills.length, 1);
+  assert.deepEqual(writeAfterRead.violations, ["unclassified process probe write.js:newProbe"]);
+
+  const benignWriteAfterRead = inventoryFiles({
+    "write.js": "const api = {probe: () => true}; function newProbe(pid) { api.probe(pid, 0); } api.probe = () => true;"
+  });
+  assert.deepEqual(benignWriteAfterRead.kills, []);
+  assert.deepEqual(benignWriteAfterRead.violations, []);
+});
+
 test("known custom forEach methods are not treated as array callbacks", () => {
   runFixture("const registry = {forEach(callback) { return true; }}; function newProbe(pid) { registry.forEach(process.kill); }", [], []);
 });
@@ -312,10 +408,27 @@ test("TypeScript parameter properties retain defaults and constructor arguments"
 });
 
 test("declared production probe inventory remains valid", () => {
-const result = inventoryProcessOwnerSites(SRC_ROOT);
-assert.equal(result.kills.length, 8);
-assert.deepEqual(result.legacyCalls, []);
-assert.deepEqual(result.violations, []);
+  const maxResolveSetCalls = 50_000_000;
+  let completedResolveSetCalls = 0;
+  const result = inventoryProcessOwnerSites(SRC_ROOT, event => {
+    if (event.phase !== "progress" && event.phase !== "complete") return;
+    if (!Number.isSafeInteger(event.resolveSetCalls) || event.resolveSetCalls < 0) {
+      throw new Error("production process-owner inventory reported an invalid resolution work count");
+    }
+    if (event.phase === "progress" && completedResolveSetCalls + event.resolveSetCalls >= maxResolveSetCalls) {
+      throw new Error("production process-owner inventory exceeded its resolution work limit");
+    }
+    if (event.phase === "complete") {
+      completedResolveSetCalls += event.resolveSetCalls;
+      if (completedResolveSetCalls >= maxResolveSetCalls) {
+        throw new Error("production process-owner inventory exceeded its resolution work limit");
+      }
+    }
+  });
+  assert.ok(result.resolutionWork.resolveSetCalls < maxResolveSetCalls);
+  assert.equal(result.kills.length, 8);
+  assert.deepEqual(result.legacyCalls, []);
+  assert.deepEqual(result.violations, []);
 });
 
 test("bound call invocation refuses", () => {
