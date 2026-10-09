@@ -122,7 +122,7 @@ function agentResultInstruction(message: NativeMessage, completion: readonly str
   if (legacyParentRequest(message)) {
     return 'This request has no exact enrolled child route. Do not execute it, send a result, or complete it. Keep it open for route reconciliation.';
   }
-  const replyCommand = `agent-send --agent-presentation ${AGENT_PRESENTATIONS.ATTACHMENT} --agent-reply-to ${agent.id}`;
+  const replyCommand = `agent-send --agent-presentation ${AGENT_PRESENTATIONS.LEGACY} --agent-reply-to ${agent.id}`;
   if (!completion) return `Return one correlated result with ${replyCommand}, then run agent-complete. Keep the request open if sending fails.`;
   const flag = (name: string): string | undefined => {
     const index = completion.indexOf(name);
@@ -139,7 +139,7 @@ function agentResultInstruction(message: NativeMessage, completion: readonly str
     '--agent-thread-id', message.agentRoute || agent.target.channelId, '--native-id', message.nativeId,
     '--generation', String(message.generation), '--text-file', textFile,
     '--dedupe-key', `agent-result-${message.id}`, '--agent-reply-to', agent.id,
-    '--agent-presentation', AGENT_PRESENTATIONS.ATTACHMENT];
+    '--agent-presentation', AGENT_PRESENTATIONS.LEGACY];
   return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run ${replyCommand} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. On duplicate=true for this request, do not repeat side effects. Run the packet's agent-complete command first; completed or duplicate ends this pickup. If no correlated result exists, inspect prior work and the result file. Resume only known unfinished work. For a completed result, reuse the exact agent-send argv and dedupe key. Complete only after sent or duplicate; unknown, failed, stale, or uncertain custody stays open for reconciliation. Do not post an ordinary Discord reply.`;
 }
 
