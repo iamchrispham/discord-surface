@@ -1,0 +1,364 @@
+import { ORDINARY_RECEIPT_KINDS } from '../../ordinary/constants';
+import { ADOPTION_REFUSAL_DETAILS, PERSISTENCE_REFUSAL_DETAILS } from '../../discord/history-access';
+import { THREAD_STATES, THREAD_DEACTIVATION_DETAILS, THREAD_RECEIPT_KINDS } from './contracts';
+import type { ThreadState, ThreadBinding, ThreadEnrollment, SqlRow, ThreadEnrollmentState, ThreadEnrollmentDependencies, ThreadEnrollmentHandlers } from './contracts';
+
+function enrollmentBoundaryMatches(existing: ThreadEnrollment | null, expected: ThreadEnrollment | null | undefined): boolean {
+  if (expected === undefined) return true;
+  if (expected === null) return existing === null;
+  if (!existing) return false;
+  return [
+    'threadId', 'parentChannelId', 'guildId', 'state', 'active',
+    'adoptedThroughId', 'adoptedAt', 'lastSeenId', 'recoveredThroughId',
+    'lastAcceptedId', 'gapFrom', 'gapTo', 'detail', 'createdAt'
+  ].every(field => existing[field as keyof ThreadEnrollment] === expected[field as keyof ThreadEnrollment]);
+}
+
+function rowEnrollment(row: SqlRow | undefined): ThreadEnrollment | null {
+  if (!row) return null;
+  return {
+    threadId: String(row.thread_id),
+    parentChannelId: String(row.parent_channel_id),
+    guildId: String(row.guild_id),
+    state: row.state as ThreadState,
+    active: Number(row.active) !== 0,
+    adoptedThroughId: row.adopted_through_id == null ? null : String(row.adopted_through_id),
+    adoptedAt: row.adopted_at == null ? null : String(row.adopted_at),
+    lastSeenId: row.last_seen_id == null ? null : String(row.last_seen_id),
+    recoveredThroughId: row.recovered_through_id == null ? null : String(row.recovered_through_id),
+    lastAcceptedId: row.last_accepted_id == null ? null : String(row.last_accepted_id),
+    gapFrom: row.gap_from == null ? null : String(row.gap_from),
+    gapTo: row.gap_to == null ? null : String(row.gap_to),
+    detail: row.detail == null ? null : String(row.detail),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
+}
+
+function maxId(compareDiscordIds: ThreadEnrollmentDependencies['compareDiscordIds'], current: string | null, candidate: string | null): string | null {
+  if (!candidate) return current;
+  if (!current || compareDiscordIds(current, candidate) < 0) return candidate;
+  return current;
+}
+
+function currentParentHandoffCutoff(state: ThreadEnrollmentState, binding: ThreadBinding): string | null {
+  const row = state.db.prepare(`SELECT json_extract(detail, '$.intakeCutoff') AS intake_cutoff
+    FROM receipts
+    WHERE kind=?
+      AND json_extract(detail, '$.channelId')=?
+      AND CAST(json_extract(detail, '$.generation') AS INTEGER)=?
+    ORDER BY id DESC LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.HANDOFF, binding.channelId, binding.generation);
+  return row?.intake_cutoff == null ? null : String(row.intake_cutoff);
+}
+
+export function createThreadEnrollmentHandlers({
+  BindingError,
+  THREAD_STATES: states,
+  READINESS,
+  assertText,
+  bindingMatchesExpected,
+  compareDiscordIds,
+  now
+}: ThreadEnrollmentDependencies): ThreadEnrollmentHandlers {
+  const validStates = new Set<ThreadState>(Object.values(states));
+
+  function requireEnrollment(state: ThreadEnrollmentState, threadId: string): ThreadEnrollment {
+    const enrollment = rowEnrollment(state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(threadId));
+    if (!enrollment) throw new BindingError('thread enrollment is unknown');
+    return enrollment;
+  }
+
+  function currentParent(state: ThreadEnrollmentState, enrollment: ThreadEnrollment, expectedBinding: ThreadBinding | null | undefined): ThreadBinding | null {
+    const binding = state.getBinding(enrollment.parentChannelId);
+    if (!binding || binding.guildId !== enrollment.guildId || !bindingMatchesExpected(binding, expectedBinding || null)) return null;
+    return binding;
+  }
+
+  function routeReady(binding: ThreadBinding, enrollment: ThreadEnrollment | null): boolean {
+    return Boolean(binding.active && binding.readiness === READINESS.READY &&
+      (!enrollment || (enrollment.active && enrollment.state === states.READY)));
+  }
+
+  const handlers: ThreadEnrollmentHandlers = {
+    getMessageRoute(state, deliveryChannelId) {
+      assertText(deliveryChannelId, 'deliveryChannelId', 128);
+      const direct = state.getBinding(deliveryChannelId);
+      const enrollment = rowEnrollment(state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(deliveryChannelId));
+      if (enrollment?.active) {
+        const binding = enrollment ? state.getBinding(enrollment.parentChannelId) : null;
+        if (!binding || !binding.active || binding.guildId !== enrollment.guildId) return null;
+        const handoffCutoffId = maxId(
+          compareDiscordIds,
+          enrollment.recoveredThroughId,
+          currentParentHandoffCutoff(state, binding)
+        );
+        return {
+          binding,
+          enrollment,
+          deliveryChannelId,
+          ready: routeReady(binding, enrollment),
+          handoffCutoffId
+        };
+      }
+      if (!direct) return null;
+      return {
+        binding: direct,
+        enrollment: null,
+        deliveryChannelId,
+        ready: routeReady(direct, null),
+        handoffCutoffId: null
+      };
+    },
+
+    enrollThread(state, input, expectedBinding = null) {
+      const threadId = assertText(input?.threadId, 'threadId', 128);
+      const parentChannelId = assertText(input?.parentChannelId, 'parentChannelId', 128);
+      const guildId = assertText(input?.guildId, 'guildId', 128);
+      const adoptionCutoff = input?.adoptionCutoff ?? null;
+      const qualifiedCutoff = typeof adoptionCutoff === 'string' && adoptionCutoff.length <= 128 && /^\d+$/.test(adoptionCutoff)
+        ? adoptionCutoff
+        : null;
+      if (threadId === parentChannelId) throw new BindingError('thread must differ from its bound parent');
+      return state.transaction(() => {
+        const binding = state.getBinding(parentChannelId);
+        if (!binding || !binding.active || binding.guildId !== guildId || !bindingMatchesExpected(binding, expectedBinding)) return null;
+        if (state.getBinding(threadId)?.active) throw new BindingError('thread channel is already bound');
+        const existing = rowEnrollment(state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(threadId));
+        if (existing) {
+          if (existing.parentChannelId !== parentChannelId || existing.guildId !== guildId) {
+            throw new BindingError('thread is already enrolled under another parent');
+          }
+          // An active concurrent winner already committed its own qualified snapshot;
+          // preserve it rather than overwriting adoption metadata.
+          if (existing.active) return existing;
+        }
+        // Fresh activation or reactivation from inactive both require an explicit
+        // decimal adoption cutoff. Already-active reuse above does no new read.
+        if (!qualifiedCutoff) {
+          throw Object.assign(new BindingError(ADOPTION_REFUSAL_DETAILS.CHILD_CUTOFF), { detail: ADOPTION_REFUSAL_DETAILS.CHILD_CUTOFF });
+        }
+        const timestamp = now();
+        // Commit activation, adoption timestamp, adopted boundary and covered cursor
+        // together so an active row can never exist without its qualified boundary.
+        state.db.prepare(`INSERT INTO thread_enrollments(
+          thread_id, parent_channel_id, guild_id, state, active,
+          adopted_through_id, adopted_at, last_seen_id, recovered_through_id, last_accepted_id,
+          gap_from, gap_to, detail, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, 1, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          state=excluded.state, active=1, adopted_through_id=excluded.adopted_through_id,
+          adopted_at=excluded.adopted_at, last_seen_id=NULL, recovered_through_id=excluded.recovered_through_id,
+          last_accepted_id=NULL, gap_from=NULL, gap_to=NULL, detail=NULL, updated_at=excluded.updated_at`).run(
+          threadId, parentChannelId, guildId, states.PENDING, qualifiedCutoff, timestamp, qualifiedCutoff, timestamp, timestamp
+        );
+        state.receipt(null, THREAD_RECEIPT_KINDS.ENROLLED, {
+          threadId, parentChannelId, guildId, state: states.PENDING,
+          adoptionCutoff: qualifiedCutoff
+        });
+        return handlers.getThreadEnrollment(state, threadId);
+      });
+    },
+
+    getThreadEnrollment(state, threadId) {
+      assertText(threadId, 'threadId', 128);
+      return rowEnrollment(state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(threadId));
+    },
+
+    listThreadEnrollments(state, parentChannelId = null) {
+      if (parentChannelId !== null && parentChannelId !== undefined) assertText(parentChannelId, 'parentChannelId', 128);
+      const rows = parentChannelId == null
+        ? state.db.prepare('SELECT * FROM thread_enrollments ORDER BY parent_channel_id, thread_id').all()
+        : state.db.prepare('SELECT * FROM thread_enrollments WHERE parent_channel_id=? ORDER BY thread_id').all(parentChannelId);
+      return rows.map(row => rowEnrollment(row)).filter((row): row is ThreadEnrollment => row !== null);
+    },
+
+    assertEnrollmentCoverage(state, parentChannelId, proof) {
+      const checkedParentChannelId = assertText(parentChannelId, 'parentChannelId', 128);
+      if (!proof || proof.parentChannelId !== checkedParentChannelId || !Array.isArray(proof.enrollments)) {
+        throw new BindingError('handoff enrollment proof is invalid');
+      }
+      const expected = new Map<string, { recoveredThroughId: string | null; updatedAt: string }>();
+      for (const enrollment of proof.enrollments) {
+        if (!enrollment || typeof enrollment.threadId !== 'string' || enrollment.active !== true ||
+          typeof enrollment.updatedAt !== 'string' || enrollment.updatedAt.length === 0 ||
+          (enrollment.recoveredThroughId !== null && typeof enrollment.recoveredThroughId !== 'string') ||
+          expected.has(enrollment.threadId)) {
+          throw new BindingError('handoff enrollment proof is invalid');
+        }
+        expected.set(enrollment.threadId, {
+          recoveredThroughId: enrollment.recoveredThroughId,
+          updatedAt: enrollment.updatedAt
+        });
+      }
+      const current = handlers.listThreadEnrollments(state, checkedParentChannelId).filter(enrollment => enrollment.active);
+      if (current.length !== expected.size || current.some(enrollment => {
+        const expectedEnrollment = expected.get(enrollment.threadId);
+        return !expectedEnrollment || expectedEnrollment.recoveredThroughId !== enrollment.recoveredThroughId ||
+          expectedEnrollment.updatedAt !== enrollment.updatedAt;
+      })) {
+        throw new BindingError('active thread enrollments changed during handoff proof');
+      }
+    },
+
+    deactivateThreadEnrollments(state, parentChannelId, expectedBinding = null, detail = THREAD_DEACTIVATION_DETAILS.UNBOUND) {
+      const checkedParentChannelId = assertText(parentChannelId, 'parentChannelId', 128);
+      const binding = state.getBinding(checkedParentChannelId);
+      if (!binding || !bindingMatchesExpected(binding, expectedBinding || null)) return 0;
+      const rows = state.db.prepare('SELECT thread_id FROM thread_enrollments WHERE parent_channel_id=? AND active=1 ORDER BY thread_id')
+        .all(checkedParentChannelId);
+      if (!rows.length) return 0;
+      const timestamp = now();
+      state.db.prepare(`UPDATE thread_enrollments
+        SET state=?, active=0, detail=?, updated_at=?
+        WHERE parent_channel_id=? AND active=1`).run(
+        states.UNAVAILABLE, detail, timestamp, checkedParentChannelId
+      );
+      for (const row of rows) {
+        state.receipt(null, THREAD_RECEIPT_KINDS.BOUNDARY, {
+          threadId: String(row.thread_id),
+          parentChannelId: checkedParentChannelId,
+          state: states.UNAVAILABLE,
+          detail,
+          generation: binding.generation
+        });
+      }
+      return rows.length;
+    },
+
+    setThreadBaseline(state, threadId, latestId, expectedBinding = null, expectedEnrollment = undefined) {
+      assertText(threadId, 'threadId', 128);
+      if (latestId !== null) assertText(latestId, 'latestId', 128);
+      return state.transaction(() => {
+        const existing = requireEnrollment(state, threadId);
+        const binding = currentParent(state, existing, expectedBinding);
+        if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
+        const timestamp = now();
+        // Observation and covered coverage stay separate facts: recording a newer
+        // observation (or re-observing the newest row) must never advance the covered
+        // cursor. An already-qualified recoveredThroughId is preserved untouched.
+        const lastSeenId = maxId(compareDiscordIds, existing.lastSeenId, latestId);
+        let recoveredThroughId = existing.recoveredThroughId;
+        let adoptedAt = existing.adoptedAt;
+        const qualifiedRecovered = typeof recoveredThroughId === 'string' && /^\d+$/.test(recoveredThroughId)
+          ? recoveredThroughId
+          : null;
+        // A parent handoff can seed covered history before this child records adoption.
+        if (existing.active === true && existing.adoptedAt === null && existing.adoptedThroughId === null &&
+          qualifiedRecovered !== null && qualifiedRecovered !== '0') {
+          adoptedAt = timestamp;
+        }
+        if (!qualifiedRecovered) {
+          // Exact legacy tuples may establish zero coverage only from an explicit
+          // verified-empty result or the literal "0", never by inference from observation.
+          const legacyZero = existing.active === true && existing.adoptedAt !== null &&
+            existing.adoptedThroughId === null && existing.recoveredThroughId === null && latestId === '0';
+          const legacyVerifiedEmpty = existing.active === true && existing.adoptedAt === null &&
+            existing.adoptedThroughId === null && existing.recoveredThroughId === null && latestId === null;
+          if (!legacyZero && !legacyVerifiedEmpty) {
+            throw Object.assign(new BindingError(PERSISTENCE_REFUSAL_DETAILS.CHILD_COVERAGE), {
+              detail: PERSISTENCE_REFUSAL_DETAILS.CHILD_COVERAGE
+            });
+          }
+          recoveredThroughId = '0';
+          if (legacyVerifiedEmpty) adoptedAt = timestamp;
+        }
+        state.db.prepare(`UPDATE thread_enrollments SET adopted_through_id=?, adopted_at=?, last_seen_id=?, recovered_through_id=?, updated_at=?
+          WHERE thread_id=? AND parent_channel_id=? AND active=1`).run(
+          existing.adoptedThroughId, adoptedAt, lastSeenId, recoveredThroughId, timestamp, threadId, existing.parentChannelId
+        );
+        state.receipt(null, THREAD_RECEIPT_KINDS.BASELINE, {
+          threadId, parentChannelId: existing.parentChannelId, latestId: existing.adoptedThroughId,
+          adoptedAt, recoveredThroughId, lastSeenId
+        });
+        return handlers.getThreadEnrollment(state, threadId);
+      });
+    },
+
+    markThreadBoundary(state, threadId, nextState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
+      assertText(threadId, 'threadId', 128);
+      if (!validStates.has(nextState)) throw new BindingError('invalid thread enrollment state');
+      if (gapFrom !== null) assertText(gapFrom, 'gapFrom', 128);
+      if (gapTo !== null) assertText(gapTo, 'gapTo', 128);
+      const boundedDetail = detail == null ? null : String(detail).slice(0, 1000) || null;
+      return state.transaction(() => {
+        const existing = requireEnrollment(state, threadId);
+        const binding = currentParent(state, existing, expectedBinding);
+        if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
+        if (nextState === states.READY && coverageId !== undefined && lastSeenBaselineId !== undefined && existing.lastSeenId &&
+          (!coverageId || compareDiscordIds(existing.lastSeenId, coverageId) > 0) &&
+          (!lastSeenBaselineId || compareDiscordIds(existing.lastSeenId, lastSeenBaselineId) > 0)) return existing;
+        const timestamp = now();
+        const persistedGapFrom = nextState === states.READY ? null : gapFrom;
+        const persistedGapTo = nextState === states.READY ? null : gapTo;
+        state.db.prepare('UPDATE thread_enrollments SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE thread_id=? AND active=1')
+          .run(nextState, boundedDetail, persistedGapFrom, persistedGapTo, timestamp, threadId);
+        state.receipt(null, THREAD_RECEIPT_KINDS.BOUNDARY, {
+          threadId, parentChannelId: existing.parentChannelId, state: nextState,
+          detail: boundedDetail, gapFrom: persistedGapFrom, gapTo: persistedGapTo
+        });
+        return handlers.getThreadEnrollment(state, threadId);
+      });
+    },
+
+    checkpointThread(state, threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
+      assertText(threadId, 'threadId', 128);
+      const checkedCoverageId = assertText(coverageId, 'coverageId', 128);
+      return state.transaction(() => {
+        const existing = requireEnrollment(state, threadId);
+        const binding = currentParent(state, existing, expectedBinding);
+        if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
+        if (existing.lastSeenId && compareDiscordIds(existing.lastSeenId, checkedCoverageId) < 0) return existing;
+        const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, checkedCoverageId);
+        const timestamp = now();
+        state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=?, updated_at=? WHERE thread_id=? AND active=1')
+          .run(recoveredThroughId, timestamp, threadId);
+        state.receipt(null, THREAD_RECEIPT_KINDS.CHECKPOINT, { threadId, coverageId: recoveredThroughId });
+        return handlers.getThreadEnrollment(state, threadId);
+      });
+    },
+
+    reconcileThread(state, threadId, expectedBinding = null) {
+      assertText(threadId, 'threadId', 128);
+      return state.transaction(() => {
+        const existing = requireEnrollment(state, threadId);
+        if (!existing.active) return null;
+        const binding = currentParent(state, existing, expectedBinding);
+        if (!binding || !binding.active) return null;
+        if (existing.state !== states.GAP && existing.state !== states.UNAVAILABLE) return existing;
+        const timestamp = now();
+        state.db.prepare('UPDATE thread_enrollments SET state=?, detail=NULL, gap_from=NULL, gap_to=NULL, updated_at=? WHERE thread_id=? AND parent_channel_id=? AND active=1')
+          .run(states.PENDING, timestamp, threadId, existing.parentChannelId);
+        state.receipt(null, THREAD_RECEIPT_KINDS.RECONCILED, {
+          threadId,
+          parentChannelId: existing.parentChannelId,
+          previousState: existing.state,
+          state: states.PENDING
+        });
+        return handlers.getThreadEnrollment(state, threadId);
+      });
+    },
+
+    noteThreadMessage(state, threadId, messageId, accepted = false, coverageId = null) {
+      assertText(threadId, 'threadId', 128);
+      assertText(messageId, 'messageId', 128);
+      if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
+      const existing = handlers.getThreadEnrollment(state, threadId);
+      if (!existing || !existing.active) return null;
+      const timestamp = now();
+      const lastSeenId = maxId(compareDiscordIds, existing.lastSeenId, messageId);
+      const lastAcceptedId = accepted ? maxId(compareDiscordIds, existing.lastAcceptedId, messageId) : existing.lastAcceptedId;
+      const qualifyingEmptyCoverage = existing.state === states.READY && coverageId === null &&
+        existing.adoptedAt !== null && existing.adoptedThroughId === null && existing.recoveredThroughId === null;
+      const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, coverageId) ||
+        (qualifyingEmptyCoverage ? '0' : null);
+      const nextState = qualifyingEmptyCoverage ? states.PENDING : existing.state;
+      state.db.prepare('UPDATE thread_enrollments SET last_seen_id=?, last_accepted_id=?, recovered_through_id=?, state=?, updated_at=? WHERE thread_id=? AND active=1')
+        .run(lastSeenId, lastAcceptedId, recoveredThroughId, nextState, timestamp, threadId);
+      return handlers.getThreadEnrollment(state, threadId);
+    }
+  };
+  return handlers;
+}

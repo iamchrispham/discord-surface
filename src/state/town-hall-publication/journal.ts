@@ -1,7 +1,8 @@
+import { isDirectPostOutcome } from '../direct-post/contracts';
+export { isDirectPostOutcome } from '../direct-post/contracts';
 import {
   DIRECT_POST_OUTCOMES,
   TOWN_HALL_PUBLICATION_EVENTS,
-  type DirectPostOutcome,
   type SqlRow,
   type TownHallPublicationDependencies,
   type TownHallPublicationEvent,
@@ -77,10 +78,6 @@ export function snapshotOwnData(
   if (exact && names.length !== required.length) return null;
   if (!names.every(name => (required as readonly string[]).includes(name))) return null;
   return snapshot;
-}
-
-export function isDirectPostOutcome(value: unknown): value is DirectPostOutcome {
-  return typeof value === 'string' && (Object.values(DIRECT_POST_OUTCOMES) as readonly string[]).includes(value);
 }
 
 function isPublicationEvent(value: unknown): value is TownHallPublicationEvent {

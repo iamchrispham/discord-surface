@@ -14,6 +14,10 @@ export const DIRECT_POST_OUTCOMES = Object.freeze([
 
 export type DirectPostOutcome = typeof DIRECT_POST_OUTCOMES[number];
 
+export function isDirectPostOutcome(value: unknown): value is DirectPostOutcome {
+  return typeof value === 'string' && (DIRECT_POST_OUTCOMES as readonly string[]).includes(value);
+}
+
 export type DirectPostPartStatus = DirectPostOutcome | 'claimed' | 'in_flight';
 
 export interface DirectPostBinding {

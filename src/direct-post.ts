@@ -22,6 +22,7 @@ type WatcherNotice = import('./watcher-notice').WatcherNotice;
 type WatcherAddress = import('./watcher-notice').WatcherAddress;
 
 import { DIRECT_POST_OUTCOMES } from './direct-post/contracts';
+import { isDirectPostOutcome } from './state/direct-post/contracts';
 import type {
   DirectPostOutcome,
   DirectPostBinding,
@@ -104,8 +105,8 @@ const { sendDiscordMessage } = require('../src/discord') as {
 
 function outcomeFor(error: unknown): DirectPostOutcome {
   const outcome = (error as { outcome?: unknown } | null | undefined)?.outcome;
-  return typeof outcome === 'string' && Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)
-    ? outcome as DirectPostOutcome
+  return isDirectPostOutcome(outcome)
+    ? outcome
     : 'unknown';
 }
 
