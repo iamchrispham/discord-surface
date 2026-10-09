@@ -1,0 +1,5180 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
+const OUTCOME_NAMES = new Set(['state', 'readiness', 'status', 'result', 'outcome']);
+
+const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+  const absolute = path.join(directory, entry.name);
+  if (entry.isDirectory()) return collectSourceFiles(absolute);
+  return SOURCE_FILE_PATTERN.test(entry.name) ? [absolute] : [];
+});
+
+const readSourceInventory = sourceRoot => collectSourceFiles(sourceRoot).map(absolute => ({
+  relative: path.relative(sourceRoot, absolute).split(path.sep).join('/'),
+  source: fs.readFileSync(absolute, 'utf8')
+}));
+
+const isIdentifierStart = character => /[A-Za-z_$]/.test(character);
+const isIdentifierPart = character => /[A-Za-z0-9_$]/.test(character);
+const REGEX_PREFIXES = new Set(['(', '{', '[', ',', ';', ':', '=', '==', '===', '!=', '!==', '!', '&&', '||', '??', '?', '=>', 'return', 'case', 'throw', 'else', 'do', 'in', 'of']);
+
+const findTemplateExpressionEnd = (source, start) => {
+  let depth = 1;
+  let index = start;
+  const templateQuote = String.fromCharCode(96);
+  while (index < source.length) {
+    const character = source[index];
+    if (character === '"' || character === "'") {
+      const quote = character;
+      let escaped = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === quote) {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '/') {
+      index += 2;
+      while (index < source.length && source[index] !== '\n') index += 1;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (character === templateQuote) {
+      index = skipTemplateSource(source, index);
+      continue;
+    }
+    if (character === '{') depth += 1;
+    else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+    index += 1;
+  }
+  return -1;
+};
+
+const skipTemplateSource = (source, start) => {
+  const templateQuote = String.fromCharCode(96);
+  let index = start + 1;
+  while (index < source.length) {
+    if (source[index] === '\\') {
+      index += 2;
+      continue;
+    }
+    if (source[index] === templateQuote) return index + 1;
+    if (source[index] === '$' && source[index + 1] === '{') {
+      const expressionEnd = findTemplateExpressionEnd(source, index + 2);
+      if (expressionEnd === -1) return source.length;
+      index = expressionEnd + 1;
+      continue;
+    }
+    index += 1;
+  }
+  return source.length;
+};
+
+const tokenizeSource = source => {
+  const tokens = [];
+  const newlineOffsets = [];
+  for (let offset = 0; offset < source.length; offset += 1) {
+    if (source[offset] === '\n') newlineOffsets.push(offset);
+  }
+  const lineAt = offset => {
+    let low = 0;
+    let high = newlineOffsets.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (newlineOffsets[middle] < offset) low = middle + 1;
+      else high = middle;
+    }
+    return low + 1;
+  };
+  let index = 0;
+  let previous = null;
+  const push = (type, value, start, end) => {
+    const token = { type, value, start, end, line: lineAt(start) };
+    tokens.push(token);
+    previous = token;
+  };
+  const canStartRegex = () => {
+    if (!previous || REGEX_PREFIXES.has(previous.value)) return true;
+    if (previous.value !== ')') return false;
+    let depth = 0;
+    for (let tokenIndex = tokens.length - 1; tokenIndex >= 0; tokenIndex -= 1) {
+      const value = tokens[tokenIndex].value;
+      if (value === ')') depth += 1;
+      else if (value === '(') {
+        depth -= 1;
+        if (depth === 0) {
+          return new Set(['if', 'while', 'for', 'with', 'switch', 'catch'])
+            .has(tokens[tokenIndex - 1]?.value);
+        }
+      }
+    }
+    return false;
+  };
+
+  while (index < source.length) {
+    const character = source[index];
+    if (/\s/.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '/') {
+      index += 2;
+      while (index < source.length && source[index] !== '\n') index += 1;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      const start = index;
+      const quote = character;
+      let escaped = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === quote) {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      push('string', source.slice(start + 1, Math.max(start + 1, index - 1)), start, index);
+      continue;
+    }
+    if (character === '`') {
+      const start = index;
+      let hasSubstitution = false;
+      const templateQuote = String.fromCharCode(96);
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === '\\') {
+          index += 2;
+          continue;
+        }
+        if (source[index] === templateQuote) {
+          index += 1;
+          break;
+        }
+        if (source[index] === '$' && source[index + 1] === '{') {
+          const expressionStart = index + 2;
+          const expressionEnd = findTemplateExpressionEnd(source, expressionStart);
+          if (expressionEnd === -1) {
+            index = source.length;
+            break;
+          }
+          if (!hasSubstitution) push('template-dynamic', null, start, start + 1);
+          hasSubstitution = true;
+          const expressionTokens = tokenizeSource(source.slice(expressionStart, expressionEnd));
+          for (const token of expressionTokens) {
+            push(token.type, token.value, expressionStart + token.start, expressionStart + token.end);
+          }
+          index = expressionEnd + 1;
+          continue;
+        }
+        index += 1;
+      }
+      if (hasSubstitution) push('template-dynamic', null, Math.max(start, index - 1), index);
+      else push('template', source.slice(start + 1, Math.max(start + 1, index - 1)), start, index);
+      continue;
+    }
+    if (character === '/' && canStartRegex()) {
+      const start = index;
+      let escaped = false;
+      let inClass = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === '[') inClass = true;
+        else if (current === ']') inClass = false;
+        else if (current === '/' && !inClass) {
+          index += 1;
+          while (index < source.length && isIdentifierPart(source[index])) index += 1;
+          break;
+        }
+        index += 1;
+      }
+      push('regex', null, start, index);
+      continue;
+    }
+    if (isIdentifierStart(character)) {
+      const start = index;
+      index += 1;
+      while (index < source.length && isIdentifierPart(source[index])) index += 1;
+      push('identifier', source.slice(start, index), start, index);
+      continue;
+    }
+    if (/[0-9]/.test(character)) {
+      const start = index;
+      index += 1;
+      while (index < source.length && /[0-9A-Za-z._]/.test(source[index])) index += 1;
+      push('number', source.slice(start, index), start, index);
+      continue;
+    }
+    const operator = ['...', '===', '!==', '&&=', '||=', '??=', '=>', '>=', '<=', '==', '!=', '&&', '||', '??', '?.', '++', '--'].find(value => source.startsWith(value, index));
+    if (operator) {
+      push('operator', operator, index, index + operator.length);
+      index += operator.length;
+      continue;
+    }
+    push('punctuation', character, index, index + 1);
+    index += 1;
+  }
+  return tokens;
+};
+
+const findTokenPairs = tokens => {
+  const pairs = new Map();
+  const stacks = new Map([['(', []], ['{', []], ['[', []]]);
+  const closing = new Map([[')', '('], ['}', '{'], [']', '[']]);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const value = tokens[index].value;
+    if (stacks.has(value)) {
+      stacks.get(value).push(index);
+      continue;
+    }
+    if (!closing.has(value)) continue;
+    const stack = stacks.get(closing.get(value));
+    const opening = stack.pop();
+    if (opening === undefined) continue;
+    pairs.set(opening, index);
+    pairs.set(index, opening);
+  }
+  return pairs;
+};
+
+const isGapEnumElementAt = (tokens, index) => {
+  const object = tokens[index]?.value;
+  const bracketIndex = tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '['
+    ? index + 2
+    : index + 1;
+  const property = tokens[bracketIndex + 1];
+  return (object === 'READINESS' || object === 'THREAD_STATES')
+    && tokens[bracketIndex]?.value === '['
+    && (property?.type === 'string' || property?.type === 'template')
+    && property.value === 'GAP'
+    && tokens[bracketIndex + 2]?.value === ']';
+};
+
+const isGapValueAt = (tokens, index) => {
+  const token = tokens[index];
+  if (!token) return false;
+  let valueEnd;
+  if ((token.type === 'string' || token.type === 'template') && token.value === 'gap') {
+    valueEnd = index + 1;
+  } else if ((token.value === 'READINESS' || token.value === 'THREAD_STATES')
+    && ((['.', '?.'].includes(tokens[index + 1]?.value) && tokens[index + 2]?.value === 'GAP')
+      || isGapEnumElementAt(tokens, index))) {
+    valueEnd = gapValueEnd(tokens, index);
+  } else {
+    return false;
+  }
+  return !['.', '?.', '[', '('].includes(tokens[valueEnd]?.value);
+};
+
+const findDelimitedEnd = (tokens, start, end, closingValue) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+    else if (value === closingValue && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+  }
+  return end;
+};
+
+const COMPARISON_OPERATORS = new Set(['==', '===', '!=', '!==', '>', '>=', '<', '<=']);
+
+const gapValueEnd = (tokens, index) => {
+  if ((tokens[index]?.type === 'string' || tokens[index]?.type === 'template')) return index + 1;
+  if ((tokens[index]?.value === 'READINESS' || tokens[index]?.value === 'THREAD_STATES')
+    && ['.', '?.'].includes(tokens[index + 1]?.value)
+    && tokens[index + 2]?.value === 'GAP') return index + 3;
+  if (isGapEnumElementAt(tokens, index)) return index + (tokens[index + 1]?.value === '?.' ? 5 : 4);
+  return index + 1;
+};
+
+const isComparisonOperand = (tokens, index, start, end) => {
+  let left = index - 1;
+  while (left >= start && (tokens[left]?.value === '.' || tokens[left]?.type === 'identifier')) left -= 1;
+  if (left >= start && COMPARISON_OPERATORS.has(tokens[left]?.value)
+    && !(tokens[left]?.value === '>'
+      && tokens[left - 1]?.type === 'identifier'
+      && tokens[left - 2]?.value === '<'
+      && ['return', '=', '(', '[', '{', ',', ':', '=>', '?', '&&', '||', '??', 'throw']
+        .includes(tokens[left - 3]?.value))) return true;
+  let right = gapValueEnd(tokens, index);
+  while (right < end && (tokens[right]?.value === '.' || tokens[right]?.type === 'identifier')) right += 1;
+  return right < end && COMPARISON_OPERATORS.has(tokens[right]?.value);
+};
+
+const scanExpressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const callParentheses = [];
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    const previousValue = tokens[index - 1]?.value;
+    const unaryOperator = ['void', 'typeof', 'delete', '!', '~'].includes(value)
+      || ['+', '-'].includes(value)
+        && (index === start || ['=', '(', '[', '{', ',', ':', 'return', '=>', '?', '&&', '||', '??'].includes(previousValue));
+    if (unaryOperator) {
+      const operandStart = index + 1;
+      let operandEnd = gapValueEnd(tokens, operandStart);
+      while (operandEnd < end
+        && (tokens[operandEnd]?.value === '.' || tokens[operandEnd]?.type === 'identifier')) operandEnd += 1;
+      index = Math.max(index, operandEnd - 1);
+      continue;
+    }
+    const insideCall = allowNestedCalls && callParentheses.some(Boolean);
+    const isGapAlias = tokens[index].type === 'identifier'
+      && aliases.has(value)
+      && !['.', '?.', '[', '('].includes(tokens[index + 1]?.value);
+    if ((parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 || insideCall)
+      && !isComparisonOperand(tokens, index, start, end)
+      && (isGapValueAt(tokens, index) || isGapAlias)) return true;
+    if (value === '(') {
+      const previous = tokens[index - 1];
+      callParentheses.push(previous?.type === 'identifier' || [')', ']'].includes(previous?.value));
+      parenDepth += 1;
+    } else if (value === ')') {
+      parenDepth -= 1;
+      callParentheses.pop();
+    }
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return false;
+};
+
+const topLevelLogicalOperatorAt = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let selected = null;
+  const precedence = new Map([['??', 1], ['||', 2], ['&&', 3]]);
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index]?.value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && precedence.has(value)) {
+      const candidate = precedence.get(value);
+      if (!selected || candidate < selected.precedence) selected = { index, value, precedence: candidate };
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return selected;
+};
+
+const knownOutcomeMemberAt = (tokens, start, end) => {
+  if (!['READINESS', 'THREAD_STATES'].includes(tokens[start]?.value)) return null;
+  let propertyIndex;
+  let memberEnd;
+  if (tokens[start + 1]?.value === '.'
+    || (tokens[start + 1]?.value === '?.' && tokens[start + 2]?.value !== '[')) {
+    propertyIndex = start + 2;
+    memberEnd = propertyIndex + 1;
+  } else {
+    const bracketIndex = tokens[start + 1]?.value === '?.' && tokens[start + 2]?.value === '['
+      ? start + 2
+      : start + 1;
+    if (tokens[bracketIndex]?.value !== '[' || tokens[bracketIndex + 2]?.value !== ']') return null;
+    propertyIndex = bracketIndex + 1;
+    memberEnd = bracketIndex + 3;
+  }
+  const property = tokens[propertyIndex];
+  if (!property || memberEnd !== end || !['identifier', 'string', 'template'].includes(property.type)) return null;
+  return { isGap: property.value === 'GAP', truthy: true, nullish: false };
+};
+
+const staticExpressionOutcomeAt = (tokens, start, end, aliases, allowNestedCalls) => {
+  while (tokens[end - 1]?.value === ';') end -= 1;
+  while (tokens[start]?.value === '(' && tokens[end - 1]?.value === ')') {
+    start += 1;
+    end -= 1;
+  }
+  if (start >= end) return { isGap: false, truthy: null, nullish: null };
+
+  const logical = topLevelLogicalOperatorAt(tokens, start, end);
+  if (logical) {
+    const left = staticExpressionOutcomeAt(tokens, start, logical.index, aliases, allowNestedCalls);
+    const right = staticExpressionOutcomeAt(tokens, logical.index + 1, end, aliases, allowNestedCalls);
+    const merge = () => ({
+      isGap: left.isGap || right.isGap,
+      truthy: left.truthy === right.truthy ? left.truthy : null,
+      nullish: left.nullish === right.nullish ? left.nullish : null
+    });
+    if (logical.value === '&&') {
+      if (left.truthy === true) return right;
+      if (left.truthy === false) return left;
+      return merge();
+    }
+    if (logical.value === '||') {
+      if (left.truthy === true) return left;
+      if (left.truthy === false) return right;
+      return merge();
+    }
+    if (left.nullish === true) return right;
+    if (left.nullish === false) return left;
+    return merge();
+  }
+
+  const outcomeMember = knownOutcomeMemberAt(tokens, start, end);
+  if (outcomeMember) return outcomeMember;
+  if (isGapValueAt(tokens, start) && gapValueEnd(tokens, start) === end
+    && !isComparisonOperand(tokens, start, start, end)) {
+    return { isGap: true, truthy: true, nullish: false };
+  }
+  if (end - start === 1) {
+    const token = tokens[start];
+    if (token.type === 'identifier' && aliases.has(token.value)) {
+      return { isGap: true, truthy: true, nullish: false };
+    }
+    if (token.value === 'true') return { isGap: false, truthy: true, nullish: false };
+    if (token.value === 'false') return { isGap: false, truthy: false, nullish: false };
+    if (token.value === 'null' || token.value === 'undefined') {
+      return { isGap: false, truthy: false, nullish: true };
+    }
+    if (token.type === 'string' || token.type === 'template') {
+      return { isGap: token.value === 'gap', truthy: Boolean(token.value), nullish: false };
+    }
+    if (token.type === 'number' && Number.isFinite(Number(token.value))) {
+      const value = Number(token.value);
+      return { isGap: false, truthy: Boolean(value), nullish: false };
+    }
+  }
+  if ((tokens[start]?.value === '[' || tokens[start]?.value === '{')
+    && end - start > 1) return { isGap: scanExpressionHasGap(tokens, start, end, aliases, allowNestedCalls), truthy: true, nullish: false };
+  return {
+    isGap: scanExpressionHasGap(tokens, start, end, aliases, allowNestedCalls),
+    truthy: null,
+    nullish: null
+  };
+};
+
+const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => (
+  staticExpressionOutcomeAt(tokens, start, end, aliases, allowNestedCalls).isGap
+);
+
+const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set(), allowNestedCalls = false) => {
+  return Array.from(objectOutcomeGapProperties(
+    tokens,
+    openingIndex,
+    closingIndex,
+    pairs,
+    aliases,
+    allowNestedCalls
+  ).values()).some(Boolean);
+};
+
+const objectOutcomeGapProperties = (tokens, openingIndex, closingIndex, pairs, aliases, allowNestedCalls) => {
+  const properties = new Map();
+  for (const [propertyStart, propertyEnd] of topLevelSegments(tokens, openingIndex + 1, closingIndex)) {
+    if (propertyStart >= propertyEnd) continue;
+    if (tokens[propertyStart].value === '...') {
+      const spreadStart = propertyStart + 1;
+      const spreadEnd = pairs.get(spreadStart);
+      if (tokens[spreadStart]?.value === '{' && spreadEnd === propertyEnd - 1) {
+        for (const [name, hasGap] of objectOutcomeGapProperties(
+          tokens,
+          spreadStart,
+          spreadEnd,
+          pairs,
+          aliases,
+          allowNestedCalls
+        )) properties.set(name, hasGap);
+      } else if (tokens[spreadStart]?.type === 'identifier') {
+        const objectRange = staticObjectInitializerRangeAt(
+          tokens,
+          tokens[spreadStart].value,
+          openingIndex,
+          pairs
+        );
+        if (objectRange) {
+          for (const [name, hasGap] of objectOutcomeGapProperties(
+            tokens,
+            objectRange.start,
+            objectRange.end - 1,
+            pairs,
+            aliases,
+            allowNestedCalls
+          )) properties.set(name, hasGap);
+        } else if (aliases.has(tokens[spreadStart].value)) {
+          properties.set('*', true);
+        }
+      }
+      continue;
+    }
+    const computedKey = tokens[propertyStart].value === '[' && tokens[propertyStart + 2]?.value === ']';
+    const propertyName = computedKey
+      ? staticPropertyName(tokens[propertyStart + 1])
+      : staticPropertyName(tokens[propertyStart]);
+    if (propertyName === null || !OUTCOME_NAMES.has(propertyName)) continue;
+    const colonIndex = computedKey ? propertyStart + 3 : propertyStart + 1;
+    if (tokens[colonIndex]?.value === ':') {
+      const valueStart = colonIndex + 1;
+      const valueEnd = findDelimitedEnd(tokens, valueStart, propertyEnd, '}');
+      properties.set(propertyName, valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls));
+    } else if (tokens[propertyStart].type === 'identifier'
+      && aliases.has(propertyName)
+      && propertyStart + 1 === propertyEnd) {
+      properties.set(propertyName, true);
+    }
+  }
+  return properties;
+};
+
+const conditionalExpressionArms = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let questionIndex;
+  let nestedQuestions = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === '?') {
+      if (questionIndex === undefined) questionIndex = index;
+      else nestedQuestions += 1;
+    } else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === ':') {
+      if (questionIndex !== undefined && nestedQuestions === 0) {
+        return {
+          predicateStart: start,
+          predicateEnd: questionIndex,
+          arms: [[questionIndex + 1, index], [index + 1, end]]
+        };
+      }
+      if (nestedQuestions > 0) nestedQuestions -= 1;
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return null;
+};
+
+const valueHasGap = (tokens, start, end, pairs, aliases = new Set(), allowNestedCalls = false) => {
+  if (start >= end) return false;
+  let valueStart = start;
+  let valueEnd = end;
+  while (tokens[valueEnd - 1]?.value === ';') valueEnd -= 1;
+  while (tokens[valueStart]?.value === '(') {
+    const closingIndex = pairs.get(valueStart);
+    if (closingIndex !== valueEnd - 1) break;
+    valueStart += 1;
+    valueEnd = closingIndex;
+  }
+  if (valueStart >= valueEnd) return false;
+  if (topLevelLogicalOperatorAt(tokens, valueStart, valueEnd)) {
+    return staticExpressionOutcomeAt(tokens, valueStart, valueEnd, aliases, allowNestedCalls).isGap;
+  }
+  if (isGapValueAt(tokens, valueStart)
+    && gapValueEnd(tokens, valueStart) === valueEnd
+    && !isComparisonOperand(tokens, valueStart, valueStart, valueEnd)) return true;
+  if (tokens[valueStart].type === 'identifier' && aliases.has(tokens[valueStart].value)
+    && valueEnd === valueStart + 1
+    && !isComparisonOperand(tokens, valueStart, valueStart, valueEnd)) return true;
+  const conditionalExpression = conditionalExpressionArms(tokens, valueStart, valueEnd);
+  if (conditionalExpression) {
+    const predicateOutcome = staticExpressionOutcomeAt(
+      tokens,
+      conditionalExpression.predicateStart,
+      conditionalExpression.predicateEnd,
+      aliases,
+      allowNestedCalls
+    );
+    let selectedArms = conditionalExpression.arms;
+    if (predicateOutcome.truthy === true) selectedArms = [conditionalExpression.arms[0]];
+    else if (predicateOutcome.truthy === false) selectedArms = [conditionalExpression.arms[1]];
+    if (selectedArms.some(([armStart, armEnd]) => valueHasGap(
+      tokens,
+      armStart,
+      armEnd,
+      pairs,
+      aliases,
+      allowNestedCalls
+    ))) return true;
+    return false;
+  }
+  if (tokens[valueStart].value === '{') {
+    const closingIndex = pairs.get(valueStart);
+    return closingIndex !== undefined && closingIndex < valueEnd
+      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex, pairs, aliases, allowNestedCalls)
+      : false;
+  }
+  return expressionHasGap(tokens, valueStart, valueEnd, aliases, allowNestedCalls);
+};
+
+const findStatementEnd = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const statementLine = tokens[start]?.line;
+  if (tokens[start]?.value === 'return' && tokens[start + 1]?.line > statementLine) return start + 1;
+  if (tokens[start - 1]?.value === 'return' && tokens[start]?.line > tokens[start - 1].line) return start;
+  const asiStarters = new Set(['function', 'const', 'let', 'var', 'if', 'return', 'for', 'while', 'switch', 'try', 'throw', 'class', 'export', 'import']);
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (index > start && tokens[index].line > statementLine && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && asiStarters.has(value) && ['identifier', 'string', 'template', 'number'].includes(tokens[index - 1]?.type)) return index;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') {
+      if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+      braceDepth -= 1;
+    } else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ';' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index + 1;
+  }
+  return end;
+};
+
+const findControlledStatementEnd = (tokens, start, end, pairs, includeElse = true) => {
+  if (start >= end) return end;
+  if (tokens[start].value === '{') return Math.min(end, (pairs.get(start) ?? end - 1) + 1);
+  if (tokens[start].value === 'if' && tokens[start + 1]?.value === '(') {
+    const conditionEnd = pairs.get(start + 1);
+    if (conditionEnd === undefined) return findStatementEnd(tokens, start, end);
+    const bodyStart = conditionEnd + 1;
+    const bodyEnd = tokens[bodyStart]?.value === '{'
+      ? Math.min(end, (pairs.get(bodyStart) ?? end - 1) + 1)
+      : findControlledStatementEnd(tokens, bodyStart, end, pairs);
+    if (includeElse && tokens[bodyEnd]?.value === 'else') return findControlledStatementEnd(tokens, bodyEnd + 1, end, pairs);
+    return bodyEnd;
+  }
+  return findStatementEnd(tokens, start, end);
+};
+
+const statementAlwaysAbrupt = (tokens, start, end, pairs) => {
+  if (start >= end) return false;
+  if (['return', 'throw'].includes(tokens[start]?.value)) return true;
+  if (tokens[start]?.value === '{') {
+    const closing = pairs.get(start);
+    return closing !== undefined && blockAlwaysAbrupt(tokens, start + 1, closing, pairs);
+  }
+  if (tokens[start]?.value !== 'if' || tokens[start + 1]?.value !== '(') return false;
+  const conditionEnd = pairs.get(start + 1);
+  if (conditionEnd === undefined) return false;
+  const consequentStart = conditionEnd + 1;
+  const consequentEnd = findControlledStatementEnd(tokens, consequentStart, end, pairs, false);
+  if (!statementAlwaysAbrupt(tokens, consequentStart, consequentEnd, pairs)
+    || tokens[consequentEnd]?.value !== 'else') return false;
+  const alternateStart = consequentEnd + 1;
+  const alternateEnd = findControlledStatementEnd(tokens, alternateStart, end, pairs, false);
+  return statementAlwaysAbrupt(tokens, alternateStart, alternateEnd, pairs);
+};
+
+const blockAlwaysAbrupt = (tokens, start, end, pairs) => {
+  let index = start;
+  while (index < end) {
+    if (tokens[index].value === ';') {
+      index += 1;
+      continue;
+    }
+    const statementEnd = findControlledStatementEnd(tokens, index, end, pairs, false);
+    if (statementAlwaysAbrupt(tokens, index, statementEnd, pairs)) return true;
+    if (statementEnd <= index) return false;
+    index = statementEnd;
+  }
+  return false;
+};
+
+const returnIsOverriddenByFinally = (tokens, returnIndex, end, pairs, functionRanges) => {
+  for (let tryIndex = 0; tryIndex < returnIndex; tryIndex += 1) {
+    if (tokens[tryIndex].value !== 'try') continue;
+    const tryOpening = tryIndex + 1;
+    const tryClosing = pairs.get(tryOpening);
+    if (tokens[tryOpening]?.value !== '{' || tryClosing === undefined) continue;
+
+    let completionStart = tryClosing + 1;
+    let catchOpening;
+    let catchClosing;
+    if (tokens[completionStart]?.value === 'catch') {
+      let catchBody = completionStart + 1;
+      if (tokens[catchBody]?.value === '(') {
+        const catchParametersEnd = pairs.get(catchBody);
+        if (catchParametersEnd === undefined) continue;
+        catchBody = catchParametersEnd + 1;
+      }
+      if (tokens[catchBody]?.value !== '{') continue;
+      catchOpening = catchBody;
+      catchClosing = pairs.get(catchOpening);
+      if (catchClosing === undefined) continue;
+      completionStart = catchClosing + 1;
+    }
+    if (tokens[completionStart]?.value !== 'finally') continue;
+    const finallyOpening = completionStart + 1;
+    const finallyClosing = pairs.get(finallyOpening);
+    if (tokens[finallyOpening]?.value !== '{' || finallyClosing === undefined || finallyClosing >= end) continue;
+
+    const returnsFromTry = tryOpening < returnIndex && returnIndex < tryClosing;
+    const returnsFromCatch = catchOpening !== undefined
+      && catchOpening < returnIndex && returnIndex < catchClosing;
+    if (!returnsFromTry && !returnsFromCatch) continue;
+    const exitsFromNestedFunction = functionRanges.some(range => (
+      tryOpening < range.opening && range.opening < returnIndex && returnIndex < range.closing
+    ));
+    if (exitsFromNestedFunction) continue;
+    if (blockAlwaysAbrupt(tokens, finallyOpening + 1, finallyClosing, pairs)) return true;
+  }
+  return false;
+};
+
+const findFunctionRanges = (tokens, pairs) => {
+  const ranges = [];
+  const classBodies = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== 'class') continue;
+    for (let body = index + 1; body < tokens.length; body += 1) {
+      if (tokens[body].value === '{') {
+        const closing = pairs.get(body);
+        if (closing !== undefined) classBodies.push({ opening: body, closing });
+        break;
+      }
+      if ([';', '}'].includes(tokens[body].value)) break;
+    }
+  }
+  const controlHeaders = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+  const isClassMethod = parameterOpening => {
+    const methodName = tokens[parameterOpening - 1];
+    if (!methodName || (methodName.type !== 'identifier' && methodName.value !== ']')
+      || controlHeaders.has(methodName.value)) return false;
+    return classBodies.some(({ opening, closing }) => (
+      opening < parameterOpening && parameterOpening < closing
+    ));
+  };
+  const isObjectMethod = parameterOpening => {
+    const methodName = tokens[parameterOpening - 1];
+    return methodName?.type === 'identifier'
+      && !controlHeaders.has(methodName.value)
+      && ['{', ','].includes(tokens[parameterOpening - 2]?.value);
+  };
+  for (let opening = 0; opening < tokens.length; opening += 1) {
+    if (tokens[opening].value !== '{') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined) continue;
+    const previousIndex = opening - 1;
+    if (tokens[previousIndex]?.value === '=>') {
+      ranges.push({ start: previousIndex, opening, closing });
+      continue;
+    }
+    if (tokens[previousIndex]?.value !== ')') continue;
+    const parameterOpening = pairs.get(previousIndex);
+    if (parameterOpening === undefined) continue;
+    let start = parameterOpening - 1;
+    while (start >= 0 && ![';', '{', '}'].includes(tokens[start].value)) {
+      if (tokens[start].value === 'function') {
+        ranges.push({ start, opening, closing });
+        break;
+      }
+      start -= 1;
+    }
+    if (isClassMethod(parameterOpening) || isObjectMethod(parameterOpening)) {
+      ranges.push({ start: parameterOpening - 1, opening, closing });
+    }
+  }
+  const findArrowExpressionEnd = start => {
+    let parenDepth = 0;
+    let braceDepth = 0;
+    let bracketDepth = 0;
+    const statementLine = tokens[start]?.line;
+    const asiStarters = new Set(['function', 'const', 'let', 'var', 'if', 'return', 'for', 'while', 'switch', 'try', 'throw', 'class', 'export', 'import']);
+    for (let index = start; index < tokens.length; index += 1) {
+      const value = tokens[index].value;
+      if (index > start && tokens[index].line > statementLine && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+        && asiStarters.has(value) && ['identifier', 'string', 'template', 'number'].includes(tokens[index - 1]?.type)) return index;
+      if (value === '(') parenDepth += 1;
+      else if (value === ')') {
+        if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+        parenDepth -= 1;
+      } else if (value === '{') braceDepth += 1;
+      else if (value === '}') {
+        if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+        braceDepth -= 1;
+      } else if (value === '[') bracketDepth += 1;
+      else if (value === ']') bracketDepth -= 1;
+      else if (value === ';' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index + 1;
+      else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+    }
+    return tokens.length;
+  };
+  for (let arrow = 0; arrow < tokens.length; arrow += 1) {
+    if (tokens[arrow].value !== '=>' || tokens[arrow + 1]?.value === '{') continue;
+    const bodyStart = arrow + 1;
+    const bodyEnd = findArrowExpressionEnd(bodyStart);
+    ranges.push({
+      start: arrow,
+      opening: bodyStart,
+      closing: bodyEnd - 1,
+      bodyStart,
+      bodyEnd,
+      expression: true
+    });
+  }
+  return ranges;
+};
+
+const findIfDecision = (tokens, triggerIndex, pairs) => {
+  let best = null;
+  for (let index = triggerIndex; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'if' || tokens[index + 1]?.value !== '(') continue;
+    const closingCondition = pairs.get(index + 1);
+    if (closingCondition === undefined || triggerIndex > closingCondition) continue;
+    if (!best || closingCondition - index < best.closingCondition - best.start) {
+      best = { start: index, closingCondition };
+    }
+  }
+  return best;
+};
+
+const findFunctionDecision = (ranges, triggerIndex) => {
+  const containing = ranges
+    .filter(range => range.expression
+      ? range.bodyStart <= triggerIndex && triggerIndex < range.bodyEnd
+      : range.opening < triggerIndex && triggerIndex < range.closing)
+    .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening));
+  if (containing[0]) return containing[0];
+  return ranges
+    .filter(range => range.start < triggerIndex
+      && (range.expression ? triggerIndex < range.bodyStart : triggerIndex < range.opening))
+    .sort((left, right) => left.opening - right.opening)[0] || null;
+};
+
+const findStatementRange = (tokens, triggerIndex) => {
+  let start = triggerIndex;
+  while (start > 0 && ![';', '{', '}'].includes(tokens[start - 1].value)) start -= 1;
+  return { start, end: findStatementEnd(tokens, start, tokens.length), opening: null };
+};
+
+const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
+  let cursor = triggerIndex - 1;
+  while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
+  let negated = false;
+  while (cursor >= conditionStart && tokens[cursor].value === '!') {
+    negated = !negated;
+    cursor -= 1;
+    while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
+  }
+  const isNegatingComparison = index => {
+    const operator = tokens[index]?.value;
+    if (operator !== '!=' && operator !== '!==' && operator !== '==' && operator !== '===') return false;
+    const left = tokens[index - 1]?.value;
+    const right = tokens[index + 1]?.value;
+    const booleanOperand = [left, right].find(value => value === 'true' || value === 'false');
+    if (booleanOperand === undefined) return operator === '!=' || operator === '!==';
+    if (operator === '!=' || operator === '!==') return booleanOperand === 'true';
+    return booleanOperand === 'false';
+  };
+  const scanForInequality = (start, step) => {
+    for (let index = start; index >= conditionStart && index < tokens.length; index += step) {
+      if (isNegatingComparison(index)) return true;
+      if (['&&', '||', '?', ':', ')'].includes(tokens[index].value)) break;
+    }
+    return false;
+  };
+  return negated
+    || scanForInequality(triggerIndex - 1, -1)
+    || scanForInequality(triggerIndex + 1, 1);
+};
+
+const branchRange = (tokens, start, end, pairs, allowLeadingBlockContinuation = false) => {
+  if (start >= end) return { start, end, opening: null };
+  if (tokens[start].value !== '{') return { start, end, opening: null };
+  const closing = pairs.get(start);
+  if (allowLeadingBlockContinuation && closing !== undefined && closing < end - 1) {
+    return { start, end, opening: null };
+  }
+  if (closing === undefined || closing >= end) return { start: start + 1, end, opening: start };
+  return { start: start + 1, end: closing, opening: start };
+};
+
+const caughtThrowHandlerEnd = (tokens, throwIndex, pairs) => {
+  for (let index = throwIndex - 1; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'try') continue;
+    const tryOpening = index + 1;
+    if (tokens[tryOpening]?.value !== '{') continue;
+    const tryClosing = pairs.get(tryOpening);
+    if (tryClosing === undefined || throwIndex <= tryOpening || throwIndex >= tryClosing) continue;
+
+    const catchIndex = tryClosing + 1;
+    if (tokens[catchIndex]?.value !== 'catch') continue;
+    let catchOpening = catchIndex + 1;
+    if (tokens[catchOpening]?.value === '(') {
+      const parameterClosing = pairs.get(catchOpening);
+      if (parameterClosing === undefined) continue;
+      catchOpening = parameterClosing + 1;
+    }
+    if (tokens[catchOpening]?.value !== '{') continue;
+    return pairs.get(catchOpening) ?? null;
+  }
+  return null;
+};
+
+const enclosingFinallyHandlerEnd = (tokens, completionIndex, pairs) => {
+  let end = null;
+  for (let index = completionIndex - 1; index >= 0; index -= 1) {
+    if (tokens[index]?.value !== 'try') continue;
+    const tryOpening = index + 1;
+    if (tokens[tryOpening]?.value !== '{') continue;
+    const tryClosing = pairs.get(tryOpening);
+    if (tryClosing === undefined) continue;
+    let handlerStart = tryClosing + 1;
+    let containsCompletion = completionIndex > tryOpening && completionIndex < tryClosing;
+    if (tokens[handlerStart]?.value === 'catch') {
+      let catchOpening = handlerStart + 1;
+      if (tokens[catchOpening]?.value === '(') {
+        const parameterClosing = pairs.get(catchOpening);
+        if (parameterClosing === undefined) continue;
+        catchOpening = parameterClosing + 1;
+      }
+      if (tokens[catchOpening]?.value !== '{') continue;
+      const catchClosing = pairs.get(catchOpening);
+      if (catchClosing === undefined) continue;
+      containsCompletion = containsCompletion
+        || (completionIndex > catchOpening && completionIndex < catchClosing);
+      handlerStart = catchClosing + 1;
+    }
+    if (!containsCompletion || tokens[handlerStart]?.value !== 'finally') continue;
+    const finallyOpening = handlerStart + 1;
+    if (tokens[finallyOpening]?.value !== '{') continue;
+    const finallyClosing = pairs.get(finallyOpening);
+    if (finallyClosing !== undefined) end = Math.max(end ?? finallyClosing, finallyClosing);
+  }
+  return end;
+};
+
+const includeAbruptCompletionHandlers = (tokens, decision, pairs, functionRanges) => {
+  if (!decision) return decision;
+  let end = decision.end;
+  const continuations = [...(decision.continuations || [])];
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (let index = decision.start; index < end; index += 1) {
+      const completion = tokens[index]?.value;
+      if (completion === 'throw') {
+        const catchEnd = caughtThrowHandlerEnd(tokens, index, pairs);
+        if (catchEnd !== null && catchEnd > end) {
+          end = catchEnd;
+          expanded = true;
+        }
+      }
+      if (!['break', 'continue', 'return', 'throw'].includes(completion)) continue;
+      if (completion === 'break') {
+        const continuation = findLoopBreakContinuation(tokens, index, pairs, functionRanges);
+        if (continuation
+          && !continuations.some(range => range.start === continuation.start && range.end === continuation.end)) {
+          continuations.push(continuation);
+          expanded = true;
+        }
+      }
+      const finallyEnd = enclosingFinallyHandlerEnd(tokens, index, pairs);
+      if (finallyEnd === null || finallyEnd <= end) continue;
+      end = finallyEnd;
+      expanded = true;
+    }
+  }
+  if (end === decision.end && continuations.length === (decision.continuations || []).length) return decision;
+  return { ...decision, end, continuations };
+};
+
+const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pairs, aliasNegated = false) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < triggerIndex; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  let questionIndex;
+  for (let index = triggerIndex + 1; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === '?' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      questionIndex = index;
+      break;
+    }
+  }
+  if (questionIndex === undefined) return null;
+  let nestedQuestions = 0;
+  let colonIndex;
+  parenDepth = 0;
+  braceDepth = 0;
+  bracketDepth = 0;
+  for (let index = questionIndex + 1; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === '?') nestedQuestions += 1;
+    else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === ':') {
+      if (nestedQuestions === 0) {
+        colonIndex = index;
+        break;
+      }
+      nestedQuestions -= 1;
+    }
+  }
+  if (colonIndex === undefined) return null;
+  const negated = Boolean(aliasNegated) !== isNegatedDeadlineCondition(tokens, start, triggerIndex);
+  const selectedStart = negated ? colonIndex + 1 : questionIndex + 1;
+  const selectedEnd = negated ? end : colonIndex;
+  return { ...branchRange(tokens, selectedStart, selectedEnd, pairs), opening: null };
+};
+
+const findShortCircuitDecision = (tokens, triggerIndex, start, end, pairs, aliasNegated = false) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const conditionStart = ['return', 'throw'].includes(tokens[start]?.value) ? start + 1 : start;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && index > triggerIndex && (value === '&&' || value === '||')) {
+      const negated = Boolean(aliasNegated) !== isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
+      const expirySelectsRight = value === '&&' ? !negated : negated;
+      if (expirySelectsRight) return branchRange(tokens, index + 1, end, pairs);
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return null;
+};
+
+const isDirectSwitchAbruptCompletion = (tokens, index, start, pairs) => {
+  if (index === start || [';', ':', '}'].includes(tokens[index - 1]?.value)) return true;
+  if (tokens[index - 1]?.value !== ')') return false;
+  const opening = pairs.get(index - 1);
+  return !['if', 'for', 'while', 'switch', 'with', 'catch'].includes(tokens[opening - 1]?.value);
+};
+
+const switchArmHasAbruptCompletion = (tokens, start, end, pairs, functionRanges) => {
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  const controlledBlocks = [];
+  for (let index = start; index < end; index += 1) {
+    const functionRange = functionRanges.find(range => range.opening === index);
+    if (functionRange) {
+      index = functionRange.closing;
+      continue;
+    }
+    const value = tokens[index].value;
+    if (braceDepth <= 1 && !controlledBlocks.includes(true) && parenDepth === 0 && bracketDepth === 0
+      && ['break', 'continue', 'return', 'throw'].includes(value)
+      && isDirectSwitchAbruptCompletion(tokens, index, start, pairs)) return value;
+    if (value === '{') {
+      let isControlled = ['else', 'do'].includes(tokens[index - 1]?.value);
+      if (tokens[index - 1]?.value === ')') {
+        const headerOpening = pairs.get(index - 1);
+        isControlled = ['if', 'for', 'while', 'switch', 'catch', 'with'].includes(tokens[headerOpening - 1]?.value);
+      }
+      controlledBlocks.push(isControlled);
+      braceDepth += 1;
+    } else if (value === '}') {
+      braceDepth -= 1;
+      controlledBlocks.pop();
+    }
+    else if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return false;
+};
+
+const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
+  let best = null;
+  for (let index = triggerIndex - 1; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'switch' || tokens[index + 1]?.value !== '(') continue;
+    const conditionEnd = pairs.get(index + 1);
+    const opening = conditionEnd === undefined ? undefined : conditionEnd + 1;
+    const closing = opening === undefined ? undefined : pairs.get(opening);
+    const inDiscriminant = conditionEnd !== undefined && triggerIndex >= index + 2 && triggerIndex < conditionEnd;
+    const inBody = opening !== undefined && closing !== undefined && triggerIndex > opening && triggerIndex < closing;
+    if (opening === undefined || tokens[opening]?.value !== '{' || closing === undefined
+      || (!inDiscriminant && !inBody)) continue;
+    if (!best || closing - opening < best.closing - best.opening) {
+      best = { opening, closing, discriminantStart: index + 2, inDiscriminant };
+    }
+  }
+  if (!best) return null;
+  const labels = [];
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  for (let index = best.opening + 1; index < best.closing; index += 1) {
+    const value = tokens[index].value;
+    if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && (value === 'case' || value === 'default')) {
+      let colon = index + 1;
+      while (colon < best.closing && tokens[colon].value !== ':') colon += 1;
+      labels.push({ index, start: Math.min(colon + 1, best.closing), valueStart: index + 1, valueEnd: colon });
+      index = colon;
+    }
+  }
+  let label;
+  if (best.inDiscriminant) {
+    const negated = Boolean(aliasNegated)
+      !== isNegatedDeadlineCondition(tokens, best.discriminantStart, triggerIndex);
+    const expectedCase = negated ? 'false' : 'true';
+    label = labels.find(candidate => candidate.valueEnd === candidate.valueStart + 1
+      && tokens[candidate.valueStart]?.value === expectedCase);
+    if (!label) label = labels.find(candidate => tokens[candidate.index]?.value === 'default');
+  } else {
+    const matchingLabels = labels.filter(candidate => candidate.index <= triggerIndex);
+    label = matchingLabels[matchingLabels.length - 1];
+  }
+  if (!label) return null;
+  let bodyPosition = labels.indexOf(label);
+  while (bodyPosition + 1 < labels.length && labels[bodyPosition].start === labels[bodyPosition + 1].index) {
+    bodyPosition += 1;
+  }
+  const start = labels[bodyPosition].start;
+  let end = best.closing;
+  for (let index = bodyPosition; index < labels.length; index += 1) {
+    const next = labels[index + 1];
+    const armEnd = next?.index ?? best.closing;
+    const abruptCompletion = switchArmHasAbruptCompletion(
+      tokens,
+      labels[index].start,
+      armEnd,
+      pairs,
+      functionRanges
+    );
+    if (abruptCompletion === 'break') {
+      const afterSwitch = best.closing + 1;
+      return {
+        start: afterSwitch,
+        end: findFallthroughScopeEnd(tokens, afterSwitch, pairs, functionRanges),
+        opening: best.opening
+      };
+    }
+    if (abruptCompletion) {
+      end = armEnd;
+      break;
+    }
+  }
+  return { start, end, opening: best.opening };
+};
+
+const findFallthroughScopeEnd = (tokens, position, pairs, functionRanges, crossBlockBoundaries = false) => {
+  const containingFunction = functionRanges.find(range =>
+    position >= range.bodyStart && position < range.bodyEnd
+  );
+  let end = containingFunction?.bodyEnd ?? tokens.length;
+  if (crossBlockBoundaries) return end;
+  for (let opening = position - 1; opening >= 0; opening -= 1) {
+    if (tokens[opening].value !== '{') continue;
+    const closing = pairs.get(opening);
+    if (closing !== undefined && closing > position && closing < end) {
+      end = closing;
+      break;
+    }
+  }
+  return end;
+};
+
+const findFallthroughStatementsEnd = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  crossBlockBoundaries = false
+) => {
+  let cursor = start;
+  while (cursor < end) {
+    while (tokens[cursor]?.value === ';') cursor += 1;
+    if (cursor >= end) break;
+    if (tokens[cursor]?.value === '}') {
+      if (!crossBlockBoundaries) break;
+      cursor += 1;
+      continue;
+    }
+    const statementEnd = findControlledStatementEnd(tokens, cursor, end, pairs);
+    if (statementEnd <= cursor || statementEnd > end) break;
+    if (switchArmHasAbruptCompletion(tokens, cursor, statementEnd, pairs, functionRanges)) {
+      return statementEnd;
+    }
+    cursor = statementEnd;
+  }
+  return cursor;
+};
+
+const findLoopBreakContinuation = (tokens, breakIndex, pairs, functionRanges) => {
+  const enclosingBreakables = [];
+  for (let index = breakIndex - 1; index >= 0; index -= 1) {
+    const kind = tokens[index]?.value;
+    if (!['for', 'while', 'switch'].includes(kind)) continue;
+    const opening = index + 1;
+    if (tokens[opening]?.value !== '(') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined || closing >= breakIndex) continue;
+    const bodyStart = closing + 1;
+    const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
+    if (breakIndex < bodyStart || breakIndex >= bodyEnd) continue;
+    const nestedFunction = functionRanges.some(range =>
+      range.start > index && range.opening < breakIndex && breakIndex < range.closing
+    );
+    if (nestedFunction) continue;
+    enclosingBreakables.push({ index, kind, bodyEnd, bodyStart });
+  }
+
+  const target = enclosingBreakables.sort((left, right) =>
+    (left.bodyEnd - left.bodyStart) - (right.bodyEnd - right.bodyStart)
+      || right.index - left.index
+  )[0];
+  if (!target || target.kind === 'switch') return null;
+
+  const scopeEnd = findFallthroughScopeEnd(tokens, target.index, pairs, functionRanges);
+  const fallthroughEnd = findFallthroughStatementsEnd(
+    tokens,
+    target.bodyEnd,
+    scopeEnd,
+    pairs,
+    functionRanges
+  );
+  if (fallthroughEnd <= target.bodyEnd) return null;
+  return branchRange(tokens, target.bodyEnd, fallthroughEnd, pairs);
+};
+
+const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
+  for (let index = triggerIndex - 1; index >= 0; index -= 1) {
+    if (!['while', 'for'].includes(tokens[index]?.value)) continue;
+    const opening = index + 1;
+    if (tokens[opening]?.value !== '(') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined || triggerIndex <= opening || triggerIndex >= closing) continue;
+
+    let conditionContainsTrigger = tokens[index].value === 'while';
+    if (tokens[index].value === 'for') {
+      let firstSeparator = null;
+      let secondSeparator = null;
+      for (let cursor = opening + 1; cursor < closing; cursor += 1) {
+        const nestedEnd = pairs.get(cursor);
+        if (nestedEnd !== undefined && nestedEnd > cursor) {
+          cursor = nestedEnd;
+          continue;
+        }
+        if (tokens[cursor].value !== ';') continue;
+        if (firstSeparator === null) firstSeparator = cursor;
+        else {
+          secondSeparator = cursor;
+          break;
+        }
+      }
+      conditionContainsTrigger = firstSeparator !== null && secondSeparator !== null
+        && triggerIndex > firstSeparator && triggerIndex < secondSeparator;
+    }
+    if (!conditionContainsTrigger) continue;
+
+    const bodyStart = closing + 1;
+    const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
+    const deadlineBranchIsNegated = Boolean(
+      isNegatedDeadlineCondition(tokens, opening + 1, triggerIndex)
+    ) !== aliasNegated;
+    if (deadlineBranchIsNegated) {
+      const scopeEnd = findFallthroughScopeEnd(tokens, index, pairs, functionRanges, true);
+      const fallthroughEnd = findFallthroughStatementsEnd(
+        tokens,
+        bodyEnd,
+        scopeEnd,
+        pairs,
+        functionRanges,
+        true
+      );
+      return branchRange(tokens, bodyEnd, fallthroughEnd, pairs, true);
+    }
+    return branchRange(tokens, bodyStart, bodyEnd, pairs);
+  }
+  return null;
+};
+
+const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
+  const ifDecision = findIfDecision(tokens, triggerIndex, pairs);
+  if (ifDecision) {
+    const conditionStart = ifDecision.start + 2;
+    const consequentStart = ifDecision.closingCondition + 1;
+    const consequentEnd = findControlledStatementEnd(tokens, consequentStart, tokens.length, pairs, false);
+    const alternateStart = tokens[consequentEnd]?.value === 'else' ? consequentEnd + 1 : consequentEnd;
+    const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
+    const deadlineBranchIsNegated = Boolean(negated) !== aliasNegated;
+    if (deadlineBranchIsNegated && alternateStart === consequentEnd) {
+      const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges, true);
+      const fallthroughEnd = findFallthroughStatementsEnd(
+        tokens,
+        consequentEnd,
+        scopeEnd,
+        pairs,
+        functionRanges,
+        true
+      );
+      return branchRange(tokens, consequentEnd, fallthroughEnd, pairs, true);
+    }
+    const selectedStart = deadlineBranchIsNegated ? alternateStart : consequentStart;
+    const selectedEnd = deadlineBranchIsNegated
+      ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs)
+      : consequentEnd;
+    const selected = branchRange(tokens, selectedStart, selectedEnd, pairs);
+    const selectedBodyStart = tokens[selectedStart]?.value === '{' ? selectedStart + 1 : selectedStart;
+    const selectedBodyEnd = tokens[selectedStart]?.value === '{' ? selectedEnd - 1 : selectedEnd;
+    if (switchArmHasAbruptCompletion(tokens, selectedBodyStart, selectedBodyEnd, pairs, functionRanges)) {
+      return selected;
+    }
+
+    const ifEnd = alternateStart === consequentEnd
+      ? consequentEnd
+      : findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs);
+    const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges);
+    const fallthroughEnd = findFallthroughStatementsEnd(
+      tokens,
+      ifEnd,
+      scopeEnd,
+      pairs,
+      functionRanges
+    );
+    if (fallthroughEnd <= ifEnd) return selected;
+    const nextIfStart = ifEnd;
+    const nextConditionOpening = nextIfStart + 1;
+    const nextConditionClosing = tokens[nextIfStart]?.value === 'if'
+      ? pairs.get(nextConditionOpening)
+      : undefined;
+    if (nextConditionClosing !== undefined) {
+      const triggerName = tokens[triggerIndex]?.value;
+      let nextTriggerIndex = nextConditionOpening + 1;
+      while (nextTriggerIndex < nextConditionClosing
+        && tokens[nextTriggerIndex]?.value !== triggerName) nextTriggerIndex += 1;
+      const nextGuardNegated = nextTriggerIndex < nextConditionClosing
+        && isNegatedDeadlineCondition(tokens, nextConditionOpening + 1, nextTriggerIndex);
+      if (nextGuardNegated) {
+        const nextConsequentStart = nextConditionClosing + 1;
+        const nextConsequentEnd = findControlledStatementEnd(
+          tokens,
+          nextConsequentStart,
+          fallthroughEnd,
+          pairs
+        );
+        const continuationStart = tokens[nextConsequentEnd]?.value === 'else'
+          ? nextConsequentEnd + 1
+          : nextConsequentEnd;
+        return {
+          ...selected,
+          continuations: continuationStart < fallthroughEnd
+            ? [branchRange(tokens, continuationStart, fallthroughEnd, pairs)]
+            : []
+        };
+      }
+    }
+    return {
+      ...selected,
+      continuations: [branchRange(tokens, ifEnd, fallthroughEnd, pairs)]
+    };
+  }
+  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
+  if (loopDecision) return loopDecision;
+  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
+  if (switchDecision) return switchDecision;
+  const statement = findStatementRange(tokens, triggerIndex);
+  const shortCircuit = findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs, aliasNegated);
+  if (shortCircuit) return shortCircuit;
+  const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
+  if (functionDecision) {
+    if (functionDecision.expression) {
+      return findConditionalExpressionDecision(
+        tokens,
+        triggerIndex,
+        functionDecision.bodyStart,
+        functionDecision.bodyEnd,
+        pairs,
+        aliasNegated
+      ) || { start: functionDecision.bodyStart, end: functionDecision.bodyEnd, opening: null };
+    }
+    const conditional = findConditionalExpressionDecision(
+      tokens,
+      triggerIndex,
+      statement.start,
+      statement.end,
+      pairs,
+      aliasNegated
+    );
+    if (conditional) return conditional;
+    if (triggerIndex < functionDecision.opening) {
+      return { start: functionDecision.opening, end: functionDecision.opening, opening: null };
+    }
+    return { start: functionDecision.opening + 1, end: functionDecision.closing, opening: functionDecision.opening };
+  }
+  return findConditionalExpressionDecision(
+    tokens,
+    triggerIndex,
+    statement.start,
+    statement.end,
+    pairs,
+    aliasNegated
+  ) || statement;
+};
+
+const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
+  ['boundary', 0],
+  ['markIntakeBoundary', 1],
+  ['intakeHandlers.markIntakeBoundary', 2],
+  ['markThreadBoundary', 1],
+  ['threadEnrollmentHandlers.markThreadBoundary', 2],
+  ['recordBoundary', 2],
+  ['recordOwnedBoundary', 2],
+  ['setBindingReadiness', 1]
+]);
+
+const isBoundaryWriter = value => BOUNDARY_WRITER_STATE_ARGUMENTS.has(value);
+
+const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get(value);
+
+const boundaryWriterCallOpening = (tokens, index) => {
+  if (tokens[index + 1]?.value === '(') return index + 1;
+  if (tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '(') return index + 2;
+  return null;
+};
+
+const staticPropertyName = token => {
+  if (token?.type === 'identifier') return token.value;
+  if (!['string', 'template'].includes(token?.type) || typeof token.value !== 'string') return null;
+  if (token.type === 'template' && token.value.includes('${')) return null;
+  const quote = token.value[0];
+  if (['"', "'", '`'].includes(quote) && token.value[token.value.length - 1] === quote) {
+    return token.value.slice(1, -1);
+  }
+  return token.value;
+};
+
+const boundaryWriterNameAt = (tokens, index) => {
+  const token = tokens[index];
+  if (token?.type === 'identifier') return token.value;
+  if (tokens[index - 1]?.value !== '[' || tokens[index + 1]?.value !== ']') return null;
+  return staticPropertyName(token);
+};
+
+const boundaryWriterDescriptorAt = (tokens, index) => {
+  const name = boundaryWriterNameAt(tokens, index);
+  if (name === null || !isBoundaryWriter(name)) return null;
+  const receiver = ['.', '?.'].includes(tokens[index - 1]?.value)
+    ? tokens[index - 2]?.value
+    : null;
+  const qualifiedName = receiver ? `${receiver}.${name}` : name;
+  return {
+    name,
+    stateArgument: boundaryWriterStateArgument(qualifiedName) ?? boundaryWriterStateArgument(name)
+  };
+};
+
+const boundaryWriterStateArgumentAt = (tokens, index, aliases) => {
+  const descriptor = boundaryWriterDescriptorAt(tokens, index);
+  if (descriptor) return descriptor.stateArgument;
+  const name = boundaryWriterNameAt(tokens, index);
+  return name === null ? undefined : aliases.get(name);
+};
+
+const boundBoundaryWriterStateArgument = (tokens, start, end, pairs, aliases = new Set()) => {
+  for (let index = start; index < end; index += 1) {
+    const descriptor = boundaryWriterDescriptorAt(tokens, index);
+    if (!descriptor || tokens[index + 1]?.value !== '.'
+      || tokens[index + 2]?.value !== 'bind' || tokens[index + 3]?.value !== '(') continue;
+    const closing = pairs.get(index + 3);
+    if (closing === undefined || closing >= end) continue;
+    const boundArguments = topLevelSegments(tokens, index + 4, closing).slice(1);
+    const preboundState = boundArguments[descriptor.stateArgument];
+    const stateWasPrebound = preboundState !== undefined;
+    return {
+      stateArgument: Math.max(0, descriptor.stateArgument - boundArguments.length),
+      stateWasPrebound,
+      preboundGap: stateWasPrebound
+        && valueHasGapOutcome(tokens, preboundState[0], preboundState[1], pairs, aliases, new Set(), false, false)
+    };
+  }
+  return undefined;
+};
+
+const boundaryWriterCallOpeningAt = (tokens, index) => {
+  if (tokens[index + 1]?.value !== ']') {
+    const callOpening = boundaryWriterCallOpening(tokens, index);
+    if (callOpening !== null) return callOpening;
+  }
+  const afterProperty = tokens[index + 1]?.value === ']' ? index + 2 : index + 1;
+  if (tokens[afterProperty]?.value === '(') return afterProperty;
+  if (tokens[afterProperty]?.value === '?.' && tokens[afterProperty + 1]?.value === '(') {
+    return afterProperty + 1;
+  }
+  if (tokens[afterProperty]?.value === '.'
+    && ['call', 'apply'].includes(tokens[afterProperty + 1]?.value)
+    && tokens[afterProperty + 2]?.value === '(') return afterProperty + 2;
+  return null;
+};
+
+const boundaryWriterCallArgumentOffsetAt = (tokens, opening) => (
+  tokens[opening - 2]?.value === '.' && tokens[opening - 1]?.value === 'call' ? 1 : 0
+);
+
+const trimExpressionRange = (tokens, start, end, pairs) => {
+  while (start < end && tokens[end - 1]?.value === ';') end -= 1;
+  while (start < end && tokens[start]?.value === '(' && pairs.get(start) === end - 1) {
+    start += 1;
+    end -= 1;
+  }
+  return { start, end };
+};
+
+const isReadinessVocabulary = value => value === 'READINESS'
+  || value === 'THREAD_STATES'
+  || /(?:^|_)READINESS$/.test(value)
+  || /Readiness$/.test(value);
+
+const isGapMemberExpression = (tokens, start, end) => end - start === 3
+  && tokens[start]?.type === 'identifier'
+  && isReadinessVocabulary(tokens[start].value)
+  && tokens[start + 1]?.value === '.'
+  && tokens[start + 2]?.value === 'GAP';
+
+const destructuredValueHasGapOutcome = (tokens, start, end, propertyPath, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (propertyPath?.length === 1 && /^\d+$/.test(propertyPath[0])
+    && tokens[expression.start]?.value === '['
+    && pairs.get(expression.start) === expression.end - 1) {
+    const element = topLevelSegments(tokens, expression.start + 1, expression.end - 1)[Number(propertyPath[0])];
+    return element !== undefined
+      && valueHasGapOutcome(tokens, element[0], element[1], pairs);
+  }
+  if (propertyPath?.length !== 1 || propertyPath[0] !== 'GAP') return false;
+  return expression.end - expression.start === 1
+    && tokens[expression.start]?.type === 'identifier'
+    && isReadinessVocabulary(tokens[expression.start].value);
+};
+
+const staticMemberExpressionName = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end || tokens[expression.start]?.type !== 'identifier') return null;
+  const parts = [tokens[expression.start].value];
+  let cursor = expression.start + 1;
+  while (cursor < expression.end) {
+    if (tokens[cursor]?.value === '.' && tokens[cursor + 1]?.type === 'identifier') {
+      parts.push(tokens[cursor + 1].value);
+      cursor += 2;
+      continue;
+    }
+    if (tokens[cursor]?.value === '[') {
+      const closing = pairs.get(cursor);
+      if (closing !== cursor + 2 || closing >= expression.end) return null;
+      if (!['string', 'number'].includes(tokens[cursor + 1]?.type)) return null;
+      const propertyName = staticPropertyName(tokens[cursor + 1]);
+      if (propertyName === null || propertyName === undefined) return null;
+      parts.push(String(propertyName));
+      cursor = closing + 1;
+      continue;
+    }
+    return null;
+  }
+  return parts.length === 1 ? parts[0] : JSON.stringify(parts);
+};
+
+const parenthesizedObjectMemberValueRangeAt = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (tokens[expression.start]?.value !== '(') return null;
+  const wrapperClosing = pairs.get(expression.start);
+  if (wrapperClosing === undefined || wrapperClosing + 3 !== expression.end
+    || !['.', '?.'].includes(tokens[wrapperClosing + 1]?.value)
+    || tokens[wrapperClosing + 2]?.type !== 'identifier') return null;
+
+  const objectOpening = expression.start + 1;
+  const objectClosing = pairs.get(objectOpening);
+  if (tokens[objectOpening]?.value !== '{' || objectClosing !== wrapperClosing - 1) return null;
+
+  const projectedProperty = tokens[wrapperClosing + 2].value;
+  for (const [propertyStart, propertyEnd] of topLevelSegments(
+    tokens,
+    objectOpening + 1,
+    objectClosing
+  )) {
+    const colonIndex = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+    if (colonIndex < 0) continue;
+    const propertyName = tokens[propertyStart]?.value === '['
+      ? (pairs.get(propertyStart) === colonIndex - 1
+        ? staticPropertyName(tokens[propertyStart + 1])
+        : null)
+      : staticPropertyName(tokens[propertyStart]);
+    if (propertyName === projectedProperty) return [colonIndex + 1, propertyEnd];
+  }
+  return null;
+};
+
+const assignmentTargetAt = (tokens, index, end, pairs) => {
+  if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.') return null;
+  let equalsIndex = index + 1;
+  while (equalsIndex < end) {
+    if (tokens[equalsIndex]?.value === '.' && tokens[equalsIndex + 1]?.type === 'identifier') {
+      equalsIndex += 2;
+      continue;
+    }
+    if (tokens[equalsIndex]?.value === '[') {
+      const closing = pairs.get(equalsIndex);
+      if (closing === undefined || closing >= end || !['string', 'number'].includes(tokens[equalsIndex + 1]?.type)
+        || staticPropertyName(tokens[equalsIndex + 1]) === null) return null;
+      equalsIndex = closing + 1;
+      continue;
+    }
+    break;
+  }
+  if (tokens[equalsIndex]?.value !== '=') return null;
+  const name = staticMemberExpressionName(tokens, index, equalsIndex, pairs);
+  return name === null ? null : { equalsIndex, name };
+};
+
+const staticArrayIndexAt = token => {
+  const value = token?.type === 'number' ? token.value : staticPropertyName(token);
+  return value !== null && value !== undefined && /^\d+$/.test(String(value))
+    ? Number(value)
+    : null;
+};
+
+const staticArrayElementRangeAt = (tokens, start, end, pairs, useIndex) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  let arrayStart;
+  let elementIndex;
+  let bindingIndex;
+  if (tokens[expression.start]?.value === '[') {
+    arrayStart = expression.start;
+    const arrayClosing = pairs.get(arrayStart);
+    const indexOpening = arrayClosing + 1;
+    const indexClosing = pairs.get(indexOpening);
+    const staticIndex = staticArrayIndexAt(tokens[indexOpening + 1]);
+    if (arrayClosing === undefined || tokens[indexOpening]?.value !== '['
+      || indexClosing !== indexOpening + 2 || indexClosing !== expression.end - 1
+      || staticIndex === null) return null;
+    elementIndex = staticIndex;
+    const element = topLevelSegments(tokens, arrayStart + 1, arrayClosing)[elementIndex];
+    return element ? { ...element, bindingIndex: `inline:${arrayStart}`, elementIndex } : null;
+  }
+
+  if (expression.end - expression.start !== 4
+    || tokens[expression.start]?.type !== 'identifier'
+    || tokens[expression.start + 1]?.value !== '['
+    || pairs.get(expression.start + 1) !== expression.end - 1) return null;
+  const staticIndex = staticArrayIndexAt(tokens[expression.start + 2]);
+  if (staticIndex === null) return null;
+  elementIndex = staticIndex;
+
+  const name = tokens[expression.start].value;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  for (let candidate = useIndex - 1; candidate >= 0; candidate -= 1) {
+    if (tokens[candidate]?.value !== name || tokens[candidate - 1]?.value !== 'const'
+      || tokens[candidate + 1]?.value !== '=') continue;
+    const declarationScope = lexicalScopePath(lexicalScopes, candidate);
+    if (isLexicallyVisible(declarationScope, useScope)) {
+      bindingIndex = candidate;
+      break;
+    }
+  }
+  if (bindingIndex === undefined) return null;
+
+  arrayStart = bindingIndex + 2;
+  const arrayEnd = trimExpressionRange(
+    tokens,
+    arrayStart,
+    findAssignmentValueEnd(tokens, arrayStart, tokens.length),
+    pairs
+  ).end;
+  if (tokens[arrayStart]?.value !== '[' || pairs.get(arrayStart) !== arrayEnd - 1) return null;
+  const element = topLevelSegments(tokens, arrayStart + 1, arrayEnd - 1)[elementIndex];
+  return element ? { ...element, bindingIndex, elementIndex } : null;
+};
+
+const staticObjectInitializerRangeAt = (tokens, name, useIndex, pairs) => {
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  for (let candidate = useIndex - 1; candidate >= 0; candidate -= 1) {
+    if (tokens[candidate]?.value !== name || tokens[candidate - 1]?.value !== 'const'
+      || tokens[candidate + 1]?.value !== '=') continue;
+    const declarationScope = lexicalScopePath(lexicalScopes, candidate);
+    if (!isLexicallyVisible(declarationScope, useScope)) continue;
+    const objectStart = candidate + 2;
+    const objectEnd = trimExpressionRange(
+      tokens,
+      objectStart,
+      findAssignmentValueEnd(tokens, objectStart, tokens.length),
+      pairs
+    ).end;
+    if (tokens[objectStart]?.value !== '{' || pairs.get(objectStart) !== objectEnd - 1) continue;
+    const isMutatedBeforeUse = tokens.slice(candidate + 1, useIndex).some((token, offset) => {
+      const index = candidate + 1 + offset;
+      if (token.value !== name || tokens[index - 1]?.value === '.') return false;
+      const memberStart = index + 1;
+      if (tokens[memberStart]?.value === '.') {
+        return tokens[memberStart + 2]?.value === '=';
+      }
+      if (tokens[memberStart]?.value === '[') {
+        const memberEnd = pairs.get(memberStart);
+        return memberEnd !== undefined && ['=', '+=', '-=', '||=', '&&=', '??=']
+          .includes(tokens[memberEnd + 1]?.value);
+      }
+      return false;
+    });
+    if (isMutatedBeforeUse) return null;
+    return { start: objectStart, end: objectEnd, bindingIndex: candidate };
+  }
+  return null;
+};
+
+const isUnshadowedIdentifierAt = (tokens, name, index, pairs) => {
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const functionRanges = findFunctionRanges(tokens, pairs);
+  const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  return !resolveVisibleBinding(lexicalBindings, name, index, lexicalScopes);
+};
+
+const isNativePromiseMethodAt = (tokens, index, method, pairs) => tokens[index]?.value === 'Promise'
+  && tokens[index + 1]?.value === '.'
+  && tokens[index + 2]?.value === method
+  && isUnshadowedIdentifierAt(tokens, 'Promise', index, pairs);
+
+const valueHasGapOutcome = (
+  tokens,
+  start,
+  end,
+  pairs,
+  aliases = new Set(),
+  resolvingArrays = new Set(),
+  allowPromiseRace = false,
+  allowPromiseResolution = true
+) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return false;
+  const projectedValue = parenthesizedObjectMemberValueRangeAt(
+    tokens,
+    expression.start,
+    expression.end,
+    pairs
+  );
+  if (projectedValue) return valueHasGapOutcome(
+    tokens,
+    projectedValue[0],
+    projectedValue[1],
+    pairs,
+    aliases,
+    resolvingArrays,
+    allowPromiseRace,
+    allowPromiseResolution
+  );
+  const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
+  if (commaSegments.length > 1) {
+    const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
+    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays, allowPromiseRace, allowPromiseResolution);
+  }
+  const assignmentIndex = topLevelToken(tokens, expression.start, expression.end, '=');
+  if (assignmentIndex >= 0) {
+    const outcomeValueStart = outcomeAssignmentValueStart(tokens, expression.start);
+    if (outcomeValueStart === null || outcomeValueStart <= assignmentIndex) return false;
+    return valueHasGapOutcome(
+      tokens,
+      outcomeValueStart,
+      expression.end,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace,
+      allowPromiseResolution
+    );
+  }
+  if (tokens[expression.start]?.value === 'await') {
+    return valueHasGapOutcome(
+      tokens,
+      expression.start + 1,
+      expression.end,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace,
+      allowPromiseResolution
+    );
+  }
+  if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
+  if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
+  const memberName = staticMemberExpressionName(tokens, expression.start, expression.end, pairs);
+  if (memberName !== null && aliases.has(memberName)) return true;
+  const arrayElement = staticArrayElementRangeAt(tokens, expression.start, expression.end, pairs, expression.start);
+  if (arrayElement) {
+    const resolutionKey = `${arrayElement.bindingIndex}:${arrayElement.elementIndex}`;
+    if (resolvingArrays.has(resolutionKey)) return false;
+    const nextResolvingArrays = new Set(resolvingArrays);
+    nextResolvingArrays.add(resolutionKey);
+    return valueHasGapOutcome(
+      tokens,
+      arrayElement[0],
+      arrayElement[1],
+      pairs,
+      aliases,
+      nextResolvingArrays,
+      allowPromiseRace,
+      allowPromiseResolution
+    );
+  }
+  if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
+  if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
+
+  const wrapperStart = expression.start;
+  const isPromiseResolve = allowPromiseResolution
+    && isNativePromiseMethodAt(tokens, wrapperStart, 'resolve', pairs);
+  const isObjectFreeze = tokens[wrapperStart]?.value === 'Object'
+    && tokens[wrapperStart + 1]?.value === '.'
+    && tokens[wrapperStart + 2]?.value === 'freeze';
+  const isPromiseRace = allowPromiseRace
+    && isNativePromiseMethodAt(tokens, wrapperStart, 'race', pairs);
+  const isPrimitiveString = tokens[wrapperStart]?.value === 'String'
+    && tokens[wrapperStart - 1]?.value !== 'new'
+    && isUnshadowedIdentifierAt(tokens, 'String', wrapperStart, pairs);
+  const wrapperOpening = wrapperStart + (isPrimitiveString ? 1 : 3);
+  if ((!isPromiseResolve && !isObjectFreeze && !isPromiseRace && !isPrimitiveString)
+    || tokens[wrapperOpening]?.value !== '(') return false;
+  const wrapperClosing = pairs.get(wrapperOpening);
+  if (wrapperClosing !== expression.end - 1) return false;
+  const effectiveArgument = topLevelSegments(tokens, wrapperOpening + 1, wrapperClosing)[0];
+  if (isPromiseRace) {
+    if (!effectiveArgument || tokens[effectiveArgument[0]]?.value !== '[') return false;
+    const arrayClosing = pairs.get(effectiveArgument[0]);
+    if (arrayClosing !== effectiveArgument[1] - 1) return false;
+    const elements = topLevelSegments(tokens, effectiveArgument[0] + 1, arrayClosing);
+    const nonEmptyElements = elements.filter(([elementStart, elementEnd]) => elementStart < elementEnd);
+    if (nonEmptyElements.length !== 1 || elements.slice(0, -1).some(
+      ([elementStart, elementEnd]) => elementStart >= elementEnd
+    )) return false;
+    const [elementStart, elementEnd] = nonEmptyElements[0];
+    if (tokens[elementStart]?.value === '...') return false;
+    return valueHasGapOutcome(
+      tokens,
+      elementStart,
+      elementEnd,
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace,
+      allowPromiseResolution
+    );
+  }
+  return effectiveArgument !== undefined
+    && valueHasGapOutcome(
+      tokens,
+      effectiveArgument[0],
+      effectiveArgument[1],
+      pairs,
+      aliases,
+      resolvingArrays,
+      allowPromiseRace,
+      allowPromiseResolution
+    );
+};
+
+const valueHasGapOutsideNestedFunctions = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  aliases,
+  allowPromiseRace = false
+) => {
+  const nestedFunctions = functionRanges
+    .filter(range => range.start >= start && range.closing <= end)
+    .sort((left, right) => left.start - right.start || right.closing - left.closing);
+  let cursor = start;
+  for (const range of nestedFunctions) {
+    if (range.start < cursor) continue;
+    if (isImmediatelyInvokedFunction(tokens, pairs, range)) {
+      const bodyStart = range.expression ? range.bodyStart : range.opening + 1;
+      const bodyEnd = range.expression ? range.bodyEnd : range.closing;
+      const invokedOutcome = range.expression
+        ? valueHasGapOutsideNestedFunctions(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          pairs,
+          functionRanges,
+          aliases,
+          allowPromiseRace
+        )
+        : hasGapOutcome(tokens, bodyStart, bodyEnd, range.opening, pairs, functionRanges, aliases);
+      if (invokedOutcome) return true;
+    }
+    if (valueHasGapOutcome(tokens, cursor, range.start, pairs, aliases, new Set(), allowPromiseRace)) return true;
+    cursor = range.closing + 1;
+  }
+  if (cursor >= end) return false;
+  return valueHasGapOutcome(tokens, cursor, end, pairs, aliases, new Set(), allowPromiseRace);
+};
+
+const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases, functionRanges = []) => {
+  if (tokens[index]?.value !== 'Object' || tokens[index + 1]?.value !== '.'
+    || tokens[index + 2]?.value !== 'assign' || tokens[index + 3]?.value !== '(') return false;
+  const opening = index + 3;
+  const closing = pairs.get(opening);
+  if (closing === undefined || closing >= end) return false;
+  const containingFunction = functionRanges
+    .filter(range => range.opening < index && range.closing > index)
+    .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
+  const sourceScopeStart = containingFunction ? containingFunction.opening + 1 : 0;
+  const argumentsList = topLevelSegments(tokens, opening + 1, closing);
+  const objectRangeForSource = (sourceStart, sourceEnd) => {
+    if (tokens[sourceStart]?.value === '{' && pairs.get(sourceStart) === sourceEnd - 1) {
+      return [sourceStart, sourceEnd];
+    }
+    if (sourceEnd - sourceStart !== 1 || tokens[sourceStart]?.type !== 'identifier') return null;
+    const sourceName = tokens[sourceStart].value;
+    for (let declaration = sourceScopeStart; declaration < index; declaration += 1) {
+      if (tokens[declaration]?.value !== 'const'
+        || tokens[declaration + 1]?.value !== sourceName
+        || tokens[declaration + 2]?.value !== '=') continue;
+      const valueStart = declaration + 3;
+      const declarationEnd = findStatementRange(tokens, declaration).end;
+      if (tokens[valueStart]?.value === '{' && pairs.get(valueStart) === declarationEnd - 2) {
+        return [valueStart, declarationEnd - 1];
+      }
+    }
+    return null;
+  };
+  const objectAssignSourceSetsState = ([objectStart, objectEnd]) => topLevelSegments(
+    tokens,
+    objectStart + 1,
+    objectEnd - 1
+  ).some(([propertyStart]) => tokens[propertyStart]?.value === 'state'
+    && tokens[propertyStart + 1]?.value === ':');
+
+  let hasGapOutcome = false;
+  for (const [patchStart, patchEnd] of argumentsList.slice(1)) {
+    const patchRange = objectRangeForSource(patchStart, patchEnd);
+    if (!patchRange || !objectAssignSourceSetsState(patchRange)) continue;
+    hasGapOutcome = valueHasGapOutcome(tokens, patchRange[0], patchRange[1], pairs, aliases);
+  }
+  return hasGapOutcome;
+};
+
+const outcomeAssignmentValueStart = (tokens, index) => {
+  if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.') return null;
+  const isOutcomeAssignment = operatorIndex => ['=', '||=', '&&=', '??='].includes(tokens[operatorIndex]?.value);
+  if (tokens[index + 1]?.value === '.'
+    && OUTCOME_NAMES.has(tokens[index + 2]?.value)
+    && isOutcomeAssignment(index + 3)) return index + 4;
+  if (tokens[index + 1]?.value === '['
+    && ['string', 'template'].includes(tokens[index + 2]?.type)
+    && OUTCOME_NAMES.has(tokens[index + 2]?.value)
+    && tokens[index + 3]?.value === ']'
+    && isOutcomeAssignment(index + 4)) return index + 5;
+  return null;
+};
+
+const staticApplyArrayArgumentsAt = (tokens, start, end, useIndex, pairs, resolvingArrays = new Set()) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return null;
+  if (tokens[expression.start]?.value === '['
+    && pairs.get(expression.start) === expression.end - 1) {
+    const elements = topLevelSegmentsWithSlots(tokens, expression.start + 1, expression.end - 1, pairs);
+    const flattened = [];
+    for (const element of elements) {
+      if (element[0] >= element[1]) {
+        flattened.push(element);
+        continue;
+      }
+      if (tokens[element[0]]?.value !== '...') {
+        flattened.push(element);
+        continue;
+      }
+      const spread = staticApplyArrayArgumentsAt(
+        tokens,
+        element[0] + 1,
+        element[1],
+        useIndex,
+        pairs,
+        resolvingArrays
+      );
+      if (!spread) return null;
+      flattened.push(...spread);
+    }
+    return flattened;
+  }
+  if (expression.end - expression.start !== 1
+    || tokens[expression.start]?.type !== 'identifier') return null;
+
+  const name = tokens[expression.start].value;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const functionRanges = findFunctionRanges(tokens, pairs);
+  const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  const binding = resolveVisibleBinding(lexicalBindings, name, useIndex, lexicalScopes, useScope);
+  if (!binding || binding.index >= useIndex || resolvingArrays.has(binding.index)
+    || tokens[binding.index - 1]?.value !== 'const'
+    || tokens[binding.index + 1]?.value !== '=') return null;
+  const arrayWasMutated = tokens.slice(binding.index + 1, useIndex).some((token, offset) => {
+    const index = binding.index + 1 + offset;
+    if (token.value !== name || tokens[index - 1]?.value === '.') return false;
+    const memberStart = index + 1;
+    if (tokens[memberStart]?.value === '[') {
+      const memberEnd = pairs.get(memberStart);
+      return memberEnd !== undefined && ['=', '+=', '-=', '||=', '&&=', '??=']
+        .includes(tokens[memberEnd + 1]?.value);
+    }
+    if (tokens[memberStart]?.value !== '.') return false;
+    if (['=', '+=', '-=', '||=', '&&=', '??='].includes(tokens[memberStart + 2]?.value)) return true;
+    return ['copyWithin', 'fill', 'pop', 'push', 'reverse', 'shift', 'sort', 'splice', 'unshift']
+      .includes(tokens[memberStart + 1]?.value)
+      && tokens[memberStart + 2]?.value === '(';
+  });
+  if (arrayWasMutated) return null;
+
+  const nextResolvingArrays = new Set(resolvingArrays);
+  nextResolvingArrays.add(binding.index);
+  const arrayStart = binding.index + 2;
+  const arrayEnd = trimExpressionRange(
+    tokens,
+    arrayStart,
+    findAssignmentValueEnd(tokens, arrayStart, tokens.length),
+    pairs
+  ).end;
+  if (tokens[arrayStart]?.value !== '[' || pairs.get(arrayStart) !== arrayEnd - 1) return null;
+  return staticApplyArrayArgumentsAt(tokens, arrayStart, arrayEnd, useIndex, pairs, nextResolvingArrays);
+};
+
+const staticCallArgumentsAt = (tokens, opening, closing, useIndex, pairs) => {
+  const argumentsList = topLevelSegments(tokens, opening + 1, closing);
+  const flattened = [];
+  for (const argument of argumentsList) {
+    if (tokens[argument[0]]?.value !== '...') {
+      flattened.push(argument);
+      continue;
+    }
+    const spread = staticApplyArrayArgumentsAt(
+      tokens,
+      argument[0] + 1,
+      argument[1],
+      useIndex,
+      pairs
+    );
+    if (!spread) return null;
+    flattened.push(...spread);
+  }
+  return flattened;
+};
+
+const callHasGapArgument = (
+  tokens,
+  opening,
+  closing,
+  pairs,
+  stateArgument,
+  aliases = new Set(),
+  allowPromiseResolution = true
+) => {
+  if (stateArgument === undefined) return false;
+  const isApplyCall = tokens[opening - 2]?.value === '.' && tokens[opening - 1]?.value === 'apply';
+  let argumentsList;
+  if (isApplyCall) {
+    const applyArguments = topLevelSegments(tokens, opening + 1, closing);
+    const argumentArray = applyArguments[1];
+    if (!argumentArray) return false;
+    argumentsList = staticApplyArrayArgumentsAt(
+      tokens,
+      argumentArray[0],
+      argumentArray[1],
+      opening,
+      pairs
+    );
+  } else {
+    argumentsList = staticCallArgumentsAt(tokens, opening, closing, opening, pairs);
+  }
+  if (!argumentsList) return false;
+  const gapArgument = argumentsList[stateArgument];
+  return gapArgument !== undefined
+    && (valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases, new Set(), false, allowPromiseResolution)
+      || localFunctionCallHasGapOutcome(
+        tokens,
+        gapArgument[0],
+        gapArgument[1],
+        pairs,
+        findFunctionRanges(tokens, pairs),
+        new Map(),
+        aliases,
+        new Map(),
+        new Set(),
+        true,
+        false
+      ));
+};
+
+const boundaryWriterCallHasGapAt = (tokens, index, end, pairs, aliases, writerAliases) => {
+  const writerName = boundaryWriterNameAt(tokens, index);
+  const writer = boundaryWriterStateArgumentAt(tokens, index, writerAliases);
+  const stateArgument = typeof writer === 'number' ? writer : writer?.stateArgument;
+  if (writerName === null || stateArgument === undefined || tokens[index - 1]?.value === 'function') {
+    return false;
+  }
+
+  const opening = boundaryWriterCallOpeningAt(tokens, index);
+  const closing = opening === null ? undefined : pairs.get(opening);
+  if (closing === undefined || closing >= end) return false;
+  if (typeof writer === 'object' && writer.stateWasPrebound) return writer.preboundGap;
+  return callHasGapArgument(
+    tokens,
+    opening,
+    closing,
+    pairs,
+    stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
+    aliases,
+    false
+  );
+};
+
+const hasBoundaryWriterGap = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  aliases,
+  writerAliases = new Map(),
+  skipScheduledOutcomeValues = false
+) => {
+  const knownWriterAliases = new Map(writerAliases);
+  const nestedFunctionStarts = new Map(functionRanges
+    .filter(range => range.start >= start && range.opening < end)
+    .map(range => [range.start, range]));
+  for (let index = start; index < end; index += 1) {
+    const nestedFunction = nestedFunctionStarts.get(index);
+    if (nestedFunction) {
+      const callbackKind = isScheduledCallback(tokens, pairs, nestedFunction);
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
+        const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
+        const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
+        if (!skipScheduledOutcomeValues && callbackKind !== 'discarded'
+          && nestedFunction.expression
+          && valueHasGapOutcome(tokens, bodyStart, bodyEnd, pairs, aliases)) return true;
+        if (hasBoundaryWriterGap(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          pairs,
+          functionRanges,
+          aliases,
+          knownWriterAliases
+        )) return true;
+      }
+      index = nestedFunction.closing;
+      continue;
+    }
+    const token = tokens[index];
+    if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
+      && tokens[index + 1]?.value === '=') {
+      const expressionStart = index + 2;
+      const expressionEnd = findAssignmentValueEnd(tokens, expressionStart, end);
+      const stateArgument = boundBoundaryWriterStateArgument(
+        tokens,
+        expressionStart,
+        expressionEnd,
+        pairs,
+        aliases
+      );
+      if (stateArgument === undefined) knownWriterAliases.delete(token.value);
+      else knownWriterAliases.set(token.value, stateArgument);
+    }
+    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, aliases, functionRanges)) return true;
+    if (boundaryWriterCallHasGapAt(tokens, index, end, pairs, aliases, knownWriterAliases)) return true;
+  }
+  return false;
+};
+
+const isControlHeaderClose = (tokens, pairs, closing) => {
+  const opening = pairs.get(closing);
+  return opening !== undefined
+    && ['if', 'while', 'for', 'switch', 'catch', 'with'].includes(tokens[opening - 1]?.value);
+};
+
+const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
+  let next = range.closing + 1;
+  while (tokens[next]?.value === ')') {
+    const opening = pairs.get(next);
+    if (opening === undefined) return false;
+    const preceding = tokens[opening - 1];
+    if ((preceding?.type === 'identifier' && preceding.value !== 'return')
+      || [']', '.', '?.'].includes(preceding?.value)
+      || (preceding?.value === ')' && !isControlHeaderClose(tokens, pairs, opening - 1))) return false;
+    next += 1;
+  }
+  if (tokens[next]?.value === '?.') next += 1;
+  return tokens[next]?.value === '(';
+};
+
+const PROMISE_EXECUTOR_CALLBACK = 'promise-executor';
+const EAGER_ARRAY_CALLBACK_METHODS = new Set(['forEach', 'map', 'some', 'every', 'filter', 'find']);
+
+const promiseChainHasShadowedRootAt = (tokens, methodIndex, pairs) => {
+  let currentMethodIndex = methodIndex;
+  while (['then', 'catch', 'finally'].includes(tokens[currentMethodIndex]?.value)) {
+    const receiverEnd = currentMethodIndex - 2;
+    if (tokens[receiverEnd]?.value !== ')') return false;
+    const callOpening = pairs.get(receiverEnd);
+    if (callOpening === undefined) return false;
+    const receiverMethodIndex = callOpening - 1;
+    const receiverMethod = tokens[receiverMethodIndex]?.value;
+    if (!['resolve', 'reject', 'race'].includes(receiverMethod)
+      && !['then', 'catch', 'finally'].includes(receiverMethod)) return false;
+    if (!['.', '?.'].includes(tokens[receiverMethodIndex - 1]?.value)) return false;
+    const promiseIndex = receiverMethodIndex - 2;
+    if (tokens[promiseIndex]?.value === 'Promise') {
+      return !isUnshadowedIdentifierAt(tokens, 'Promise', promiseIndex, pairs);
+    }
+    currentMethodIndex = receiverMethodIndex;
+  }
+  return false;
+};
+
+const isScheduledCallback = (tokens, pairs, range) => {
+  const start = range.start;
+  let callbackStart;
+  if (tokens[start]?.value === '=>') {
+    callbackStart = tokens[start - 1]?.value === ')'
+      ? pairs.get(start - 1)
+      : start - 1;
+  } else if (tokens[start]?.value === 'function') {
+    callbackStart = start;
+  } else {
+    return false;
+  }
+  if (tokens[callbackStart - 1]?.value === 'async') callbackStart -= 1;
+  let callOpening = callbackStart - 1;
+  if (tokens[callOpening]?.value !== '(') {
+    let nestedClosers = 0;
+    for (let index = callOpening - 1; index >= 0; index -= 1) {
+      if ([')', '}', ']'].includes(tokens[index].value)) {
+        nestedClosers += 1;
+        continue;
+      }
+      if (!['(', '{', '['].includes(tokens[index].value)) continue;
+      if (nestedClosers > 0) {
+        nestedClosers -= 1;
+        continue;
+      }
+      if (tokens[index].value === '(') {
+        callOpening = index;
+        break;
+      }
+      return false;
+    }
+  }
+  if (tokens[callOpening]?.value !== '(') return false;
+  const callClosing = pairs.get(callOpening);
+  if (callClosing === undefined || callClosing < range.closing) return false;
+  let calleeIndex = callOpening - 1;
+  if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
+  const callee = tokens[calleeIndex]?.value;
+  if (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new'
+    && isUnshadowedIdentifierAt(tokens, 'Promise', calleeIndex, pairs)) {
+    return PROMISE_EXECUTOR_CALLBACK;
+  }
+  const processNextTick = callee === 'nextTick'
+    && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value)
+    && tokens[calleeIndex - 2]?.value === 'process'
+    && isUnshadowedIdentifierAt(tokens, 'process', calleeIndex - 2, pairs);
+  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
+    || processNextTick
+    || (EAGER_ARRAY_CALLBACK_METHODS.has(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))
+    || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
+  if (!['then', 'catch'].includes(callee) || !['.', '?.'].includes(tokens[calleeIndex - 1]?.value)) return false;
+  if (promiseChainHasShadowedRootAt(tokens, calleeIndex, pairs)) return false;
+  return promiseHandlerIsUnreachable(tokens, range, callee, calleeIndex, callOpening, callClosing, pairs)
+    ? 'discarded'
+    : 'outcome';
+};
+
+const promiseHandlerIsUnreachable = (tokens, range, callee, calleeIndex, callOpening, callClosing, pairs) => {
+  const receiverEnd = calleeIndex - 2;
+  if (tokens[receiverEnd]?.value !== ')') return false;
+  const settledOpening = pairs.get(receiverEnd);
+  if (settledOpening === undefined) return false;
+  const settledMethodIndex = settledOpening - 1;
+  const settledMethod = tokens[settledMethodIndex]?.value;
+  if (!['resolve', 'reject'].includes(settledMethod)
+    || !isNativePromiseMethodAt(tokens, settledMethodIndex - 2, settledMethod, pairs)) return false;
+
+  const callbackArgumentIndex = topLevelSegments(tokens, callOpening + 1, callClosing)
+    .findIndex(([argumentStart, argumentEnd]) => range.start >= argumentStart && range.start < argumentEnd);
+  if (callbackArgumentIndex < 0) return false;
+  if (callee === 'catch') return settledMethod === 'resolve' && callbackArgumentIndex === 0;
+  if (settledMethod === 'resolve') return callbackArgumentIndex === 1;
+  return callbackArgumentIndex === 0;
+};
+
+const promiseExecutorHasGapResolution = (tokens, range, bodyStart, bodyEnd, pairs, aliases) => {
+  let parameterStart = range.start;
+  if (tokens[parameterStart]?.value === '=>') {
+    parameterStart = tokens[parameterStart - 1]?.value === ')'
+      ? pairs.get(parameterStart - 1)
+      : parameterStart - 1;
+  }
+  if (tokens[parameterStart]?.value === 'async') parameterStart += 1;
+  if (tokens[parameterStart]?.value === 'function') {
+    while (parameterStart < range.opening && tokens[parameterStart]?.value !== '(') parameterStart += 1;
+  }
+
+  let resolverName;
+  if (tokens[parameterStart]?.value === '(') {
+    const parameterEnd = pairs.get(parameterStart);
+    if (parameterEnd !== undefined) {
+      const parameters = topLevelSegments(tokens, parameterStart + 1, parameterEnd);
+      const firstParameter = parameters[0];
+      if (firstParameter && firstParameter[1] - firstParameter[0] === 1
+        && tokens[firstParameter[0]]?.type === 'identifier') {
+        resolverName = tokens[firstParameter[0]].value;
+      }
+    }
+  } else if (tokens[parameterStart]?.type === 'identifier') {
+    resolverName = tokens[parameterStart].value;
+  }
+  if (!resolverName) return false;
+
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    if (tokens[index]?.value !== resolverName || tokens[index + 1]?.value !== '(') continue;
+    const callClosing = pairs.get(index + 1);
+    if (callClosing === undefined || callClosing >= bodyEnd) continue;
+    if (topLevelSegments(tokens, index + 2, callClosing).some(([valueStart, valueEnd]) => (
+      valueHasGapOutcome(tokens, valueStart, valueEnd, pairs, aliases)
+    ))) return true;
+    index = callClosing;
+  }
+  return false;
+};
+
+const localFunctionBindingNameAt = (tokens, range, pairs) => {
+  let syntaxStart = range.start;
+  if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
+  if (tokens[syntaxStart]?.value === '=>') {
+    const parameterEnd = syntaxStart - 1;
+    syntaxStart = tokens[parameterEnd]?.value === ')'
+      ? pairs.get(parameterEnd) ?? parameterEnd
+      : parameterEnd;
+  }
+  for (let cursor = syntaxStart - 1; cursor >= Math.max(0, syntaxStart - 4); cursor -= 1) {
+    if (tokens[cursor]?.value === '=') {
+      const binding = tokens[cursor - 1];
+      return binding?.type === 'identifier' && ['const', 'let', 'var'].includes(tokens[cursor - 2]?.value)
+        ? binding.value
+        : null;
+    }
+    if ([';', '{', '}', ','].includes(tokens[cursor]?.value)) break;
+  }
+  const functionIndex = tokens[range.start]?.value === 'async' ? range.start + 1 : range.start;
+  return tokens[functionIndex]?.value === 'function' && tokens[functionIndex + 1]?.type === 'identifier'
+    ? tokens[functionIndex + 1].value
+    : null;
+};
+
+const localObjectMethodAt = (tokens, index, useIndex, pairs, functionRanges) => {
+  const priorReceiverContinues = ['.', '?.', ']'].includes(tokens[index - 3]?.value)
+    || (tokens[index - 3]?.value === ')' && !isControlHeaderClose(tokens, pairs, index - 3));
+  if (!['.', '?.'].includes(tokens[index - 1]?.value) || tokens[index - 2]?.type !== 'identifier'
+    || priorReceiverContinues) return null;
+  const objectRange = staticObjectInitializerRangeAt(tokens, tokens[index - 2].value, useIndex, pairs);
+  if (!objectRange) return null;
+  const methodName = tokens[index].value;
+  const method = topLevelSegments(tokens, objectRange.start + 1, objectRange.end - 1)
+    .filter(([propertyStart]) => tokens[propertyStart]?.value === methodName)
+    .pop();
+  if (!method) return null;
+  const [methodStart, methodEnd] = method;
+  const colon = topLevelToken(tokens, methodStart, methodEnd, ':');
+  if (colon >= 0) {
+    const functionValueAt = (start, end) => {
+      const value = trimExpressionRange(tokens, start, end, pairs);
+      const question = topLevelToken(tokens, value.start, value.end, '?');
+      if (question >= 0) {
+        let nestedQuestions = 0;
+        let colonIndex = -1;
+        for (let cursor = question + 1; cursor < value.end; cursor += 1) {
+          if (tokens[cursor]?.value === '?') nestedQuestions += 1;
+          else if (tokens[cursor]?.value === ':') {
+            if (nestedQuestions === 0) {
+              colonIndex = cursor;
+              break;
+            }
+            nestedQuestions -= 1;
+          }
+        }
+        if (colonIndex >= 0) {
+          const selected = staticBooleanValueAt(tokens, value.start, question, pairs, new Map());
+          if (selected === true) return functionValueAt(question + 1, colonIndex);
+          if (selected === false) return functionValueAt(colonIndex + 1, value.end);
+        }
+      }
+      return functionRanges.find(range => range.start >= value.start
+        && range.start < value.end
+        && range.closing < value.end
+        && (range.bodyEnd === value.end || range.closing === value.end - 1)) ?? null;
+    };
+    return functionValueAt(colon + 1, methodEnd);
+  }
+  return functionRanges.find(range => range.start === methodStart
+    && range.opening > objectRange.start
+    && range.closing < objectRange.end
+    && range.closing < useIndex) ?? null;
+};
+
+const functionParentOpening = (range, functionRanges) => functionRanges
+  .filter(candidate => candidate !== range
+    && candidate.start < range.start
+    && candidate.closing > range.closing)
+  .sort((left, right) => (left.closing - left.start) - (right.closing - right.start))[0]?.opening ?? null;
+
+const functionScopeOpeningAt = (position, functionRanges) => functionRanges
+  .filter(range => range.opening < position && range.closing >= position)
+  .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0]?.opening ?? null;
+
+const localFunctionWasReassigned = (tokens, name, start, end) => {
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    if (['=', '+=', '-=', '++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value)) return true;
+  }
+  return false;
+};
+
+const localFunctionDeclarationWasReassignedAt = (tokens, range, useIndex, pairs, functionRanges) => {
+  const name = localFunctionBindingNameAt(tokens, range, pairs);
+  if (name === null) return false;
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const declarationScope = lexicalScopePath(lexicalScopes, range.start);
+  for (let index = range.closing + 1; index < useIndex; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    const isAssignment = ['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??='].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value);
+    if (!isAssignment
+      || !isLexicallyVisible(declarationScope, lexicalScopePath(lexicalScopes, index))) continue;
+    if (!resolveVisibleBinding(bindings, name, index + 1, lexicalScopes)) return true;
+  }
+  return false;
+};
+
+const localFunctionForCallAt = (
+  tokens,
+  name,
+  useIndex,
+  pairs,
+  functionRanges,
+  knownLocalFunctions,
+  resolvingBindings = new Set()
+) => {
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const visibleBinding = resolveVisibleBinding(bindings, name, useIndex, lexicalScopes);
+  if (visibleBinding) {
+    if (visibleBinding.index >= useIndex || resolvingBindings.has(visibleBinding.index)
+      || !Number.isInteger(visibleBinding.expressionStart)
+      || !Number.isInteger(visibleBinding.expressionEnd)) return null;
+    for (let index = visibleBinding.index + 1; index < useIndex; index += 1) {
+      if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+      const isAssignment = ['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??='].includes(tokens[index + 1]?.value)
+        || ['++', '--'].includes(tokens[index + 1]?.value)
+        || ['++', '--'].includes(tokens[index - 1]?.value);
+      if (!isAssignment) continue;
+      const assignedBinding = resolveVisibleBinding(bindings, name, index + 1, lexicalScopes);
+      if (assignedBinding?.index === visibleBinding.index) return null;
+    }
+
+    const functionValue = functionRanges.find(range => (
+      localFunctionBindingNameAt(tokens, range, pairs) === name
+      && visibleBinding.expressionStart <= range.start
+      && range.start < visibleBinding.expressionEnd
+      && range.closing < useIndex
+    ));
+    if (functionValue) return functionValue;
+
+    const initializer = trimExpressionRange(
+      tokens,
+      visibleBinding.expressionStart,
+      visibleBinding.expressionEnd,
+      pairs
+    );
+    if (initializer.end - initializer.start === 3
+      && tokens[initializer.start]?.type === 'identifier'
+      && tokens[initializer.start + 1]?.value === '.'
+      && tokens[initializer.start + 2]?.type === 'identifier') {
+      return localObjectMethodAt(
+        tokens,
+        initializer.start + 2,
+        useIndex,
+        pairs,
+        functionRanges
+      );
+    }
+    if (initializer.end - initializer.start !== 1
+      || tokens[initializer.start]?.type !== 'identifier') return null;
+    const nextResolvingBindings = new Set(resolvingBindings);
+    nextResolvingBindings.add(visibleBinding.index);
+    return localFunctionForCallAt(
+      tokens,
+      tokens[initializer.start].value,
+      initializer.start,
+      pairs,
+      functionRanges,
+      knownLocalFunctions,
+      nextResolvingBindings
+    );
+  }
+
+  if (!knownLocalFunctions.has(name)) return null;
+  const useFunctionScope = functionScopeOpeningAt(useIndex, functionRanges);
+  const lexicalScopeAtUse = lexicalScopePath(lexicalScopes, useIndex);
+  const candidates = functionRanges
+    .filter(range => localFunctionBindingNameAt(tokens, range, pairs) === name
+      && range.start < useIndex
+      && range.closing < useIndex
+      && functionParentOpening(range, functionRanges) === useFunctionScope
+      && isLexicallyVisible(lexicalScopePath(lexicalScopes, range.start), lexicalScopeAtUse))
+    .sort((left, right) => lexicalScopePath(lexicalScopes, right.start).length
+      - lexicalScopePath(lexicalScopes, left.start).length
+      || right.start - left.start);
+  const localFunction = candidates[0];
+  if (!localFunction) return null;
+
+  const functionNameIndex = tokens[localFunction.start]?.value === 'async'
+    ? localFunction.start + 1
+    : localFunction.start;
+  if (tokens[functionNameIndex]?.value !== 'function'
+    || localFunctionDeclarationWasReassignedAt(tokens, localFunction, useIndex, pairs, functionRanges)) return null;
+  return localFunction;
+};
+
+const functionParameterRangesAt = (tokens, range, pairs) => {
+  let syntaxStart = range.start;
+  if (tokens[syntaxStart]?.value === 'async') syntaxStart += 1;
+  let parameterOpening;
+  let parameterClosing;
+  if (tokens[syntaxStart]?.value === 'function') {
+    parameterOpening = syntaxStart + 1;
+    while (parameterOpening < range.opening && tokens[parameterOpening]?.value !== '(') {
+      parameterOpening += 1;
+    }
+    parameterClosing = pairs.get(parameterOpening);
+  } else if (tokens[range.start]?.value === '=>') {
+    parameterClosing = range.start - 1;
+    if (tokens[parameterClosing]?.value === ')') parameterOpening = pairs.get(parameterClosing);
+    else return tokens[parameterClosing]?.type === 'identifier'
+      ? [[parameterClosing, parameterClosing + 1]]
+      : [];
+  } else {
+    let methodName = range.start;
+    if (tokens[methodName]?.value === 'async') methodName += 1;
+    if (tokens[methodName]?.value === '*') methodName += 1;
+    let possibleOpening = methodName + 1;
+    if (tokens[possibleOpening]?.value === '*') possibleOpening += 1;
+    if (tokens[possibleOpening]?.value !== '(') return [];
+    parameterOpening = possibleOpening;
+    parameterClosing = pairs.get(parameterOpening);
+  }
+  if (parameterOpening === undefined || parameterClosing === undefined) return [];
+  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing);
+};
+
+const topLevelSegmentsWithSlots = (tokens, start, end, pairs) => {
+  const segments = [];
+  let segmentStart = start;
+  for (let index = start; index < end; index += 1) {
+    const closing = pairs.get(index);
+    if (closing !== undefined && closing > index && closing < end) {
+      index = closing;
+      continue;
+    }
+    if (tokens[index]?.value === ',') {
+      segments.push([segmentStart, index]);
+      segmentStart = index + 1;
+    }
+  }
+  if (segmentStart < end || segments.length > 0) segments.push([segmentStart, end]);
+  return segments;
+};
+
+const parameterPatternBindingsAt = (tokens, start, end, pairs, path = []) => {
+  const pattern = trimExpressionRange(tokens, start, end, pairs);
+  const defaultIndex = topLevelToken(tokens, pattern.start, pattern.end, '=');
+  const patternEnd = defaultIndex < 0 ? pattern.end : defaultIndex;
+  const defaultRange = defaultIndex < 0
+    ? null
+    : { defaultStart: defaultIndex + 1, defaultEnd: pattern.end };
+  if (patternEnd - pattern.start === 1 && tokens[pattern.start]?.type === 'identifier') {
+    return [{ name: tokens[pattern.start].value, path, ...defaultRange }];
+  }
+
+  if (tokens[pattern.start]?.value === '{'
+    && pairs.get(pattern.start) === patternEnd - 1) {
+    return topLevelSegmentsWithSlots(tokens, pattern.start + 1, patternEnd - 1, pairs)
+      .flatMap(([propertyStart, propertyEnd]) => {
+        if (propertyStart >= propertyEnd || tokens[propertyStart]?.value === '...') return [];
+        const propertyName = staticPropertyName(tokens[propertyStart]);
+        if (propertyName === null) return [];
+        const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+        const bindingStart = colon < 0 ? propertyStart : colon + 1;
+        const bindingEnd = colon < 0 ? propertyEnd : propertyEnd;
+        return parameterPatternBindingsAt(
+          tokens,
+          bindingStart,
+          bindingEnd,
+          pairs,
+          [...path, propertyName]
+        );
+      });
+  }
+
+  if (tokens[pattern.start]?.value === '['
+    && pairs.get(pattern.start) === patternEnd - 1) {
+    return topLevelSegmentsWithSlots(tokens, pattern.start + 1, patternEnd - 1, pairs)
+      .flatMap(([elementStart, elementEnd], elementIndex) => elementStart >= elementEnd
+        ? []
+        : parameterPatternBindingsAt(
+          tokens,
+          elementStart,
+          elementEnd,
+          pairs,
+          [...path, elementIndex]
+        ));
+  }
+  return [];
+};
+
+const staticObjectPropertyValueAt = (tokens, start, end, propertyName, pairs) => {
+  const object = trimExpressionRange(tokens, start, end, pairs);
+  if (tokens[object.start]?.value !== '{' || pairs.get(object.start) !== object.end - 1) return null;
+  let selected = null;
+  for (const [propertyStart, propertyEnd] of topLevelSegmentsWithSlots(
+    tokens,
+    object.start + 1,
+    object.end - 1,
+    pairs
+  )) {
+    if (propertyStart >= propertyEnd) continue;
+    if (tokens[propertyStart]?.value === '...') {
+      const spread = trimExpressionRange(tokens, propertyStart + 1, propertyEnd, pairs);
+      if (tokens[spread.start]?.value !== '{' || pairs.get(spread.start) !== spread.end - 1) return null;
+      const spreadValue = staticObjectPropertyValueAt(
+        tokens,
+        spread.start,
+        spread.end,
+        propertyName,
+        pairs
+      );
+      if (spreadValue) selected = spreadValue;
+      continue;
+    }
+    if (staticPropertyName(tokens[propertyStart]) !== propertyName) continue;
+    const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+    selected = trimExpressionRange(
+      tokens,
+      colon < 0 ? propertyStart : colon + 1,
+      propertyEnd,
+      pairs
+    );
+  }
+  return selected;
+};
+
+const argumentValueAtPath = (tokens, start, end, path, pairs) => {
+  let value = trimExpressionRange(tokens, start, end, pairs);
+  for (const segment of path) {
+    if (value.start >= value.end) return null;
+    if (typeof segment === 'number'
+      && tokens[value.start]?.value === '[') {
+      const elements = staticApplyArrayArgumentsAt(tokens, value.start, value.end, end, pairs);
+      if (!elements) return null;
+      const element = elements[segment];
+      if (!element || element[0] >= element[1]) return null;
+      value = trimExpressionRange(tokens, element[0], element[1], pairs);
+      continue;
+    }
+    if (typeof segment === 'string' && tokens[value.start]?.value === '{') {
+      value = staticObjectPropertyValueAt(tokens, value.start, value.end, segment, pairs);
+      if (!value) return null;
+      continue;
+    }
+    return null;
+  }
+  return value.start < value.end ? value : null;
+};
+
+const isAggregateLiteralAt = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  return ['{', '['].includes(tokens[expression.start]?.value)
+    && pairs.get(expression.start) === expression.end - 1;
+};
+
+const functionParameterDescriptorsAt = (tokens, range, pairs) => functionParameterRangesAt(
+  tokens,
+  range,
+  pairs
+).map(([start, end]) => {
+  const defaultIndex = topLevelToken(tokens, start, end, '=');
+  const bindingEnd = defaultIndex < 0 ? end : defaultIndex;
+  return {
+    name: bindingEnd - start === 1 && tokens[start]?.type === 'identifier' ? tokens[start].value : null,
+    bindings: parameterPatternBindingsAt(tokens, start, bindingEnd, pairs),
+    defaultStart: defaultIndex < 0 ? null : defaultIndex + 1,
+    defaultEnd: defaultIndex < 0 ? null : end,
+    patternStart: start,
+    patternEnd: bindingEnd
+  };
+});
+
+const functionParameterNamesAt = (tokens, range, pairs) => functionParameterDescriptorsAt(
+  tokens,
+  range,
+  pairs
+).map(parameter => parameter.name);
+
+const callbackParameterNameAt = (tokens, range, pairs) => functionParameterNamesAt(tokens, range, pairs)[0] ?? null;
+
+const promiseHandlerOutcomesAt = (
+  tokens,
+  handler,
+  inputHasGap,
+  pairs,
+  functionRanges,
+  aliases,
+  callbackKind = 'outcome'
+) => {
+  const handlerExpression = trimExpressionRange(tokens, handler[0], handler[1], pairs);
+  const identityHandler = handlerExpression.end - handlerExpression.start === 1
+    && ['undefined', 'null'].includes(tokens[handlerExpression.start]?.value);
+  if (identityHandler) {
+    return {
+      canFulfill: true,
+      fulfillmentHasGap: inputHasGap,
+      canReject: false,
+      rejectionHasGap: false
+    };
+  }
+
+  const handlerRange = functionRanges
+    .filter(range => range.start >= handlerExpression.start && range.closing < handlerExpression.end)
+    .filter(range => isScheduledCallback(tokens, pairs, range) === callbackKind)
+    .filter(range => !functionRanges.some(parent => parent !== range
+      && parent.start >= handlerExpression.start
+      && parent.start < range.start
+      && parent.closing > range.closing
+      && parent.closing < handlerExpression.end))
+    .sort((left, right) => (right.closing - right.start) - (left.closing - left.start))[0];
+  if (!handlerRange) return null;
+
+  const handlerAliases = new Set(aliases);
+  const parameterName = callbackParameterNameAt(tokens, handlerRange, pairs);
+  if (inputHasGap && parameterName) handlerAliases.add(parameterName);
+  const bodyStart = handlerRange.expression ? handlerRange.bodyStart : handlerRange.opening + 1;
+  let bodyEnd = handlerRange.expression ? handlerRange.bodyEnd : handlerRange.closing;
+  while (bodyEnd > bodyStart && tokens[bodyEnd - 1]?.value === ';') bodyEnd -= 1;
+  const startsWithThrow = !handlerRange.expression && tokens[bodyStart]?.value === 'throw';
+  const returnedValueStart = !handlerRange.expression && tokens[bodyStart]?.value === 'return'
+    ? bodyStart + 1
+    : bodyStart;
+  const rejectedCallOpening = returnedValueStart + 3;
+  const startsWithPromiseReject = isNativePromiseMethodAt(tokens, returnedValueStart, 'reject', pairs)
+    && tokens[rejectedCallOpening]?.value === '(';
+  const alwaysRejects = startsWithThrow
+    || (startsWithPromiseReject
+      && pairs.get(rejectedCallOpening) === bodyEnd - 1);
+  const nestedRanges = functionRanges.filter(range => range !== handlerRange
+    && range.start >= bodyStart
+    && range.closing < bodyEnd);
+  let canReject = false;
+  let rejectionHasGap = false;
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    if (nestedRanges.some(range => range.start <= index && range.closing >= index)) continue;
+    if (tokens[index]?.value === 'throw') {
+      canReject = true;
+      rejectionHasGap ||= valueHasGapOutcome(
+        tokens,
+        index + 1,
+        gapValueEnd(tokens, index + 1),
+        pairs,
+        handlerAliases
+      );
+    }
+    const rejectCall = isNativePromiseMethodAt(tokens, index, 'reject', pairs)
+      && tokens[index + 3]?.value === '(';
+    if (!rejectCall) continue;
+    const rejectClosing = pairs.get(index + 3);
+    if (rejectClosing === undefined || rejectClosing >= bodyEnd) continue;
+    const rejectArguments = topLevelSegments(tokens, index + 4, rejectClosing);
+    canReject = true;
+    rejectionHasGap ||= rejectArguments.length > 0
+      && valueHasGapOutcome(tokens, rejectArguments[0][0], rejectArguments[0][1], pairs, handlerAliases);
+  }
+  const canFulfill = !alwaysRejects;
+  const fulfillmentHasGap = canFulfill && (handlerRange.expression
+    ? valueHasGapOutsideNestedFunctions(
+      tokens,
+      bodyStart,
+      bodyEnd,
+      pairs,
+      functionRanges,
+      handlerAliases,
+      true
+    )
+    : hasGapOutcome(
+      tokens,
+      bodyStart,
+      bodyEnd,
+      handlerRange.opening,
+      pairs,
+      functionRanges,
+      handlerAliases
+    ));
+  return { canFulfill, fulfillmentHasGap, canReject, rejectionHasGap };
+};
+
+const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  let expressionEnd = expression.end;
+  while (expressionEnd > expression.start && tokens[expressionEnd - 1]?.value === ';') expressionEnd -= 1;
+  const startMethod = tokens[expression.start + 2]?.value;
+  const opening = expression.start + 3;
+  if (!['resolve', 'reject'].includes(startMethod)
+    || !isNativePromiseMethodAt(tokens, expression.start, startMethod, pairs)
+    || tokens[opening]?.value !== '(') return null;
+  const closing = pairs.get(opening);
+  if (closing === undefined || closing >= expression.end) return null;
+  const initialArguments = topLevelSegments(tokens, opening + 1, closing);
+  const initialHasGap = initialArguments.length > 0
+    && valueHasGapOutcome(tokens, initialArguments[0][0], initialArguments[0][1], pairs, aliases);
+  let fulfillmentPossible = startMethod === 'resolve';
+  let rejectionPossible = startMethod === 'reject';
+  let fulfillmentHasGap = fulfillmentPossible && initialHasGap;
+  let rejectionHasGap = rejectionPossible && initialHasGap;
+  let cursor = closing + 1;
+  let handlerCount = 0;
+
+  while (cursor < expressionEnd) {
+    const separator = tokens[cursor]?.value;
+    const methodIndex = cursor + 1;
+    const callOpening = cursor + 2;
+    const method = tokens[methodIndex]?.value;
+    if (!['.', '?.'].includes(separator)
+      || !['then', 'catch', 'finally'].includes(method)
+      || tokens[callOpening]?.value !== '(') break;
+    const callClosing = pairs.get(callOpening);
+    if (callClosing === undefined || callClosing >= expressionEnd) return null;
+    const handlerArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+
+    if (method === 'finally') {
+      const callback = handlerArguments[0];
+      if (callback && callback[0] < callback[1]) {
+        const callbackExpression = trimExpressionRange(tokens, callback[0], callback[1], pairs);
+        const ignoredCallback = callbackExpression.end - callbackExpression.start === 1
+          && ['undefined', 'null'].includes(tokens[callbackExpression.start]?.value);
+        if (!ignoredCallback) {
+          const outcomes = promiseHandlerOutcomesAt(
+            tokens,
+            callback,
+            false,
+            pairs,
+            functionRanges,
+            aliases,
+            'discarded'
+          );
+          if (!outcomes) return null;
+          const hadSettlement = fulfillmentPossible || rejectionPossible;
+          if (!outcomes.canFulfill) {
+            fulfillmentPossible = false;
+            fulfillmentHasGap = false;
+            rejectionPossible = hadSettlement && outcomes.canReject;
+            rejectionHasGap = outcomes.rejectionHasGap;
+          } else if (outcomes.canReject) {
+            rejectionPossible ||= hadSettlement;
+            rejectionHasGap ||= outcomes.rejectionHasGap;
+          }
+        }
+      }
+    } else {
+      const fulfillmentHandler = method === 'catch' ? null : handlerArguments[0];
+      const rejectionHandler = method === 'catch' ? handlerArguments[0] : handlerArguments[1];
+      let nextFulfillmentPossible = false;
+      let nextRejectionPossible = false;
+      let nextFulfillmentHasGap = false;
+      let nextRejectionHasGap = false;
+
+      if (fulfillmentPossible) {
+        if (fulfillmentHandler && fulfillmentHandler[0] < fulfillmentHandler[1]) {
+          const outcomes = promiseHandlerOutcomesAt(
+            tokens,
+            fulfillmentHandler,
+            fulfillmentHasGap,
+            pairs,
+            functionRanges,
+            aliases
+          );
+          if (!outcomes) return null;
+          nextFulfillmentPossible ||= outcomes.canFulfill;
+          nextFulfillmentHasGap ||= outcomes.fulfillmentHasGap;
+          nextRejectionPossible ||= outcomes.canReject;
+          nextRejectionHasGap ||= outcomes.rejectionHasGap;
+        } else {
+          nextFulfillmentPossible = true;
+          nextFulfillmentHasGap = fulfillmentHasGap;
+        }
+      }
+
+      if (rejectionPossible) {
+        if (rejectionHandler && rejectionHandler[0] < rejectionHandler[1]) {
+          const outcomes = promiseHandlerOutcomesAt(
+            tokens,
+            rejectionHandler,
+            rejectionHasGap,
+            pairs,
+            functionRanges,
+            aliases
+          );
+          if (!outcomes) return null;
+          nextFulfillmentPossible ||= outcomes.canFulfill;
+          nextFulfillmentHasGap ||= outcomes.fulfillmentHasGap;
+          nextRejectionPossible ||= outcomes.canReject;
+          nextRejectionHasGap ||= outcomes.rejectionHasGap;
+        } else {
+          nextRejectionPossible = true;
+          nextRejectionHasGap = rejectionHasGap;
+        }
+      }
+
+      fulfillmentPossible = nextFulfillmentPossible;
+      rejectionPossible = nextRejectionPossible;
+      fulfillmentHasGap = nextFulfillmentHasGap;
+      rejectionHasGap = nextRejectionHasGap;
+    }
+
+    handlerCount += 1;
+    cursor = callClosing + 1;
+  }
+
+  return handlerCount > 0
+    ? { start: expression.start, end: cursor, hasGap: fulfillmentHasGap || rejectionHasGap }
+    : null;
+};
+
+const promiseThenChainGapOutcome = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  const chain = promiseThenChainAt(
+    tokens,
+    expression.start,
+    expression.end,
+    pairs,
+    functionRanges,
+    aliases
+  );
+  if (!chain) return null;
+  for (let index = chain.end; index < expression.end; index += 1) {
+    if (tokens[index]?.value !== ';') return null;
+  }
+  return chain.hasGap;
+};
+
+const localFunctionInvocationAt = (
+  tokens,
+  index,
+  pairs,
+  functionRanges,
+  knownLocalFunctions
+) => {
+  const isObjectMethod = ['.', '?.'].includes(tokens[index - 1]?.value);
+  const invocationMethod = tokens[index + 1]?.value === '.'
+    && ['call', 'apply', 'bind'].includes(tokens[index + 2]?.value)
+    && tokens[index + 3]?.value === '(';
+  if (invocationMethod) {
+    const localFunction = isObjectMethod
+      ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
+      : localFunctionForCallAt(
+        tokens,
+        tokens[index].value,
+        index,
+        pairs,
+        functionRanges,
+        knownLocalFunctions
+      );
+    if (!localFunction) return null;
+    const callOpening = index + 3;
+    const callClosing = pairs.get(callOpening);
+    if (callClosing === undefined) return null;
+    const suppliedArguments = staticCallArgumentsAt(tokens, callOpening, callClosing, callOpening, pairs);
+    if (!suppliedArguments) return null;
+    if (tokens[index + 2].value === 'bind') {
+      const invokeOpening = callClosing + 1;
+      if (tokens[invokeOpening]?.value !== '(') return null;
+      const invokeClosing = pairs.get(invokeOpening);
+      if (invokeClosing === undefined) return null;
+      const boundArguments = suppliedArguments.slice(1);
+      const invocationArguments = staticCallArgumentsAt(
+        tokens,
+        invokeOpening,
+        invokeClosing,
+        invokeOpening,
+        pairs
+      );
+      if (!invocationArguments) return null;
+      return {
+        localFunction,
+        argumentsList: [...boundArguments, ...invocationArguments],
+        callClosing: invokeClosing
+      };
+    }
+    let argumentsList;
+    if (tokens[index + 2].value === 'call') {
+      argumentsList = suppliedArguments.slice(1);
+    } else {
+      const appliedArray = suppliedArguments[1];
+      if (!appliedArray) argumentsList = [];
+      else argumentsList = staticApplyArrayArgumentsAt(
+        tokens,
+        appliedArray[0],
+        appliedArray[1],
+        callOpening,
+        pairs
+      ) || [];
+    }
+    return { localFunction, argumentsList, callClosing };
+  }
+
+  const callOpening = tokens[index + 1]?.value === '('
+    ? index + 1
+    : tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '('
+      ? index + 2
+      : null;
+  if (callOpening === null) return null;
+  const localFunction = isObjectMethod
+    ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
+    : localFunctionForCallAt(
+      tokens,
+      tokens[index].value,
+      index,
+      pairs,
+      functionRanges,
+      knownLocalFunctions
+    );
+  const callClosing = pairs.get(callOpening);
+  const argumentsList = staticCallArgumentsAt(tokens, callOpening, callClosing, callOpening, pairs);
+  if (!localFunction || callClosing === undefined || !argumentsList) return null;
+  return {
+    localFunction,
+    argumentsList,
+    callClosing
+  };
+};
+
+const returnedParameterPathAt = (tokens, start, end, parameters, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  const root = tokens[expression.start];
+  if (root?.type !== 'identifier') return null;
+  let parameterIndex = -1;
+  let parameterBinding;
+  for (let index = parameters.length - 1; index >= 0; index -= 1) {
+    const binding = parameters[index].bindings.find(candidate => candidate.name === root.value);
+    if (binding) {
+      parameterIndex = index;
+      parameterBinding = binding;
+      break;
+    }
+  }
+  if (!parameterBinding) return null;
+
+  const path = [...parameterBinding.path];
+  let cursor = expression.start + 1;
+  while (cursor < expression.end) {
+    if (['.', '?.'].includes(tokens[cursor]?.value)
+      && tokens[cursor + 1]?.type === 'identifier') {
+      path.push(tokens[cursor + 1].value);
+      cursor += 2;
+      continue;
+    }
+    if (tokens[cursor]?.value === '[') {
+      const closing = pairs.get(cursor);
+      if (closing !== cursor + 2) return null;
+      const property = tokens[cursor + 1];
+      if (property?.type === 'number') path.push(Number(property.value));
+      else if (property?.type === 'string') path.push(staticPropertyName(property));
+      else return null;
+      cursor = closing + 1;
+      continue;
+    }
+    return null;
+  }
+  return { parameterIndex, path };
+};
+
+const isStaticUndefinedExpressionAt = (tokens, start, end, pairs) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.end - expression.start === 2
+    && tokens[expression.start]?.value === 'void'
+    && tokens[expression.start + 1]?.value === '0') return true;
+  return expression.end - expression.start === 1
+    && tokens[expression.start]?.value === 'undefined'
+    && isUnshadowedIdentifierAt(tokens, 'undefined', expression.start, pairs);
+};
+
+const localParameterArgumentAt = (tokens, parameter, argumentsList, parameterIndex, pairs) => {
+  const supplied = argumentsList[parameterIndex];
+  if (supplied && supplied[0] < supplied[1]) {
+    if (parameter.defaultStart !== null
+      && isStaticUndefinedExpressionAt(tokens, supplied[0], supplied[1], pairs)) {
+      return [parameter.defaultStart, parameter.defaultEnd];
+    }
+    return supplied;
+  }
+  return parameter.defaultStart === null
+    ? null
+    : [parameter.defaultStart, parameter.defaultEnd];
+};
+
+const parameterBindingArgumentAt = (tokens, parameter, argument, binding, pairs) => {
+  if (!argument) return null;
+  const value = argumentValueAtPath(tokens, argument[0], argument[1], binding.path, pairs);
+  if (value && !isStaticUndefinedExpressionAt(tokens, value.start, value.end, pairs)) return value;
+  if (binding.defaultStart !== undefined) {
+    return trimExpressionRange(tokens, binding.defaultStart, binding.defaultEnd, pairs);
+  }
+  return value;
+};
+
+const parameterWasReassignedBefore = (tokens, name, start, end) => {
+  const assignmentOperators = new Set(['=', '+=', '-=', '*=', '/=', '||=', '&&=', '??=']);
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.value !== name || tokens[index - 1]?.value === '.') continue;
+    if (assignmentOperators.has(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index + 1]?.value)
+      || ['++', '--'].includes(tokens[index - 1]?.value)) return true;
+  }
+  return false;
+};
+
+const localFunctionIsAsyncAt = (tokens, range) => tokens[range.start]?.value === 'async'
+  || tokens[range.start - 1]?.value === 'async';
+
+const localCallableReturnsGapOutcome = (
+  tokens,
+  localFunction,
+  parameters,
+  argumentsList,
+  pairs,
+  functionRanges,
+  aliases
+) => {
+  const bodyStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
+  const bodyEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+  const returns = [];
+  if (localFunction.expression) {
+    returns.push([bodyStart, bodyEnd]);
+  } else {
+    const nestedFunctions = new Map(functionRanges
+      .filter(range => range !== localFunction && range.start >= bodyStart && range.opening < bodyEnd)
+      .map(range => [range.start, range]));
+    for (let index = bodyStart; index < bodyEnd; index += 1) {
+      const nested = nestedFunctions.get(index);
+      if (nested) {
+        index = nested.closing;
+        continue;
+      }
+      if (tokens[index]?.value !== 'return') continue;
+      const statementEnd = findStatementEnd(tokens, index + 1, bodyEnd);
+      returns.push([index + 1, statementEnd]);
+      index = statementEnd - 1;
+    }
+  }
+
+  return returns.some(([start, end]) => {
+    const returnedPath = returnedParameterPathAt(tokens, start, end, parameters, pairs);
+    if (!returnedPath) return false;
+    const parameter = parameters[returnedPath.parameterIndex];
+    const bindingName = tokens[trimExpressionRange(tokens, start, end, pairs).start]?.value;
+    if (parameterWasReassignedBefore(tokens, bindingName, bodyStart, start)) return false;
+    const argument = localParameterArgumentAt(
+      tokens,
+      parameter,
+      argumentsList,
+      returnedPath.parameterIndex,
+      pairs
+    );
+    if (!argument) return false;
+    const binding = parameter.bindings.find(candidate => candidate.name === bindingName);
+    const value = parameterBindingArgumentAt(
+      tokens,
+      parameter,
+      argument,
+      { ...(binding || {}), path: returnedPath.path },
+      pairs
+    );
+    return value !== null
+      && valueHasGapOutcome(tokens, value.start, value.end, pairs, aliases, new Set(), true);
+  });
+};
+
+const localFunctionCallHasGapOutcome = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  knownLocalFunctions,
+  aliases,
+  writerAliases,
+  resolvingFunctions,
+  includeReturnedValues = true,
+  allowAsyncOutcome = true
+) => {
+  for (let index = start; index < end; index += 1) {
+    if (tokens[index]?.type !== 'identifier') continue;
+    const invocation = localFunctionInvocationAt(
+      tokens,
+      index,
+      pairs,
+      functionRanges,
+      knownLocalFunctions
+    );
+    const localFunction = invocation?.localFunction;
+    if (!localFunction || resolvingFunctions.has(localFunction)) continue;
+
+    const callbackStart = localFunction.expression ? localFunction.bodyStart : localFunction.opening + 1;
+    const callbackEnd = localFunction.expression ? localFunction.bodyEnd : localFunction.closing;
+    const callAliases = new Set(aliases);
+    const parameters = functionParameterDescriptorsAt(tokens, localFunction, pairs);
+    const callArguments = invocation.argumentsList;
+    const callbackReturnsAreMeaningful = includeReturnedValues
+      && (allowAsyncOutcome || !localFunctionIsAsyncAt(tokens, localFunction));
+    parameters.forEach((parameter, parameterIndex) => {
+      const argument = localParameterArgumentAt(tokens, parameter, callArguments, parameterIndex, pairs);
+      if (!argument) {
+        parameter.bindings.forEach(binding => callAliases.delete(binding.name));
+        return;
+      }
+      parameter.bindings.forEach(binding => {
+        const boundValue = parameterBindingArgumentAt(
+          tokens,
+          parameter,
+          argument,
+          binding,
+          pairs
+        );
+        const isScalarGap = boundValue !== null
+          && !isAggregateLiteralAt(tokens, boundValue.start, boundValue.end, pairs)
+          && valueHasGapOutcome(
+            tokens,
+            boundValue.start,
+            boundValue.end,
+            pairs,
+            aliases,
+            new Set(),
+            true
+          );
+        if (isScalarGap) callAliases.add(binding.name);
+        else callAliases.delete(binding.name);
+      });
+    });
+    if (callbackReturnsAreMeaningful && localCallableReturnsGapOutcome(
+      tokens,
+      localFunction,
+      parameters,
+      callArguments,
+      pairs,
+      functionRanges,
+      aliases
+    )) return true;
+    const nextResolvingFunctions = new Set(resolvingFunctions);
+    nextResolvingFunctions.add(localFunction);
+    const callbackHasGap = localFunction.expression
+      ? (callbackReturnsAreMeaningful && valueHasGapOutsideNestedFunctions(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        pairs,
+        functionRanges,
+        callAliases,
+        true
+      )) || localFunctionCallHasGapOutcome(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        pairs,
+        functionRanges,
+        knownLocalFunctions,
+        callAliases,
+        writerAliases,
+        nextResolvingFunctions,
+        callbackReturnsAreMeaningful
+      )
+      : hasGapOutcome(
+        tokens,
+        callbackStart,
+        callbackEnd,
+        localFunction.opening,
+        pairs,
+        functionRanges,
+        callAliases,
+        writerAliases,
+        nextResolvingFunctions,
+        callbackReturnsAreMeaningful
+      );
+    if (callbackHasGap || hasBoundaryWriterGap(
+      tokens,
+      callbackStart,
+      callbackEnd,
+      pairs,
+      functionRanges,
+      aliases,
+      writerAliases
+    )) return true;
+  }
+  return false;
+};
+
+const abruptCompletionIsUnconditionalAt = (tokens, index, start, end, pairs) => {
+  for (let cursor = start; cursor < index; cursor += 1) {
+    if (tokens[cursor]?.value === 'if' && tokens[cursor + 1]?.value === '(') {
+      const conditionEnd = pairs.get(cursor + 1);
+      if (conditionEnd === undefined) continue;
+      const consequentStart = conditionEnd + 1;
+      const consequentEnd = findControlledStatementEnd(tokens, consequentStart, end, pairs, false);
+      if (index >= consequentStart && index < consequentEnd) return false;
+      if (tokens[consequentEnd]?.value === 'else') {
+        const alternateStart = consequentEnd + 1;
+        const alternateEnd = findControlledStatementEnd(tokens, alternateStart, end, pairs, false);
+        if (index >= alternateStart && index < alternateEnd) return false;
+      }
+    }
+    if (['for', 'while', 'switch', 'catch'].includes(tokens[cursor]?.value)
+      && tokens[cursor + 1]?.value === '(') {
+      const conditionEnd = pairs.get(cursor + 1);
+      if (conditionEnd === undefined) continue;
+      const bodyStart = conditionEnd + 1;
+      const bodyEnd = findControlledStatementEnd(tokens, bodyStart, end, pairs, false);
+      if (index >= bodyStart && index < bodyEnd) return false;
+    }
+    if (tokens[cursor]?.value === 'try') {
+      const bodyStart = cursor + 1;
+      const bodyEnd = findControlledStatementEnd(tokens, bodyStart, end, pairs, false);
+      const hasHandler = ['catch', 'finally'].includes(tokens[bodyEnd]?.value)
+        || tokens[bodyEnd]?.value === 'catch' && tokens[bodyEnd + 1]?.value === '(';
+      if (hasHandler && index >= bodyStart && index < bodyEnd) return false;
+    }
+  }
+  return true;
+};
+
+const eagerNamedCallbackAt = (tokens, index, pairs) => {
+  if (!EAGER_ARRAY_CALLBACK_METHODS.has(tokens[index]?.value)
+    || !['.', '?.'].includes(tokens[index - 1]?.value)
+    || tokens[index + 1]?.value !== '(') return null;
+  const closing = pairs.get(index + 1);
+  if (closing === undefined) return null;
+  const callbackArgument = topLevelSegments(tokens, index + 2, closing)[0];
+  if (!callbackArgument) return null;
+  const callback = trimExpressionRange(tokens, callbackArgument[0], callbackArgument[1], pairs);
+  if (callback.end - callback.start !== 1 || tokens[callback.start]?.type !== 'identifier') return null;
+  return { name: tokens[callback.start].value, useIndex: callback.start };
+};
+
+const hasGapOutcome = (
+  tokens,
+  start,
+  end,
+  opening,
+  pairs,
+  functionRanges,
+  aliases = new Set(),
+  writerAliases = new Map(),
+  resolvingFunctions = new Set(),
+  includeReturnedValues = true
+) => {
+  const knownAliases = new Set(aliases);
+  const knownWriterAliases = new Map(writerAliases);
+  const knownBooleanAliases = new Map();
+  const localAssignments = findIdentifierAssignments(tokens, findLexicalScopes(tokens, pairs));
+  const knownLocalFunctions = new Map();
+  const knownOutcomeObjects = new Map();
+  const unreachableRanges = new Map();
+  const localFunctionScope = functionScopeOpeningAt(start, functionRanges);
+  for (const candidate of functionRanges) {
+    if (candidate.start >= start || candidate.closing >= start
+      || functionParentOpening(candidate, functionRanges) !== localFunctionScope) continue;
+    const bindingName = localFunctionBindingNameAt(tokens, candidate, pairs);
+    if (bindingName !== null) knownLocalFunctions.set(bindingName, candidate);
+  }
+  const nestedFunctionStarts = new Map(functionRanges
+    .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
+    .map(range => [range.start, range]));
+  for (let index = start; index < end; index += 1) {
+    const unreachableThrough = unreachableRanges.get(index);
+    if (unreachableThrough !== undefined) {
+      index = unreachableThrough;
+      continue;
+    }
+    const nestedFunction = nestedFunctionStarts.get(index);
+    if (nestedFunction) {
+      const bindingName = localFunctionBindingNameAt(tokens, nestedFunction, pairs);
+      if (bindingName !== null && functionParentOpening(nestedFunction, functionRanges) === localFunctionScope) {
+        knownLocalFunctions.set(bindingName, nestedFunction);
+      }
+      const callbackKind = isScheduledCallback(tokens, pairs, nestedFunction);
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
+        const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
+        const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
+        if (callbackKind === PROMISE_EXECUTOR_CALLBACK) {
+          if (promiseExecutorHasGapResolution(
+            tokens,
+            nestedFunction,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            knownAliases
+          )) return true;
+          index = nestedFunction.closing;
+          continue;
+        }
+        if (callbackKind === 'discarded'
+          && hasBoundaryWriterGap(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            functionRanges,
+            knownAliases,
+            knownWriterAliases
+          )) return true;
+        if (callbackKind !== 'discarded'
+          && nestedFunction.expression
+          && valueHasGapOutsideNestedFunctions(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            functionRanges,
+            knownAliases,
+            true
+          )) return true;
+        if (callbackKind !== 'discarded' && hasGapOutcome(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          nestedFunction.opening,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases
+        )) return true;
+      }
+      index = nestedFunction.closing;
+      continue;
+    }
+    const token = tokens[index];
+    if (['const', 'let', 'var'].includes(token.value)
+      && tokens[index + 1]?.type === 'identifier'
+      && tokens[index + 2]?.value === '=') {
+      const objectName = tokens[index + 1].value;
+      const initializerStart = index + 3;
+      const initializerEnd = findAssignmentValueEnd(tokens, initializerStart, end);
+      if (tokens[initializerStart]?.value === '{'
+        && pairs.get(initializerStart) === initializerEnd - 1) {
+        const outcomeProperties = new Map();
+        for (const [propertyStart, propertyEnd] of topLevelSegments(
+          tokens,
+          initializerStart + 1,
+          initializerEnd - 1
+        )) {
+          const propertyName = staticPropertyName(tokens[propertyStart]);
+          const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+          if (propertyName === null || !OUTCOME_NAMES.has(propertyName) || colon < 0) continue;
+          outcomeProperties.set(propertyName, valueHasGapOutcome(
+            tokens,
+            colon + 1,
+            propertyEnd,
+            pairs,
+            knownAliases,
+            new Set(),
+            false,
+            false
+          ));
+        }
+        knownOutcomeObjects.set(objectName, outcomeProperties);
+      } else {
+        knownOutcomeObjects.delete(objectName);
+      }
+    }
+    if (token.value === 'delete'
+      && [';', '{', '}', undefined].includes(tokens[index - 1]?.value)) {
+      const objectName = tokens[index + 1]?.value;
+      let propertyName = null;
+      if (tokens[index + 2]?.value === '.') propertyName = tokens[index + 3]?.value;
+      else if (tokens[index + 2]?.value === '[') propertyName = staticPropertyName(tokens[index + 3]);
+      const outcomeProperties = knownOutcomeObjects.get(objectName);
+      if (outcomeProperties && propertyName !== null && OUTCOME_NAMES.has(propertyName)) {
+        outcomeProperties.delete(propertyName);
+        index = Math.max(index, findStatementEnd(tokens, index, end) - 1);
+        continue;
+      }
+    }
+    if (['if', 'while', 'for'].includes(token.value) && tokens[index + 1]?.value === '(') {
+      const conditionClosing = pairs.get(index + 1);
+      let conditionStart = index + 2;
+      let conditionEnd = conditionClosing;
+      let unreachableUpdate = null;
+      if (token.value === 'for' && conditionClosing !== undefined) {
+        const initializerEnd = topLevelToken(tokens, index + 2, conditionClosing, ';');
+        const conditionSeparator = initializerEnd < 0
+          ? -1
+          : topLevelToken(tokens, initializerEnd + 1, conditionClosing, ';');
+        if (initializerEnd < 0 || conditionSeparator < 0) conditionEnd = undefined;
+        else {
+          conditionStart = initializerEnd + 1;
+          conditionEnd = conditionSeparator;
+          unreachableUpdate = [conditionSeparator + 1, conditionClosing];
+        }
+      }
+      const condition = conditionClosing === undefined || conditionEnd === undefined
+        ? null
+        : staticBooleanValueAt(tokens, conditionStart, conditionEnd, pairs, knownBooleanAliases);
+      const bodyStart = conditionClosing === undefined ? -1 : conditionClosing + 1;
+      const bodyClosing = tokens[bodyStart]?.value === '{' ? pairs.get(bodyStart) : undefined;
+      const bodyEnd = bodyClosing === undefined
+        ? findStatementEnd(tokens, bodyStart, end)
+        : bodyClosing + 1;
+      if (token.value === 'if' && bodyEnd > bodyStart && condition === false) {
+        index = bodyEnd - 1;
+        continue;
+      }
+      if (token.value === 'if' && bodyEnd > bodyStart && condition === true && tokens[bodyEnd]?.value === 'else') {
+        const elseStart = bodyEnd + 1;
+        const elseClosing = tokens[elseStart]?.value === '{' ? pairs.get(elseStart) : undefined;
+        const elseEnd = elseClosing === undefined
+          ? findStatementEnd(tokens, elseStart, end)
+          : elseClosing + 1;
+        if (elseEnd > elseStart) {
+          index = elseEnd - 1;
+          continue;
+        }
+      }
+      if (token.value !== 'if' && bodyEnd > bodyStart && condition === false) {
+        if (unreachableUpdate && unreachableUpdate[0] < unreachableUpdate[1]) {
+          unreachableRanges.set(unreachableUpdate[0], unreachableUpdate[1] - 1);
+        }
+        unreachableRanges.set(bodyStart, bodyEnd - 1);
+      }
+    }
+    if (token.type === 'identifier' && tokens[index + 1]?.value === '=') {
+      const assignment = localAssignments.find(candidate => candidate.index === index);
+      if (assignment) {
+        const assignmentValue = staticBooleanValueAt(
+          tokens,
+          assignment.equalsIndex + 1,
+          findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, end),
+          pairs,
+          knownBooleanAliases
+        );
+        const conditionalScopes = assignment.scope
+          .filter(scope => isConditionalBlockScopeAt(tokens, scope));
+        const unconditionalInSelectedBlock = opening !== null
+          && conditionalScopes.includes(opening)
+          && conditionalScopes.every(scope => scope === opening)
+          && ![')', 'else'].includes(tokens[assignment.index - 1]?.value);
+        if (unconditionalInSelectedBlock) {
+          if (assignmentValue === null) knownBooleanAliases.delete(assignment.name);
+          else knownBooleanAliases.set(assignment.name, assignmentValue);
+        } else if (knownBooleanAliases.has(assignment.name)
+          && assignmentValue !== knownBooleanAliases.get(assignment.name)) {
+          knownBooleanAliases.delete(assignment.name);
+        }
+      }
+    }
+    if (token.value === 'throw') {
+      const statementEnd = findStatementEnd(tokens, index + 1, end);
+      const hasHandler = caughtThrowHandlerEnd(tokens, index, pairs) !== null
+        || enclosingFinallyHandlerEnd(tokens, index, pairs) !== null;
+      if (!hasHandler && abruptCompletionIsUnconditionalAt(tokens, index, start, end, pairs)) return false;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (token.type === 'identifier'
+      && (tokens[index + 1]?.value === '('
+        || (tokens[index + 1]?.value === '.'
+          && ['call', 'apply', 'bind'].includes(tokens[index + 2]?.value)
+          && tokens[index + 3]?.value === '('))) {
+      const isMemberCall = tokens[index - 1]?.value === '.';
+      const eagerCallback = eagerNamedCallbackAt(tokens, index, pairs);
+      if (eagerCallback) {
+        const callbackFunction = localFunctionForCallAt(
+          tokens,
+          eagerCallback.name,
+          eagerCallback.useIndex,
+          pairs,
+          functionRanges,
+          knownLocalFunctions
+        );
+        if (callbackFunction && !resolvingFunctions.has(callbackFunction)) {
+          const callbackStart = callbackFunction.expression
+            ? callbackFunction.bodyStart
+            : callbackFunction.opening + 1;
+          const callbackEnd = callbackFunction.expression
+            ? callbackFunction.bodyEnd
+            : callbackFunction.closing;
+          const nextResolvingFunctions = new Set(resolvingFunctions);
+          nextResolvingFunctions.add(callbackFunction);
+          const callbackHasGap = callbackFunction.expression
+            ? valueHasGapOutsideNestedFunctions(
+              tokens,
+              callbackStart,
+              callbackEnd,
+              pairs,
+              functionRanges,
+              knownAliases,
+              true
+            )
+            : hasGapOutcome(
+              tokens,
+              callbackStart,
+              callbackEnd,
+              callbackFunction.opening,
+              pairs,
+              functionRanges,
+              knownAliases,
+              knownWriterAliases,
+              nextResolvingFunctions
+            );
+          if (callbackHasGap || hasBoundaryWriterGap(
+            tokens,
+            callbackStart,
+            callbackEnd,
+            pairs,
+            functionRanges,
+            knownAliases,
+            knownWriterAliases
+          )) return true;
+        }
+      }
+      const invocation = localFunctionInvocationAt(
+        tokens,
+        index,
+        pairs,
+        functionRanges,
+        knownLocalFunctions
+      );
+      const localFunction = invocation?.localFunction;
+      const memberReassigned = isMemberCall && localFunction
+        ? localFunctionWasReassigned(tokens, token.value, localFunction.closing + 1, index)
+        : false;
+      if (localFunction && invocation && !memberReassigned
+        && !resolvingFunctions.has(localFunction)
+        && localFunctionCallHasGapOutcome(
+          tokens,
+          index,
+          invocation.callClosing + 1,
+          pairs,
+          functionRanges,
+          knownLocalFunctions,
+          knownAliases,
+          knownWriterAliases,
+          resolvingFunctions,
+          false
+        )) return true;
+    }
+    if (token.value === 'return') {
+      const statementEnd = findStatementEnd(tokens, index + 1, end);
+      const expressionStart = index + 1;
+      const returnIsEffective = !returnIsOverriddenByFinally(tokens, index, end, pairs, functionRanges);
+      const returnedExpression = trimExpressionRange(tokens, expressionStart, statementEnd, pairs);
+      if (includeReturnedValues && returnIsEffective
+        && returnedExpression.end - returnedExpression.start === 1) {
+        const returnedName = tokens[returnedExpression.start]?.value;
+        const outcomeProperties = knownOutcomeObjects.get(returnedName);
+        if (outcomeProperties && [...outcomeProperties.values()].some(Boolean)) return true;
+      }
+      const returnedAssignment = assignmentTargetAt(tokens, expressionStart, statementEnd, pairs);
+      if (includeReturnedValues && returnIsEffective && returnedAssignment
+        && valueHasGapOutcome(
+          tokens,
+          returnedAssignment.equalsIndex + 1,
+          statementEnd,
+          pairs,
+          knownAliases
+        )) return true;
+      const promiseChainGap = promiseThenChainGapOutcome(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases,
+        true
+      );
+      if (includeReturnedValues && returnIsEffective && promiseChainGap === true) return true;
+      if (includeReturnedValues && returnIsEffective && promiseChainGap === null
+        && (valueHasGapOutsideNestedFunctions(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases,
+        true
+      ) || localFunctionCallHasGapOutcome(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownLocalFunctions,
+        knownAliases,
+        knownWriterAliases,
+        resolvingFunctions
+      ))) return true;
+      if (hasBoundaryWriterGap(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases,
+        knownWriterAliases,
+        includeReturnedValues && promiseChainGap !== null
+      )) return true;
+      if (includeReturnedValues && promiseChainGap !== null) {
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
+      for (const callback of functionRanges) {
+        if (callback.start < expressionStart || callback.closing >= statementEnd) continue;
+        const callbackKind = isScheduledCallback(tokens, pairs, callback);
+        if (!callbackKind) continue;
+        if (callbackKind === PROMISE_EXECUTOR_CALLBACK) {
+          if (promiseExecutorHasGapResolution(
+            tokens,
+            callback,
+            callback.expression ? callback.bodyStart : callback.opening + 1,
+            callback.expression ? callback.bodyEnd : callback.closing,
+            pairs,
+            knownAliases
+          )) return true;
+          continue;
+        }
+        if (callback.expression) continue;
+        if (hasGapOutcome(
+          tokens,
+          callback.opening + 1,
+          callback.closing,
+          callback.opening,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases,
+          resolvingFunctions
+        )) return true;
+      }
+      const hasFinallyHandler = enclosingFinallyHandlerEnd(tokens, index, pairs) !== null;
+      if (returnIsEffective && !hasFinallyHandler
+        && abruptCompletionIsUnconditionalAt(tokens, index, start, end, pairs)) return false;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    const assignmentValueStart = outcomeAssignmentValueStart(tokens, index);
+    if (assignmentValueStart !== null) {
+      const statementEnd = findStatementEnd(tokens, assignmentValueStart, end);
+      const assignedGap = valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases);
+      const declaredAlias = ['const', 'let', 'var'].includes(token.value)
+        && tokens[index + 1]?.type === 'identifier'
+        ? tokens[index + 1].value
+        : null;
+      const assignmentTarget = assignmentTargetAt(tokens, index, end, pairs);
+      let outcomePropertyName = null;
+      if (tokens[index + 1]?.value === '.') outcomePropertyName = tokens[index + 2]?.value;
+      else if (tokens[index + 1]?.value === '[') outcomePropertyName = staticPropertyName(tokens[index + 2]);
+      const outcomeProperties = knownOutcomeObjects.get(token.value);
+      if (outcomeProperties && assignmentTarget && OUTCOME_NAMES.has(outcomePropertyName)) {
+        outcomeProperties.set(outcomePropertyName, valueHasGapOutcome(
+          tokens,
+          assignmentValueStart,
+          statementEnd,
+          pairs,
+          knownAliases,
+          new Set(),
+          false,
+          false
+        ));
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
+      const aliasName = assignmentTarget?.name || declaredAlias;
+      const isSimpleLocalAssignment = declaredAlias !== null
+        || (token.type === 'identifier' && tokens[index + 1]?.value === '=');
+      if (includeReturnedValues && assignedGap && !isSimpleLocalAssignment) return true;
+      if (aliasName) {
+        if (assignedGap) knownAliases.add(aliasName);
+        else knownAliases.delete(aliasName);
+      } else if (assignedGap) {
+        return true;
+      }
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (['const', 'let', 'var'].includes(token.value) && tokens[index + 1]?.value === '{') {
+      const bindingEnd = pairs.get(index + 1);
+      const equalsIndex = bindingEnd === undefined ? undefined : bindingEnd + 1;
+      if (equalsIndex !== undefined && tokens[equalsIndex]?.value === '='
+        && tokens[equalsIndex + 1]?.value === 'READINESS') {
+        for (const [bindingStart, bindingSegmentEnd] of topLevelSegments(tokens, index + 2, bindingEnd)) {
+          const propertyName = staticPropertyName(tokens[bindingStart]);
+          const colonIndex = topLevelToken(tokens, bindingStart, bindingSegmentEnd, ':');
+          const aliasIndex = colonIndex >= 0 ? colonIndex + 1 : bindingStart;
+          if (propertyName === 'GAP' && tokens[aliasIndex]?.type === 'identifier') {
+            knownAliases.add(tokens[aliasIndex].value);
+          }
+        }
+        const statementEnd = findStatementEnd(tokens, equalsIndex + 1, end);
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
+    }
+    const assignmentTarget = assignmentTargetAt(tokens, index, end, pairs);
+    if (assignmentTarget) {
+      const assignmentValueStart = assignmentTarget.equalsIndex + 1;
+      const statementEnd = findStatementEnd(tokens, assignmentValueStart, end);
+      const assignedGap = valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases);
+      if (assignedGap) knownAliases.add(assignmentTarget.name);
+      else knownAliases.delete(assignmentTarget.name);
+      const stateArgument = boundBoundaryWriterStateArgument(
+        tokens,
+        assignmentValueStart,
+        statementEnd,
+        pairs,
+        knownAliases
+      );
+      if (stateArgument === undefined) knownWriterAliases.delete(assignmentTarget.name);
+      else knownWriterAliases.set(assignmentTarget.name, stateArgument);
+      const isSimpleLocalAssignment = token.type === 'identifier' && tokens[index + 1]?.value === '=';
+      const isReturnedAssignment = tokens[index - 1]?.value === 'return';
+      const isNamedOutcomeAssignment = OUTCOME_NAMES.has(assignmentTarget.name) && !isSimpleLocalAssignment;
+      if (includeReturnedValues && assignedGap && (isReturnedAssignment || isNamedOutcomeAssignment)) return true;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, knownAliases, functionRanges)) return true;
+    if (boundaryWriterCallHasGapAt(tokens, index, end, pairs, knownAliases, knownWriterAliases)) return true;
+  }
+  const fallbackStart = tokens[start]?.value === 'return' ? start + 1 : start;
+  return includeReturnedValues && opening === null && valueHasGapOutsideNestedFunctions(
+    tokens,
+    fallbackStart,
+    end,
+    pairs,
+    functionRanges,
+    knownAliases
+  );
+};
+
+const staticBooleanValueAt = (tokens, start, end, pairs, aliases) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return null;
+  if (tokens[expression.start]?.value === '!') {
+    const value = staticBooleanValueAt(tokens, expression.start + 1, expression.end, pairs, aliases);
+    return value === null ? null : !value;
+  }
+  if (expression.end - expression.start !== 1) return null;
+  const token = tokens[expression.start];
+  if (token.value === 'true') return true;
+  if (token.value === 'false') return false;
+  return token.type === 'identifier' && aliases.has(token.value)
+    ? aliases.get(token.value)
+    : null;
+};
+
+const DEADLINE_PREDICATE_NAMES = new Set(['isDeadlineReached']);
+
+const isDeadlineTriggerAt = (
+  tokens,
+  index,
+  isDeadlineTimestampAlias = () => false,
+  isDeadlineEnumAlias = () => false,
+  isGlobalBuiltinAt = () => true,
+  pairs = new Map()
+) => {
+  const value = tokens[index]?.value;
+  if (value === 'deadlineReached') return true;
+  if (tokens[index]?.type === 'identifier'
+    && DEADLINE_PREDICATE_NAMES.has(value)
+    && tokens[index + 1]?.value === '('
+    && tokens[index + 2]?.value === ')') return true;
+
+  const comparisonOrMembershipAt = (memberStart, memberEnd) => {
+    const isSetHasMembership = tokens[memberStart - 4]?.value === 'new'
+      && tokens[memberStart - 3]?.value === 'Set'
+      && tokens[memberStart - 2]?.value === '('
+      && tokens[memberStart - 1]?.value === '['
+      && tokens[memberEnd]?.value === ']'
+      && tokens[memberEnd + 1]?.value === ')'
+      && tokens[memberEnd + 2]?.value === '.'
+      && tokens[memberEnd + 3]?.value === 'has'
+      && tokens[memberEnd + 4]?.value === '(';
+    return COMPARISON_OPERATORS.has(tokens[memberStart - 1]?.value)
+      || COMPARISON_OPERATORS.has(tokens[memberEnd]?.value)
+      || tokens[memberStart - 1]?.value === 'case'
+      || (tokens[memberEnd]?.value === ']'
+        && tokens[memberEnd + 1]?.value === '.'
+        && tokens[memberEnd + 2]?.value === 'includes'
+        && tokens[memberEnd + 3]?.value === '(')
+      || isSetHasMembership;
+  };
+
+  if (value === 'DEADLINE'
+    || (['string', 'template'].includes(tokens[index]?.type) && value === 'deadline')) {
+    const isComputedMember = ['string', 'template'].includes(tokens[index]?.type)
+      && tokens[index - 1]?.value === '['
+      && tokens[index + 1]?.value === ']'
+      && tokens[index - 2]?.type === 'identifier';
+    let memberStart = isComputedMember ? index - 2 : index;
+    while (tokens[memberStart - 1]?.value === '.' && tokens[memberStart - 2]?.type === 'identifier') {
+      memberStart -= 2;
+    }
+    let memberEnd = isComputedMember ? index + 2 : index + 1;
+    while (tokens[memberEnd]?.value === '.' && tokens[memberEnd + 1]?.type === 'identifier') memberEnd += 2;
+    if (comparisonOrMembershipAt(memberStart, memberEnd)) return true;
+  }
+  if (tokens[index]?.type === 'identifier' && isDeadlineEnumAlias(index)
+    && comparisonOrMembershipAt(index, index + 1)) return true;
+
+  const wrappedEnd = (end, openingParentheses) => {
+    for (let offset = 0; offset < openingParentheses; offset += 1) {
+      if (tokens[end + offset]?.value !== ')') return null;
+    }
+    return end + openingParentheses;
+  };
+  const deadlineOperandEnd = start => {
+    let operandStart = start;
+    let openingParentheses = 0;
+    while (tokens[operandStart]?.value === '(') {
+      openingParentheses += 1;
+      operandStart += 1;
+    }
+    if (tokens[operandStart]?.value === 'new'
+      && tokens[operandStart + 1]?.value === 'Date'
+      && tokens[operandStart + 2]?.value === '('
+      && isGlobalBuiltinAt('Date', operandStart + 1)) {
+      const callOpening = operandStart + 2;
+      const callClosing = pairs.get(callOpening);
+      if (callClosing === undefined) return null;
+      const dateArguments = topLevelSegments(tokens, callOpening + 1, callClosing);
+      if (dateArguments.length !== 1) return null;
+      const argumentEnd = deadlineOperandEnd(dateArguments[0][0]);
+      if (argumentEnd !== dateArguments[0][1]) return null;
+      return wrappedEnd(callClosing + 1, openingParentheses);
+    }
+    if (tokens[operandStart]?.type !== 'identifier') return null;
+    let end = operandStart + 1;
+    while (['.', '?.'].includes(tokens[end]?.value) && tokens[end + 1]?.type === 'identifier') end += 2;
+    if (!/deadline/i.test(tokens[end - 1]?.value) && !isDeadlineTimestampAlias(operandStart)) return null;
+    return wrappedEnd(end, openingParentheses);
+  };
+  const dateNow = start => tokens[start]?.value === 'Date'
+    && tokens[start + 1]?.value === '.'
+    && tokens[start + 2]?.value === 'now'
+    && tokens[start + 3]?.value === '('
+    && tokens[start + 4]?.value === ')'
+    && isGlobalBuiltinAt('Date', start);
+  const dateObjectNow = start => tokens[start]?.value === 'new'
+    && tokens[start + 1]?.value === 'Date'
+    && tokens[start + 2]?.value === '('
+    && tokens[start + 3]?.value === ')'
+    && isGlobalBuiltinAt('Date', start + 1);
+  const currentTimeEndAt = start => dateNow(start)
+    ? start + 5
+    : dateObjectNow(start)
+      ? start + 4
+      : null;
+  const currentTimeEnd = currentTimeEndAt(index);
+  const directComparison = currentTimeEnd !== null
+    && ['>', '>='].includes(tokens[currentTimeEnd]?.value)
+    && deadlineOperandEnd(currentTimeEnd + 1) !== null;
+  const reverseOperandEnd = deadlineOperandEnd(index);
+  const reverseComparison = reverseOperandEnd !== null
+    && ['<', '<='].includes(tokens[reverseOperandEnd]?.value)
+    && currentTimeEndAt(reverseOperandEnd + 1) !== null;
+  const remainingBudget = dateNow(index)
+    && tokens[index - 1]?.value === '-'
+    && deadlineOperandEnd(index - 2) === index - 1;
+  const elapsedTime = currentTimeEnd !== null
+    && tokens[currentTimeEnd]?.value === '-'
+    && deadlineOperandEnd(currentTimeEnd + 1) !== null;
+  return directComparison || reverseComparison || remainingBudget || elapsedTime;
+};
+const findAssignedAlias = (tokens, triggerIndex) => {
+  if (tokens[triggerIndex - 1]?.value === '=>' || tokens[triggerIndex + 1]?.value === '=>') return null;
+  if (tokens[triggerIndex - 1]?.value === '{'
+    && ['const', 'let', 'var'].includes(tokens[triggerIndex - 2]?.value)
+    && tokens[triggerIndex + 1]?.value === ':'
+    && tokens[triggerIndex + 2]?.type === 'identifier') {
+    return { name: tokens[triggerIndex + 2].value, index: triggerIndex + 2, destructured: true };
+  }
+  let statementStart = triggerIndex;
+  while (statementStart > 0 && ![';', '{', '}'].includes(tokens[statementStart - 1].value)) statementStart -= 1;
+  const statementEnd = findStatementEnd(tokens, statementStart, tokens.length);
+  const declarationIndex = tokens
+    .slice(statementStart, triggerIndex)
+    .findIndex(token => ['const', 'let', 'var'].includes(token.value));
+  if (declarationIndex >= 0) {
+    const declarationStart = statementStart + declarationIndex + 1;
+    const declarationSegments = topLevelSegments(tokens, declarationStart, statementEnd);
+    const containingSegment = declarationSegments.find(([start, end]) => triggerIndex >= start && triggerIndex < end);
+    if (containingSegment) {
+      const equalsIndex = topLevelToken(tokens, containingSegment[0], containingSegment[1], '=');
+      const annotationIndex = topLevelToken(tokens, containingSegment[0], equalsIndex, ':');
+      const bindingIndex = annotationIndex > containingSegment[0] ? annotationIndex - 1 : equalsIndex - 1;
+      if (equalsIndex > containingSegment[0]
+        && tokens[bindingIndex]?.type === 'identifier'
+        && tokens[bindingIndex - 1]?.value !== '.') {
+        return { name: tokens[bindingIndex].value, index: bindingIndex };
+      }
+    }
+  }
+  let assignedAlias = null;
+  for (let index = statementStart; index < triggerIndex; index += 1) {
+    if (tokens[index].value === '=>') return null;
+    if (tokens[index].value !== '=' || tokens[index - 1]?.type !== 'identifier' || tokens[index - 2]?.value === '.') continue;
+    assignedAlias = { name: tokens[index - 1].value, index: index - 1 };
+  }
+  return assignedAlias;
+};
+
+const findStaticMemberAssignments = (tokens, pairs, lexicalScopes, lexicalBindings) => tokens.flatMap((token, index) => {
+  if (token.type !== 'identifier' || tokens[index - 1]?.value === '.') return [];
+  const assignment = assignmentTargetAt(tokens, index, tokens.length, pairs);
+  if (!assignment || assignment.name === token.value) return [];
+  const binding = resolveVisibleBinding(lexicalBindings, token.value, index, lexicalScopes);
+  return [{
+    ...assignment,
+    index,
+    baseName: token.value,
+    baseBindingIndex: binding?.index,
+    scope: lexicalScopePath(lexicalScopes, index),
+    expressionStart: assignment.equalsIndex + 1,
+    expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
+  }];
+});
+
+const deadlineMemberAliasAt = (
+  tokens,
+  index,
+  useIndex,
+  pairs,
+  lexicalScopes,
+  lexicalBindings,
+  variableDeclarations,
+  memberAssignments,
+  assignments
+) => {
+  if (tokens[index]?.type !== 'identifier' || tokens[index + 1]?.value !== '.') return null;
+  let memberEnd = index + 1;
+  while (tokens[memberEnd]?.value === '.' && tokens[memberEnd + 1]?.type === 'identifier') memberEnd += 2;
+  const memberName = staticMemberExpressionName(tokens, index, memberEnd, pairs);
+  if (memberName === null) return null;
+  const baseName = tokens[index].value;
+  const baseBinding = resolveVisibleBinding(lexicalBindings, baseName, index, lexicalScopes);
+  if (!baseBinding) return null;
+  const declaration = variableDeclarations.find(candidate => candidate.name === baseName
+    && candidate.index === baseBinding.index);
+  if (!declaration) return null;
+  const initializer = trimExpressionRange(
+    tokens,
+    declaration.expressionStart,
+    declaration.expressionEnd,
+    pairs
+  );
+  if (tokens[initializer.start]?.value !== '{'
+    || pairs.get(initializer.start) !== initializer.end - 1) return null;
+  const baseWasReassigned = assignments.some(assignment => assignment.name === baseName
+    && assignment.bindingIndex === baseBinding.index
+    && assignment.index > baseBinding.index
+    && assignment.index < useIndex);
+  if (baseWasReassigned) return null;
+  const useScope = lexicalScopePath(lexicalScopes, useIndex);
+  const visibleWrites = memberAssignments
+    .filter(assignment => assignment.name === memberName
+      && assignment.baseBindingIndex === baseBinding.index
+      && assignment.index < useIndex
+      && isLexicallyVisible(assignment.scope, useScope))
+    .sort((left, right) => left.index - right.index);
+  const latestWrite = visibleWrites[visibleWrites.length - 1];
+  if (!latestWrite || isConditionalAssignment(tokens, pairs, latestWrite)) return null;
+  const expression = trimExpressionRange(
+    tokens,
+    latestWrite.expressionStart,
+    latestWrite.expressionEnd,
+    pairs
+  );
+  let valueStart = expression.start;
+  let negated = false;
+  while (tokens[valueStart]?.value === '!') {
+    negated = !negated;
+    valueStart += 1;
+  }
+  const isDeadlineIdentifier = valueStart + 1 === expression.end
+    && tokens[valueStart]?.value === 'deadlineReached';
+  const isDeadlinePredicateCall = tokens[valueStart]?.value === 'isDeadlineReached'
+    && tokens[valueStart + 1]?.value === '('
+    && pairs.get(valueStart + 1) === expression.end - 1
+    && topLevelSegments(tokens, valueStart + 2, expression.end - 1).length === 1
+    && topLevelSegments(tokens, valueStart + 2, expression.end - 1)[0][0]
+      === topLevelSegments(tokens, valueStart + 2, expression.end - 1)[0][1];
+  return isDeadlineIdentifier || isDeadlinePredicateCall ? { negated } : null;
+};
+
+const findIdentifierAssignments = (tokens, lexicalScopes) => tokens.flatMap((token, index) => {
+  const annotationColon = tokens[index - 2]?.value === ':' ? index - 2 : null;
+  const nameIndex = annotationColon === null ? index - 1 : annotationColon - 1;
+  if (!['=', '||=', '&&=', '??='].includes(token.value)
+    || tokens[nameIndex]?.type !== 'identifier' || tokens[nameIndex - 1]?.value === '.') {
+    return [];
+  }
+  return [{
+    name: tokens[nameIndex].value,
+    index: nameIndex,
+    equalsIndex: index,
+    operator: token.value,
+    scope: lexicalScopePath(lexicalScopes, nameIndex)
+  }];
+});
+
+const findAssignmentValueEnd = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && (value === ',' || value === ';')) return index;
+  }
+  return end;
+};
+
+const isConditionalAssignment = (tokens, pairs, assignment) => {
+  const conditionalControls = new Set(['if', 'for', 'while', 'switch', 'catch']);
+  const followsConditionalHeader = closingIndex => {
+    if (tokens[closingIndex]?.value !== ')') return false;
+    let depth = 0;
+    for (let index = closingIndex; index >= 0; index -= 1) {
+      if (tokens[index].value === ')') depth += 1;
+      else if (tokens[index].value === '(') {
+        depth -= 1;
+        if (depth === 0) return conditionalControls.has(tokens[index - 1]?.value);
+      }
+    }
+    return false;
+  };
+  if (tokens[assignment.index - 1]?.value === 'else'
+    || followsConditionalHeader(assignment.index - 1)) return true;
+  const writeScope = assignment.writeScope || assignment.scope;
+  return writeScope.some(opening => tokens[opening - 1]?.value === 'else'
+    || tokens[opening - 1]?.value === '=>'
+    || followsConditionalHeader(opening - 1));
+};
+
+const isConditionalBlockScopeAt = (tokens, openingIndex) => {
+  const conditionalControls = new Set(['if', 'for', 'while', 'switch', 'catch']);
+  const closingIndex = openingIndex - 1;
+  if (tokens[closingIndex]?.value === 'else' || tokens[closingIndex]?.value === '=>') return true;
+  if (tokens[closingIndex]?.value !== ')') return false;
+  let depth = 0;
+  for (let index = closingIndex; index >= 0; index -= 1) {
+    if (tokens[index].value === ')') depth += 1;
+    else if (tokens[index].value === '(') {
+      depth -= 1;
+      if (depth === 0) return conditionalControls.has(tokens[index - 1]?.value);
+    }
+  }
+  return false;
+};
+
+const assignmentIsConditionalAtUse = (tokens, pairs, assignment, index) => {
+  if (!isConditionalAssignment(tokens, pairs, assignment)) return false;
+  const conditionalScopes = (assignment.writeScope || assignment.scope)
+    .filter(opening => isConditionalBlockScopeAt(tokens, opening));
+  return conditionalScopes.length === 0 || !conditionalScopes.every(opening => {
+    const closing = pairs.get(opening);
+    return opening < index && closing > index;
+  });
+};
+
+const logicalAssignmentRhsSelection = (tokens, pairs, assignments, assignment) => {
+  if (assignment.operator === '=') return true;
+  if (!['||=', '&&=', '??='].includes(assignment.operator)) return null;
+  const priorWrites = assignments
+    .filter(candidate => candidate.name === assignment.name
+      && candidate.bindingIndex === assignment.bindingIndex
+      && candidate.index < assignment.index)
+    .sort((left, right) => left.index - right.index);
+  const prior = priorWrites[priorWrites.length - 1];
+  if (!prior || prior.operator !== '=' || isConditionalAssignment(tokens, pairs, prior)) return null;
+  const priorValue = staticExpressionOutcomeAt(
+    tokens,
+    prior.expressionStart,
+    prior.expressionEnd,
+    new Set(),
+    false
+  );
+  if (assignment.operator === '||=') return priorValue.truthy === null ? null : !priorValue.truthy;
+  if (assignment.operator === '&&=') return priorValue.truthy;
+  return priorValue.nullish;
+};
+
+const resolveVisibleAssignments = (assignments, name, index, lexicalScopes, bindingIndex, tokens, pairs) => {
+  const visible = assignments
+    .filter(assignment => assignment.name === name
+      && assignment.index < index
+      && assignment.bindingIndex === bindingIndex
+      && logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== false
+      && (isLexicallyVisible(assignment.scope, lexicalScopePath(lexicalScopes, index))
+        || isConditionalAssignment(tokens, pairs, assignment)))
+    .sort((left, right) => left.index - right.index);
+  let possibleAssignments = [];
+  for (const assignment of visible) {
+    if (assignmentIsConditionalAtUse(tokens, pairs, assignment, index)) possibleAssignments.push(assignment);
+    else possibleAssignments = [assignment];
+  }
+  return possibleAssignments;
+};
+
+const findLexicalScopes = (tokens, pairs) => tokens.flatMap((token, opening) => {
+  if (token.value !== '{') return [];
+  const closing = pairs.get(opening);
+  return closing === undefined ? [] : [{ opening, closing }];
+});
+
+const lexicalScopePath = (scopes, index) => scopes
+  .filter(scope => scope.opening < index && index < scope.closing)
+  .sort((left, right) => left.opening - right.opening)
+  .map(scope => scope.opening);
+
+const isLexicallyVisible = (declarationScope, useScope) => declarationScope.every(
+  (scope, index) => useScope[index] === scope
+);
+
+const findDeclarationEquals = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === '=') return index;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === ';') return -1;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return -1;
+};
+
+const findVariableDeclarations = (tokens, pairs, lexicalScopes, functionRanges = []) => {
+  const declarations = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!['const', 'let', 'var'].includes(tokens[index].value)) continue;
+    const declarationEnd = findStatementEnd(tokens, index + 1, tokens.length);
+    const functionScope = functionRanges
+      .filter(range => !range.expression && range.opening < index && index < range.closing)
+      .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
+    for (const [segmentStart, segmentEnd] of topLevelSegments(tokens, index + 1, declarationEnd)) {
+      const equalsIndex = topLevelToken(tokens, segmentStart, segmentEnd, '=');
+      if (equalsIndex < 0 && tokens[index].value !== 'var') continue;
+      const bindingEnd = equalsIndex < 0 ? segmentEnd : equalsIndex;
+      const bindingIndexes = parameterBindingIndexes(tokens, pairs, segmentStart, bindingEnd);
+      for (const binding of bindingIndexes) {
+        const nameIndex = binding.index;
+        if (tokens[nameIndex]?.type !== 'identifier') continue;
+        declarations.push({
+          name: tokens[nameIndex].value,
+          index: nameIndex,
+          kind: tokens[index].value,
+          propertyPath: binding.propertyPath,
+          scope: tokens[index].value === 'var' && functionScope
+            ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
+            : lexicalScopePath(lexicalScopes, index),
+          expressionStart: equalsIndex < 0 ? segmentEnd : equalsIndex + 1,
+          expressionEnd: segmentEnd
+        });
+      }
+    }
+  }
+  return declarations;
+};
+
+const topLevelToken = (tokens, start, end, target) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === target) return index;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return -1;
+};
+
+const topLevelSegments = (tokens, start, end) => {
+  const segments = [];
+  let segmentStart = start;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      segments.push([segmentStart, index]);
+      segmentStart = index + 1;
+    }
+  }
+  segments.push([segmentStart, end]);
+  return segments;
+};
+
+const parameterBindingIndexes = (tokens, pairs, start, end) => {
+  while (start < end && tokens[start].value === '...') start += 1;
+  const equalsIndex = topLevelToken(tokens, start, end, '=');
+  if (equalsIndex >= 0) end = equalsIndex;
+  if (start >= end) return [];
+  if (tokens[start].value === '{' || tokens[start].value === '[') {
+    const objectPattern = tokens[start].value === '{';
+    const closing = pairs.get(start);
+    const patternEnd = closing !== undefined && closing < end ? closing : end;
+    return topLevelSegments(tokens, start + 1, patternEnd).flatMap(([segmentStart, segmentEnd], elementIndex) => {
+      const rest = tokens[segmentStart]?.value === '...';
+      while (segmentStart < segmentEnd && tokens[segmentStart].value === '...') segmentStart += 1;
+      const colonIndex = topLevelToken(tokens, segmentStart, segmentEnd, ':');
+      const propertyPath = rest
+        ? []
+        : [objectPattern ? tokens[segmentStart]?.value : String(elementIndex)];
+      return parameterBindingIndexes(
+        tokens,
+        pairs,
+        colonIndex >= 0 ? colonIndex + 1 : segmentStart,
+        segmentEnd
+      ).map(binding => ({
+        ...binding,
+        propertyPath: [...propertyPath, ...(binding.propertyPath || [])]
+      }));
+    });
+  }
+  return tokens[start].type === 'identifier'
+    ? [{ name: tokens[start].value, index: start, propertyPath: [] }]
+    : [];
+};
+
+const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRanges) => functionRanges.flatMap(range => {
+  const scope = lexicalScopePath(lexicalScopes, range.opening + 1);
+  if (tokens[range.start]?.value === '=>') {
+    const previousIndex = range.start - 1;
+    if (tokens[previousIndex]?.type === 'identifier') {
+      return [{ name: tokens[previousIndex].value, index: previousIndex, scope }];
+    }
+    if (tokens[previousIndex]?.value === ')') {
+      const parameterOpening = pairs.get(previousIndex);
+      if (parameterOpening !== undefined) {
+        return parameterBindingIndexes(tokens, pairs, parameterOpening + 1, previousIndex)
+          .map(binding => ({ ...binding, scope }));
+      }
+    }
+    return [];
+  }
+  const parameterClosing = range.opening - 1;
+  const parameterOpening = tokens[parameterClosing]?.value === ')' ? pairs.get(parameterClosing) : undefined;
+  if (parameterOpening === undefined || parameterClosing >= range.opening) return [];
+  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing).flatMap(([start, end]) => (
+    parameterBindingIndexes(tokens, pairs, start, end).map(binding => ({ ...binding, scope }))
+  ));
+});
+
+const findCatchBindings = (tokens, pairs, lexicalScopes) => {
+  const bindings = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== 'catch' || tokens[index + 1]?.value !== '(') continue;
+    const parameterClosing = pairs.get(index + 1);
+    const bodyOpening = parameterClosing === undefined ? undefined : parameterClosing + 1;
+    if (bodyOpening === undefined || tokens[bodyOpening]?.value !== '{') continue;
+    const scope = lexicalScopePath(lexicalScopes, bodyOpening + 1);
+    for (const binding of parameterBindingIndexes(tokens, pairs, index + 2, parameterClosing)) {
+      bindings.push({ ...binding, scope });
+    }
+  }
+  return bindings;
+};
+
+const findDestructuredDeadlineBindings = (tokens, pairs, lexicalScopes) => tokens.flatMap((token, index) => {
+  if (token.value !== 'deadlineReached'
+    || tokens[index - 1]?.value !== '{'
+    || !['const', 'let', 'var'].includes(tokens[index - 2]?.value)
+    || tokens[index + 1]?.value !== ':'
+    || tokens[index + 2]?.type !== 'identifier') return [];
+  const patternEnd = pairs.get(index - 1);
+  if (patternEnd === undefined || tokens[patternEnd + 1]?.value !== '=') return [];
+  return [{
+    name: tokens[index + 2].value,
+    index: index + 2,
+    kind: tokens[index - 2].value,
+    scope: lexicalScopePath(lexicalScopes, index - 2)
+  }];
+});
+
+const collectLexicalBindings = (tokens, pairs, lexicalScopes, functionRanges) => [
+  ...findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges),
+  ...findDestructuredDeadlineBindings(tokens, pairs, lexicalScopes),
+  ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges),
+  ...findCatchBindings(tokens, pairs, lexicalScopes)
+];
+
+const resolveVisibleBinding = (bindings, name, useIndex, lexicalScopes, useScope = null) => {
+  const scope = useScope || lexicalScopePath(lexicalScopes, useIndex);
+  const candidates = bindings
+    .filter(binding => binding.name === name
+      && (binding.index < useIndex || binding.kind === 'var')
+      && isLexicallyVisible(binding.scope, scope))
+    .sort((left, right) => left.scope.length - right.scope.length || left.index - right.index);
+  return candidates[candidates.length - 1] || null;
+};
+
+const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges, baseAliases = new Set()) => {
+  const declarations = findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges)
+    .filter(declaration => declaration.index < limit)
+    .sort((left, right) => left.index - right.index);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const useScope = lexicalScopePath(lexicalScopes, limit);
+  const knownAliases = new Set(baseAliases);
+  const assignments = findIdentifierAssignments(tokens, lexicalScopes)
+    .filter(assignment => assignment.index < limit)
+    .map(assignment => {
+      const binding = resolveVisibleBinding(
+        bindings,
+        assignment.name,
+        assignment.index + 1,
+        lexicalScopes
+      );
+      const bindingAtUse = resolveVisibleBinding(
+        bindings,
+        assignment.name,
+        limit,
+        lexicalScopes,
+        useScope
+      );
+      if (!binding || !bindingAtUse || binding.index !== bindingAtUse.index
+        || !isLexicallyVisible(binding.scope, useScope)) return null;
+      return {
+        ...assignment,
+        bindingIndex: binding.index,
+        expressionStart: assignment.equalsIndex + 1,
+        expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.index - right.index);
+  const simpleAssignmentIndexes = new Set(assignments.map(assignment => assignment.index));
+  for (const declaration of declarations) {
+    if (!isLexicallyVisible(declaration.scope, useScope)) continue;
+    const visibleBinding = resolveVisibleBinding(
+      bindings,
+      declaration.name,
+      limit,
+      lexicalScopes,
+      useScope
+    );
+    if (!visibleBinding || visibleBinding.index !== declaration.index) continue;
+    if (simpleAssignmentIndexes.has(declaration.index)) continue;
+    const assignedGap = declaration.propertyPath?.length
+      ? destructuredValueHasGapOutcome(
+        tokens,
+        declaration.expressionStart,
+        declaration.expressionEnd,
+        declaration.propertyPath,
+        pairs
+      )
+      : valueHasGapOutcome(
+        tokens,
+        declaration.expressionStart,
+        declaration.expressionEnd,
+        pairs,
+        knownAliases
+      );
+    if (assignedGap) knownAliases.add(declaration.name);
+    else knownAliases.delete(declaration.name);
+  }
+  for (const assignment of assignments) {
+    const rhsSelected = logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment);
+    if (rhsSelected === false) continue;
+    if (rhsSelected === null) {
+      knownAliases.delete(assignment.name);
+      continue;
+    }
+    const assignedGap = valueHasGapOutcome(
+      tokens,
+      assignment.expressionStart,
+      assignment.expressionEnd,
+      pairs,
+      knownAliases
+    );
+    if (assignedGap) knownAliases.add(assignment.name);
+    else knownAliases.delete(assignment.name);
+  }
+  return knownAliases;
+};
+
+const visibleBoundaryWriterAliasesAt = (
+  tokens,
+  limit,
+  pairs,
+  lexicalScopes,
+  lexicalBindings,
+  assignments
+) => {
+  const useScope = lexicalScopePath(lexicalScopes, limit);
+  const visibleNames = new Set(lexicalBindings
+    .filter(binding => binding.index < limit && isLexicallyVisible(binding.scope, useScope))
+    .map(binding => binding.name));
+  const aliases = new Map();
+  for (const name of visibleNames) {
+    const binding = resolveVisibleBinding(lexicalBindings, name, limit, lexicalScopes, useScope);
+    if (!binding) continue;
+    const destructuredWriterName = binding.propertyPath?.join('.');
+    const destructuredStateArgument = destructuredWriterName
+      ? boundaryWriterStateArgument(destructuredWriterName)
+      : undefined;
+    if (destructuredStateArgument !== undefined) {
+      aliases.set(name, destructuredStateArgument);
+      continue;
+    }
+    const assignment = assignments
+      .filter(candidate => candidate.name === name
+        && candidate.bindingIndex === binding.index
+        && candidate.index < limit)
+      .sort((left, right) => right.index - left.index)[0];
+    if (!assignment) continue;
+    const stateArgument = boundBoundaryWriterStateArgument(
+      tokens,
+      assignment.expressionStart,
+      assignment.expressionEnd,
+      pairs,
+      aliases
+    );
+    if (stateArgument !== undefined) aliases.set(name, stateArgument);
+  }
+  return aliases;
+};
+
+const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
+  if (findIfDecision(tokens, triggerIndex, pairs)
+    || findSwitchDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated)) return true;
+  if (findLoopDecision(tokens, triggerIndex, pairs, functionRanges)) return true;
+  const statement = findStatementRange(tokens, triggerIndex);
+  if (findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs, aliasNegated)) return true;
+  const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
+  if (functionDecision?.expression) {
+    return Boolean(findConditionalExpressionDecision(
+      tokens,
+      triggerIndex,
+      functionDecision.bodyStart,
+      functionDecision.bodyEnd,
+      pairs
+    ));
+  }
+  return Boolean(findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs));
+};
+
+const deadlineDecisionHasGapOutcome = (
+  tokens,
+  decision,
+  pairs,
+  functionRanges,
+  lexicalScopes,
+  lexicalBindings,
+  assignments
+) => {
+  return [decision, ...(decision.continuations || [])].some(range => {
+    const knownAliases = visibleGapAliasesAt(
+      tokens,
+      range.start,
+      pairs,
+      lexicalScopes,
+      functionRanges
+    );
+    const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+      tokens,
+      range.start,
+      pairs,
+      lexicalScopes,
+      lexicalBindings,
+      assignments
+    );
+    if (tokens[range.start]?.value === 'return') {
+      const statementEnd = findStatementEnd(tokens, range.start + 1, tokens.length);
+      const promiseChain = promiseThenChainAt(
+        tokens,
+        range.start + 1,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases
+      );
+      if (promiseChain && promiseChain.start === range.start + 1) {
+        return promiseChain.hasGap || hasBoundaryWriterGap(
+          tokens,
+          promiseChain.start,
+          promiseChain.end,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases,
+          true
+        );
+      }
+    }
+    return hasGapOutcome(
+      tokens,
+      range.start,
+      range.end,
+      range.opening,
+      pairs,
+      functionRanges,
+      knownAliases,
+      knownWriterAliases
+    );
+  });
+};
+
+const isGapEnumNamespaceMemberAt = (tokens, index) => {
+  if (tokens[index + 1]?.value === '.'
+    || (tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value !== '[')) {
+    return tokens[index + 2]?.value === 'GAP';
+  }
+  const bracketIndex = tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '['
+    ? index + 2
+    : index + 1;
+  const property = tokens[bracketIndex + 1];
+  return tokens[bracketIndex]?.value === '['
+    && (property?.type === 'string' || property?.type === 'template')
+    && property.value === 'GAP'
+    && tokens[bracketIndex + 2]?.value === ']';
+};
+
+const isGapEnumNamespaceAliasAt = (
+  tokens,
+  tokenIndex,
+  pairs,
+  lexicalScopes,
+  lexicalBindings,
+  assignments,
+  resolvingBindings = new Set()
+) => {
+  const token = tokens[tokenIndex];
+  if (token?.type !== 'identifier') return false;
+  if (token.value === 'READINESS' || token.value === 'THREAD_STATES') return true;
+  const binding = resolveVisibleBinding(lexicalBindings, token.value, tokenIndex, lexicalScopes);
+  if (!binding || resolvingBindings.has(binding.index)) return false;
+  const visibleAssignments = resolveVisibleAssignments(
+    assignments,
+    token.value,
+    tokenIndex,
+    lexicalScopes,
+    binding.index,
+    tokens,
+    pairs
+  ).sort((left, right) => right.index - left.index);
+  for (const assignment of visibleAssignments) {
+    const rhsSelected = logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment);
+    if (rhsSelected === false) continue;
+    if (rhsSelected !== true) return false;
+    const value = trimExpressionRange(
+      tokens,
+      assignment.expressionStart,
+      assignment.expressionEnd,
+      pairs
+    );
+    if (value.end - value.start !== 1 || tokens[value.start]?.type !== 'identifier') return false;
+    if (['READINESS', 'THREAD_STATES'].includes(tokens[value.start].value)) return true;
+    const nextBindings = new Set(resolvingBindings);
+    nextBindings.add(binding.index);
+    return isGapEnumNamespaceAliasAt(
+      tokens,
+      value.start,
+      pairs,
+      lexicalScopes,
+      lexicalBindings,
+      assignments,
+      nextBindings
+    );
+  }
+  return false;
+};
+
+const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
+  const tokens = tokenizeSource(source);
+  const pairs = findTokenPairs(tokens);
+  const functionRanges = findFunctionRanges(tokens, pairs);
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const assignments = findIdentifierAssignments(tokens, lexicalScopes).map(assignment => {
+    const binding = resolveVisibleBinding(
+      lexicalBindings,
+      assignment.name,
+      assignment.index + 1,
+      lexicalScopes
+    );
+    return {
+      ...assignment,
+      bindingIndex: binding?.index,
+      scope: binding?.scope || assignment.scope,
+      writeScope: assignment.scope,
+      expressionStart: assignment.equalsIndex + 1,
+      expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
+    };
+  });
+  const variableDeclarations = findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges);
+  const memberAssignments = findStaticMemberAssignments(tokens, pairs, lexicalScopes, lexicalBindings);
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (isGapEnumNamespaceMemberAt(tokens, index)
+      && isGapEnumNamespaceAliasAt(
+        tokens,
+        index,
+        pairs,
+        lexicalScopes,
+        lexicalBindings,
+        assignments
+      )) {
+      tokens[index].value = 'READINESS';
+    }
+  }
+  const deadlineTimestampAliases = [];
+  let timestampAliasesAdded = true;
+  while (timestampAliasesAdded) {
+    timestampAliasesAdded = false;
+    for (const assignment of assignments) {
+      if (assignment.bindingIndex === undefined
+        || logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== true
+        || deadlineTimestampAliases.some(alias => alias.index === assignment.index
+          && alias.bindingIndex === assignment.bindingIndex)) continue;
+      const valueRange = trimExpressionRange(
+        tokens,
+        assignment.expressionStart,
+        assignment.expressionEnd,
+        pairs
+      );
+      if (valueRange.end - valueRange.start !== 1) continue;
+      const sourceToken = tokens[valueRange.start];
+      if (sourceToken?.type !== 'identifier') continue;
+      const sourceBinding = resolveVisibleBinding(
+        lexicalBindings,
+        sourceToken.value,
+        valueRange.start,
+        lexicalScopes
+      );
+      const sourceAlias = deadlineTimestampAliases.find(alias => alias.name === sourceToken.value
+        && alias.bindingIndex === sourceBinding?.index
+        && alias.index < valueRange.start);
+      if (!/deadline/i.test(sourceToken.value) && !sourceAlias) continue;
+      if (sourceAlias) {
+        const sourceAssignments = resolveVisibleAssignments(
+          assignments,
+          sourceAlias.name,
+          valueRange.start,
+          lexicalScopes,
+          sourceBinding.index,
+          tokens,
+          pairs
+        );
+        if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
+      }
+      deadlineTimestampAliases.push({
+        name: assignment.name,
+        index: assignment.index,
+        bindingIndex: assignment.bindingIndex
+      });
+      timestampAliasesAdded = true;
+    }
+  }
+  const isDeadlineTimestampAliasAt = tokenIndex => {
+    const token = tokens[tokenIndex];
+    if (token?.type !== 'identifier') return false;
+    const binding = resolveVisibleBinding(lexicalBindings, token.value, tokenIndex, lexicalScopes);
+    if (!binding) return false;
+    return deadlineTimestampAliases.some(alias => alias.name === token.value
+      && alias.bindingIndex === binding.index
+      && alias.index < tokenIndex
+      && resolveVisibleAssignments(
+        assignments,
+        alias.name,
+        tokenIndex,
+        lexicalScopes,
+        binding.index,
+        tokens,
+        pairs
+      ).some(candidate => candidate.index === alias.index));
+  };
+  const isDeadlineEnumAliasAt = tokenIndex => {
+    const token = tokens[tokenIndex];
+    if (token?.type !== 'identifier') return false;
+    const binding = resolveVisibleBinding(lexicalBindings, token.value, tokenIndex, lexicalScopes);
+    if (!binding) return false;
+    for (let cursor = binding.index + 1; cursor < tokenIndex; cursor += 1) {
+      if (tokens[cursor]?.value !== token.value || tokens[cursor - 1]?.value === '.') continue;
+      if (!['=', '+=', '-=', '||=', '&&=', '??='].includes(tokens[cursor + 1]?.value)) continue;
+      const writeBinding = resolveVisibleBinding(lexicalBindings, token.value, cursor + 1, lexicalScopes);
+      if (writeBinding?.index === binding.index) return false;
+    }
+    const isDeadlineMember = (start, end) => end - start === 3
+      && tokens[start]?.value === 'CODEX_VALIDATION_KINDS'
+      && tokens[start + 1]?.value === '.'
+      && tokens[start + 2]?.value === 'DEADLINE';
+    if (Number.isInteger(binding.expressionStart)
+      && Number.isInteger(binding.expressionEnd)
+      && isDeadlineMember(
+        trimExpressionRange(tokens, binding.expressionStart, binding.expressionEnd, pairs).start,
+        trimExpressionRange(tokens, binding.expressionStart, binding.expressionEnd, pairs).end
+      )) return true;
+
+    for (let opening = binding.index - 1; opening >= 0; opening -= 1) {
+      if (tokens[opening]?.value !== '{' || pairs.get(opening) <= binding.index
+        || tokens[opening - 1]?.value !== 'const') continue;
+      const closing = pairs.get(opening);
+      const property = topLevelSegments(tokens, opening + 1, closing)
+        .find(([start, end]) => start <= binding.index && binding.index < end);
+      if (!property) return false;
+      const [propertyStart, propertyEnd] = property;
+      const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+      const aliasIndex = colon < 0 ? propertyStart : colon + 1;
+      if (aliasIndex !== binding.index
+        || staticPropertyName(tokens[propertyStart]) !== 'DEADLINE') return false;
+      if (tokens[closing + 1]?.value !== '=') return false;
+      const initializer = trimExpressionRange(
+        tokens,
+        closing + 2,
+        findAssignmentValueEnd(tokens, closing + 2, tokens.length),
+        pairs
+      );
+      return initializer.end - initializer.start === 1
+        && tokens[initializer.start]?.value === 'CODEX_VALIDATION_KINDS';
+    }
+    return false;
+  };
+  const isUnshadowedBuiltinAt = (name, useIndex) => !resolveVisibleBinding(
+    lexicalBindings,
+    name,
+    useIndex,
+    lexicalScopes
+  );
+  const memberDeadlineAliasAt = (tokenIndex, useIndex) => deadlineMemberAliasAt(
+    tokens,
+    tokenIndex,
+    useIndex,
+    pairs,
+    lexicalScopes,
+    lexicalBindings,
+    variableDeclarations,
+    memberAssignments,
+    assignments
+  );
+  const lines = new Set();
+  const deadlineAliases = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const memberAlias = memberDeadlineAliasAt(index, index);
+    if (!memberAlias && !isDeadlineTriggerAt(
+      tokens,
+      index,
+      isDeadlineTimestampAliasAt,
+      isDeadlineEnumAliasAt,
+      isUnshadowedBuiltinAt,
+      pairs
+    )) continue;
+    if (memberAlias) {
+      if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges, memberAlias.negated)) {
+        const decision = includeAbruptCompletionHandlers(
+          tokens,
+          extractDeadlineDecision(tokens, index, pairs, functionRanges, memberAlias.negated),
+          pairs,
+          functionRanges
+        );
+        if (deadlineDecisionHasGapOutcome(
+          tokens,
+          decision,
+          pairs,
+          functionRanges,
+          lexicalScopes,
+          lexicalBindings,
+          assignments
+        )) {
+          lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+        }
+      }
+      continue;
+    }
+    const alias = findAssignedAlias(tokens, index);
+    if (alias) {
+      const aliasBinding = resolveVisibleBinding(
+        lexicalBindings,
+        alias.name,
+        alias.index + 1,
+        lexicalScopes
+      );
+      const activeAliasAssignments = aliasBinding
+        ? resolveVisibleAssignments(
+          assignments,
+          alias.name,
+          index,
+          lexicalScopes,
+          aliasBinding.index,
+          tokens,
+          pairs
+        )
+        : [];
+      if (activeAliasAssignments.length > 0
+        && !activeAliasAssignments.some(assignment => assignment.index === alias.index)) continue;
+      let aliasNegationCount = 0;
+      for (let negationIndex = alias.index + 2; tokens[negationIndex]?.value === '!'; negationIndex += 1) {
+        aliasNegationCount += 1;
+      }
+      const isBooleanComparison = (operator, literal) => ['===', '!==', '==', '!='].includes(operator)
+        && ['true', 'false'].includes(literal);
+      let comparisonOperator = null;
+      let comparisonLiteral = null;
+      if (isBooleanComparison(tokens[index + 1]?.value, tokens[index + 2]?.value)) {
+        comparisonOperator = tokens[index + 1].value;
+        comparisonLiteral = tokens[index + 2].value;
+      } else if (isBooleanComparison(tokens[index - 1]?.value, tokens[index - 2]?.value)) {
+        comparisonOperator = tokens[index - 1].value;
+        comparisonLiteral = tokens[index - 2].value;
+      }
+      const comparisonNegated = comparisonOperator !== null
+        && ((['===', '=='].includes(comparisonOperator) && comparisonLiteral === 'false')
+          || (['!==', '!='].includes(comparisonOperator) && comparisonLiteral === 'true'));
+      const aliasPolarity = (aliasNegationCount % 2 === 1) !== comparisonNegated;
+      const aliasNegated = aliasPolarity;
+      deadlineAliases.push({
+        ...alias,
+        negated: aliasNegated,
+        bindingIndex: resolveVisibleBinding(
+          lexicalBindings,
+          alias.name,
+          alias.index + 1,
+          lexicalScopes
+        )?.index,
+        scope: lexicalScopePath(lexicalScopes, alias.index)
+      });
+      if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges, aliasNegated)) {
+        const decision = includeAbruptCompletionHandlers(
+          tokens,
+          extractDeadlineDecision(tokens, index, pairs, functionRanges, aliasNegated),
+          pairs,
+          functionRanges
+        );
+        if (deadlineDecisionHasGapOutcome(
+          tokens,
+          decision,
+          pairs,
+          functionRanges,
+          lexicalScopes,
+          lexicalBindings,
+          assignments
+        )) {
+          lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+        }
+      }
+      continue;
+    }
+    if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
+    const decision = includeAbruptCompletionHandlers(
+      tokens,
+      extractDeadlineDecision(tokens, index, pairs, functionRanges),
+      pairs,
+      functionRanges
+    );
+    if (deadlineDecisionHasGapOutcome(
+      tokens,
+      decision,
+      pairs,
+      functionRanges,
+      lexicalScopes,
+      lexicalBindings,
+      assignments
+    )) {
+      lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+    }
+  }
+  let aliasesAdded = true;
+  while (aliasesAdded) {
+    aliasesAdded = false;
+    for (const assignment of assignments) {
+      if (assignment.bindingIndex === undefined
+        || logicalAssignmentRhsSelection(tokens, pairs, assignments, assignment) !== true
+        || deadlineAliases.some(alias => alias.index === assignment.index
+          && alias.bindingIndex === assignment.bindingIndex)) continue;
+      const valueEnd = findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length);
+      const valueRange = trimExpressionRange(tokens, assignment.equalsIndex + 1, valueEnd, pairs);
+      let sourceStart = valueRange.start;
+      let sourceNegated = false;
+      while (tokens[sourceStart]?.value === '!') {
+        sourceNegated = !sourceNegated;
+        sourceStart += 1;
+      }
+      if (valueRange.end - sourceStart !== 1) continue;
+      const sourceToken = tokens[sourceStart];
+      if (sourceToken?.type !== 'identifier') continue;
+      const sourceBinding = resolveVisibleBinding(
+        lexicalBindings,
+        sourceToken.value,
+        sourceStart,
+        lexicalScopes
+      );
+      const sourceAlias = deadlineAliases.find(alias => alias.name === sourceToken.value
+        && alias.bindingIndex === sourceBinding?.index
+        && alias.index < sourceStart);
+      const sourceIsDeadline = isDeadlineTriggerAt(
+        tokens,
+        sourceStart,
+        isDeadlineTimestampAliasAt,
+        isDeadlineEnumAliasAt,
+        isUnshadowedBuiltinAt,
+        pairs
+      );
+      if (!sourceAlias && !sourceIsDeadline) continue;
+      if (sourceAlias) {
+        const sourceAssignments = resolveVisibleAssignments(
+          assignments,
+          sourceAlias.name,
+          sourceStart,
+          lexicalScopes,
+          sourceBinding.index,
+          tokens,
+          pairs
+        );
+        if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
+      }
+      deadlineAliases.push({
+        name: assignment.name,
+        index: assignment.index,
+        negated: sourceNegated ? !Boolean(sourceAlias?.negated) : Boolean(sourceAlias?.negated),
+        bindingIndex: assignment.bindingIndex,
+        scope: assignment.scope
+      });
+      aliasesAdded = true;
+    }
+  }
+  for (const alias of deadlineAliases) {
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
+      if (lexicalBindings.some(binding => binding.name === alias.name && binding.index === index)) continue;
+      const binding = resolveVisibleBinding(lexicalBindings, alias.name, index, lexicalScopes);
+      if (!binding || binding.index !== alias.bindingIndex) continue;
+      const visibleAssignments = resolveVisibleAssignments(
+        assignments,
+        alias.name,
+        index,
+        lexicalScopes,
+        binding.index,
+        tokens,
+        pairs
+      );
+      if (!alias.destructured && !visibleAssignments.some(candidate => candidate.index === alias.index)) continue;
+      if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges, alias.negated)) continue;
+      const decision = includeAbruptCompletionHandlers(
+        tokens,
+        extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated),
+        pairs,
+        functionRanges
+      );
+      if (deadlineDecisionHasGapOutcome(
+        tokens,
+        decision,
+        pairs,
+        functionRanges,
+        lexicalScopes,
+        lexicalBindings,
+        assignments
+      )) {
+        lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+      }
+    }
+  }
+  return [...lines].sort((left, right) => left - right).map(line => `${relative}:${line}`);
+});
+
+module.exports = { findDeadlineGapOffenders, readSourceInventory };
