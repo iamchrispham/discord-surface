@@ -81,6 +81,7 @@
     "src/state/watcher-notice.ts",
     "src/state/watcher-notice/contracts.ts",
     "src/state/ordinary-binding.ts",
+    "src/state/ordinary-binding-claude.ts",
     "src/state/ordinary-binding/contracts.ts",
     "src/ordinary/constants.ts",
     "src/state/thread-enrollment.ts",
@@ -128,6 +129,7 @@
     "src/state/town-hall-publication/context.ts",
     "src/state/thread-enrollment/contracts.ts",
     "src/state/thread-enrollment/handlers.ts",
-    "src/direct-post/transport-rejection.ts"
+    "src/direct-post/transport-rejection.ts",
+    "src/state/town-hall-publication/journal.ts"
   ]
 }

@@ -77,6 +77,7 @@
     "src/state/watcher-notice.ts",
     "src/state/watcher-notice/contracts.ts",
     "src/state/ordinary-binding.ts",
+    "src/state/ordinary-binding-claude.ts",
     "src/state/ordinary-binding/contracts.ts",
     "src/ordinary/constants.ts",
     "src/state/thread-enrollment.ts",
@@ -117,6 +118,7 @@
     "test/board-refresh-types.ts",
     "test/direct-post-state-types.ts",
     "test/ordinary-binding-types.ts",
+    "test/types/ordinary-claude-binding-types.ts",
     "test/issue-thread-types.ts",
     "test/direct-post-types.ts",
     "test/decision-types.ts",
@@ -160,6 +162,7 @@
     "test/types/town-hall-publication-types.ts",
     "test/types/town-hall-publication-parts-types.ts",
     "src/state/thread-enrollment/contracts.ts",
-    "src/state/thread-enrollment/handlers.ts"
+    "src/state/thread-enrollment/handlers.ts",
+    "src/state/town-hall-publication/journal.ts"
   ]
 }
