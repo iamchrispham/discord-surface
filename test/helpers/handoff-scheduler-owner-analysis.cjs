@@ -63,39 +63,39 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
     scopeDeclaresTimerName, lexicalBinding, isNodeTimersRequire,
     nodeTimersNamespaceBinding, nodeTimersFunctionBinding
   } = createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses });
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
 
-  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   function isKnownConstructorStateInitializer(node, member) {
     if (!ts.isConstructorDeclaration(member) || !ts.isPropertyAccessExpression(node) ||
@@ -125,6 +125,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
 
   function receiverAliasEvents(member) {
     const events = new Map();
+    const directCallsByBinding = new Map();
     let nextSequence = 0;
     function executionScope(node) {
       for (let current = node; current && current !== member; current = current.parent) {
@@ -174,7 +175,12 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
       if (!expression) return false;
       if (ts.isThis(expression)) return tracksGatewayThis;
       if (ts.isIdentifier(expression)) {
-        return statusAt(lexicalBinding(expression), expression.pos, executionScope(expression));
+        const binding = lexicalBinding(expression);
+        const readScope = executionScope(expression);
+        const invocations = directInvocationCalls(readScope);
+        if (invocations.length) return invocations.some(invocation =>
+          statusAt(binding, invocation.pos, executionScope(invocation)));
+        return statusAt(binding, expression.pos, readScope);
       }
       return false;
     }
@@ -194,6 +200,50 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
       }
       return parent && ts.isCallExpression(parent) && parent.expression === expression ? parent : null;
     }
+    function finiteArrayCallbackInvocation(functionNode) {
+      let expression = functionNode;
+      while (expression.parent && ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
+      const invocation = expression.parent;
+      if (!invocation || !ts.isCallExpression(invocation) ||
+        !invocation.arguments.some(argument => unwrapParentheses(argument) === functionNode)) return null;
+      const callee = unwrapParentheses(invocation.expression);
+      if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== 'forEach') return null;
+      const receiver = unwrapParentheses(callee.expression);
+      if (!ts.isArrayLiteralExpression(receiver) || receiver.elements.length === 0 ||
+        receiver.elements.some(ts.isSpreadElement)) return null;
+      return invocation;
+    }
+    function functionBinding(functionNode) {
+      if (ts.isFunctionDeclaration(functionNode) && functionNode.name) return lexicalBinding(functionNode.name);
+      let expression = functionNode;
+      while (expression.parent && ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
+      const declaration = expression.parent;
+      if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer === expression &&
+        ts.isIdentifier(declaration.name)) return lexicalBinding(declaration.name);
+      return null;
+    }
+    function directInvocationCalls(functionNode) {
+      const binding = functionBinding(functionNode);
+      return binding ? directCallsByBinding.get(binding) || [] : [];
+    }
+    function indexDirectInvocationCalls(node) {
+      function visit(current) {
+        if (ts.isCallExpression(current)) {
+          const expression = unwrapParentheses(current.expression);
+          if (ts.isIdentifier(expression) && executionScope(current) === member) {
+            const binding = lexicalBinding(expression);
+            if (binding) {
+              const calls = directCallsByBinding.get(binding) || [];
+              calls.push(current);
+              directCallsByBinding.set(binding, calls);
+            }
+          }
+        }
+        ts.forEachChild(current, visit);
+      }
+      if (member.body) visit(member.body);
+      if (member.initializer) visit(member.initializer);
+    }
     function collect(node, tracksGatewayThis = true) {
       const startsDynamicThisScope = ts.isClassDeclaration(node) || ts.isClassExpression(node) ||
         ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
@@ -212,7 +262,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
         const conditional = isConditionallyExecuted(node);
         record(lexicalBinding(left), node.end, scope, value, conditional);
         if (scope !== member) {
-          const invocation = immediateInvocation(scope);
+          const invocation = immediateInvocation(scope) || finiteArrayCallbackInvocation(scope);
           if (invocation) {
             const callerScope = executionScope(invocation);
             record(lexicalBinding(left), invocation.end, callerScope, value,
@@ -222,6 +272,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
       }
       ts.forEachChild(node, child => collect(child, tracksGatewayThisHere));
     }
+    indexDirectInvocationCalls(member.body || member.initializer);
     if (member.body) collect(member.body);
     if (member.initializer) collect(member.initializer);
     for (const parameter of member.parameters || []) collect(parameter);
@@ -230,11 +281,26 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
     return { receiverIsGatewayThis, statusAt };
   }
   function timerReference(expression) {
+    return resolveTimerReference(expression, new Set());
+  }
+  function resolveTimerReference(expression, visitedBindings) {
     expression = unwrapParentheses(expression);
     if (!expression) return null;
     if (ts.isIdentifier(expression)) {
-      const importedTimerName = nodeTimersFunctionBinding(lexicalBinding(expression));
+      const binding = lexicalBinding(expression);
+      const importedTimerName = nodeTimersFunctionBinding(binding);
       if (importedTimerName) return importedTimerName;
+      if (binding && !visitedBindings.has(binding)) {
+        visitedBindings.add(binding);
+        const declaration = binding.parent;
+        const declarationList = declaration?.parent;
+        if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer &&
+          ts.isIdentifier(declaration.name) && declarationList && ts.isVariableDeclarationList(declarationList) &&
+          (declarationList.flags & ts.NodeFlags.Const) !== 0) {
+          const aliasedTimer = resolveTimerReference(declaration.initializer, visitedBindings);
+          if (aliasedTimer) return aliasedTimer;
+        }
+      }
       const timerName = expression.text;
       if (!timerApiNames.has(timerName)) return null;
       for (let scope = expression.parent; scope; scope = scope.parent) {
@@ -265,9 +331,19 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
   function isUnshadowedTimerCall(node) {
     if (!ts.isCallExpression(node)) return false;
     const callee = unwrapParentheses(node.expression);
-    if ((ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
-      ts.isPropertyAccessExpression(callee) && ["call", "apply"].includes(callee.name.text)) {
-      return timerReference(callee.expression) !== null;
+    if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+      const forwardingName = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : unwrapParentheses(callee.argumentExpression)?.text;
+      if (["call", "apply"].includes(forwardingName)) return timerReference(callee.expression) !== null;
+    }
+    if (ts.isCallExpression(callee)) {
+      const bindAccess = unwrapParentheses(callee.expression);
+      if ((ts.isPropertyAccessExpression(bindAccess) || ts.isElementAccessExpression(bindAccess)) &&
+        (ts.isPropertyAccessExpression(bindAccess) ? bindAccess.name.text :
+          unwrapParentheses(bindAccess.argumentExpression)?.text) === 'bind') {
+        return timerReference(bindAccess.expression) !== null;
+      }
     }
     return timerReference(callee) !== null;
   }
@@ -311,6 +387,39 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
             bodyNode.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
             receiverAliases.receiverIsGatewayThis(bodyNode.right, tracksGatewayThisHere) &&
             assignmentPatternHasSchedulerField(unwrapParentheses(bodyNode.left))) accessesSchedulerState = true;
+          if (ts.isCallExpression(bodyNode) && bodyNode.arguments.length > 1) {
+            const callee = unwrapParentheses(bodyNode.expression);
+            let objectShadowed = false;
+            if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) &&
+              callee.expression.text === 'Object') {
+              for (let current = callee.expression.parent; current; current = current.parent) {
+                if (scopeDeclaresTimerName(current, 'Object')) {
+                  objectShadowed = true;
+                  break;
+                }
+              }
+            }
+            const isObjectAssign = ts.isPropertyAccessExpression(callee) &&
+              ts.isIdentifier(callee.expression) && callee.expression.text === 'Object' &&
+              callee.name.text === 'assign' && !objectShadowed;
+            if (isObjectAssign && receiverAliases.receiverIsGatewayThis(bodyNode.arguments[0], tracksGatewayThisHere)) {
+              for (const source of bodyNode.arguments.slice(1)) {
+                if (!ts.isObjectLiteralExpression(unwrapParentheses(source))) continue;
+                const properties = unwrapParentheses(source).properties;
+                if (properties.some(property => {
+                  if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) return false;
+                  let name = null;
+                  if (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) {
+                    name = property.name.text;
+                  } else if (ts.isComputedPropertyName(property.name)) {
+                    const key = unwrapParentheses(property.name.expression);
+                    if (ts.isStringLiteralLike(key)) name = key.text;
+                  }
+                  return HANDOFF_STATE_FIELDS.has(name);
+                })) accessesSchedulerState = true;
+              }
+            }
+          }
 
           ts.forEachChild(bodyNode, child => scan(child, tracksGatewayThisHere));
         }

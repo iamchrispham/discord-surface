@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
+const { unwrapTransparentExpression } = require('./handoff-scheduler-owner-expressions.cjs');
 
 const SOURCE_ROOT = path.resolve(__dirname, '..', '..', 'src');
 const SCHEDULER_METHODS = new Set([
@@ -11,19 +12,13 @@ const SCHEDULER_METHODS = new Set([
   'schedulePendingHandoffRecoveryPoll'
 ]);
 
-function unwrapParentheses(node) {
-  let current = node;
-  while (ts.isParenthesizedExpression(current)) current = current.expression;
-  return current;
-}
-
 function schedulerAccessName(node) {
-  const access = unwrapParentheses(node);
+  const access = unwrapTransparentExpression(node);
   if (ts.isPropertyAccessExpression(access) && SCHEDULER_METHODS.has(access.name.text)) {
     return access.name.text;
   }
   if (ts.isElementAccessExpression(access) && access.argumentExpression) {
-    const key = unwrapParentheses(access.argumentExpression);
+    const key = unwrapTransparentExpression(access.argumentExpression);
     if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   }
   return null;
@@ -33,7 +28,7 @@ function schedulerLiteralKeyName(key) {
   if (ts.isIdentifier(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
   if (ts.isComputedPropertyName(key)) {
-    const expression = unwrapParentheses(key.expression);
+    const expression = unwrapTransparentExpression(key.expression);
     if (ts.isStringLiteralLike(expression) && SCHEDULER_METHODS.has(expression.text)) {
       return expression.text;
     }
@@ -65,7 +60,7 @@ function isDestructuringAssignmentObject(node) {
     }
     if ((ts.isForOfStatement(parent) || ts.isForInStatement(parent)) && parent.initializer === current) return true;
     if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      unwrapParentheses(parent.left) === unwrapParentheses(current)) return true;
+      unwrapTransparentExpression(parent.left) === unwrapTransparentExpression(current)) return true;
     return false;
   }
   return false;
@@ -80,6 +75,13 @@ function schedulerAssignmentName(node) {
 function enclosingSchedulerOwner(node, source) {
   let current = node.parent;
   let fallback = null;
+  function contains(root, target) {
+    for (let currentNode = target; currentNode; currentNode = currentNode.parent) {
+      if (currentNode === root) return true;
+      if (ts.isSourceFile(currentNode)) break;
+    }
+    return false;
+  }
   while (current && !ts.isSourceFile(current)) {
     if (ts.isMethodDeclaration(current) || ts.isConstructorDeclaration(current) ||
       ts.isGetAccessorDeclaration(current) || ts.isSetAccessorDeclaration(current)) {
@@ -97,6 +99,11 @@ function enclosingSchedulerOwner(node, source) {
       fallback ||= className ? `${className}.${memberName}` : memberName || '<anonymous property>';
     }
     if (ts.isFunctionDeclaration(current) && current.name) return current.name.text;
+    if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      contains(current.right, node)) {
+      const left = unwrapTransparentExpression(current.left);
+      if (ts.isPropertyAccessExpression(left)) fallback ||= left.name.text;
+    }
     if (ts.isVariableDeclaration(current)) fallback ||= current.name.getText(source);
     if (ts.isPropertyAssignment(current)) fallback ||= current.name.getText(source);
     if (ts.isSourceFile(current)) break;

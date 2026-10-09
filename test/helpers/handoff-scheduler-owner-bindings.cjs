@@ -9,12 +9,12 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return false;
     }
-  
+
   function declarationListContainsName(declarations, soughtName, blockScopedOnly = false) {
       if (blockScopedOnly && (declarations.flags & ts.NodeFlags.BlockScoped) === 0) return false;
       return declarations.declarations.some(declaration => bindingContainsName(declaration.name, soughtName));
     }
-  
+
   function statementsContainName(statements, soughtName, blockScopedOnly = false) {
       return statements.some(statement => {
         if (ts.isVariableStatement(statement)) {
@@ -26,7 +26,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
           statement.name && ts.isIdentifier(statement.name) && statement.name.text === soughtName;
       });
     }
-  
+
   function functionHasVarBinding(functionNode, soughtName) {
       if (!functionNode.body) return false;
       let found = false;
@@ -43,7 +43,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       scan(functionNode.body);
       return found;
     }
-  
+
   function sourceFileContainsName(sourceNode, soughtName) {
       return sourceNode.statements.some(statement => {
         if (ts.isImportDeclaration(statement)) {
@@ -64,7 +64,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
           statement.name && ts.isIdentifier(statement.name) && statement.name.text === soughtName;
       });
     }
-  
+
   function scopeDeclaresTimerName(scope, soughtName) {
       if (ts.isFunctionLike(scope)) {
         if (scope.parameters.some(parameter => bindingContainsName(parameter.name, soughtName)) ||
@@ -81,7 +81,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
         declarationListContainsName(scope.initializer, soughtName)) return true;
       return ts.isSourceFile(scope) && sourceFileContainsName(scope, soughtName);
     }
-  
+
   function bindingIdentifier(bindingName, soughtName) {
       if (ts.isIdentifier(bindingName)) return bindingName.text === soughtName ? bindingName : null;
       if (ts.isObjectBindingPattern(bindingName) || ts.isArrayBindingPattern(bindingName)) {
@@ -93,7 +93,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function variableBinding(declarations, soughtName, blockScopedOnly = false) {
       if (blockScopedOnly && (declarations.flags & ts.NodeFlags.BlockScoped) === 0) return null;
       for (const declaration of declarations.declarations) {
@@ -102,7 +102,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function statementBinding(statements, soughtName, blockScopedOnly = false) {
       for (const statement of statements) {
         if (ts.isVariableStatement(statement)) {
@@ -119,7 +119,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function functionVarBinding(functionNode, soughtName) {
       if (!functionNode.body) return null;
       let found = null;
@@ -136,7 +136,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       scan(functionNode.body);
       return found;
     }
-  
+
   function scopeBinding(scope, soughtName) {
       if (ts.isFunctionLike(scope)) {
         for (const parameter of scope.parameters) {
@@ -182,7 +182,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function lexicalBinding(identifier) {
       if (!ts.isIdentifier(identifier)) return null;
       for (let scope = identifier.parent; scope; scope = scope.parent) {
@@ -191,7 +191,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function moduleSpecifierForImportBinding(binding) {
       if (ts.isNamespaceImport(binding)) {
         const declaration = binding.parent.parent;
@@ -203,12 +203,12 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return null;
     }
-  
+
   function isNodeTimersModuleSpecifier(specifier) {
       return Boolean(specifier && ts.isStringLiteralLike(specifier) &&
         (specifier.text === 'node:timers' || specifier.text === 'timers'));
     }
-  
+
   function isNodeTimersRequire(expression) {
       const call = unwrapParentheses(expression);
       if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) ||
@@ -217,7 +217,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       return ts.isStringLiteralLike(specifier) &&
         (specifier.text === 'node:timers' || specifier.text === 'timers');
     }
-  
+
   function nodeTimersNamespaceBinding(binding, seen = new Set()) {
       if (!binding || seen.has(binding)) return false;
       seen.add(binding);
@@ -231,7 +231,7 @@ function createOwnerBindings({ ts, source, timerApiNames, unwrapParentheses }) {
       }
       return false;
     }
-  
+
   function nodeTimersFunctionBinding(binding, seen = new Set()) {
       if (!binding || seen.has(binding)) return null;
       seen.add(binding);

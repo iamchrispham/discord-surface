@@ -1,5 +1,7 @@
 'use strict';
 
+const { unwrapParentheses } = require('./handoff-scheduler-owner-expressions.cjs');
+
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
