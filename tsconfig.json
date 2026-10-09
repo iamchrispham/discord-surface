@@ -112,6 +112,7 @@
     "src/state/courier-route/envelope.ts",
     "src/state/courier-route/forward.ts",
     "src/state/courier-route/recovery.ts",
+    "src/state/courier-route/retirement.ts",
     "src/state/courier-route/route.ts",
     "src/state/courier-route/types.ts",
     "src/state/decision/handlers.ts",
