@@ -12,14 +12,55 @@ const SCHEDULER_METHODS = new Set([
   'schedulePendingHandoffRecoveryPoll'
 ]);
 
+function constantSchedulerKey(expression, visited = new Set()) {
+  expression = unwrapTransparentExpression(expression);
+  if (!expression) return null;
+  if (ts.isStringLiteralLike(expression)) return expression.text;
+  if (!ts.isIdentifier(expression) || visited.has(expression.text)) return null;
+  visited.add(expression.text);
+
+  const name = expression.text;
+  for (let scope = expression.parent; scope; scope = scope.parent) {
+    if (ts.isCatchClause(scope) && ts.isIdentifier(scope.variableDeclaration?.name) &&
+      scope.variableDeclaration.name.text === name) return null;
+    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter =>
+      ts.isIdentifier(parameter.name) && parameter.name.text === name)) return null;
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+
+    let declaration = null;
+    for (const statement of scope.statements || []) {
+      if (ts.isVariableStatement(statement)) {
+        for (const candidate of statement.declarationList.declarations) {
+          if (ts.isIdentifier(candidate.name) && candidate.name.text === name) declaration = candidate;
+        }
+      } else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+        statement.name?.text === name) {
+        return null;
+      } else if (ts.isImportDeclaration(statement) && statement.importClause) {
+        const clause = statement.importClause;
+        const bindings = clause.namedBindings;
+        if (clause.name?.text === name || bindings && ts.isNamespaceImport(bindings) && bindings.name.text === name ||
+          bindings && ts.isNamedImports(bindings) && bindings.elements.some(element => element.name.text === name)) return null;
+      }
+    }
+    if (declaration) {
+      if (declaration.end >= expression.pos) return null;
+      const declarationList = declaration.parent;
+      if ((declarationList.flags & ts.NodeFlags.Const) === 0 || !declaration.initializer) return null;
+      return constantSchedulerKey(declaration.initializer, visited);
+    }
+  }
+  return null;
+}
+
 function schedulerAccessName(node) {
   const access = unwrapTransparentExpression(node);
   if (ts.isPropertyAccessExpression(access) && SCHEDULER_METHODS.has(access.name.text)) {
     return access.name.text;
   }
   if (ts.isElementAccessExpression(access) && access.argumentExpression) {
-    const key = unwrapTransparentExpression(access.argumentExpression);
-    if (ts.isStringLiteralLike(key) && SCHEDULER_METHODS.has(key.text)) return key.text;
+    const key = constantSchedulerKey(access.argumentExpression);
+    if (key && SCHEDULER_METHODS.has(key)) return key;
   }
   return null;
 }
@@ -34,6 +75,23 @@ function schedulerLiteralKeyName(key) {
     }
   }
   return null;
+}
+
+function shadowsImportedScheduler(node, name) {
+  for (let scope = node.parent; scope; scope = scope.parent) {
+    if (ts.isCatchClause(scope) && ts.isIdentifier(scope.variableDeclaration?.name) &&
+      scope.variableDeclaration.name.text === name) return true;
+    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter =>
+      ts.isIdentifier(parameter.name) && parameter.name.text === name)) return true;
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+    for (const statement of scope.statements || []) {
+      if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(declaration =>
+        ts.isIdentifier(declaration.name) && declaration.name.text === name)) return true;
+      if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+        statement.name?.text === name) return true;
+    }
+  }
+  return false;
 }
 
 function schedulerBindingName(node) {
@@ -133,6 +191,15 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
     const scriptKind = path.extname(filePath).toLowerCase() === '.ts' ? ts.ScriptKind.TS : ts.ScriptKind.JS;
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, scriptKind);
     assert.deepEqual(source.parseDiagnostics, [], `${filePath}: parse diagnostics`);
+    const importedSchedulers = new Map();
+    function collectSchedulerImports(node) {
+      if (ts.isImportSpecifier(node)) {
+        const imported = node.propertyName || node.name;
+        if (SCHEDULER_METHODS.has(imported.text)) importedSchedulers.set(node.name.text, imported.text);
+      }
+      ts.forEachChild(node, collectSchedulerImports);
+    }
+    collectSchedulerImports(source);
     function visit(node) {
       const isObjectBindingElement = ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent);
       const isObjectAssignmentElement = (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) &&
@@ -148,6 +215,28 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
             file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),
             owner: enclosingSchedulerOwner(node, source),
             scheduler
+          });
+        }
+      }
+      if (ts.isCallExpression(node)) {
+        const callee = unwrapTransparentExpression(node.expression);
+        if (ts.isIdentifier(callee) && importedSchedulers.has(callee.text) &&
+          !shadowsImportedScheduler(callee, callee.text)) {
+          inventory.push({
+            file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),
+            owner: enclosingSchedulerOwner(callee, source),
+            scheduler: importedSchedulers.get(callee.text)
+          });
+        }
+      }
+      if (ts.isExportSpecifier(node)) {
+        const exportedScheduler = [node.propertyName, node.name].filter(Boolean)
+          .find(candidate => SCHEDULER_METHODS.has(candidate.text));
+        if (exportedScheduler) {
+          inventory.push({
+            file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),
+            owner: enclosingSchedulerOwner(node, source),
+            scheduler: exportedScheduler.text
           });
         }
       }

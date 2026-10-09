@@ -109,5 +109,23 @@ test('computed factory dependency keys exercise the owner contract parser', () =
   const computedDependency = `[(${JSON.stringify(bindingName)})]: ${bindingName}`;
   const changedOwner = owner.replace(dependency.getText(ownerAst), computedDependency);
   assert.notEqual(changedOwner, owner);
-  assert.doesNotThrow(() => exactOwnerContract({ ownerText: changedOwner }));
+  assert.equal(exactOwnerContract({ ownerText: changedOwner }), true);
+});
+
+test('duplicate Gateway scheduler facade declarations invalidate the owner contract', () => {
+  const ts = require('typescript');
+  const gateway = fs.readFileSync(GATEWAY_PATH, 'utf8');
+  const gatewayAst = sourceFile(GATEWAY_PATH, gateway);
+  const methodName = 'scheduleDeferredHandoffRecovery';
+  let method;
+  function findFacade(node) {
+    if (ts.isMethodDeclaration(node) && node.name?.text === methodName) method = node;
+    if (!method) ts.forEachChild(node, findFacade);
+  }
+  findFacade(gatewayAst);
+  assert.ok(method);
+  const duplicate = method.getText(gatewayAst);
+  const insertion = method.parent.members.end;
+  const changedGateway = `${gateway.slice(0, insertion)}\n${duplicate}\n${gateway.slice(insertion)}`;
+  assert.equal(exactOwnerContract({ gatewayText: changedGateway }), false);
 });

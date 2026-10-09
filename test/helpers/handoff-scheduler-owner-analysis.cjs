@@ -201,19 +201,6 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
       }
       return parent && ts.isCallExpression(parent) && parent.expression === expression ? parent : null;
     }
-    function finiteArrayCallbackInvocation(functionNode) {
-      let expression = functionNode;
-      while (expression.parent && ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
-      const invocation = expression.parent;
-      if (!invocation || !ts.isCallExpression(invocation) ||
-        !invocation.arguments.some(argument => unwrapParentheses(argument) === functionNode)) return null;
-      const callee = unwrapParentheses(invocation.expression);
-      if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== 'forEach') return null;
-      const receiver = unwrapParentheses(callee.expression);
-      if (!ts.isArrayLiteralExpression(receiver) || receiver.elements.length === 0 ||
-        receiver.elements.some(ts.isSpreadElement)) return null;
-      return invocation;
-    }
     function functionBinding(functionNode) {
       if (ts.isFunctionDeclaration(functionNode) && functionNode.name) return lexicalBinding(functionNode.name);
       let expression = functionNode;
@@ -232,8 +219,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
           ts,
           unwrapParentheses,
           lexicalBinding,
-          executionScope,
-          isShadowed: (node, name) => scopeDeclaresTimerName(node, name)
+          executionScope
         });
       }
       return [...new Set([...existing, ...invocationIndex.callsFor(functionNode, binding)])];
@@ -276,8 +262,7 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
         if (scope !== member) {
           const invocations = [...new Set([
             ...directInvocationCalls(scope),
-            immediateInvocation(scope),
-            finiteArrayCallbackInvocation(scope)
+            immediateInvocation(scope)
           ].filter(Boolean))];
           for (const invocation of invocations) {
             if (!ts.isCallExpression(invocation)) continue;
@@ -405,12 +390,16 @@ const source = sourceFile(GATEWAY_PATH, sourceText);
       if (["call", "apply"].includes(forwardingName)) {
         if (timerReference(callee.expression) !== null) return true;
         const nested = unwrapParentheses(callee.expression);
-        if (forwardingName === 'call' && ts.isPropertyAccessExpression(nested) && nested.name.text === 'call' &&
+        const nestedForwardingName = nested && (ts.isPropertyAccessExpression(nested)
+          ? nested.name.text
+          : ts.isElementAccessExpression(nested) ? constantPropertyName(nested.argumentExpression) : null);
+        if (forwardingName === 'call' && nestedForwardingName === 'call' &&
           timerReference(nested.expression) !== null && timerReference(node.arguments[0]) !== null) return true;
-        if (forwardingName === 'apply' && ts.isIdentifier(callee.expression) &&
-          callee.expression.text === 'Reflect' && node.arguments.length > 1 &&
+        const forwardingReceiver = unwrapParentheses(callee.expression);
+        if (forwardingName === 'apply' && ts.isIdentifier(forwardingReceiver) &&
+          forwardingReceiver.text === 'Reflect' && node.arguments.length > 1 &&
           timerReference(node.arguments[0]) !== null) {
-          for (let scope = callee.expression.parent; scope; scope = scope.parent) {
+          for (let scope = forwardingReceiver.parent; scope; scope = scope.parent) {
             if (scopeDeclaresTimerName(scope, 'Reflect')) return false;
           }
           return true;

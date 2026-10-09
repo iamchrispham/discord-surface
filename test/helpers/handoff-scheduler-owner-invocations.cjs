@@ -1,6 +1,6 @@
 'use strict';
 
-function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBinding, executionScope, isShadowed }) {
+function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBinding, executionScope }) {
   const byBinding = new Map();
   const byFunction = new Map();
   const functionsByBinding = new Map();
@@ -32,7 +32,7 @@ function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBindin
       return 'array';
     }
     if (ts.isNewExpression(expression) && ts.isIdentifier(expression.expression) &&
-      expression.expression.text === 'Set' && !(isShadowed && isShadowed(expression, 'Set'))) {
+      expression.expression.text === 'Set' && !isShadowedName(expression.expression, 'Set')) {
       const initial = expression.arguments?.[0];
       return finiteCollection(initial, visited) === 'array' ? 'set' : null;
     }
@@ -46,6 +46,35 @@ function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBindin
       !declarationList || !ts.isVariableDeclarationList(declarationList) ||
       (declarationList.flags & ts.NodeFlags.Const) === 0) return null;
     return finiteCollection(declaration.initializer, visited);
+  }
+
+  function bindsName(binding, name) {
+    if (ts.isIdentifier(binding)) return binding.text === name;
+    if (ts.isArrayBindingPattern(binding) || ts.isObjectBindingPattern(binding)) {
+      return binding.elements.some(element => !ts.isOmittedExpression(element) && bindsName(element.name, name));
+    }
+    return false;
+  }
+
+  function isShadowedName(node, name) {
+    for (let scope = node.parent; scope; scope = scope.parent) {
+      if (ts.isCatchClause(scope) && bindsName(scope.variableDeclaration.name, name)) return true;
+      if (ts.isFunctionLike(scope) && scope.parameters.some(parameter => bindsName(parameter.name, name))) return true;
+      if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+      for (const statement of scope.statements || []) {
+        if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(declaration =>
+          bindsName(declaration.name, name))) return true;
+        if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+          statement.name?.text === name) return true;
+        if (ts.isImportDeclaration(statement) && statement.importClause) {
+          const clause = statement.importClause;
+          const bindings = clause.namedBindings;
+          if (clause.name?.text === name || bindings && ts.isNamespaceImport(bindings) && bindings.name.text === name ||
+            bindings && ts.isNamedImports(bindings) && bindings.elements.some(element => element.name.text === name)) return true;
+        }
+      }
+    }
+    return false;
   }
 
   function functionsForReference(expression) {

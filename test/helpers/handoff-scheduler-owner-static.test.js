@@ -460,6 +460,23 @@ test('the public inventory catches a new optional-chain source owner and ignores
       { file: 'wrappers.ts', owner: 'wrapped', scheduler: 'schedulePendingHandoffRecoveryPoll' },
       { file: 'wrappers.ts', owner: 'wrapped', scheduler: 'schedulePendingHandoffRecoveryPoll' }
     ]);
+
+    fs.writeFileSync(path.join(sourceRoot, 'computed-import.ts'), [
+      "function computed(gateway: any) { const method = 'scheduleDeferredHandoffRecovery'; gateway[method]?.(); }",
+      "import { scheduleDeferredHandoffRecovery as schedule } from './scheduler-api.js';",
+      "function imported() { schedule('channel'); }",
+      "function shadowed(schedule: (channel: string) => void) { schedule('control'); }",
+      "export { scheduleDeferredHandoffRecovery as forwarded } from './scheduler-api.js';"
+    ].join('\n') + '\n');
+    const computedAndImported = schedulerCallsiteInventory(sourceRoot)
+      .filter(site => site.file === 'computed-import.ts');
+    assert.deepEqual(computedAndImported.map(site => site.scheduler).sort(), [
+      'scheduleDeferredHandoffRecovery',
+      'scheduleDeferredHandoffRecovery',
+      'scheduleDeferredHandoffRecovery'
+    ]);
+    assert.ok(computedAndImported.some(site => site.owner === 'computed'));
+    assert.ok(computedAndImported.some(site => site.owner === 'imported'));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -489,11 +506,67 @@ test('the owner guard detects finite timer aliases, reflective writes, and invok
   assert.deepEqual(inventoryFor('privateShadowedTimerAliasOwner(setTimeout) { const schedule = setTimeout; schedule(() => {}, 1); }'), []);
   assert.deepEqual(inventoryFor('privateUninvokedBoundTimerOwner() { setTimeout.bind(globalThis); }'), []);
 
+  const timerForwarders = [
+    ['privateBoundGlobalTimer', 'setTimeout.bind(globalThis)(() => {}, 1);'],
+    ['privateBoundRequireTimer', "require('node:timers').setTimeout.bind(null)(() => {}, 1);"],
+    ['privateBracketCallTimer', "setTimeout['call'](globalThis, () => {}, 1);"],
+    ['privateBracketApplyRequireTimer', "require('node:timers').setTimeout['apply'](null, [() => {}, 1]);"],
+    ['privateConstBoundAlias', 'const schedule = setTimeout.bind(globalThis); schedule(() => {}, 1);'],
+    ["privateComputedForwarding", "const method = 'call'; setTimeout[method](globalThis, () => {}, 1);"],
+    ['privateReflectApply', 'Reflect.apply(setTimeout, globalThis, [() => {}, 1]);'],
+    ['privateCallCall', 'setTimeout.call.call(setTimeout, globalThis, () => {}, 1);'],
+    ['privateLetAlias', 'let schedule = setTimeout; schedule(() => {}, 1);'],
+    ['privateFiniteApply', 'const args = [() => {}, 1]; setTimeout.apply(globalThis, args);'],
+    ['privateTemplateKeyCall', 'setTimeout[`call`](globalThis, () => {}, 1);'],
+    ['privateBindThenCall', 'setTimeout.bind(globalThis).call(null, () => {}, 1);'],
+    ['privateBracketCallCall', "setTimeout['call']['call'](setTimeout, globalThis, () => {}, 1);"],
+    ['privateParenthesizedReflect', '(Reflect).apply(setTimeout, globalThis, [() => {}, 1]);']
+  ];
+  for (const [name, body] of timerForwarders) {
+    assert.ok(inventoryFor(`${name}() { ${body} }`).includes(`${name}: timer API`),
+      `${name}: finite timer forwarding escaped`);
+  }
+  assert.deepEqual(inventoryFor('privateShadowedReflectTimer(Reflect) { Reflect.apply(setTimeout, globalThis, [() => {}, 1]); }'), []);
+
   assert.deepEqual(inventoryFor('privateReflectiveSchedulerWrite() { Object.assign(this, { deferredHandoffRecoveryDelayMs: 1 }); }'),
     ['privateReflectiveSchedulerWrite']);
   assert.deepEqual(inventoryFor('privateOtherReflectiveWrite(other) { Object.assign(other, { deferredHandoffRecoveryDelayMs: 1 }); }'), []);
+  const reflectiveWrites = [
+    ['privateDefineProperty', "Object.defineProperty(this, 'deferredHandoffRecoveryDelayMs', { value: 1 });"],
+    ['privateReflectSet', "Reflect.set(this, 'deferredHandoffRecoveryChannels', new Set());"],
+    ['privateAssignVariableSource', 'const patch = { deferredHandoffRecoveryDelayMs: 1 }; Object.assign(this, patch);'],
+    ['privateAssignSpread', 'Object.assign(this, { ...{ deferredHandoffRecoveryDelayMs: 1 } });'],
+    ['privateAssignAlias', 'const gateway = this; Object.assign(gateway, { deferredHandoffRecoveryDelayMs: 1 });'],
+    ['privateBracketAssign', "Object['assign'](this, { deferredHandoffRecoveryDelayMs: 1 });"],
+    ['privateParenthesizedAssign', '((Object)).assign(this, { deferredHandoffRecoveryDelayMs: 1 });'],
+    ['privateBracketReflectSet', "Reflect['set'](this, 'deferredHandoffRecoveryChannels', new Set());"],
+    ['privateBracketDefineProperty', "Object['defineProperty'](this, 'deferredHandoffRecoveryDelayMs', { value: 1 });"],
+    ['privateReflectDefineProperty', "Reflect.defineProperty(this, 'deferredHandoffRecoveryDelayMs', { value: 1 });"],
+    ['privateDefineProperties', 'Object.defineProperties(this, { deferredHandoffRecoveryDelayMs: { value: 1 } });'],
+    ['privateDefinePropertiesAlias', 'const descriptors = { deferredHandoffRecoveryDelayMs: { value: 1 } }; Object.defineProperties(this, descriptors);'],
+    ['privateDefinePropertiesSpread', 'Object.defineProperties(this, { ...{ deferredHandoffRecoveryDelayMs: { value: 1 } } });']
+  ];
+  for (const [name, body] of reflectiveWrites) {
+    assert.deepEqual(inventoryFor(`${name}() { ${body} }`), [name], `${name}: reflective write escaped`);
+  }
+  assert.deepEqual(inventoryFor("privateShadowedObject(Object) { Object.assign(this, { deferredHandoffRecoveryDelayMs: 1 }); }"), []);
+  assert.deepEqual(inventoryFor("privateShadowedReflect(Reflect) { Reflect.set(this, 'deferredHandoffRecoveryDelayMs', 1); }"), []);
+  assert.deepEqual(inventoryFor('privateOtherDefineProperties(other) { Object.defineProperties(other, { deferredHandoffRecoveryDelayMs: { value: 1 } }); }'), []);
   assert.deepEqual(inventoryFor('privateInvokedFiniteCallbackWrite(other) { let gateway = other; [0].forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'),
     ['privateInvokedFiniteCallbackWrite']);
+  const invokedCallbackWrites = [
+    ['privateNamedResetCall', 'const reset = () => { gateway = this; }; reset();'],
+    ['privateMapOtherToGateway', '[0].map(() => { gateway = this; });'],
+    ['privateSomeOtherToGateway', '[0].some(() => { gateway = this; });'],
+    ['privateVariableArrayForEach', 'const items = [0]; items.forEach(() => { gateway = this; });'],
+    ['privateSetForEach', 'new Set([0]).forEach(() => { gateway = this; });']
+  ];
+  for (const [name, body] of invokedCallbackWrites) {
+    assert.deepEqual(inventoryFor(`${name}(other) { let gateway = other; ${body} return gateway.deferredHandoffRecoveryChannels; }`),
+      [name], `${name}: invoked callback write escaped`);
+  }
+  assert.deepEqual(inventoryFor('privateEmptyForEach(other) { let gateway = other; [].forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'), []);
+  assert.deepEqual(inventoryFor('privateShadowedSetForEach(Set, other) { let gateway = other; new Set([0]).forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'), []);
   assert.deepEqual(inventoryFor('privateUninvokedOtherCallbackWrite(other) { let gateway = other; const reset = () => { gateway = this; }; return gateway.deferredHandoffRecoveryChannels; }'), []);
   assert.deepEqual(inventoryFor('privateClosureReadAfterWrite(other) { let gateway = other; const read = () => gateway.deferredHandoffRecoveryChannels; gateway = this; return read(); }'),
     ['privateClosureReadAfterWrite']);

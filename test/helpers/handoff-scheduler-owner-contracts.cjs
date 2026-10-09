@@ -63,7 +63,14 @@ function isIdentifier(node, expected) {
 
 function hasExactFacade(sourceText, methodName) {
   const source = sourceFile(GATEWAY_PATH, sourceText);
-  if (source.parseDiagnostics.length || !methodOf(source, methodName)) return false;
+  if (source.parseDiagnostics.length) return false;
+  const method = methodOf(source, methodName);
+  if (!method || !method.parent?.members) return false;
+  const declarations = method.parent.members.filter(candidate =>
+    ts.isMethodDeclaration(candidate) && candidate.name &&
+    (ts.isIdentifier(candidate.name) || ts.isStringLiteralLike(candidate.name)) &&
+    candidate.name.text === methodName);
+  if (declarations.length !== 1) return false;
   return facadeOwnerInventory(ts, source, {
     ownerName: 'handoffSchedulerHandlers', factoryName: FACTORY_NAME,
     facadeNames: Object.keys(METHOD_HASHES)
