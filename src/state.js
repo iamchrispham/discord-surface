@@ -44,6 +44,7 @@ const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = requ
 const { classifyProcessOwner, normalizeOwnerEvidence, OWNER_EVIDENCE } = require('./state/process-owner-evidence');
 const { captureProcessOwnerIdentity } = require('./state/process-owner-capture');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
+const { createOrdinaryClaudeBindingHandlers } = require('./state/ordinary-binding-claude');
 const {
   createThreadEnrollmentHandlers,
   THREAD_DEACTIVATION_DETAILS,
@@ -460,6 +461,15 @@ function assertOrdinaryNativeIdentity(provider, nativeId, identity) {
   }
 }
 
+const ordinaryClaudeBindingHandlers = createOrdinaryClaudeBindingHandlers({
+  BindingError,
+  PROVIDERS,
+  READINESS,
+  assertOrdinaryIdentity,
+  assertOrdinaryNativeIdentity,
+  bindingMatchesExpected
+});
+
 
 
 const schemaHandlers = createSchemaHandlers({ SCHEMA_VERSION, StateCorruptError, parseJson, compareDiscordIds, READINESS, now });
@@ -611,14 +621,7 @@ class SurfaceState {
   }
 
   _bindOrdinaryClaude(binding, identity, adoptionCutoff = null, options = {}) {
-    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
-    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
-    assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
-    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
-      intakeCutoff: adoptionCutoff,
-      intakeCutoffDetail: 'ordinary binding adoption cutoff',
-      beforeMutation: options.beforeMutation
-    });
+    return ordinaryClaudeBindingHandlers.bindOrdinaryClaude(this, binding, identity, adoptionCutoff, options);
   }
 
   _rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
@@ -626,77 +629,35 @@ class SurfaceState {
   }
 
   _rebindOrdinaryClaude(binding, identity, intakeCutoff = null, options = {}) {
-    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
-    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
-    const existing = this.getBinding(binding.channelId);
-    if (!existing || existing.active || !this._isOrdinaryBindingRecord(existing)) {
-      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
-    }
-    if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CLAUDE ||
-      existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace || existing.endpoint !== binding.endpoint ||
-      identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
-      throw new BindingError('ordinary binding owner changed; use explicit handoff');
-    }
-    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
-      intakeCutoff,
-      beforeMutation: options.beforeMutation
-    });
+    return ordinaryClaudeBindingHandlers.rebindOrdinaryClaude(this, binding, identity, intakeCutoff, options);
   }
 
   _isOrdinaryBindingRecord(binding) {
     if (binding?.provider === PROVIDERS.CODEX) return ordinaryBindingHandlers.isOrdinaryBindingRecord(this, binding);
-    if (!binding || !Object.values(PROVIDERS).includes(binding.provider) || binding.conductorId || binding.repoKey) return false;
-    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind=?
-        AND json_extract(detail, '$.channelId')=?
-        AND json_extract(detail, '$.provider')=?
-        AND json_extract(detail, '$.nativeId')=?
-        AND json_extract(detail, '$.workspace')=?
-        AND json_extract(detail, '$.generation')=?
-      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.BOUND, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
+    if (binding?.provider === PROVIDERS.CLAUDE) return ordinaryClaudeBindingHandlers.isOrdinaryBindingRecord(this, binding);
+    return false;
   }
 
   _isOrdinaryBinding(binding) {
     if (binding?.provider === PROVIDERS.CODEX) return ordinaryBindingHandlers.isOrdinaryBinding(this, binding);
-    return Boolean(binding?.active) && this._isOrdinaryBindingRecord(binding);
+    if (binding?.provider === PROVIDERS.CLAUDE) return ordinaryClaudeBindingHandlers.isOrdinaryBinding(this, binding);
+    return false;
   }
 
   _hasOrdinaryPreflight(binding) {
     if (binding?.provider === PROVIDERS.CODEX) return ordinaryBindingHandlers.hasOrdinaryPreflight(this, binding);
-    if (!this._isOrdinaryBinding(binding)) return false;
-    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind=?
-        AND json_extract(detail, '$.channelId')=?
-        AND json_extract(detail, '$.provider')=?
-        AND json_extract(detail, '$.nativeId')=?
-        AND json_extract(detail, '$.workspace')=?
-        AND json_extract(detail, '$.generation')=?
-        AND json_extract(detail, '$.sessionRoot') IS ?
-        AND json_extract(detail, '$.outcome')='verified'
-      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
+    if (binding?.provider === PROVIDERS.CLAUDE) return ordinaryClaudeBindingHandlers.hasOrdinaryPreflight(this, binding);
+    return false;
   }
 
   _recordOrdinaryPreflight(binding, detail = {}) {
     if (binding?.provider === PROVIDERS.CODEX) return ordinaryBindingHandlers.recordOrdinaryPreflight(this, binding, detail);
+    if (binding?.provider === PROVIDERS.CLAUDE) return ordinaryClaudeBindingHandlers.recordOrdinaryPreflight(this, binding, detail);
     return this.transaction(() => {
       const current = this.getBinding(binding?.channelId);
       if (!bindingMatchesExpected(current, binding)) return null;
       if (!this._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
-      if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
-        detail.sessionId !== current.nativeId || detail.threadId !== current.nativeId || detail.workspace !== current.workspace) {
-        throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
-      }
-      if (current.provider === PROVIDERS.CLAUDE && (detail.harness !== 'claude-code' || detail.endpoint !== current.endpoint)) {
-        throw new BindingError('ordinary Claude native preflight proof does not match the binding');
-      }
-      this.receipt(null, ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, {
-        ...detail,
-        channelId: current.channelId, guildId: current.guildId, provider: current.provider,
-        nativeId: current.nativeId, workspace: current.workspace, generation: current.generation,
-        sessionRoot: current.sessionRoot || null,
-        outcome: 'verified'
-      });
-      return current;
+      return null;
     });
   }
 
