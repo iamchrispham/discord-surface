@@ -25,6 +25,7 @@ const TOKEN = 'town-hall-child-disposable-credential';
 const ORDINARY_DOMAIN = 'discord-tether/agent-message/v1';
 const PACKET_ID_PREFIX = 'townhall_';
 const PACKET_ID_DOMAIN = 'discord-surface/town-hall-child/v1';
+const JOURNAL_KEY_DOMAIN = 'discord-surface/town-hall-journal/v1';
 
 const PACKET_ERROR = 'invalid town-hall child packet';
 const CREDENTIAL_ERROR = 'town-hall child credential unavailable';
@@ -67,6 +68,18 @@ function packetIdFor(packet) {
       canonical(packet.target)
     ]))
     .digest('hex');
+}
+
+function rawSourceJournalKey(source, broadcastId) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    JOURNAL_KEY_DOMAIN,
+    source.guildId,
+    source.channelId,
+    source.provider,
+    source.nativeId,
+    source.generation,
+    broadcastId
+  ])).digest('hex');
 }
 
 function validPacket(overrides = {}) {
@@ -284,6 +297,19 @@ test('rejects journal keys derived for another source or broadcast', () => {
       PACKET_ERROR
     );
   }
+});
+
+test('rejects the legacy raw-uppercase source key for a canonical journal', () => {
+  const source = { ...SOURCE, nativeId: SOURCE_UUID.toUpperCase() };
+  const journalKey = rawSourceJournalKey(source, 'broadcast-1');
+  assert.notEqual(journalKey, JOURNAL_KEY);
+  const packet = validPacket({ source, journalKey });
+
+  expectError(() => encodeTownHallChild(packet, TOKEN), PACKET_ERROR);
+  expectError(
+    () => decodeTownHallChild(signJson(packet), TOKEN, { ...TARGET }),
+    PACKET_ERROR
+  );
 });
 
 test('packet ID binds the frozen recipient identity', () => {

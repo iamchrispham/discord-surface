@@ -10,6 +10,7 @@ const { Worker } = require('node:worker_threads');
 
 const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
 const { SurfaceState, BindingError, StateCorruptError } = require('../src/state');
+const { encodeTownHallChild, decodeTownHallChild } = require('../src/town-hall-child.js');
 const {
   TOWN_HALL_JOURNAL_RECEIPTS,
   TOWN_HALL_JOURNAL_STATES
@@ -199,6 +200,47 @@ test('canonical broadcast creates one complete planned journal', t => {
     assert.equal(detail.packetId, expectedPlan.recipients[index].packetId);
     assert.deepEqual(detail.target, expectedPlan.recipients[index].target);
   }
+});
+
+test('uppercase source packet resolves the canonical State journal custody', t => {
+  const f = fixture(t);
+  const uppercaseSourceId = SOURCE_ID.toUpperCase();
+  const sourceInput = input({
+    broadcastId: 'uppercase-source',
+    source: address({ channelId: '200', nativeId: uppercaseSourceId })
+  });
+  const plan = planTownHallBroadcast(sourceInput);
+  assert.equal(sourceInput.source.nativeId, uppercaseSourceId);
+  assert.equal(plan.source.nativeId, SOURCE_ID);
+
+  const created = f.state.createTownHallBroadcast(sourceInput);
+  assert.equal(created.broadcast.journalKey, expectedJournalKey(plan));
+  const recipient = plan.recipients[0];
+  const packet = {
+    id: recipient.packetId,
+    kind: 'request',
+    source: { ...sourceInput.source },
+    target: { ...recipient.target },
+    replyTo: null,
+    routingVersion: 2,
+    text: plan.text,
+    purpose: 'town-hall-child/v1',
+    broadcastId: plan.broadcastId,
+    journalKey: created.broadcast.journalKey,
+    planFingerprint: plan.fingerprint,
+    room: { ...plan.townHall },
+    roomMessageId: '12345678901234567890'
+  };
+  const wire = encodeTownHallChild(packet, 'town-hall-journal-disposable-token');
+  const decoded = decodeTownHallChild(wire, 'town-hall-journal-disposable-token', packet.target);
+  assert.ok(decoded);
+
+  const custody = f.state.getTownHallBroadcast(decoded.journalKey);
+  assert.ok(custody);
+  assert.equal(custody.journalKey, created.broadcast.journalKey);
+  assert.deepEqual(custody.plan, plan);
+  assert.equal(custody.recipients[0].packetId, decoded.id);
+  assert.deepEqual(custody.recipients[0].target, decoded.target);
 });
 
 test('repeated canonical creation writes no additional receipts', t => {

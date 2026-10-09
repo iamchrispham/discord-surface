@@ -12,7 +12,7 @@ export function deriveTownHallJournalKey(
     source.guildId,
     source.channelId,
     source.provider,
-    source.nativeId,
+    source.nativeId.toLowerCase(),
     source.generation,
     broadcastId
   ])).digest('hex');
