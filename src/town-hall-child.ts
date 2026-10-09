@@ -267,6 +267,9 @@ export function decodeTownHallChild(
     throw invalidEncoding();
   }
   const packet = snapshotPacket(parsed);
-  if (!sameAddress(canonicalAddress(packet.target), canonicalAddress(target))) throw staleTarget();
+  const expectedTarget = snapshotAddress(target);
+  if (expectedTarget === null || !sameAddress(canonicalAddress(packet.target), canonicalAddress(expectedTarget))) {
+    throw staleTarget();
+  }
   return packet;
 }

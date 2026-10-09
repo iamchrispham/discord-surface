@@ -835,3 +835,97 @@ test('stale target addresses refuse without returning a packet', () => {
   const markers = fixture.match(/@ts-expect-error/g) || [];
   assert.equal(markers.length, 6, 'type fixture must contain exactly six @ts-expect-error markers');
 });
+
+test('expected decoder targets snapshot own data fields before canonicalization', () => {
+  const packet = validPacket();
+  const wire = encodeTownHallChild(packet, TOKEN);
+
+  assert.equal(decodeTownHallChild(wire, TOKEN, { ...TARGET }).id, packet.id);
+  assert.equal(
+    decodeTownHallChild(wire, TOKEN, { ...TARGET, nativeId: TARGET_UUID.toUpperCase() }).id,
+    packet.id
+  );
+
+  for (const enumerable of [true, false]) {
+    let reads = 0;
+    const target = { ...TARGET };
+    Object.defineProperty(target, 'nativeId', {
+      configurable: true,
+      enumerable,
+      get() {
+        reads += 1;
+        return TARGET_UUID;
+      }
+    });
+    expectError(() => decodeTownHallChild(wire, TOKEN, target), TARGET_ERROR);
+    assert.equal(reads, 0, `enumerable=${enumerable} getter must not be read`);
+  }
+
+  let throwingReads = 0;
+  const throwingTarget = { ...TARGET };
+  Object.defineProperty(throwingTarget, 'nativeId', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throwingReads += 1;
+      throw new Error('expected target getter ran');
+    }
+  });
+  expectError(() => decodeTownHallChild(wire, TOKEN, throwingTarget), TARGET_ERROR);
+  assert.equal(throwingReads, 0);
+
+  let changingReads = 0;
+  const changingTarget = { ...TARGET };
+  Object.defineProperty(changingTarget, 'nativeId', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      changingReads += 1;
+      return changingReads === 1 ? TARGET_UUID : THIRD_UUID;
+    }
+  });
+  expectError(() => decodeTownHallChild(wire, TOKEN, changingTarget), TARGET_ERROR);
+  assert.equal(changingReads, 0);
+
+  let proxyReads = 0;
+  const proxiedTarget = new Proxy({ ...TARGET }, {
+    get(target, property, receiver) {
+      proxyReads += 1;
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  assert.equal(decodeTownHallChild(wire, TOKEN, proxiedTarget).id, packet.id);
+  assert.equal(proxyReads, 0);
+
+  let proxyAccessorReads = 0;
+  let proxyPropertyReads = 0;
+  const accessorTarget = { ...TARGET };
+  Object.defineProperty(accessorTarget, 'nativeId', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      proxyAccessorReads += 1;
+      return TARGET_UUID;
+    }
+  });
+  const proxiedAccessorTarget = new Proxy(accessorTarget, {
+    get(target, property, receiver) {
+      proxyPropertyReads += 1;
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  expectError(() => decodeTownHallChild(wire, TOKEN, proxiedAccessorTarget), TARGET_ERROR);
+  assert.equal(proxyAccessorReads, 0);
+  assert.equal(proxyPropertyReads, 0);
+
+  for (const malformed of [
+    null,
+    [],
+    {},
+    { ...TARGET, extra: true },
+    { ...TARGET, nativeId: 'not-a-uuid' },
+    { ...TARGET, generation: 0 }
+  ]) {
+    expectError(() => decodeTownHallChild(wire, TOKEN, malformed), TARGET_ERROR);
+  }
+});
