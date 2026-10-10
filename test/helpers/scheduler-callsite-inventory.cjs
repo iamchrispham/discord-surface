@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
-const { unwrapTransparentExpression } = require('./handoff-scheduler-owner-expressions.cjs');
+const { unwrapTransparentExpression, bindingContainsName } = require('./handoff-scheduler-owner-expressions.cjs');
 
 const SOURCE_ROOT = path.resolve(__dirname, '..', '..', 'src');
 const SCHEDULER_METHODS = new Set([
@@ -21,17 +21,15 @@ function constantSchedulerKey(expression, visited = new Set()) {
 
   const name = expression.text;
   for (let scope = expression.parent; scope; scope = scope.parent) {
-    if (ts.isCatchClause(scope) && ts.isIdentifier(scope.variableDeclaration?.name) &&
-      scope.variableDeclaration.name.text === name) return null;
-    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter =>
-      ts.isIdentifier(parameter.name) && parameter.name.text === name)) return null;
+    if (ts.isCatchClause(scope) && scope.variableDeclaration && bindingContainsName(scope.variableDeclaration.name, name)) return null;
+    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter => bindingContainsName(parameter.name, name))) return null;
     if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
 
     let declaration = null;
     for (const statement of scope.statements || []) {
       if (ts.isVariableStatement(statement)) {
         for (const candidate of statement.declarationList.declarations) {
-          if (ts.isIdentifier(candidate.name) && candidate.name.text === name) declaration = candidate;
+          if (bindingContainsName(candidate.name, name)) declaration = candidate;
         }
       } else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
         statement.name?.text === name) {
@@ -79,14 +77,12 @@ function schedulerLiteralKeyName(key) {
 
 function shadowsImportedScheduler(node, name) {
   for (let scope = node.parent; scope; scope = scope.parent) {
-    if (ts.isCatchClause(scope) && ts.isIdentifier(scope.variableDeclaration?.name) &&
-      scope.variableDeclaration.name.text === name) return true;
-    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter =>
-      ts.isIdentifier(parameter.name) && parameter.name.text === name)) return true;
+    if (ts.isCatchClause(scope) && scope.variableDeclaration && bindingContainsName(scope.variableDeclaration.name, name)) return true;
+    if (ts.isFunctionLike(scope) && scope.parameters.some(parameter => bindingContainsName(parameter.name, name))) return true;
     if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
     for (const statement of scope.statements || []) {
       if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(declaration =>
-        ts.isIdentifier(declaration.name) && declaration.name.text === name)) return true;
+        bindingContainsName(declaration.name, name))) return true;
       if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
         statement.name?.text === name) return true;
     }
@@ -230,13 +226,14 @@ function schedulerCallsiteInventory(sourceRoot = SOURCE_ROOT) {
         }
       }
       if (ts.isExportSpecifier(node)) {
-        const exportedScheduler = [node.propertyName, node.name].filter(Boolean)
-          .find(candidate => SCHEDULER_METHODS.has(candidate.text));
-        if (exportedScheduler) {
+        const localName = (node.propertyName || node.name).text;
+        const scheduler = importedSchedulers.get(localName) ||
+          (SCHEDULER_METHODS.has(localName) ? localName : null);
+        if (scheduler) {
           inventory.push({
             file: path.relative(sourceRoot, filePath).split(path.sep).join('/'),
             owner: enclosingSchedulerOwner(node, source),
-            scheduler: exportedScheduler.text
+            scheduler
           });
         }
       }

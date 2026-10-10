@@ -140,6 +140,24 @@ function exactOwnerContract(sourceOverrides = {}) {
   if (!ts.isBindingElement(option) || !isIdentifier(option.name, 'pendingGeneration') ||
     (option.propertyName && option.propertyName.text !== 'pendingGeneration') ||
     option.initializer?.kind !== ts.SyntaxKind.FalseKeyword) return false;
+  const factoryImports = gatewaySource.statements.flatMap(statement => {
+    if (!ts.isVariableStatement(statement)) return [];
+    return statement.declarationList.declarations.flatMap(declaration => {
+      if (!ts.isObjectBindingPattern(declaration.name) || !declaration.initializer ||
+        !ts.isCallExpression(declaration.initializer) || !ts.isIdentifier(declaration.initializer.expression) ||
+        declaration.initializer.expression.text !== 'require' || declaration.initializer.arguments.length !== 1) return [];
+      const factoryBinding = declaration.name.elements.find(element => {
+        const importedName = element.propertyName || element.name;
+        return (ts.isIdentifier(importedName) || ts.isStringLiteralLike(importedName)) &&
+          importedName.text === FACTORY_NAME;
+      });
+      return factoryBinding ? [{ source: declaration.initializer.arguments[0], localName: factoryBinding.name }] : [];
+    });
+  });
+  if (factoryImports.length !== 1 || !ts.isIdentifier(factoryImports[0].localName) ||
+    factoryImports[0].localName.text !== FACTORY_NAME || !ts.isStringLiteralLike(factoryImports[0].source) ||
+    factoryImports[0].source.text !== './discord/handoff-scheduler') return false;
+
   for (const methodName of gatewayMethods) {
     const declaration = declarations.find(candidate => candidate.name.text === methodName);
     if (declaration.modifiers?.length || declaration.asteriskToken) return false;

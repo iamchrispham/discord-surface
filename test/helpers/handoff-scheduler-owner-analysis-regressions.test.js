@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const test = require('node:test');
+const { schedulerCallsiteInventory } = require('./scheduler-callsite-inventory.cjs');
 const {
   GATEWAY_PATH,
   OWNER_PATH,
@@ -41,6 +42,9 @@ test('invoked callbacks and escaped closures update Gateway receiver analysis', 
 
   assert.deepEqual(inventoryFor('privateEmptyForEach(other) { let gateway = other; [].forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'), []);
   assert.deepEqual(inventoryFor('privateUninvokedOtherCallbackWrite(other) { let gateway = other; const reset = () => { gateway = this; }; return gateway.deferredHandoffRecoveryChannels; }'), []);
+  assertInventoryReports('privateLocalSetAlias', 'privateLocalSetAlias(other) { const Set = globalThis.Set; let gateway = other; new Set([0]).forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }');
+  assert.deepEqual(inventoryFor('privateShadowedSetForEach(other, Set) { let gateway = other; new Set([0]).forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'), []);
+  assert.deepEqual(inventoryFor('privateCustomSetForEach(other) { const Set = CustomSet; let gateway = other; new Set([0]).forEach(() => { gateway = this; }); return gateway.deferredHandoffRecoveryChannels; }'), []);
 
   const closureReads = [
     ['privateReturnedClosure', 'privateReturnedClosure(other) { let gateway = other; const read = () => gateway.deferredHandoffRecoveryChannels; gateway = this; return read; }'],
@@ -66,11 +70,14 @@ test('timer inventory follows finite forwarding and rejects shadowed or uninvoke
     ['privateLetAlias', 'privateLetAlias() { let schedule = setTimeout; schedule(() => {}, 1); }'],
     ['privateFiniteApply', 'privateFiniteApply() { const args = [() => {}, 1]; setTimeout.apply(globalThis, args); }'],
     ['privateTemplateKeyCall', 'privateTemplateKeyCall() { setTimeout[`call`](globalThis, () => {}, 1); }'],
-    ['privateBindThenCall', 'privateBindThenCall() { setTimeout.bind(globalThis).call(null, () => {}, 1); }']
+    ['privateBindThenCall', 'privateBindThenCall() { setTimeout.bind(globalThis).call(null, () => {}, 1); }'],
+    ['privateBracketCallCallTimer', "privateBracketCallCallTimer() { setTimeout['call']['call'](setTimeout, globalThis, () => {}, 1); }"],
+    ['privateParenthesizedReflectApply', 'privateParenthesizedReflectApply() { (Reflect).apply(setTimeout, globalThis, [() => {}, 1]); }']
   ];
   for (const [name, member] of positives) assertTimerReported(name, member);
 
   assert.deepEqual(inventoryFor('privateShadowedTimerAliasOwner(setTimeout) { const schedule = setTimeout; schedule(() => {}, 1); }'), []);
+  assert.deepEqual(inventoryFor('privateShadowedReflectApply(Reflect) { (Reflect).apply(setTimeout, globalThis, [() => {}, 1]); }'), []);
   assert.deepEqual(inventoryFor('privateUninvokedBoundTimer() { return setTimeout.bind(globalThis); }'), []);
 });
 
@@ -81,12 +88,47 @@ test('reflective writes and aliased Object.assign sources stay in the Gateway in
     ['privateAssignVariableSource', 'privateAssignVariableSource() { const patch = { deferredHandoffRecoveryDelayMs: 1 }; Object.assign(this, patch); }'],
     ['privateAssignAliasedSource', 'privateAssignAliasedSource() { const update = { deferredHandoffRecoveryDelayMs: 1 }; Object.assign(this, update); }'],
     ['privateAssignSpread', 'privateAssignSpread() { Object.assign(this, { ...{ deferredHandoffRecoveryDelayMs: 1 } }); }'],
-    ['privateAssignAlias', 'privateAssignAlias() { const gateway = this; Object.assign(gateway, { deferredHandoffRecoveryDelayMs: 1 }); }']
+    ['privateAssignAlias', 'privateAssignAlias() { const gateway = this; Object.assign(gateway, { deferredHandoffRecoveryDelayMs: 1 }); }'],
+    ['privateBracketAssign', "privateBracketAssign() { Object['assign'](this, { deferredHandoffRecoveryDelayMs: 1 }); }"],
+    ['privateParenthesizedAssign', 'privateParenthesizedAssign() { (Object).assign(this, { deferredHandoffRecoveryDelayMs: 1 }); }'],
+    ['privateBracketReflectSet', "privateBracketReflectSet() { Reflect['set'](this, 'deferredHandoffRecoveryChannels', new Set()); }"],
+    ['privateBracketDefineProperty', "privateBracketDefineProperty() { Object['defineProperty'](this, 'deferredHandoffRecoveryDelayMs', { value: 1 }); }"],
+    ['privateDefineProperties', 'privateDefineProperties() { Object.defineProperties(this, { deferredHandoffRecoveryDelayMs: { value: 1 } }); }']
   ];
   for (const [name, member] of positives) assertInventoryReports(name, member);
 
   assert.deepEqual(inventoryFor('privateOtherReflectiveWrite(other) { Object.assign(other, { deferredHandoffRecoveryDelayMs: 1 }); }'), []);
   assert.deepEqual(inventoryFor("privateOtherDefineProperty(other) { Object.defineProperty(other, 'deferredHandoffRecoveryDelayMs', { value: 1 }); }"), []);
+  assert.deepEqual(inventoryFor("privateOtherDefineProperties(other) { Object.defineProperties(other, { deferredHandoffRecoveryDelayMs: { value: 1 } }); }"), []);
+  assert.deepEqual(inventoryFor("privateShadowedObject(Object) { Object['assign'](this, { deferredHandoffRecoveryDelayMs: 1 }); }"), []);
+  assert.deepEqual(inventoryFor("privateShadowedReflect(Reflect) { Reflect['set'](this, 'deferredHandoffRecoveryDelayMs', 1); }"), []);
+});
+
+function schedulerInventoryFor(sourceText) {
+  const path = require('node:path');
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'scheduler-inventory-'));
+  try {
+    fs.writeFileSync(path.join(root, 'consumer.js'), sourceText);
+    return schedulerCallsiteInventory(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('scheduler inventory resolves immutable computed method keys and respects lexical shadows', () => {
+  const computed = schedulerInventoryFor("const method = 'scheduleDeferredHandoffRecovery'; gateway[method]();");
+  assert.ok(computed.some(entry => entry.scheduler === 'scheduleDeferredHandoffRecovery'));
+
+  const shadowed = schedulerInventoryFor("const method = 'scheduleDeferredHandoffRecovery'; function wrapper({ method }) { gateway[method](); }");
+  assert.deepEqual(shadowed, []);
+});
+
+test('scheduler inventory follows imported aliases through exports and ignores destructured shadows', () => {
+  const reexport = schedulerInventoryFor("import { scheduleDeferredHandoffRecovery as schedule } from './scheduler-api.js'; export { schedule as run };");
+  assert.ok(reexport.some(entry => entry.scheduler === 'scheduleDeferredHandoffRecovery'));
+
+  const shadowed = schedulerInventoryFor("import { scheduleDeferredHandoffRecovery as schedule } from './scheduler-api.js'; function wrapper({ schedule }) { schedule(); }");
+  assert.deepEqual(shadowed, []);
 });
 
 test('facade timer detection reports a timer inserted into an existing method', () => {
@@ -128,4 +170,13 @@ test('duplicate Gateway scheduler facade declarations invalidate the owner contr
   const insertion = method.parent.members.end;
   const changedGateway = `${gateway.slice(0, insertion)}\n${duplicate}\n${gateway.slice(insertion)}`;
   assert.equal(exactOwnerContract({ gatewayText: changedGateway }), false);
+});
+
+test('Gateway owner contract pins the scheduler factory require source', () => {
+  const changedGateway = gateway.replace("require('./discord/handoff-scheduler')", "require('./alternate-scheduler')");
+  assert.notEqual(changedGateway, gateway);
+  assert.equal(exactOwnerContract({ gatewayText: changedGateway }), false);
+
+  const duplicateImport = `${gateway}\nconst { createHandoffSchedulerHandlers: alternateFactory } = require('./alternate-scheduler');\n`;
+  assert.equal(exactOwnerContract({ gatewayText: duplicateImport }), false);
 });

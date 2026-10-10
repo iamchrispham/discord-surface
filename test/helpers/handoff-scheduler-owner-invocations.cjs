@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindingContainsName } = require('./handoff-scheduler-owner-expressions.cjs');
+
 function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBinding, executionScope }) {
   const byBinding = new Map();
   const byFunction = new Map();
@@ -24,6 +26,33 @@ function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBindin
     return null;
   }
 
+  function isNativeSetConstructor(expression, visitedBindings = new Set()) {
+    expression = unwrapParentheses(expression);
+    if (!expression) return false;
+    if (ts.isIdentifier(expression) && expression.text === 'Set') {
+      const binding = lexicalBinding(expression);
+      if (!binding) return !isShadowedName(expression, 'Set');
+      if (visitedBindings.has(binding)) return false;
+      visitedBindings.add(binding);
+      const declaration = binding.parent;
+      const declarationList = declaration?.parent;
+      if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer ||
+        !declarationList || !ts.isVariableDeclarationList(declarationList) ||
+        (declarationList.flags & ts.NodeFlags.Const) === 0) return false;
+      return isNativeSetConstructor(declaration.initializer, visitedBindings);
+    }
+    const property = ts.isPropertyAccessExpression(expression)
+      ? expression.name.text
+      : ts.isElementAccessExpression(expression) && ts.isStringLiteralLike(unwrapParentheses(expression.argumentExpression))
+        ? unwrapParentheses(expression.argumentExpression).text
+        : null;
+    const receiver = ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)
+      ? unwrapParentheses(expression.expression)
+      : null;
+    return property === 'Set' && receiver && ts.isIdentifier(receiver) && receiver.text === 'globalThis' &&
+      !isShadowedName(receiver, 'globalThis');
+  }
+
   function finiteCollection(expression, visited = new Set()) {
     expression = unwrapParentheses(expression);
     if (!expression) return null;
@@ -31,8 +60,7 @@ function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBindin
       if (expression.elements.length === 0 || expression.elements.some(ts.isSpreadElement)) return null;
       return 'array';
     }
-    if (ts.isNewExpression(expression) && ts.isIdentifier(expression.expression) &&
-      expression.expression.text === 'Set' && !isShadowedName(expression.expression, 'Set')) {
+    if (ts.isNewExpression(expression) && isNativeSetConstructor(expression.expression)) {
       const initial = expression.arguments?.[0];
       return finiteCollection(initial, visited) === 'array' ? 'set' : null;
     }
@@ -48,22 +76,14 @@ function indexFunctionInvocations(member, { ts, unwrapParentheses, lexicalBindin
     return finiteCollection(declaration.initializer, visited);
   }
 
-  function bindsName(binding, name) {
-    if (ts.isIdentifier(binding)) return binding.text === name;
-    if (ts.isArrayBindingPattern(binding) || ts.isObjectBindingPattern(binding)) {
-      return binding.elements.some(element => !ts.isOmittedExpression(element) && bindsName(element.name, name));
-    }
-    return false;
-  }
-
   function isShadowedName(node, name) {
     for (let scope = node.parent; scope; scope = scope.parent) {
-      if (ts.isCatchClause(scope) && bindsName(scope.variableDeclaration.name, name)) return true;
-      if (ts.isFunctionLike(scope) && scope.parameters.some(parameter => bindsName(parameter.name, name))) return true;
+      if (ts.isCatchClause(scope) && bindingContainsName(scope.variableDeclaration.name, name)) return true;
+      if (ts.isFunctionLike(scope) && scope.parameters.some(parameter => bindingContainsName(parameter.name, name))) return true;
       if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
       for (const statement of scope.statements || []) {
         if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(declaration =>
-          bindsName(declaration.name, name))) return true;
+          bindingContainsName(declaration.name, name))) return true;
         if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
           statement.name?.text === name) return true;
         if (ts.isImportDeclaration(statement) && statement.importClause) {

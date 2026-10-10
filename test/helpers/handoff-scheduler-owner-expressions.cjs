@@ -22,4 +22,12 @@ function unwrapTransparentExpression(node) {
   return current;
 }
 
-module.exports = { unwrapParentheses, unwrapTransparentExpression };
+function bindingContainsName(binding, name) {
+  if (ts.isIdentifier(binding)) return binding.text === name;
+  if (ts.isArrayBindingPattern(binding) || ts.isObjectBindingPattern(binding)) {
+    return binding.elements.some(element => !ts.isOmittedExpression(element) && bindingContainsName(element.name, name));
+  }
+  return false;
+}
+
+module.exports = { unwrapParentheses, unwrapTransparentExpression, bindingContainsName };
