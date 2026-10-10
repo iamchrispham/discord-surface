@@ -6,6 +6,7 @@ export const DECISION_JOURNAL = 'decision-v1' as const;
 export const DECISION_STATES = {
   PRESENTATION_PENDING: 'presentation_pending',
   PRESENTED_UNANSWERED: 'presented_unanswered',
+  AUTHORIZATION_PENDING: 'authorization_pending',
   CLICK_ADMITTED: 'click_admitted',
   CALLBACK_PENDING: 'callback_pending',
   CANONICAL_PENDING: 'canonical_pending',
@@ -25,8 +26,13 @@ export const DECISION_RECEIPT_KINDS = {
   PRESENTATION_OUTCOME: 'decision-presentation-outcome',
   PRESENTATION_STALE: 'decision-presentation-stale',
   CLICK: 'decision-click',
+  AUTHORIZATION_OUTCOME: 'decision-authorization-outcome',
+  CLICK_STALE: 'decision-click-stale',
   CALLBACK_ATTEMPT: 'decision-callback-attempt',
   CALLBACK_OUTCOME: 'decision-callback-outcome',
+  REJECTION_ATTEMPT: 'decision-rejection-attempt',
+  REJECTION_OUTCOME: 'decision-rejection-outcome',
+  TOKEN_RELEASE: 'decision-token-release',
   CANONICAL_IMPORT: 'decision-canonical-import',
   PROJECTION_OUTCOME: 'decision-projection-outcome',
   NATIVE_RETURN: 'decision-native-return',
@@ -34,6 +40,13 @@ export const DECISION_RECEIPT_KINDS = {
 } as const;
 
 export type DecisionReceiptKind = (typeof DECISION_RECEIPT_KINDS)[keyof typeof DECISION_RECEIPT_KINDS];
+
+export const DECISION_AUTHORIZATION_OUTCOMES = {
+  AUTHORIZED: 'authorized',
+  DENIED: 'denied'
+} as const;
+
+export type DecisionAuthorizationOutcome = (typeof DECISION_AUTHORIZATION_OUTCOMES)[keyof typeof DECISION_AUTHORIZATION_OUTCOMES];
 
 export const DECISION_TRANSPORT_OUTCOMES = {
   SENT: 'sent',
@@ -192,6 +205,8 @@ export interface DecisionClickInput {
   channelId: string;
   messageId: string;
   binding: DecisionBindingInput;
+  applicationId?: string;
+  token?: string;
 }
 
 export interface DecisionPresentationLookupInput {
@@ -261,10 +276,15 @@ export interface DecisionClick {
   guildId: string;
   channelId: string;
   messageId: string;
+  applicationId: string | null;
+  token: string | null;
   binding: DecisionBinding;
   state: DecisionState;
+  authorizationOutcome: DecisionAuthorizationOutcome | null;
   callbackAttempted: boolean;
   callbackOutcome: DecisionTransportOutcome | null;
+  rejectionAttempted: boolean;
+  rejectionOutcome: DecisionTransportOutcome | null;
   canonical: DecisionCanonicalResult | null;
   projectionOutcome: DecisionTransportOutcome | null;
   nativeReturn: DecisionNativeReturn | null;
@@ -319,6 +339,11 @@ export interface DecisionTransitionResult {
   click: DecisionClick | null;
 }
 
+export interface DecisionBindingRecoveryResult {
+  binding: DecisionBinding | null;
+  click: DecisionClick | null;
+}
+
 export interface DecisionHandlers {
   registerPresentation(state: DecisionStateStore, input: DecisionPresentationInput): DecisionPresentationResult;
   findPresentation(state: DecisionStateStore, input: DecisionPresentationLookupInput): DecisionPresentation | null;
@@ -327,9 +352,14 @@ export interface DecisionHandlers {
   getPresentation(state: DecisionStateStore, presentationId: string): DecisionPresentation | null;
   admitClick(state: DecisionStateStore, input: DecisionClickInput): DecisionClickAdmission;
   admitClickAndBeginCallback(state: DecisionStateStore, input: DecisionClickInput): DecisionClickAdmission;
+  admitClickAndBeginAuthorization(state: DecisionStateStore, input: DecisionClickInput): DecisionClickAdmission;
+  recordAuthorizationOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionAuthorizationOutcome): DecisionClickAdmission;
+  reconcileClickBinding(state: DecisionStateStore, interactionId: string): DecisionBindingRecoveryResult;
   getClick(state: DecisionStateStore, interactionId: string): DecisionClick | null;
   beginCallback(state: DecisionStateStore, interactionId: string): DecisionTransitionResult;
   recordCallbackOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
+  beginRejectionFollowup(state: DecisionStateStore, interactionId: string): DecisionTransitionResult;
+  recordRejectionOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
   recoverCallbackAttemptsAfterRestart(state: DecisionStateStore): number;
   importWinner(state: DecisionStateStore, interactionId: string, result: DecisionCanonicalResult): DecisionTransitionResult;
   recordProjectionOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
@@ -377,10 +407,15 @@ export interface MutableClick {
   guildId: string;
   channelId: string;
   messageId: string;
+  applicationId: string | null;
+  token: string | null;
   binding: DecisionBinding;
   state: DecisionState;
+  authorizationOutcome: DecisionAuthorizationOutcome | null;
   callbackAttempted: boolean;
   callbackOutcome: DecisionTransportOutcome | null;
+  rejectionAttempted: boolean;
+  rejectionOutcome: DecisionTransportOutcome | null;
   canonical: DecisionCanonicalResult | null;
   projectionOutcome: DecisionTransportOutcome | null;
   nativeReturn: DecisionNativeReturn | null;

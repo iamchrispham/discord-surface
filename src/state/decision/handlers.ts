@@ -1,4 +1,5 @@
 import {
+  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
   DECISION_REASONS,
@@ -6,9 +7,11 @@ import {
   DECISION_TRANSPORT_OUTCOMES,
   DECISION_WINNER_SOURCES,
   DecisionError,
+  type DecisionAuthorizationOutcome,
   type DecisionBinding,
   type DecisionCanonicalResult,
   type DecisionCanonicalRoute,
+  type DecisionClick,
   type DecisionClickAdmission,
   type DecisionClickInput,
   type DecisionHandlers,
@@ -16,6 +19,7 @@ import {
   type DecisionPresentationLookupInput,
   type DecisionState,
   type DecisionStateStore,
+  type DecisionTransportOutcome,
   type DecisionTransitionResult,
   type MutableClick,
   type MutablePresentation
@@ -23,6 +27,7 @@ import {
 import {
   PENDING_STATES,
   append,
+  authorizationOutcome,
   bindingMatches,
   clickFor,
   currentBinding,
@@ -95,14 +100,49 @@ function requireClickInput(input: DecisionClickInput): NormalizedClickInput {
     guildId: text(input?.guildId, 'guildId', 128),
     channelId: text(input?.channelId, 'channelId', 128),
     messageId: text(input?.messageId, 'messageId', 256),
-    binding: normalizeBinding(input?.binding)
+    binding: normalizeBinding(input?.binding),
+    ...(input?.applicationId === undefined ? {} : { applicationId: text(input.applicationId, 'applicationId', 256) }),
+    ...(input?.token === undefined ? {} : { token: text(input.token, 'token', 512) })
   };
+}
+
+function pending(click: MutableClick): boolean {
+  return PENDING_STATES.has(click.state) ||
+    (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED && !rejectionTerminal(click));
+}
+
+function rejectionTerminal(click: MutableClick, outcomeValue = click.rejectionOutcome): boolean {
+  return outcomeValue === DECISION_TRANSPORT_OUTCOMES.SENT ||
+    outcomeValue === DECISION_TRANSPORT_OUTCOMES.REJECTED ||
+    (outcomeValue === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT);
+}
+
+function projectionRetryable(outcomeValue: DecisionTransportOutcome | null): boolean {
+  return outcomeValue === null || outcomeValue === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
+    outcomeValue === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED || outcomeValue === DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+}
+
+function releaseToken(state: DecisionStateStore, interactionId: string, tokenHeld = Boolean(clickFor(state, interactionId)?.token)): void {
+  if (tokenHeld) append(state, DECISION_RECEIPT_KINDS.TOKEN_RELEASE, { interactionId });
+}
+
+function writeAuthorizationOutcome(state: DecisionStateStore, click: MutableClick, outcomeValue: DecisionAuthorizationOutcome): DecisionClick {
+  const tokenHeld = Boolean(click.token);
+  append(state, DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: click.interactionId,
+    outcome: outcomeValue
+  });
+  if (outcomeValue === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+    releaseToken(state, click.interactionId, tokenHeld);
+  }
+  return mutableClickOutput(clickFor(state, click.interactionId) as MutableClick);
 }
 
 function admitClickInTransaction(
   state: DecisionStateStore,
   input: NormalizedClickInput,
-  beginCallback: boolean
+  beginCallback: boolean,
+  authorizationPending = false
 ): DecisionClickAdmission {
   const existing = clickFor(state, input.interactionId);
   if (existing) {
@@ -112,7 +152,7 @@ function admitClickInTransaction(
     return {
       accepted: false,
       duplicate: true,
-      continuing: PENDING_STATES.has(existing.state),
+      continuing: pending(existing),
       click: mutableClickOutput(existing)
     };
   }
@@ -144,7 +184,10 @@ function admitClickInTransaction(
     guildId: input.guildId,
     channelId: input.channelId,
     messageId: input.messageId,
-    binding: presentation.binding
+    binding: presentation.binding,
+    ...(input.applicationId ? { applicationId: input.applicationId } : {}),
+    ...(input.token ? { token: input.token } : {}),
+    ...(authorizationPending ? { authorizationPending: true } : {})
   });
   if (beginCallback) append(state, DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT, { interactionId: input.interactionId });
   return { accepted: true, click: mutableClickOutput(clickFor(state, input.interactionId) as MutableClick) };
@@ -321,9 +364,71 @@ export function createDecisionHandlers(): DecisionHandlers {
       return state.transaction(() => admitClickInTransaction(state, input, true));
     },
 
+    admitClickAndBeginAuthorization(state, rawInput) {
+      const input = requireClickInput(rawInput);
+      return state.transaction(() => admitClickInTransaction(state, input, true, true));
+    },
+
+    recordAuthorizationOutcome(state, interactionId, rawOutcome) {
+      const id = text(interactionId, 'interactionId', 256);
+      const nextOutcome = authorizationOutcome(rawOutcome);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+        if (click.authorizationOutcome) {
+          if (click.authorizationOutcome === nextOutcome) return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (click.state !== DECISION_STATES.AUTHORIZATION_PENDING) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        let recordedOutcome = nextOutcome;
+        if (nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          const binding = state.getBinding(click.channelId);
+          if (!binding) {
+            return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+          }
+          if (!currentBinding(state, click.binding, binding)) recordedOutcome = DECISION_AUTHORIZATION_OUTCOMES.DENIED;
+        }
+        return {
+          accepted: true,
+          click: writeAuthorizationOutcome(state, click, recordedOutcome)
+        };
+      });
+    },
+
+    reconcileClickBinding(state, interactionId) {
+      const id = text(interactionId, 'interactionId', 256);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { binding: null, click: null };
+        const binding = state.getBinding(click.channelId);
+        if (!binding) return { binding: null, click: mutableClickOutput(click) };
+        if (currentBinding(state, click.binding, binding)) {
+          return { binding, click: mutableClickOutput(click) };
+        }
+        if (click.authorizationOutcome === null) {
+          if (click.state !== DECISION_STATES.AUTHORIZATION_PENDING) {
+            return { binding: null, click: mutableClickOutput(click) };
+          }
+          return {
+            binding: null,
+            click: writeAuthorizationOutcome(state, click, DECISION_AUTHORIZATION_OUTCOMES.DENIED)
+          };
+        }
+        if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED ||
+          (click.nativeReturn && click.nativeReturn.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
+          return { binding: null, click: mutableClickOutput(click) };
+        }
+        append(state, DECISION_RECEIPT_KINDS.CLICK_STALE, { interactionId: id });
+        releaseToken(state, id, Boolean(click.token));
+        return { binding: null, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
+      });
+    },
+
     getClick(state, interactionId) {
       const click = clickFor(state, interactionId);
-      return click ? mutableClickOutput(click) : null;
+      return click && click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED ? mutableClickOutput(click) : null;
     },
 
     beginCallback(state, interactionId) {
@@ -356,6 +461,50 @@ export function createDecisionHandlers(): DecisionHandlers {
       });
     },
 
+    beginRejectionFollowup(state, interactionId) {
+      const id = text(interactionId, 'interactionId', 256);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+        if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (rejectionTerminal(click)) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        if (click.rejectionAttempted && click.rejectionOutcome === null) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_ATTEMPT, { interactionId: id });
+        return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
+      });
+    },
+
+    recordRejectionOutcome(state, interactionId, rawOutcome) {
+      const id = text(interactionId, 'interactionId', 256);
+      const nextOutcome = outcome(rawOutcome);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+        if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (!click.rejectionAttempted) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (rejectionTerminal(click)) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        const tokenHeld = Boolean(click.token);
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, {
+          interactionId: id,
+          outcome: nextOutcome
+        });
+        if (rejectionTerminal(click, nextOutcome)) releaseToken(state, id, tokenHeld);
+        return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
+      });
+    },
+
     recoverCallbackAttemptsAfterRestart(state) {
       const interrupted = [...snapshot(state).clicks.values()].filter(click => click.callbackAttempted && !click.callbackOutcome);
       for (const click of interrupted) {
@@ -365,7 +514,16 @@ export function createDecisionHandlers(): DecisionHandlers {
           reason: 'process stopped before decision callback outcome'
         });
       }
-      return interrupted.length;
+      const interruptedRejections = [...snapshot(state).clicks.values()].filter(click =>
+        click.rejectionAttempted && click.rejectionOutcome === null);
+      for (const click of interruptedRejections) {
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, {
+          interactionId: click.interactionId,
+          outcome: DECISION_TRANSPORT_OUTCOMES.UNKNOWN,
+          reason: 'process stopped before decision rejection outcome'
+        });
+      }
+      return interrupted.length + interruptedRejections.length;
     },
 
     importWinner(state, interactionId, rawResult) {
@@ -436,9 +594,13 @@ export function createDecisionHandlers(): DecisionHandlers {
         if (!click.canonical?.materialized) return { accepted: false, reason: DECISION_REASONS.PROJECTION_REQUIRES_MATERIALIZED_WINNER, click: mutableClickOutput(click) };
         if (click.projectionOutcome) {
           if (click.projectionOutcome === nextOutcome) return { accepted: false, duplicate: true, reason: DECISION_REASONS.PROJECTION_OUTCOME_RECORDED, click: mutableClickOutput(click) };
-          return { accepted: false, reason: DECISION_REASONS.PROJECTION_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
+          if (!projectionRetryable(click.projectionOutcome)) return { accepted: false, reason: DECISION_REASONS.PROJECTION_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
         }
+        const tokenHeld = Boolean(click.token);
         append(state, DECISION_RECEIPT_KINDS.PROJECTION_OUTCOME, { interactionId: id, outcome: nextOutcome });
+        if (click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED && !projectionRetryable(nextOutcome)) {
+          releaseToken(state, id, tokenHeld);
+        }
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
       });
     },
@@ -459,16 +621,28 @@ export function createDecisionHandlers(): DecisionHandlers {
           if (click.nativeReturn.outcome === nextOutcome) return { accepted: false, duplicate: true, reason: DECISION_REASONS.NATIVE_OUTCOME_RECORDED, click: mutableClickOutput(click) };
           const completesInFlight = click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT &&
             nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED;
-          if (!completesInFlight) return { accepted: false, reason: DECISION_REASONS.NATIVE_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
+          const reconcilesNotSubmitted = click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED &&
+            nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED;
+          const resolvesUnknown = click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.UNKNOWN &&
+            nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED;
+          if (!completesInFlight && !reconcilesNotSubmitted && !resolvesUnknown) {
+            return { accepted: false, reason: DECISION_REASONS.NATIVE_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
+          }
         }
+        const tokenHeld = Boolean(click.token);
         append(state, DECISION_RECEIPT_KINDS.NATIVE_OUTCOME, { interactionId: id, outcome: nextOutcome });
+        if (nextOutcome !== DECISION_NATIVE_OUTCOMES.IN_FLIGHT &&
+          !(nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED &&
+            click.projectionOutcome !== null && projectionRetryable(click.projectionOutcome))) {
+          releaseToken(state, id, tokenHeld);
+        }
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
       });
     },
 
     pendingWork(state) {
       const current = snapshot(state);
-      return [...current.clicks.values()].filter(click => PENDING_STATES.has(click.state)).map(mutableClickOutput);
+      return [...current.clicks.values()].filter(pending).map(mutableClickOutput);
     }
   };
 }

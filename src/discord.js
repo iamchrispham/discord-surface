@@ -12,7 +12,7 @@ const {
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
@@ -38,8 +38,8 @@ const {
 } = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
-const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
-const { createDecisionConsumer } = require('./discord/decision');
+const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, sendInteractionFollowup, upsertGuildCsCommand } = require('./discord-interaction');
+const { createDecisionConsumer, renderDecisionProjection } = require('./discord/decision');
 const { sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
 const { sendGatewayTransportReceipt } = require('./discord/transport-receipts');
 const { createSurfaceConsumer: createSurfaceConsumerImpl } = require('./discord/surface-consumer');
@@ -218,7 +218,7 @@ function createSurfaceConsumer(options) {
 }
 
 const liveAttachmentRecovery = createLiveAttachmentRecoveryHandlers({ recoveryKind, bindingIdentityMatches, AGENT_ATTACHMENT_RECOVERY_KINDS, CODEX_VALIDATION_KINDS, READINESS, THREAD_STATES });
-const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES });
+const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES });
 const transportRecovery = createTransportRecoveryHandlers({ READINESS, THREAD_STATES, RECOVERY_POLICIES, recoveryKind, createTransportRecoveryWaiter, RECOVERY_WAITER_DEADLINE_GRACE_MS });
 
 const { createOutboundDeliveryHandlers } = require('./discord/outbound-delivery');
@@ -263,10 +263,19 @@ class DiscordGateway {
     this.recoveryPromise = null;
     this.decisionRecoveryPromise = null;
     this.decisionRecoveryController = null;
+    this.decisionRecoveryWakeTimer = null;
+    this.decisionRecoveryWakeDeadline = 0;
+    this.decisionRecoveryWakeChannels = new Set();
+    this.decisionRecoveryWakeDeadlines = new Map();
+    this.decisionRecoveryWakeDecisionDeadlines = new Map();
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels = new Set();
+    this.queuedDecisionRecoveryDeferred = false;
     this.recoveryFollowupPromise = null;
     this.recoveryFollowupScope = null;
     this.recoveryActiveWaiters = new Set();
     this.recoveryRetryScheduledChannels = new Set();
+    this.queuedDecisionRecoveryNonDeferred = false;
     this.closingCustodyRetries = new Map();
     this.pendingRecoveryChannels = new Set();
     this.pendingRecoveryRequests = [];
@@ -383,6 +392,9 @@ class DiscordGateway {
       state,
       interactionFetch: this.interactionFetch,
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
+      authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
+      reject: (interaction, reason, signal, deferred) => this.sendInteractionRejection(interaction, reason, signal, deferred),
+      scheduleRecovery: (channelIds, options) => this.scheduleDecisionRecovery(channelIds, options),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -510,14 +522,35 @@ class DiscordGateway {
     return this.consumer.processAccepted(message, signal);
   }
 
-  async projectDecisionMessage({ click, answer }, signal) {
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+  async projectDecisionMessage({ click, presentation, answer }, signal) {
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     const channel = await this.client.channels?.fetch?.(click.channelId);
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
+    const sendPermission = this.historyPermission(channel, { requireSend: true });
+    if (!sendPermission.known || !sendPermission.allowed) {
+      throw Object.assign(new Error('decision projection requires Send Messages permission'), { outcome: 'not_sent', retryable: true });
+    }
+    const embedPermission = this.historyPermission(channel, { requireSend: true, requireEmbedLinks: true });
+    if (!embedPermission.known) {
+      throw Object.assign(new Error('decision projection Embed Links permission is unknown'), { outcome: 'not_sent', retryable: true });
+    }
+    const inline = answer.length <= 4096;
+    const prompt = presentation?.content || '';
+    const promptSeparator = prompt.length > 0 ? '\n\n' : '';
+    const plainProjection = `${prompt}${promptSeparator}Selected action:\n${answer}`;
+    const plainFits = inline && plainProjection.length <= 2000;
+    const needsFile = !inline || (!embedPermission.allowed && !plainFits);
+    if (needsFile) {
+      const attachPermission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
+      if (!attachPermission.known || !attachPermission.allowed) {
+        throw Object.assign(new Error('decision projection requires Attach Files permission'), { outcome: 'not_sent', retryable: true });
+      }
+    }
     const message = await channel?.messages?.fetch?.(click.messageId);
     if (!message || typeof message.edit !== 'function') {
-      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent' });
+      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent', retryable: true });
     }
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     const stored = this.state.getMessage(click.interactionId);
     if (stored) {
       this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
@@ -535,11 +568,49 @@ class DiscordGateway {
         throw new Error('decision projection authorization is no longer valid');
       }
     }
-    return message.edit({ content: answer, components: [] });
+    const original = presentation || this.state.getDecisionPresentation(click.presentationId);
+    return message.edit(renderDecisionProjection(original, answer, {
+      embed: embedPermission.allowed,
+      attach: needsFile
+    }));
   }
 
-  async sendInteractionRejection(interaction, reason, signal) {
+  async authorizeDecisionInteraction({ channelId }, signal) {
+    if (signal?.aborted || this.stopping) return null;
+    const fetchPromise = Promise.resolve().then(() => this.client.channels?.fetch?.(channelId));
+    let timeout;
+    let abort;
+    const abortPromise = new Promise(resolve => {
+      abort = () => resolve(null);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
+    const timeoutPromise = new Promise(resolve => {
+      timeout = setTimeout(() => resolve(null), this.interactionCallbackTimeoutMs);
+    });
     try {
+      const channel = await Promise.race([fetchPromise, abortPromise, timeoutPromise]);
+      if (signal?.aborted || this.stopping || !channel) return null;
+      const permission = this.historyPermission(channel, { requireSend: true });
+      return permission.known ? permission.allowed : null;
+    } catch (error) {
+      if (error?.code === 10003) return false;
+      return null;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (signal && abort) signal.removeEventListener('abort', abort);
+    }
+  }
+
+  async sendInteractionRejection(interaction, reason, signal, deferred = false) {
+    try {
+      if (deferred && interaction.applicationId) {
+        return await sendInteractionFollowup(interaction, {
+          signal,
+          fetchImpl: this.interactionFetch,
+          content: interactionRejectionMessage(reason),
+          timeoutMs: this.interactionCallbackTimeoutMs
+        });
+      }
       return await sendInteractionCallback(interaction, {
         signal,
         fetchImpl: this.interactionFetch,
@@ -745,8 +816,8 @@ class DiscordGateway {
     return [];
   }
 
-  historyPermission(channel, { requireSend = false } = {}) {
-    return historyPermission(channel, this.client.user, requireSend);
+  historyPermission(channel, { requireSend = false, requireAttachFiles = false, requireEmbedLinks = false } = {}) {
+    return historyPermission(channel, this.client.user, requireSend, requireAttachFiles, requireEmbedLinks);
   }
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = null, expectedBoundary = undefined, expectedReadiness = undefined) {
@@ -1606,14 +1677,118 @@ class DiscordGateway {
 
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
-  startDecisionRecovery(signal, channelIds = null) {
-    if (this.stopping || this.decisionRecoveryPromise || !this.decisionConsumer) return this.decisionRecoveryPromise;
+  _refreshDecisionRecoveryWakeChannels() {
+    this.decisionRecoveryWakeChannels.clear();
+    for (const channelId of this.decisionRecoveryWakeDeadlines.keys()) this.decisionRecoveryWakeChannels.add(channelId);
+    for (const { channelId } of this.decisionRecoveryWakeDecisionDeadlines.values()) this.decisionRecoveryWakeChannels.add(channelId);
+  }
+
+  _armDecisionRecoveryWakeTimer() {
+    if (this.decisionRecoveryWakeTimer) clearTimeout(this.decisionRecoveryWakeTimer);
+    this.decisionRecoveryWakeTimer = null;
+    this.decisionRecoveryWakeDeadline = 0;
+    if (this.stopping || (!this.decisionRecoveryWakeDeadlines?.size && !this.decisionRecoveryWakeDecisionDeadlines?.size)) return;
+    const deadlines = [
+      ...this.decisionRecoveryWakeDeadlines.values(),
+      ...[...this.decisionRecoveryWakeDecisionDeadlines.values()].map(({ deadline }) => deadline)
+    ];
+    const deadline = Math.min(...deadlines);
+    this.decisionRecoveryWakeDeadline = deadline;
+    this.decisionRecoveryWakeTimer = setTimeout(() => {
+      this.decisionRecoveryWakeTimer = null;
+      this.decisionRecoveryWakeDeadline = 0;
+      if (this.stopping) {
+        this.decisionRecoveryWakeChannels.clear();
+        this.decisionRecoveryWakeDeadlines.clear();
+        this.decisionRecoveryWakeDecisionDeadlines.clear();
+        return;
+      }
+      const now = Date.now();
+      const channels = new Set();
+      for (const [channelId, channelDeadline] of this.decisionRecoveryWakeDeadlines) {
+        if (channelDeadline > now) continue;
+        channels.add(channelId);
+        this.decisionRecoveryWakeDeadlines.delete(channelId);
+      }
+      for (const [decisionId, wake] of this.decisionRecoveryWakeDecisionDeadlines) {
+        if (wake.deadline > now) continue;
+        channels.add(wake.channelId);
+        this.decisionRecoveryWakeDecisionDeadlines.delete(decisionId);
+      }
+      this._refreshDecisionRecoveryWakeChannels();
+      if (channels.size) this.startDecisionRecovery(undefined, channels);
+      this._armDecisionRecoveryWakeTimer();
+    }, Math.max(0, deadline - Date.now()));
+  }
+
+  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0, decisionId = null } = {}) {
+    const delay = Number(delayMs);
+    const scheduledDecisionId = typeof decisionId === 'string' && decisionId.length > 0 ? decisionId : null;
+    if (!Number.isFinite(delay) || delay <= 0) {
+      if (this.decisionRecoveryWakeDeadlines?.size || this.decisionRecoveryWakeDecisionDeadlines?.size) {
+        if (scheduledDecisionId) this.decisionRecoveryWakeDecisionDeadlines.delete(scheduledDecisionId);
+        if (channelIds === null) {
+          this.decisionRecoveryWakeDeadlines.clear();
+        } else {
+          for (const channelId of channelIds || []) this.decisionRecoveryWakeDeadlines.delete(channelId);
+        }
+        this._refreshDecisionRecoveryWakeChannels();
+        this._armDecisionRecoveryWakeTimer();
+      }
+      return this.startDecisionRecovery(undefined, channelIds, { deferIfActive });
+    }
+    if (this.stopping || !this.decisionConsumer || !channelIds?.size) return this.decisionRecoveryPromise;
+    if (!this.decisionRecoveryWakeDeadlines) this.decisionRecoveryWakeDeadlines = new Map();
+    if (!this.decisionRecoveryWakeDecisionDeadlines) this.decisionRecoveryWakeDecisionDeadlines = new Map();
+    const deadline = Date.now() + Math.ceil(delay);
+    for (const channelId of channelIds) {
+      this.decisionRecoveryWakeChannels.add(channelId);
+      if (scheduledDecisionId) {
+        const currentWake = this.decisionRecoveryWakeDecisionDeadlines.get(scheduledDecisionId);
+        if (!currentWake || deadline < currentWake.deadline) {
+          this.decisionRecoveryWakeDecisionDeadlines.set(scheduledDecisionId, { channelId, deadline });
+        }
+      } else {
+        const currentDeadline = this.decisionRecoveryWakeDeadlines.get(channelId);
+        this.decisionRecoveryWakeDeadlines.set(channelId, currentDeadline === undefined ? deadline : Math.min(currentDeadline, deadline));
+      }
+    }
+    const earliestDeadline = Math.min(
+      ...this.decisionRecoveryWakeDeadlines.values(),
+      ...[...this.decisionRecoveryWakeDecisionDeadlines.values()].map(({ deadline: wakeDeadline }) => wakeDeadline)
+    );
+    if (this.decisionRecoveryWakeTimer && this.decisionRecoveryWakeDeadline <= earliestDeadline) return this.decisionRecoveryPromise;
+    this._armDecisionRecoveryWakeTimer();
+    return this.decisionRecoveryPromise;
+  }
+
+  startDecisionRecovery(signal, channelIds = null, { deferIfActive = false } = {}) {
+    if (this.stopping || !this.decisionConsumer) return this.decisionRecoveryPromise;
+    if (this.decisionRecoveryPromise) {
+      if (signal?.aborted) return this.decisionRecoveryPromise;
+      if (channelIds === null) this.queuedDecisionRecoveryAll = true;
+      else if (!this.queuedDecisionRecoveryAll) {
+        for (const channelId of channelIds) this.queuedDecisionRecoveryChannels.add(channelId);
+      }
+      if (deferIfActive) this.queuedDecisionRecoveryDeferred = true;
+      else this.queuedDecisionRecoveryNonDeferred = true;
+      return this.decisionRecoveryPromise;
+    }
+    if (this.queuedDecisionRecoveryAll) channelIds = null;
+    else if (channelIds !== null && this.queuedDecisionRecoveryChannels.size) {
+      channelIds = new Set([...channelIds, ...this.queuedDecisionRecoveryChannels]);
+    }
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels.clear();
+    this.queuedDecisionRecoveryDeferred = false;
+    this.queuedDecisionRecoveryNonDeferred = false;
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
     else signal?.addEventListener('abort', relayAbort, { once: true });
     this.decisionRecoveryController = controller;
-    const work = Promise.resolve().then(() => this.decisionConsumer.recover(controller.signal, channelIds));
+    const scope = channelIds === null ? null : new Set(channelIds);
+    const work = Promise.resolve().then(() => this.decisionConsumer.recover(controller.signal, scope));
     const tracked = work.catch(error => {
       this.logger(`Discord decision recovery failed: ${error.message}`);
       return [];
@@ -1623,7 +1798,29 @@ class DiscordGateway {
     tracked.finally(() => {
       signal?.removeEventListener('abort', relayAbort);
       this.inFlight.delete(tracked);
-      if (this.decisionRecoveryPromise === tracked) this.decisionRecoveryPromise = null;
+      if (this.decisionRecoveryPromise === tracked) {
+        this.decisionRecoveryPromise = null;
+        const queuedAll = this.queuedDecisionRecoveryAll;
+        const queuedChannels = new Set(this.queuedDecisionRecoveryChannels);
+        const queuedDeferred = this.queuedDecisionRecoveryDeferred;
+        const queuedNonDeferred = this.queuedDecisionRecoveryNonDeferred;
+        if (!this.stopping && (queuedNonDeferred || !queuedDeferred) && (queuedAll || queuedChannels.size > 0)) {
+          this.queuedDecisionRecoveryAll = false;
+          this.queuedDecisionRecoveryChannels.clear();
+          this.queuedDecisionRecoveryDeferred = false;
+          this.queuedDecisionRecoveryNonDeferred = false;
+          queueMicrotask(() => {
+            if (!this.stopping && !this.decisionRecoveryPromise) {
+              this.startDecisionRecovery(undefined, queuedAll ? null : queuedChannels);
+            }
+          });
+        } else if (!queuedDeferred) {
+          this.queuedDecisionRecoveryAll = false;
+          this.queuedDecisionRecoveryChannels.clear();
+          this.queuedDecisionRecoveryDeferred = false;
+          this.queuedDecisionRecoveryNonDeferred = false;
+        }
+      }
       if (this.decisionRecoveryController === controller) this.decisionRecoveryController = null;
     }).catch(() => {});
     return tracked;

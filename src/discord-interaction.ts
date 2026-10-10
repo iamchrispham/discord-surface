@@ -116,6 +116,7 @@ export interface InteractionCallbackResult {
   outcome: InteractionOutcome;
   responseMessageId?: string;
   statusCode?: number;
+  retryAfterMs?: number;
   reason?: string;
   visibility?: 'available' | 'unknown';
   terminal?: boolean;
@@ -256,6 +257,26 @@ function responseStatus(response: InteractionCallbackFetchResponse): number | nu
   return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
 }
 
+async function readRetryAfterMs(response: InteractionCallbackFetchResponse, deadline: Promise<never>): Promise<number | null> {
+  const headers = response?.headers as { get?: (name: string) => unknown; [key: string]: unknown } | undefined;
+  const headerValue = typeof headers?.get === 'function'
+    ? headers.get('retry-after') ?? headers.get('Retry-After')
+    : headers?.['retry-after'] ?? headers?.['Retry-After'];
+  const headerSeconds = headerValue === null || headerValue === undefined ||
+    (typeof headerValue === 'string' && headerValue.trim().length === 0)
+    ? Number.NaN
+    : Number(headerValue);
+  if (Number.isFinite(headerSeconds) && headerSeconds >= 0) return Math.ceil(headerSeconds * 1000);
+  try {
+    const body = await Promise.race([response.json?.() || Promise.resolve(null), deadline]);
+    const rawBodySeconds = (body as { retry_after?: unknown } | null)?.retry_after;
+    const bodySeconds = rawBodySeconds === null || rawBodySeconds === undefined ? Number.NaN : Number(rawBodySeconds);
+    return Number.isFinite(bodySeconds) && bodySeconds >= 0 ? Math.ceil(bodySeconds * 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
 type InteractionCallbackRequest =
   | { type: typeof CALLBACK_TYPE; data: Record<string, unknown>; withResponse: true }
   | { type: typeof DEFERRED_UPDATE_MESSAGE_CALLBACK_TYPE; withResponse: false };
@@ -309,7 +330,7 @@ async function sendCallbackRequest(
     const response = await Promise.race([request, deadline]);
     const status = responseStatus(response);
     if (response?.ok !== true) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return {
         outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }),
@@ -317,7 +338,7 @@ async function sendCallbackRequest(
       };
     }
     if (!requestSpec.withResponse) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) };
     }
     let responseBody: unknown = null;
@@ -325,7 +346,7 @@ async function sendCallbackRequest(
     catch (error) { if (timedOut) throw error; }
     const responseId = responseMessageId(responseBody);
     if (!responseId) {
-      await Promise.race([cancelBody(response), deadline]);
+      try { await Promise.race([cancelBody(response), deadline]); } catch {}
       return {
         outcome: INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }),
@@ -334,7 +355,7 @@ async function sendCallbackRequest(
         terminal: true
       };
     }
-    await Promise.race([cancelBody(response), deadline]);
+    try { await Promise.race([cancelBody(response), deadline]); } catch {}
     return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: responseId, visibility: 'available' };
   } catch (error) {
     return {
@@ -367,6 +388,62 @@ export async function sendInteractionCallback(
       ...(ephemeral ? { flags: EPHEMERAL_MESSAGE_FLAG } : {})
     }
   }, { signal, fetchImpl, timeoutMs });
+}
+
+export async function sendInteractionFollowup(
+  interaction: Pick<ParsedComponentInteraction, 'applicationId' | 'token'>,
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch,
+    content, timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
+    signal?: AbortSignal;
+    fetchImpl?: InteractionFetch;
+    content: string;
+    timeoutMs?: number;
+  }
+): Promise<InteractionCallbackResult> {
+  if (signal?.aborted) return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'followup stopped before request' };
+  if (typeof fetchImpl !== 'function') return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'Discord interaction followup fetch is unavailable' };
+  const controller = new AbortController();
+  const relayAbort = () => controller.abort();
+  signal?.addEventListener('abort', relayAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let requestStarted = false;
+  try {
+    const request = Promise.resolve().then(() => {
+      if (signal?.aborted) throw Object.assign(new Error('followup stopped before request'), { preSend: true });
+      requestStarted = true;
+      return fetchImpl(
+        `https://discord.com/api/v10/webhooks/${encodeURIComponent(interaction.applicationId)}/${encodeURIComponent(interaction.token)}`,
+        {
+          method: 'POST',
+          headers: { 'User-Agent': 'DiscordBot (discord-surface, 0.1.0)', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content, flags: EPHEMERAL_MESSAGE_FLAG, allowed_mentions: { parse: [] } }),
+          signal: controller.signal
+        }
+      );
+    });
+    const timeout = Number(timeoutMs);
+    const boundedTimeout = Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, 3000) : DEFAULT_CALLBACK_TIMEOUT_MS;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new Error('Discord interaction followup deadline exceeded')); }, boundedTimeout);
+    });
+    const response = await Promise.race([request, deadline]);
+    const status = responseStatus(response);
+    const retryAfterMs = status === 429 ? await readRetryAfterMs(response, deadline) : null;
+    try {
+      await Promise.race([cancelBody(response), deadline]);
+    } catch {}
+    return response?.ok === true
+      ? { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) }
+      : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
+        ...(status === null ? {} : { statusCode: status }), ...(retryAfterMs === null ? {} : { retryAfterMs }), reason: 'Discord interaction followup request rejected' };
+  } catch (error) {
+    const preSend = (error as { preSend?: unknown })?.preSend === true || (!requestStarted && signal?.aborted);
+    return { outcome: preSend ? INTERACTION_OUTCOMES.NOT_SENT : INTERACTION_OUTCOMES.UNKNOWN, reason: String((error as { message?: unknown })?.message || error).slice(0, 200) };
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener('abort', relayAbort);
+    controller.abort();
+  }
 }
 
 export async function sendComponentCallback(

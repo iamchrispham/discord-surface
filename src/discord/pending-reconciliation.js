@@ -1,6 +1,6 @@
 'use strict';
 
-function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES }) {
+function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES }) {
   return {
     async reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
       const deadline = Date.now() + this.recoveryTimeoutMs;
@@ -25,7 +25,51 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
         (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
         (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
           isHeldDurable(message));
-      this.startDecisionRecovery(signal, selectedChannels);
+      const pendingDecisions = new Map((this.state.listDecisionPendingWork?.() || [])
+        .map(click => [click.interactionId, click]));
+      const pendingNativeReturnOutcomes = new Set([
+        DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED,
+        DECISION_NATIVE_OUTCOMES.IN_FLIGHT,
+        DECISION_NATIVE_OUTCOMES.UNKNOWN
+      ]);
+      const decisionProjectionPending = message => {
+        const click = pendingDecisions.get(message.id);
+        const retryable = click?.projectionOutcome == null || [
+          DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+          DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
+          DECISION_TRANSPORT_OUTCOMES.UNKNOWN
+        ].includes(click.projectionOutcome);
+        return Boolean(click?.canonical?.materialized && click.canonical.answer?.length > 4096 && retryable);
+      };
+      const reconcileDecisionSubmission = messageId => {
+        const click = this.state.getDecisionClick?.(messageId) || pendingDecisions.get(messageId);
+        if (!pendingNativeReturnOutcomes.has(click?.nativeReturn?.outcome)) return;
+        const current = this.state.getMessage(messageId);
+        const submittedStates = [
+          MESSAGE_STATES.SUBMITTED,
+          MESSAGE_STATES.REPLY_READY,
+          MESSAGE_STATES.REPLYING,
+          MESSAGE_STATES.REPLIED
+        ];
+        if (!submittedStates.includes(current?.state)) return;
+        this.state.recordDecisionNativeReturnOutcome(messageId, DECISION_NATIVE_OUTCOMES.SUBMITTED);
+      };
+      const decisionRecovery = Promise.resolve(this.startDecisionRecovery(signal, selectedChannels));
+      let decisionRecoverySettled = false;
+      const settleDecisionRecovery = async () => {
+        if (decisionRecoverySettled) return;
+        try {
+          await waitForRecoveryOperation(() => decisionRecovery, signal, deadline);
+        } catch (error) {
+          const kind = recoveryKind(error);
+          if (kind !== CODEX_VALIDATION_KINDS.DEADLINE && kind !== CODEX_VALIDATION_KINDS.STOPPED) throw error;
+        }
+        decisionRecoverySettled = true;
+        const unresolved = new Map((this.state.listDecisionPendingWork?.() || [])
+          .map(click => [click.interactionId, click]));
+        pendingDecisions.clear();
+        for (const [interactionId, click] of unresolved) pendingDecisions.set(interactionId, click);
+      };
       const candidates = this.state.recoveryCandidates(before).filter(allowed);
       const retryOrder = messageIds ? new Map(messageIds.map((messageId, index) => [messageId, index])) : null;
       const ordered = candidates.sort((a, b) => {
@@ -320,6 +364,17 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             ).finally(() => signal?.removeEventListener('abort', relayAbort));
           };
           if (message.state === 'accepted') {
+            if (pendingDecisions.has(message.id)) await settleDecisionRecovery();
+            const decisionClick = this.state.getDecisionClick?.(message.id) || pendingDecisions.get(message.id);
+            if (decisionClick && (decisionClick.state === DECISION_STATES.STALE ||
+              decisionClick.nativeReturn?.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
+              blockedOwners.add(key);
+              continue;
+            }
+            if (decisionProjectionPending(message)) {
+              blockedOwners.add(key);
+              continue;
+            }
             for (let attempt = 0; attempt < 2; attempt += 1) {
               recoveryOperationStarted = false;
               result = await waitForRecoveryOperation(
@@ -343,6 +398,7 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             recoveryOperationStarted = false;
             result = await deliverReplyWithinRecovery(storedMessage, { status: message.state, message });
           }
+          reconcileDecisionSubmission(message.id);
           if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
             blockedOwners.add(key);
           }

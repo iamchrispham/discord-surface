@@ -1,6 +1,7 @@
 import { PROVIDERS, type AgentProvider } from '../../agent-message';
 import {
   DECISION_JOURNAL,
+  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
   DECISION_STATES,
@@ -8,6 +9,7 @@ import {
   DECISION_WINNER_SOURCES,
   DecisionError,
   type DecisionBinding,
+  type DecisionAuthorizationOutcome,
   type DecisionCanonicalResult,
   type DecisionCanonicalRoute,
   type DecisionClick,
@@ -42,11 +44,50 @@ const BINDING_KEYS: readonly (keyof DecisionBinding)[] = [
 
 const RECEIPT_KIND_VALUES = Object.values(DECISION_RECEIPT_KINDS) as DecisionReceiptKind[];
 const TRANSPORT_OUTCOME_VALUES = Object.values(DECISION_TRANSPORT_OUTCOMES) as DecisionTransportOutcome[];
+const AUTHORIZATION_OUTCOME_VALUES = Object.values(DECISION_AUTHORIZATION_OUTCOMES) as DecisionAuthorizationOutcome[];
 const WINNER_SOURCE_VALUES = Object.values(DECISION_WINNER_SOURCES) as DecisionWinnerSource[];
 const NATIVE_OUTCOME_VALUES = Object.values(DECISION_NATIVE_OUTCOMES) as DecisionNativeOutcome[];
 const CANONICAL_ROUTE_PATH_MAX = 4096;
 const CANONICAL_CONTENT_MAX = 2000;
+const PROJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
+  DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+  DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
+  DECISION_TRANSPORT_OUTCOMES.UNKNOWN
+]);
+const REJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
+  DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+  DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
+]);
+
+function projectionStateAfterOutcome(click: MutableClick): DecisionState {
+  const native = click.nativeReturn;
+  if (!native) return PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome as DecisionTransportOutcome)
+    ? DECISION_STATES.UNKNOWN
+    : DECISION_STATES.TERMINAL;
+  if (native.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
+    if (click.projectionOutcome && !PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.TERMINAL;
+    }
+    if (click.projectionOutcome && PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.MATERIALIZED_PROJECTION_PENDING;
+    }
+  }
+  return native.state;
+}
+
+function nativeStateAfterOutcome(click: MutableClick, nextOutcome: DecisionNativeOutcome): DecisionState {
+  if (nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
+    if (click.canonical?.materialized && click.projectionOutcome !== null &&
+      PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.MATERIALIZED_PROJECTION_PENDING;
+    }
+    return DECISION_STATES.TERMINAL;
+  }
+  if (nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT) return DECISION_STATES.NATIVE_RETURN_PENDING;
+  return DECISION_STATES.UNKNOWN;
+}
 export const PENDING_STATES = new Set<DecisionState>([
+  DECISION_STATES.AUTHORIZATION_PENDING,
   DECISION_STATES.CLICK_ADMITTED,
   DECISION_STATES.CALLBACK_PENDING,
   DECISION_STATES.CANONICAL_PENDING,
@@ -89,6 +130,11 @@ export function generation(value: unknown, name = 'generation'): number {
 export function outcome(value: unknown): DecisionTransportOutcome {
   if (!TRANSPORT_OUTCOME_VALUES.includes(value as DecisionTransportOutcome)) throw new DecisionError('invalid decision transport outcome');
   return value as DecisionTransportOutcome;
+}
+
+export function authorizationOutcome(value: unknown): DecisionAuthorizationOutcome {
+  if (!AUTHORIZATION_OUTCOME_VALUES.includes(value as DecisionAuthorizationOutcome)) throw new DecisionError('invalid decision authorization outcome');
+  return value as DecisionAuthorizationOutcome;
 }
 
 export function nativeOutcome(value: unknown): DecisionNativeOutcome {
@@ -272,10 +318,15 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         guildId: text(detail.guildId, 'guildId', 128),
         channelId: text(detail.channelId, 'channelId', 128),
         messageId: text(detail.messageId, 'messageId', 256),
+        applicationId: optionalText(detail.applicationId, 'applicationId', 256),
+        token: optionalText(detail.token, 'token', 512),
         binding: normalizeBinding(detail.binding),
-        state: DECISION_STATES.CLICK_ADMITTED,
+        state: detail.authorizationPending === true ? DECISION_STATES.AUTHORIZATION_PENDING : DECISION_STATES.CLICK_ADMITTED,
+        authorizationOutcome: null,
         callbackAttempted: false,
         callbackOutcome: null,
+        rejectionAttempted: false,
+        rejectionOutcome: null,
         canonical: null,
         projectionOutcome: null,
         nativeReturn: null,
@@ -289,13 +340,49 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     }
     const click = interactionId ? clicks.get(interactionId) : undefined;
     if (!click) continue;
-    if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT) {
+    if (row.kind === DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME) {
+      const nextOutcome = authorizationOutcome(detail.outcome);
+      click.authorizationOutcome = nextOutcome;
+      if (nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) click.token = null;
+      click.state = nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED
+        ? DECISION_STATES.REFUSED
+        : click.callbackOutcome ? DECISION_STATES.CANONICAL_PENDING : DECISION_STATES.CALLBACK_PENDING;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.CLICK_STALE) {
+      click.state = DECISION_STATES.STALE;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT) {
       click.callbackAttempted = true;
-      if (!click.canonical && !click.nativeReturn) click.state = DECISION_STATES.CALLBACK_PENDING;
+      if (!click.canonical && !click.nativeReturn && click.authorizationOutcome === null) click.state = click.state === DECISION_STATES.AUTHORIZATION_PENDING
+        ? DECISION_STATES.AUTHORIZATION_PENDING
+        : DECISION_STATES.CALLBACK_PENDING;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_OUTCOME) {
       click.callbackOutcome = outcome(detail.outcome);
-      if (!click.canonical && !click.nativeReturn) click.state = DECISION_STATES.CANONICAL_PENDING;
+      if (!click.canonical && !click.nativeReturn) {
+        if (click.authorizationOutcome === null) {
+          click.state = click.state === DECISION_STATES.AUTHORIZATION_PENDING
+            ? DECISION_STATES.AUTHORIZATION_PENDING
+            : DECISION_STATES.CANONICAL_PENDING;
+        } else if (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          click.state = DECISION_STATES.CANONICAL_PENDING;
+        } else {
+          click.state = DECISION_STATES.REFUSED;
+        }
+      }
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_ATTEMPT) {
+      click.rejectionAttempted = true;
+      click.rejectionOutcome = null;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
+      click.rejectionOutcome = outcome(detail.outcome);
+      const retryable = REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome) ||
+        (click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.SENT);
+      if (!retryable) click.token = null;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE) {
+      click.token = null;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CANONICAL_IMPORT) {
       const source = winnerSource(detail.source);
@@ -314,10 +401,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.PROJECTION_OUTCOME) {
       click.projectionOutcome = outcome(detail.outcome);
-      if (click.nativeReturn) click.state = click.nativeReturn.state;
-      else click.state = click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN
-        ? DECISION_STATES.UNKNOWN
-        : DECISION_STATES.TERMINAL;
+      click.state = projectionStateAfterOutcome(click);
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.NATIVE_RETURN) {
       const canonical = click.canonical;
@@ -342,11 +426,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     } else if (row.kind === DECISION_RECEIPT_KINDS.NATIVE_OUTCOME && click.nativeReturn) {
       const nextOutcome = nativeOutcome(detail.outcome);
       click.nativeReturn.outcome = nextOutcome;
-      click.nativeReturn.state = nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED
-        ? DECISION_STATES.TERMINAL
-        : nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT
-          ? DECISION_STATES.NATIVE_RETURN_PENDING
-          : DECISION_STATES.UNKNOWN;
+      click.nativeReturn.state = nativeStateAfterOutcome(click, nextOutcome);
       click.state = click.nativeReturn.state;
       click.updatedAt = row.created_at;
     }
@@ -423,7 +503,10 @@ export function sameClickInput(click: MutableClick, input: Omit<DecisionClickInp
     click.messageId === input.messageId && bindingMatches(click.binding, binding);
 }
 
-export function currentBinding(state: DecisionStateStore, binding: DecisionBinding): boolean {
-  const current = state.getBinding(binding.channelId);
+export function currentBinding(
+  state: DecisionStateStore,
+  binding: DecisionBinding,
+  current = state.getBinding(binding.channelId)
+): boolean {
   return Boolean(current && current.active !== false && bindingMatches(normalizeBinding(current), binding));
 }

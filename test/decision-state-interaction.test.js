@@ -5,7 +5,11 @@ const os = require('node:os');
 const path = require('node:path');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { claudeEvent, codexPrompt } = require('../src/native');
-const { DECISION_REASONS: DOMAIN_DECISION_REASONS } = require('../src/state/decision');
+const { createDecisionConsumer } = require('../src/discord/decision');
+const {
+  DECISION_AUTHORIZATION_OUTCOMES,
+  DECISION_REASONS: DOMAIN_DECISION_REASONS
+} = require('../src/state/decision');
 const {
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
@@ -47,6 +51,237 @@ test('native return advances from in-flight to submitted across reopen', () => {
     const conflict = fixtureState.state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED);
     assert.equal(conflict.accepted, false);
     assert.equal(conflict.reason, 'native-outcome-conflict');
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('binding recovery holds missing lookups and persists stale authorized clicks', () => {
+  const fixtureState = fixture();
+  try {
+    const { state, dbPath } = fixtureState;
+    presented(state);
+    const savedBinding = state.getBinding('channel');
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({
+      ...click(state), applicationId: 'application', token: 'authorized-token'
+    }).accepted, true);
+    assert.equal(state.recordDecisionCallbackOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+    const original = state.getDecisionClick('interaction-1');
+
+    const getBinding = state.getBinding.bind(state);
+    state.getBinding = () => null;
+    const missing = state.reconcileDecisionClickBinding('interaction-1');
+    assert.equal(missing.binding, null);
+    assert.equal(missing.click.authorizationOutcome, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+    assert.equal(state.listDecisionPendingWork().length, 1);
+
+    state.getBinding = channelId => channelId === 'channel' ? { ...savedBinding, active: false } : getBinding(channelId);
+    const stale = state.reconcileDecisionClickBinding('interaction-1');
+    assert.equal(stale.binding, null);
+    assert.equal(stale.click.state, DECISION_STATES.STALE);
+    assert.equal(stale.click.authorizationOutcome, original.authorizationOutcome);
+    assert.equal(stale.click.selectedKey, original.selectedKey);
+    assert.deepEqual(stale.click.canonical, original.canonical);
+    assert.deepEqual(stale.click.nativeReturn, original.nativeReturn);
+    assert.equal(state.listDecisionPendingWork().length, 0);
+
+    state.close();
+    fixtureState.state = new SurfaceState(dbPath);
+    assert.equal(fixtureState.state.getDecisionClick('interaction-1').state, DECISION_STATES.STALE);
+    assert.equal(fixtureState.state.getDecisionClick('interaction-1').authorizationOutcome, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+    assert.equal(fixtureState.state.listDecisionPendingWork().length, 0);
+    assert.equal(fixtureState.state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.CLICK_STALE).length, 1);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('binding recovery preserves unknown native-return custody', () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    const savedBinding = state.getBinding('channel');
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({ ...click(state), applicationId: 'application' }).accepted, true);
+    assert.equal(state.recordDecisionCallbackOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+    assert.equal(state.importDecisionWinner('interaction-1', materializedWinner()).accepted, true);
+    assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    const queuedDuplicate = state.queueDecisionNativeReturn('interaction-1');
+    assert.equal(queuedDuplicate.accepted, false);
+    assert.equal(queuedDuplicate.duplicate, true);
+    assert.equal(state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.UNKNOWN).accepted, true);
+
+    state.getBinding = channelId => channelId === 'channel' ? { ...savedBinding, generation: savedBinding.generation + 1 } : null;
+    const held = state.reconcileDecisionClickBinding('interaction-1');
+    assert.equal(held.binding, null);
+    assert.equal(held.click.nativeReturn.outcome, DECISION_NATIVE_OUTCOMES.UNKNOWN);
+    assert.notEqual(held.click.state, DECISION_STATES.STALE);
+    assert.equal(state.listDecisionPendingWork().length, 1);
+    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.CLICK_STALE).length, 0);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('native recovery does not redispatch in-flight or unknown returns', async () => {
+  for (const nativeOutcome of [DECISION_NATIVE_OUTCOMES.IN_FLIGHT, DECISION_NATIVE_OUTCOMES.UNKNOWN]) {
+    const fixtureState = fixture();
+    try {
+      const { state } = fixtureState;
+      presented(state);
+      const interactionId = nativeOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT ? '9001' : '9002';
+      assert.equal(state.admitDecisionClickAndBeginAuthorization({
+        ...click(state, { interactionId }), applicationId: 'application'
+      }).accepted, true);
+      assert.equal(state.recordDecisionCallbackOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+      assert.equal(state.recordDecisionAuthorizationOutcome(interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+      assert.equal(state.importDecisionWinner(interactionId, materializedWinner({ reference: `answer-${nativeOutcome}` })).accepted, true);
+      assert.equal(state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.NOT_SENT).accepted, true);
+      assert.equal(state.queueDecisionNativeReturn(interactionId).duplicate, true);
+      assert.equal(state.recordDecisionNativeReturnOutcome(interactionId, nativeOutcome).accepted, true);
+      const dispatches = [];
+      const consumer = createDecisionConsumer({
+        state,
+        processAccepted: async () => { dispatches.push(interactionId); return { status: 'submitted' }; },
+        project: async () => {}
+      });
+      const remaining = await consumer.recover(new AbortController().signal);
+
+      assert.deepEqual(dispatches, []);
+      assert.equal(state.getDecisionClick(interactionId).nativeReturn.outcome, nativeOutcome);
+      assert.deepEqual(remaining.map(click => click.interactionId), [interactionId]);
+
+      const projection = state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT);
+      assert.equal(projection.accepted || projection.duplicate, true);
+      assert.equal(state.claimDispatch(interactionId).claimed, true);
+      state.markSubmitted(interactionId);
+      const settled = await consumer.recover(new AbortController().signal);
+
+      assert.deepEqual(dispatches, []);
+      assert.equal(state.getDecisionClick(interactionId).nativeReturn.outcome, DECISION_NATIVE_OUTCOMES.SUBMITTED);
+      assert.equal(state.listDecisionPendingWork().some(click => click.interactionId === interactionId), false);
+      assert.deepEqual(settled, []);
+    } finally {
+      closeFixture(fixtureState);
+    }
+  }
+});
+
+test('denied rejection follow-up stays pending across restart until sent', () => {
+  const fixtureState = fixture();
+  try {
+    const { state, dbPath } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({ ...click(state), applicationId: 'application', token: 'token' }).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.DENIED).accepted, true);
+    assert.equal(state.beginDecisionRejectionFollowup('interaction-1').accepted, true);
+    assert.equal(state.recordDecisionRejectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED).accepted, true);
+    assert.equal(state.listDecisionPendingWork().length, 1);
+
+    state.close();
+    fixtureState.state = new SurfaceState(dbPath);
+    const recovered = fixtureState.state.listDecisionPendingWork()[0];
+    assert.equal(recovered.token, 'token');
+    assert.equal(fixtureState.state.beginDecisionRejectionFollowup('interaction-1').accepted, true);
+    assert.equal(fixtureState.state.recordDecisionRejectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(fixtureState.state.listDecisionPendingWork().length, 0);
+    assert.equal(fixtureState.state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('authorized interaction releases its callback token custody', () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({
+      ...click(state), applicationId: 'application', token: 'authorized-token'
+    }).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.token, null);
+    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+    assert.equal(state.listReceipts().some(row => String(row.detail).includes('authorized-token')), false);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('retryable projection closes custody after native submission', () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClick(click(state)).accepted, true);
+    assert.equal(state.importDecisionWinner('interaction-1', materializedWinner()).accepted, true);
+    assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.NOT_SENT).accepted, true);
+    assert.equal(state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.SUBMITTED).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.state, DECISION_STATES.MATERIALIZED_PROJECTION_PENDING);
+    assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.state, DECISION_STATES.TERMINAL);
+    assert.equal(state.listDecisionPendingWork().length, 0);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('permanent projection outcomes terminalize submitted native custody', () => {
+  for (const initialOutcome of [DECISION_TRANSPORT_OUTCOMES.UNKNOWN, DECISION_TRANSPORT_OUTCOMES.NOT_SENT]) {
+    const fixtureState = fixture();
+    try {
+      const { state } = fixtureState;
+      presented(state);
+      const interactionId = `permanent-projection-${initialOutcome}`;
+      assert.equal(state.admitDecisionClickAndBeginCallback({
+        ...click(state),
+        interactionId,
+        applicationId: 'application',
+        token: `token-${initialOutcome}`
+      }).accepted, true);
+      assert.equal(state.importDecisionWinner(interactionId, materializedWinner({ reference: `answer-${initialOutcome}` })).accepted, true);
+      assert.equal(state.recordDecisionProjectionOutcome(interactionId, initialOutcome).accepted, true);
+      assert.equal(state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.SUBMITTED).accepted, true);
+      assert.equal(state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.REJECTED).accepted, true);
+
+      const terminal = state.getDecisionClick(interactionId);
+      assert.equal(terminal?.state, DECISION_STATES.TERMINAL);
+      assert.equal(terminal?.token, null);
+      assert.equal(state.listDecisionPendingWork().length, 0);
+      assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+      assert.equal(state.listReceipts().some(row => String(row.detail).includes(`token-${initialOutcome}`)), false);
+    } finally {
+      closeFixture(fixtureState);
+    }
+  }
+});
+
+test('rejected projection reconciles later native success after a not-submitted journal', async () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    const interactionId = 'rejected-native-reconcile';
+    assert.equal(state.admitDecisionClick(click(state, { interactionId })).accepted, true);
+    assert.equal(state.importDecisionWinner(interactionId, materializedWinner({ reference: 'answer-rejected-native' })).accepted, true);
+    assert.equal(state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.REJECTED).accepted, true);
+    assert.equal(state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED).accepted, true);
+    assert.equal(state.claimDispatch(interactionId).claimed, true);
+    state.markSubmitted(interactionId);
+
+    const consumer = createDecisionConsumer({
+      state,
+      processAccepted: async () => { throw new Error('native retry should be reconciled from the stored message'); },
+      project: async () => {}
+    });
+    const remaining = await consumer.recover(new AbortController().signal);
+
+    assert.deepEqual(remaining, []);
+    assert.equal(state.getDecisionClick(interactionId)?.nativeReturn?.outcome, DECISION_NATIVE_OUTCOMES.SUBMITTED);
+    assert.equal(state.getDecisionClick(interactionId)?.state, DECISION_STATES.TERMINAL);
+    assert.equal(state.listDecisionPendingWork().length, 0);
   } finally {
     closeFixture(fixtureState);
   }

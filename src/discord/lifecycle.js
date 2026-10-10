@@ -133,7 +133,15 @@ function createGatewayLifecycleHandlers({
     this.deferredHandoffRecoveryChannels.clear();
     this.pendingHandoffRecoveryChannels.clear();
     this.pendingFullRecovery = false;
+    if (this.decisionRecoveryWakeTimer) clearTimeout(this.decisionRecoveryWakeTimer);
+    this.decisionRecoveryWakeTimer = null;
+    this.decisionRecoveryWakeDeadline = 0;
+    this.decisionRecoveryWakeChannels.clear();
+    this.decisionRecoveryWakeDeadlines.clear();
     this.pendingRecoveryChannels.clear();
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels.clear();
+    this.queuedDecisionRecoveryDeferred = false;
     for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
     this.recoveryRetryScheduledChannels.clear();
     this.closingCustodyRetries.clear();
