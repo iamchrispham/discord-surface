@@ -97,7 +97,10 @@ function rearmDeadline(f) {
 // Records each reconciliation pass started on the current gateway (including
 // the pass an abandoned waiter's settlement queues) and drains them in order,
 // so a late settlement is awaited instead of polled.
-function trackReconcilePasses(f) {
+const RECONCILIATION_QUIET_PERIOD_MS = 150;
+const RECONCILIATION_OBSERVATION_BOUND_MS = 500;
+
+function trackReconcilePasses(f, t) {
   const passes = [];
   const original = f.gateway.reconcilePending.bind(f.gateway);
   f.gateway.reconcilePending = (...args) => {
@@ -105,17 +108,59 @@ function trackReconcilePasses(f) {
     passes.push(pass);
     return pass;
   };
-  return async function drain() {
+  const quietTimers = new Map();
+  let observationTimer;
+  let closed = false;
+  const cleanup = () => {
+    closed = true;
+    f.gateway.reconcilePending = original;
+    if (observationTimer) {
+      clearTimeout(observationTimer);
+      observationTimer = null;
+    }
+    for (const [timer, resolve] of quietTimers) {
+      clearTimeout(timer);
+      resolve();
+    }
+    quietTimers.clear();
+  };
+  const waitForQuietPeriod = milliseconds => new Promise(resolve => {
+    const timer = setTimeout(() => {
+      quietTimers.delete(timer);
+      resolve();
+    }, milliseconds);
+    quietTimers.set(timer, resolve);
+  });
+  t.after(cleanup);
+  const drainPassesAndWaitForQuiet = async () => {
     let index = 0;
     for (;;) {
-      while (index < passes.length) {
+      while (!closed && index < passes.length) {
         await passes[index].catch(() => {});
         index += 1;
       }
+      if (closed) return;
       await f.gateway.consumer.waitForReceipts();
+      if (closed) return;
       await f.gateway.consumer.waitForNativeWork();
+      if (closed) return;
       await Promise.resolve();
-      if (index >= passes.length) break;
+      if (closed) return;
+      if (index < passes.length) continue;
+      const observedPassCount = passes.length;
+      await waitForQuietPeriod(RECONCILIATION_QUIET_PERIOD_MS);
+      if (closed) return;
+      if (index === passes.length && observedPassCount === passes.length) return;
+    }
+  };
+  return async function drain() {
+    const observation = new Promise((_, reject) => {
+      observationTimer = setTimeout(() => reject(new Error('reconciliation observation exceeded its fixture bound')), RECONCILIATION_OBSERVATION_BOUND_MS);
+    });
+    try {
+      await Promise.race([drainPassesAndWaitForQuiet(), observation]);
+    } finally {
+      cleanup();
     }
   };
 }
@@ -389,7 +434,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   await f.reopen();
   rearmDeadline(f);
   const lookup = getReconciliationLookup(f.gateway.client, '1000');
-  const drain = trackReconcilePasses(f);
+  const drain = trackReconcilePasses(f, t);
   await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
   assert.equal(pending.fetches, 1, 'T5.1: the reconnect adopts the outstanding lookup');
   assert.equal(f.state.getMessage('101').state, 'reply_ready', 'T5.1: the adopted deadline keeps custody held');
@@ -425,7 +470,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   await f.reopen();
   rearmDeadline(f);
   const lookup = getReconciliationLookup(f.gateway.client, '1000');
-  const drain = trackReconcilePasses(f);
+  const drain = trackReconcilePasses(f, t);
 
   pending.release();
   await lookup.catch(() => {});
@@ -450,7 +495,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   await f.reopen();
   rearmDeadline(f);
   const lookup = getReconciliationLookup(f.gateway.client, '1000');
-  const drain = trackReconcilePasses(f);
+  const drain = trackReconcilePasses(f, t);
   await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
   assert.equal(pending.fetches, 1, 'T5.3: the reconnect adopts the outstanding lookup');
 
@@ -461,6 +506,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   assert.equal(f.replies.length, 0, 'T5.3: a stale generation must not send');
   assert.equal(f.dispatched.length, 0, 'T5.3: a stale generation must not dispatch');
   assert.equal(f.state.getMessage('103').state, 'reply_ready', 'T5.3: custody stays held');
+  assert.equal(pending.fetches, 1, 'T5.3: late settlement does not start another fetch');
   });
 
 // T5.4: authority fencing by revoked permission. The adopted waiter is current,
@@ -477,7 +523,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   await f.reopen();
   rearmDeadline(f);
   const lookup = getReconciliationLookup(f.gateway.client, '1000');
-  const drain = trackReconcilePasses(f);
+  const drain = trackReconcilePasses(f, t);
   await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
   assert.equal(pending.fetches, 1, 'T5.4: the reconnect adopts the outstanding lookup');
 
@@ -488,6 +534,7 @@ test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
   assert.equal(f.replies.length, 0, 'T5.4: revoked permission must not send');
   assert.equal(f.dispatched.length, 0, 'T5.4: revoked permission must not dispatch');
   assert.equal(f.state.getMessage('104').state, 'reply_ready', 'T5.4: custody stays held');
+  assert.equal(pending.fetches, 1, 'T5.4: late settlement does not start another fetch');
   });
 
 // T5.5: repeated-deadline guard. Two consecutive adopted deadline expiries must
