@@ -349,7 +349,7 @@ test('real Monitor payloads carry the shared ACK branch for human, agent, and wa
     assertPointerDelegates(requestPayload.pointer, requestPayload.payload);
     assertSharedBranchInstruction(requestPayload.payload.instructions, 'Follow the agent request instruction in content');
     assertAcknowledgmentCommand(requestPayload.payload, request, f);
-    assert.match(requestPayload.payload.content, /agent-send --agent-reply-to contract-request-2006/);
+    assert.match(requestPayload.payload.content, /agent-send --agent-presentation legacy --agent-reply-to contract-request-2006/);
     assert.match(requestPayload.payload.content, /On duplicate=true for this request/);
     assert.equal(requestPayload.payload.reply, undefined);
     assert.equal(requestPayload.payload.completion.command[2], 'agent-complete');
@@ -452,7 +452,7 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
 
     const requestContent = contentFor(request.id);
     assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'On duplicate=true, run the exact completion command below');
-    assert.match(requestContent, /agent-send --agent-reply-to contract-request-2104/);
+    assert.match(requestContent, /agent-send --agent-presentation legacy --agent-reply-to contract-request-2104/);
     assert.doesNotMatch(requestContent, /either use the reply tool|Use the reply tool with messageId/);
     assert.ok(requestContent.includes(JSON.stringify(completionFor(f.state.getMessage(request.id)))));
 

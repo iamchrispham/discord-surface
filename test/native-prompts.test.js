@@ -9,6 +9,9 @@ const prompts = require('../dist/native/prompts.js');
 const { createWatcherNotice } = require('../src/watcher-notice');
 const { ENVELOPE_TYPE } = require('../dist/state/courier-route/constants.js');
 const { KINDS } = require('../src/agent-message');
+const { parseArgs } = require('../src/cli');
+const fs = require('node:fs');
+const ts = require('typescript');
 
 const source = { guildId: '100', channelId: '101', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 4 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 4 };
@@ -119,19 +122,19 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '11edf96231becac9a713c2d769ba7c23d76848336e61a02b04bb24ee0f9be934',
+  messageRequestAgentRequest: '16230031c9ff3ef7a175b0bad887f00c8ffa228e7203a2323a83a4e6886b91aa',
   messageRequestAgentResult: '3d716e555095170db45917e68da407e44dca8ff7f16010dc86309bd0f2e1e80f',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: 'd11920ce583470ba710b2989e741076d633914b0d443d02e4c71d9e0292db895',
+  codexPromptAgentRequest: 'efaaad23d66b173196ef7fd54711a4008084c164df8e10856dbc87658274b1d3',
   codexPromptAgentResult: 'f88215d73e2a267afba9c33a5cf2a32c814e35d31afcec3c20111245518accec',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '911abc7b2fa1a150eaa9aca8ac98095cd53f4f73ea81c18ee5c6b67a5ac75f4c',
   claudeEventAttachment: '22eb3473721966977f21e52d12f95b3119d69be2dda0df03496129f25fafc5bf',
-  claudeEventAgentRequest: 'e957e4d0b76c8923ea691f99db9736b6e279f387b2fcf4bb7e790dc960e81f09',
+  claudeEventAgentRequest: '6b7b59095b11f6ab29d0c58fdf9f8ead941e2fcd4e57fb7b29e19fc9ce3deceb',
   claudeEventAgentResult: '06200d8e2398583fa24d6457dd9ffa9b3e289ccbd4d97068b2552f529a366be6',
   claudeEventDecision: '013e49f8486367da8108864033bfa960ede92a9881183986d0721e0f841b8ff4',
   claudeEventWatcher: '450bba4f711e01e1c173517032984718d5d9d03edbfe74aa40f9d1b796b4ea5c'
@@ -148,7 +151,7 @@ test('native facade preserves the public export inventory', () => {
   }
 });
 
-test('native presentation matches the 314de71 baseline bytes', () => {
+test('native presentation preserves baseline bytes except agent reply instructions', () => {
   const values = {
     agentCompletionCommand: facade.agentCompletionCommand(agentResult, '/tmp/state.sqlite', '/tmp/cli.js', '/tmp/state'),
     watcherNoticeCompletionCommand: facade.watcherNoticeCompletionCommand(watcher, '/tmp/state.sqlite', '/tmp/cli.js', '/tmp/state'),
@@ -190,7 +193,7 @@ test('agent pickup requires a correlated result while human pickup keeps replies
   const directResult = facade.claudeEvent(agentResult, completion).content;
 
   for (const prompt of [requestPrompt, directRequest]) {
-    assert.match(prompt, /agent-send --agent-reply-to agent-request/);
+    assert.match(prompt, /agent-send --agent-presentation legacy --agent-reply-to agent-request/);
     assert.match(prompt, /agent-complete/);
     assert.match(prompt, /After it reports sent or duplicate/);
     assert.match(prompt, /On duplicate=true for this request/);
@@ -230,4 +233,48 @@ test('agent request pickup acknowledges first and uses the exact child result ro
     completion, stateDir: '/tmp/state', dbPath: '/tmp/state.sqlite', cliPath: '/tmp/cli.js', textFile: '/tmp/result.txt' });
   assert.equal(monitor.completion, undefined);
   assert.match(monitor.instructions, /Keep it open for route reconciliation/);
+});
+
+test('generated agent result commands keep legacy presentation for both vendors', () => {
+  for (const provider of ['codex', 'claude']) {
+    const message = { ...agentRequest, provider,
+      agentMessage: { ...agentRequest.agentMessage, target: { ...agentRequest.agentMessage.target, provider } } };
+    const text = provider === 'codex'
+      ? facade.codexPrompt(message, null, completion)
+      : facade.claudeEvent(message, completion).content;
+    const argv = JSON.parse(text.match(/with exact argv (\[[^\n]*\])\./)[1]);
+    const parsed = parseArgs(argv.slice(2));
+    assert.equal(parsed.command, 'agent-send');
+    assert.equal(parsed.args['agent-presentation'], 'legacy');
+    assert.equal(parsed.args.provider, provider);
+    assert.equal(parsed.args['agent-thread-id'], message.agentMessage.target.channelId);
+    assert.equal(parsed.args['native-id'], message.nativeId);
+    assert.equal(parsed.args.generation, String(message.generation));
+    assert.equal(parsed.args['agent-reply-to'], message.agentMessage.id);
+    assert.equal(parsed.args['dedupe-key'], `agent-result-${message.id}`);
+    assert.match(facade.messageRequest(message), /agent-send --agent-presentation legacy --agent-reply-to/);
+  }
+});
+
+test('new agent-send vocabulary sites require an inventory update', () => {
+  const root = path.join(__dirname, '..', 'src');
+  const sites = {};
+  const files = fs.readdirSync(root, { recursive: true })
+    .filter(file => /\.[cm]?[tj]s$/.test(file));
+  for (const file of files) {
+    const ast = ts.createSourceFile(file, fs.readFileSync(path.join(root, file), 'utf8'), ts.ScriptTarget.Latest, true);
+    const visit = node => {
+      const literal = ts.isStringLiteralLike(node) ||
+        node.kind === ts.SyntaxKind.TemplateHead ||
+        node.kind === ts.SyntaxKind.TemplateMiddle ||
+        node.kind === ts.SyntaxKind.TemplateTail;
+      if (literal && node.text.includes('agent-send')) {
+        const name = file.split(path.sep).join('/');
+        sites[name] = (sites[name] || 0) + 1;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+  }
+  assert.deepEqual(sites, { 'cli.js': 5, 'cli/flag-policy.js': 1, 'native/prompts.ts': 4 });
 });
