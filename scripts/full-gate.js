@@ -53,6 +53,20 @@ function noVerdict(reason, detail, scratch, output = 2, secret) {
   return NO_VERDICT;
 }
 
+function removeTestBytecode(root) {
+  const cacheDirectory = path.join(root, 'src', '__pycache__');
+  let directory;
+  try { directory = fs.lstatSync(cacheDirectory); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('test bytecode directory is not a regular directory');
+  for (const name of fs.readdirSync(cacheDirectory)) {
+    if (!/^conductor_worker_proof\..*\.pyc$/.test(name)) continue;
+    const cachePath = path.join(cacheDirectory, name);
+    const file = fs.lstatSync(cachePath);
+    if (file.isFile() || file.isSymbolicLink()) fs.rmSync(cachePath, { force: true });
+  }
+}
+
 function canFinish(stopping) {
   return !stopping;
 }
@@ -323,7 +337,7 @@ async function runFullGate(root, label, entry, args) {
   let sentinelSecret;
   let declined = false;
   const decline = (reason, detail) => {
-    if (!declined) { declined = true; noVerdict(reason, detail, scratch, 2, sentinelSecret); }
+    if (!declined) { declined = true; noVerdict(reason, detail, scratch, reason === REASONS.TIMEOUT ? 1 : 2, sentinelSecret); }
     return NO_VERDICT;
   };
   const started = Date.now();
@@ -389,6 +403,8 @@ async function runFullGate(root, label, entry, args) {
     });
   });
   try {
+    try { removeTestBytecode(root); }
+    catch (error) { return decline(REASONS.SETUP, 'test bytecode cleanup failed: ' + error.message); }
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
     if (Math.floor((deadline - Date.now()) / 1000) - slowest < 1) {
       return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');

@@ -1,11 +1,43 @@
 'use strict';
 
 const { fork, spawn, spawnSync } = require('node:child_process');
+const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { MESSAGES, REASONS, NO_VERDICT, canFinish, releaseScratch, NO_VERDICT_SECRET, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
+const PROCESS_MONITOR_INTERVAL_MS = 1000;
+const DARWIN_PROCESS_IDENTITY_SCRIPT = `
+import ctypes
+import json
+import sys
+
+class ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ('pbi_flags', ctypes.c_uint32), ('pbi_status', ctypes.c_uint32),
+        ('pbi_xstatus', ctypes.c_uint32), ('pbi_pid', ctypes.c_uint32),
+        ('pbi_ppid', ctypes.c_uint32), ('pbi_uid', ctypes.c_uint32),
+        ('pbi_gid', ctypes.c_uint32), ('pbi_ruid', ctypes.c_uint32),
+        ('pbi_rgid', ctypes.c_uint32), ('pbi_svuid', ctypes.c_uint32),
+        ('pbi_svgid', ctypes.c_uint32), ('rfu_1', ctypes.c_uint32),
+        ('pbi_comm', ctypes.c_char * 16), ('pbi_name', ctypes.c_char * 32),
+        ('pbi_nfiles', ctypes.c_uint32), ('pbi_pgid', ctypes.c_uint32),
+        ('pbi_pjobc', ctypes.c_uint32), ('e_tdev', ctypes.c_uint32),
+        ('e_tpgid', ctypes.c_uint32), ('pbi_nice', ctypes.c_int32),
+        ('pbi_start_tvsec', ctypes.c_uint64), ('pbi_start_tvusec', ctypes.c_uint64),
+    ]
+
+proc_pidinfo = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo
+proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+proc_pidinfo.restype = ctypes.c_int
+identities = {}
+for raw_pid in sys.argv[1:]:
+    info = ProcBsdInfo()
+    if proc_pidinfo(int(raw_pid), 3, 0, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info):
+        identities[raw_pid] = str(info.pbi_start_tvsec) + ':' + str(info.pbi_start_tvusec)
+print(json.dumps(identities))
+`;
 let stopping = false;
 let draining = false;
 let body;
@@ -15,17 +47,47 @@ let bodyExited = false;
 let orphan = false;
 const escapedDescendants = new Map();
 let processMonitor;
+function readProcessIdentities(pids) {
+  const uniquePids = [...new Set(pids)];
+  const identities = new Map();
+  if (!uniquePids.length) return identities;
+  if (process.platform === 'linux') {
+    for (const pid of uniquePids) {
+      try {
+        const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+        const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+        if (fields[19]) identities.set(pid, 'linux:' + fields[19]);
+      } catch {}
+    }
+    return identities;
+  }
+  if (process.platform !== 'darwin') return identities;
+  const result = spawnSync(process.env.PYTHON || 'python3', ['-c', DARWIN_PROCESS_IDENTITY_SCRIPT, ...uniquePids.map(String)], {
+    encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, timeout: 1000
+  });
+  if (result.status !== 0) return identities;
+  try {
+    for (const [rawPid, identity] of Object.entries(JSON.parse(result.stdout))) {
+      const pid = Number(rawPid);
+      if (uniquePids.includes(pid) && typeof identity === 'string' && identity) identities.set(pid, 'darwin:' + identity);
+    }
+  } catch {}
+  return identities;
+}
+function sameProcessIdentity(expected, actual) {
+  return typeof expected === 'string' && expected.length > 0 && expected === actual;
+}
 function readProcessTable(timeout = Math.max(1, Number(deadline) - Date.now())) {
-  const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat=,lstart='], {
+  const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat='], {
     encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, timeout
   });
   if (result.status !== 0) return null;
   const rows = result.stdout.split('\n').map(line => {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)$/);
     if (!match) return null;
-    return { pid: Number(match[1]), parent: Number(match[2]), pgid: Number(match[3]), state: match[4], started: match[5] };
-  }).filter(Boolean);
-  if (!rows.some(row => row.pid === process.pid) || !rows.some(row => row.pid === group)) return null;
+    return { pid: Number(match[1]), parent: Number(match[2]), pgid: Number(match[3]), state: match[4] };
+  }).filter(Boolean).filter(row => row.pid !== result.pid);
+  if (!rows.some(row => row.pid === process.pid)) return null;
   return { rows, scannerPid: result.pid };
 }
 function rememberEscapedDescendants(rows) {
@@ -37,19 +99,40 @@ function rememberEscapedDescendants(rows) {
       if (descendants.has(row.parent) && !descendants.has(row.pid) && !row.state.startsWith('Z')) {
         descendants.add(row.pid);
         changed = true;
-        if (row.pgid !== group) escapedDescendants.set(row.pid, row.started);
+        if (row.pid !== process.pid && row.pgid !== group && !escapedDescendants.has(row.pid)) escapedDescendants.set(row.pid, null);
       }
     }
   }
+  const unresolved = [...escapedDescendants]
+    .filter(([pid, identity]) => identity === null && rows.some(row => row.pid === pid && !row.state.startsWith('Z')))
+    .map(([pid]) => pid);
+  for (const [pid, identity] of readProcessIdentities(unresolved)) escapedDescendants.set(pid, identity);
 }
 function signalEscapedDescendants(signal, rows) {
   if (!rows) return;
   const byPid = new Map(rows.map(row => [row.pid, row]));
-  for (const [pid, started] of escapedDescendants) {
+  const candidates = [...escapedDescendants].filter(([pid, identity]) => identity && byPid.has(pid));
+  const identities = readProcessIdentities(candidates.map(([pid]) => pid));
+  for (const [pid, expected] of candidates) {
     const row = byPid.get(pid);
-    if (!row || row.started !== started || row.state.startsWith('Z')) continue;
+    if (!row || row.state.startsWith('Z') || !sameProcessIdentity(expected, identities.get(pid))) continue;
     try { process.kill(pid, signal); } catch {}
   }
+}
+function hasLiveEscapedDescendants(rows) {
+  const byPid = new Map(rows.map(row => [row.pid, row]));
+  const candidates = [...escapedDescendants].filter(([pid]) => byPid.has(pid));
+  const identities = readProcessIdentities(candidates.map(([pid]) => pid));
+  return candidates.some(([pid, expected]) => {
+    const row = byPid.get(pid);
+    if (!row || row.state.startsWith('Z')) return false;
+    return !expected || !identities.has(pid) || sameProcessIdentity(expected, identities.get(pid));
+  });
+}
+function hasOwnedProcesses(table) {
+  if (!table) return true;
+  const peers = table.rows.some(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
+  return peers || hasLiveEscapedDescendants(table.rows);
 }
 function monitorDescendants() {
   if (!body || stopping) return;
@@ -69,10 +152,21 @@ function stop() {
   }
   try { process.kill(-group, 'SIGTERM'); } catch {}
   setTimeout(() => {
-    if (orphan) releaseScratch(process.env[SCRATCH_ROOT], Number(deadline));
     const remaining = readProcessTable(1000);
-    if (remaining) signalEscapedDescendants('SIGKILL', remaining.rows);
+    if (remaining) {
+      rememberEscapedDescendants(remaining.rows);
+      signalEscapedDescendants('SIGKILL', remaining.rows);
+    }
     try { process.kill(-group, 'SIGKILL'); } catch {}
+    if (orphan) {
+      setTimeout(() => {
+        const verified = readProcessTable(1000);
+        if (hasOwnedProcesses(verified)) return process.exit(NO_VERDICT);
+        if (!releaseScratch(process.env[SCRATCH_ROOT], Number(deadline))) return process.exit(NO_VERDICT);
+        process.exit(NO_VERDICT);
+      }, 50);
+      return;
+    }
     process.exit(NO_VERDICT);
   }, 2000);
 }
@@ -85,10 +179,7 @@ function check() {
   rememberEscapedDescendants(table.rows);
   const peers = table.rows.filter(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
   if (peers.length) return stop();
-  const liveEscapes = [...escapedDescendants].some(([pid, started]) => {
-    const row = table.rows.find(candidate => candidate.pid === pid);
-    return row && row.started === started && !row.state.startsWith('Z');
-  });
+  const liveEscapes = hasLiveEscapedDescendants(table.rows);
   if (liveEscapes) return stop();
   process.exit(0);
 }
@@ -131,7 +222,7 @@ process.on('message', message => {
     body.once('close', (code, signal) => {
       reportBodyExit(signal ? 128 + os.constants.signals[signal] : code);
     });
-    processMonitor = setInterval(monitorDescendants, 50);
+    processMonitor = setInterval(monitorDescendants, PROCESS_MONITOR_INTERVAL_MS);
     processMonitor.unref();
   }
   if (message.kind === MESSAGES.DRAIN && (!body || bodyExited)) { draining = true; check(); }

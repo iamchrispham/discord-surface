@@ -5,8 +5,9 @@ const { fork } = require('node:child_process');
 const { MESSAGES, NO_VERDICT, canFinish, noVerdict, releaseScratch, REASONS, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, entry, ...args] = process.argv.slice(2);
 const guard = fork(path.join(__dirname, 'full-gate-watchdog.js'), [deadline, String(process.pid), entry, ...args], {
-  stdio: ['ignore', 'inherit', 'inherit', 'ipc', 'ignore']
+  detached: true, stdio: ['ignore', 'inherit', 'inherit', 'ipc', 'ignore']
 });
+let stopReason = REASONS.INTERRUPTED;
 guard.on('message', message => {
   if (!process.connected) return;
   if (message.kind === MESSAGES.READY) process.send({ kind: MESSAGES.READY, holder: process.pid, guardian: guard.pid });
@@ -15,13 +16,16 @@ guard.on('message', message => {
 process.on('message', message => {
   if ([MESSAGES.START, MESSAGES.ADMIT].includes(message.kind) && guard.connected) guard.send(message);
   if (message.kind === MESSAGES.CLOSE && guard.connected) guard.send({ kind: MESSAGES.DRAIN });
-  if (message.kind === MESSAGES.STOP && guard.connected) guard.send(message);
+  if (message.kind === MESSAGES.STOP) {
+    stopReason = message.reason || REASONS.INTERRUPTED;
+    if (guard.connected) guard.send(message);
+  }
 });
 let stopping = false;
-function stop() {
+function stop(reason = stopReason) {
   if (stopping) return;
   stopping = true;
-  noVerdict(REASONS.INTERRUPTED, 'worker stopped before teardown completed');
+  noVerdict(reason, 'worker stopped before teardown completed', process.env[SCRATCH_ROOT], reason === REASONS.TIMEOUT ? 1 : 2);
   try { process.kill(-process.pid, 'SIGTERM'); } catch {}
   setTimeout(() => {
     if (!process.connected) releaseScratch(process.env[SCRATCH_ROOT], Number(deadline));
@@ -29,6 +33,6 @@ function stop() {
     process.exit(NO_VERDICT);
   }, 2000);
 }
-process.on('SIGTERM', () => { if (guard.connected) guard.send({ kind: MESSAGES.STOP }); else stop(); });
-process.on('disconnect', () => { if (guard.connected) guard.send({ kind: MESSAGES.STOP, orphan: true }); else stop(); });
+process.on('SIGTERM', () => { stopReason = REASONS.INTERRUPTED; if (guard.connected) guard.send({ kind: MESSAGES.STOP, reason: stopReason }); else stop(); });
+process.on('disconnect', () => { stopReason = REASONS.INTERRUPTED; if (guard.connected) guard.send({ kind: MESSAGES.STOP, orphan: true, reason: stopReason }); else stop(); });
 guard.once('exit', code => { if (code === 0 && canFinish(stopping)) process.exit(0); else stop(); });

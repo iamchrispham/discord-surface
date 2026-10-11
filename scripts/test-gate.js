@@ -19,6 +19,10 @@ function validSelection(suites) {
 }
 
 async function body(suites) {
+  if (!validSelection(suites)) {
+    process.stderr.write('test gate requires the complete registered suite list without selection options\n');
+    return 4;
+  }
   const commands = [
     [npm, ['run', 'build']],
     [npm, ['run', 'typecheck']],
@@ -27,7 +31,10 @@ async function body(suites) {
   for (const [command, args] of commands) {
     if (command === process.execPath) process.stdout.write('FULL_GATE_TEST_ARGUMENTS=' + JSON.stringify(suites) + '\n');
     const env = { ...process.env };
-    if (command === process.execPath) delete env.NODE_TEST_CONTEXT;
+    if (command === process.execPath) {
+      delete env.NODE_TEST_CONTEXT;
+      env.PYTHONDONTWRITEBYTECODE = '1';
+    }
     const result = spawnSync(command, args, { cwd: root, stdio: 'inherit', env });
     if (result.error) throw result.error;
     if (result.signal) return 128 + os.constants.signals[result.signal];

@@ -79,6 +79,7 @@ function fixture(t) {
     "  if (process.env.FIXTURE_MOVE_TARGET_BODY) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
     "  if (process.env.FIXTURE_STDERR_FRAGMENT) process.stderr.write('checking');",
     "  if (process.env.FIXTURE_STDOUT_BYTES) process.stdout.write('x'.repeat(Number(process.env.FIXTURE_STDOUT_BYTES)));",
+    "  if (process.env.FIXTURE_STDERR_BYTES) process.stderr.write('x'.repeat(Number(process.env.FIXTURE_STDERR_BYTES)));",
     "  if (process.env.FIXTURE_CHANGE_BODY) fs.writeFileSync(require('node:path').join(process.env.FIXTURE_ROOT,'input'),'changed during body');",
     "  if (process.env.FIXTURE_BODY_DANGLING_SOURCE) { const input = require('node:path').join(process.env.FIXTURE_ROOT,'input'); fs.unlinkSync(input); fs.symlinkSync('missing-source-target', input); }",
     "  if (process.env.FIXTURE_LATE_WRITE) {",
@@ -96,14 +97,14 @@ function fixture(t) {
     "  }",
     "  if (process.env.FIXTURE_ESCAPE_PIPE) {",
     "    const cp=require('node:child_process');const marker=process.env.FIXTURE_MARKER+'.escape-signalled';",
-    "    const program=\"const fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_MARKER+'.escape-signalled','terminated');process.exit(0);});setTimeout(()=>process.exit(0),90000);\";",
+    "    const program=\"const fs=require('node:fs');const path=require('node:path');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_MARKER+'.escape-signalled','terminated');if(process.env.FIXTURE_RECREATE_SCRATCH){const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(path.join(scratch,'writer'),'active');},5);}else process.exit(0);});setTimeout(()=>process.exit(0),90000);\";",
     "    const escape=cp.spawn(process.execPath,['-e',program],{detached:true,stdio:'inherit'});escape.unref();",
     "    const info=JSON.parse(fs.readFileSync(process.env.FIXTURE_MARKER,'utf8'));info.escapePid=escape.pid;info.escapeStart=cp.spawnSync('ps',['-p',String(escape.pid),'-o','lstart='],{encoding:'utf8',timeout:10000}).stdout.trim();fs.writeFileSync(process.env.FIXTURE_MARKER+'.part',JSON.stringify(info));fs.renameSync(process.env.FIXTURE_MARKER+'.part',process.env.FIXTURE_MARKER);",
     "  }",
     "  if (process.env.FIXTURE_READ_ONLY_SCRATCH) { const ro=require('node:path').join(process.env.DISCORD_SURFACE_GATE_SCRATCH,'ro');fs.mkdirSync(ro);fs.writeFileSync(require('node:path').join(ro,'f'),'x');fs.chmodSync(ro,0o500); }",
     "  if (process.env.FIXTURE_GROUP_SIGNAL) process.kill(0,'SIGTERM');",
     "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
-    "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
+    "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
     "}",
     "module.exports = { runBody };",
@@ -647,7 +648,7 @@ test('final source snapshot timeout is a no-verdict result', { timeout: 180000 }
 
 test('watchdog cleans a TERM-resistant body after its supervisor is killed', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_HANG: '1' });
+  const run = f.launch({ FIXTURE_HANG: '1', FIXTURE_RECREATE_SCRATCH: '1' });
   await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));
@@ -1031,8 +1032,9 @@ test('watchdog process-group inspection uses its remaining deadline', () => {
     require: name => {
       if (name === 'node:child_process') return { spawn: () => {}, spawnSync: (command, args, options) => {
         inspections.push({ command, args, options });
-        return { status: 0, stdout: '12345 1 12345 S Mon Oct 11 10:00:00 2026\n23456 12345 12345 S Mon Oct 11 10:00:00 2026\n', pid: 23457 };
+        return { status: 0, stdout: '12345 1 12345 S\n23456 12345 12345 S\n', pid: 23457 };
       } };
+      if (name === 'node:fs') return fs;
       if (name === 'node:os') return { constants: { signals: {} } };
       if (name === 'node:path') return path;
       if (name === './full-gate') return { MESSAGES, NO_VERDICT, canFinish: () => true, releaseScratch: () => true, NO_VERDICT_SECRET: 'secret', SCRATCH_ROOT: 'scratch' };
@@ -1227,7 +1229,7 @@ test('worker loss during admission is interruption, never capacity', { timeout: 
 
 test('gate cleanup terminates a detached descendant before accepting a verdict', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5' });
+  const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1', APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5' });
   let escaped;
   try {
     const result = await run.done;
@@ -1260,18 +1262,59 @@ test('gate cleanup terminates a detached descendant before accepting a verdict',
 test('blocked manager output stays within its deadline and releases scratch', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const run = f.launch({
-    FIXTURE_STDOUT_BYTES: '4194304',
+    FIXTURE_STDERR_BYTES: '4194304',
     APERTURE_GATE_TIME_LEFT_S: '8',
     APERTURE_GATE_SLOWEST_RUN_S: '1'
   });
-  run.child.stdout.pause();
-  await new Promise(resolve => setTimeout(resolve, 4000));
-  run.child.stdout.resume();
+  const timeoutMarker = new Promise(resolve => run.child.stdout.on('data', chunk => {
+    if (chunk.toString().includes('APERTURE-GATE-INDETERMINATE reason=timeout')) resolve(true);
+  }));
+  run.child.stderr.pause();
+  const markerArrivedBeforeDrain = await Promise.race([
+    timeoutMarker,
+    new Promise(resolve => setTimeout(() => resolve(false), 10000))
+  ]);
+  run.child.stderr.resume();
   const result = await run.done;
+  assert.ok(markerArrivedBeforeDrain, 'timeout marker is emitted before stderr drains');
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(result.code, 98, result.output);
   assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=timeout/);
   assert.equal(fs.existsSync(body.scratch), false);
+});
+
+test('gate removes ignored test bytecode before capturing its source', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const cacheDirectory = path.join(f.root, 'src', '__pycache__');
+  fs.mkdirSync(cacheDirectory, { recursive: true });
+  fs.writeFileSync(path.join(f.root, '.gitignore'), '__pycache__/\n');
+  const cache = path.join(cacheDirectory, 'conductor_worker_proof.cpython-314.pyc');
+  fs.writeFileSync(cache, 'cached module');
+  const result = await f.launch().done;
+  assert.equal(result.code, 0, result.output);
+  assert.equal(fs.existsSync(cache), false);
+});
+
+test('admitted test body revalidates its registered suite list', async () => {
+  const { runBody } = require('../scripts/test-gate');
+  assert.equal(await runBody([]), 4);
+});
+
+test('watchdog has one identity-checked escaped PID signal site and a bounded host scan interval', () => {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-watchdog.js'), 'utf8');
+  const pidSignalSites = source.match(/process\.kill\(pid, signal\)/g) || [];
+  const ownerStart = source.indexOf('function signalEscapedDescendants');
+  const ownerEnd = source.indexOf('\nfunction hasLiveEscapedDescendants', ownerStart);
+  const signalOwner = source.slice(ownerStart, ownerEnd);
+  const identitySource = source.match(/function sameProcessIdentity[\s\S]*?\n}/)?.[0];
+  const sameProcessIdentity = vm.runInNewContext(identitySource + '\nsameProcessIdentity');
+  assert.equal(pidSignalSites.length, 1, 'new PID signal sites must go through the identity owner');
+  assert.match(signalOwner, /sameProcessIdentity\(expected, identities\.get\(pid\)\)/);
+  assert.equal(sameProcessIdentity('darwin:1791712345:100001', 'darwin:1791712345:900002'), false);
+  assert.equal(sameProcessIdentity('linux:78123456', 'linux:78123456'), true);
+  assert.match(source, /const PROCESS_MONITOR_INTERVAL_MS = 1000/);
+  assert.match(source, /setInterval\(monitorDescendants, PROCESS_MONITOR_INTERVAL_MS\)/);
 });
 
 for (const { escape, mode } of [
