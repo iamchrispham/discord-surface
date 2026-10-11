@@ -415,9 +415,13 @@ whole-second budget and `APERTURE_GATE_SLOWEST_RUN_S` to its measured execution
 allowance. The defaults are 7200 and 3600 seconds. A shorter outer timeout needs
 shorter values that still cover admission and the full run.
 
-Exit 98 and one `APERTURE-GATE-INDETERMINATE` line mean no verdict. A
-`queue-missing` reason needs setup recovery before rescheduling. Capacity,
-interruption and timeout never establish a pass or a test failure. Raw build,
+Exit 98 with one `APERTURE-GATE-INDETERMINATE` line means no verdict. The
+`setup` and `queue-missing` reasons require admission setup repair before retry.
+The `cleanup` reason requires the gate's owned process group or scratch directory
+to be inspected and cleaned before retry. `capacity` means reschedule later with
+the same ticket so admission retains the queue arrival. `interrupted`, `stale`
+and `timeout` never establish a pass or a test failure. A raw body exit 98
+without the marker is the command result, not a no-verdict result. Raw build,
 typecheck and test failures retain their command exit. The entry does not retry.
 Detached checkouts, private uncommitted Git copies and source archives are
 supported. Archive source fencing excludes `.git`, `node_modules` and `dist`,

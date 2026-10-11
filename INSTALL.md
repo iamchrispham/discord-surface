@@ -18,9 +18,13 @@ must support `--full-gate`, `--holder`, `--max-wait` and `--ticket`. Set
 `APERTURE_GATE_TIME_LEFT_S` to the caller's remaining seconds and
 `APERTURE_GATE_SLOWEST_RUN_S` to the measured full execution allowance. The
 defaults are 7200 and 3600 seconds. Both wait and execution must fit the caller.
-Missing setup returns exit 98 with `APERTURE-GATE-INDETERMINATE
-reason=queue-missing` and starts no work. Recover that setup before rescheduling.
-Never treat no verdict as a package or test pass.
+Exit 98 with one `APERTURE-GATE-INDETERMINATE` line means no verdict. The
+`setup` and `queue-missing` reasons require admission setup repair before retry.
+The `cleanup` reason requires the gate's owned process group or scratch directory
+to be inspected and cleaned before retry. `capacity` means reschedule later with
+the same ticket so admission retains the queue arrival. `interrupted`, `stale`
+and `timeout` do not establish a package or test pass. A raw body exit 98
+without the marker is the command result, not a no-verdict result.
 
 In a new checkout, replace `RELEASE_COMMIT` with the full commit supplied by the release owner, then select it:
 

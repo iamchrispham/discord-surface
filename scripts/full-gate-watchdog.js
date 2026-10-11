@@ -2,13 +2,14 @@
 
 const { fork, spawn, spawnSync } = require('node:child_process');
 const os = require('node:os');
-const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, BODY_LABEL, SCRATCH_ROOT } = require('./full-gate');
+const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, BODY_LABEL, BODY_TOKEN, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
 let stopping = false;
 let draining = false;
 let body;
 let admission;
+let admissionSucceeded = false;
 let bodyExited = false;
 let orphan = false;
 function stop(reason = REASONS.INTERRUPTED) {
@@ -38,16 +39,24 @@ process.on('message', message => {
   if (message.kind === MESSAGES.ADMIT && !admission) {
     admission = spawn(message.command, message.args, { stdio: 'inherit' });
     admission.once('error', error => { if (process.connected) process.send({ kind: MESSAGES.ADMISSION_EXIT, error: error.message }); });
-    admission.once('exit', code => { if (process.connected) process.send({ kind: MESSAGES.ADMISSION_EXIT, code }); });
+    admission.once('exit', code => {
+      admissionSucceeded = code === 0;
+      if (process.connected) process.send({ kind: MESSAGES.ADMISSION_EXIT, code });
+    });
   }
   if (message.kind === MESSAGES.START && !body) {
+    if (!admissionSucceeded || !process.env[BODY_TOKEN]) return stop(REASONS.ADMISSION);
     body = fork(entry, args, { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
     body.on('message', message => {
       if (message?.kind !== MESSAGES.BODY_AUTH_REQUEST) return;
+      const authorized = admissionSucceeded
+        && Boolean(process.env[BODY_TOKEN])
+        && message.label === process.env[BODY_LABEL];
       body.send({
         kind: MESSAGES.BODY_AUTHORIZED,
         label: message.label,
-        authorized: message.label === process.env[BODY_LABEL]
+        authorized,
+        ...(authorized ? { token: process.env[BODY_TOKEN] } : {})
       });
     });
     body.once('error', () => { bodyExited = true; if (process.connected) process.send({ kind: MESSAGES.BODY_EXIT, code: 1 }); });

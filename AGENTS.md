@@ -41,9 +41,15 @@ migration is not authorization to redesign delivery or change persisted formats.
   checks, not invented runtime assertions.
 - Both full entries self-admit through `APERTURE_GATE_ADMISSION_COMMAND`.
   Configure a supported `--full-gate` executable and execution allowances that
-  fit the caller's remaining timeout. Exit 98 plus
-  `APERTURE-GATE-INDETERMINATE` means no verdict. Recover missing setup before
-  rescheduling. Never replace a held full gate with selected-suite proof.
+  fit the caller's remaining timeout. Exit 98 with one
+  `APERTURE-GATE-INDETERMINATE` line means no verdict. The `setup` and
+  `queue-missing` reasons require admission setup recovery. The `cleanup` reason
+  requires inspecting and cleaning the gate's owned process group or scratch
+  directory. `capacity` means reschedule later with the same ticket so admission
+  retains the queue arrival. `interrupted`, `stale` and `timeout` do not establish
+  a pass or a test failure. A raw body exit 98 without the marker is the command
+  result, not a no-verdict result. Never replace a held full gate with
+  selected-suite proof.
 - Use disposable databases, temporary transcript roots, and simulated transport
   for automated tests. Never use live credentials, production databases, native
   sessions, or the shared Gateway as test fixtures.

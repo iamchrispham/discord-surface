@@ -7,7 +7,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { PassThrough } = require('node:stream');
-const { relay, revision } = require('../scripts/full-gate');
+const { relay, revision, BODY_LABEL, BODY_TOKEN, MESSAGES } = require('../scripts/full-gate');
 
 const PROJECT = path.resolve(__dirname, '..');
 const GATE = path.join(PROJECT, 'scripts/full-gate.js');
@@ -37,6 +37,7 @@ function fixture(t) {
     "fs.writeFileSync(process.env.FIXTURE_PROTOCOL, JSON.stringify(process.argv.slice(2)));",
     "if (process.env.FIXTURE_CHANGE) fs.writeFileSync(process.env.FIXTURE_CHANGE, 'changed');",
     "if (process.env.FIXTURE_MOVE_TARGET_WAIT) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
+    "if (process.env.FIXTURE_SWITCH_BRANCH) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'switch','-c',process.env.FIXTURE_SWITCH_BRANCH]);",
     "if (process.env.FIXTURE_ADMISSION_SIGNAL) process.kill(process.pid, process.env.FIXTURE_ADMISSION_SIGNAL);",
     "if (process.env.FIXTURE_HOLD_ADMISSION) {",
     "  const argv=process.argv.slice(2); const holder=Number(argv[argv.indexOf('--holder')+1]);",
@@ -97,6 +98,76 @@ function fixture(t) {
   return { root, marker, protocol, launch, git, env };
 }
 
+function filesUnder(root) {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const absolute = path.join(root, entry.name);
+    if (entry.isDirectory()) return filesUnder(absolute);
+    return entry.isFile() ? [absolute] : [];
+  });
+}
+
+function publicEntry(t, file, authorization) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-public-entry-'));
+  const bin = path.join(scratch, 'bin');
+  fs.mkdirSync(bin);
+  const admission = path.join(scratch, 'admit');
+  const admissionMarker = path.join(scratch, 'admission-started');
+  const bodyMarker = path.join(scratch, 'body-started');
+  const npm = path.join(bin, process.platform === 'win32' ? 'npm.cmd' : 'npm');
+  fs.writeFileSync(admission, '#!' + process.execPath + '\nrequire("node:fs").writeFileSync(process.env.FIXTURE_PUBLIC_ADMISSION,"started");process.exit(0);\n', { mode: 0o700 });
+  fs.writeFileSync(npm, '#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.env.FIXTURE_PUBLIC_BODY,"started");process.exit(7);\n', { mode: 0o700 });
+  const label = file === 'scripts/test-gate.js' ? 'test' : 'package-smoke';
+  const env = {
+    ...process.env,
+    [BODY_LABEL]: label,
+    [BODY_TOKEN]: 'caller-owned-token',
+    APERTURE_GATE_ADMISSION_COMMAND: admission,
+    APERTURE_GATE_TIME_LEFT_S: authorization === 'silence' ? '8' : '60',
+    APERTURE_GATE_SLOWEST_RUN_S: authorization === 'silence' ? '1' : '5',
+    FIXTURE_PUBLIC_ADMISSION: admissionMarker,
+    FIXTURE_PUBLIC_BODY: bodyMarker,
+    PATH: bin + path.delimiter + (process.env.PATH || ''),
+    NODE_OPTIONS: ''
+  };
+  delete env.NODE_TEST_CONTEXT;
+  const registered = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
+  const args = file === 'scripts/test-gate.js' ? registered : [];
+  const child = spawn(process.execPath, [path.join(PROJECT, file), ...args], {
+    cwd: PROJECT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+  });
+  let output = '';
+  let requests = 0;
+  for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output += chunk.toString(); });
+  child.on('message', message => {
+    if (message?.kind !== MESSAGES.BODY_AUTH_REQUEST) return;
+    requests += 1;
+    if (authorization === 'reply') child.send({ kind: MESSAGES.BODY_AUTHORIZED, label: message.label, authorized: true });
+    if (authorization === 'disconnect') child.disconnect();
+  });
+  const done = new Promise(resolve => {
+    if (authorization !== 'disconnect') {
+      child.once('close', (code, signal) => resolve({ code, signal, output }));
+      return;
+    }
+    child.once('exit', (code, signal) => setImmediate(() => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolve({ code, signal, output });
+    }));
+  });
+  const bound = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }, authorization === 'silence' ? 6000 : 12000);
+  t.after(() => {
+    clearTimeout(bound);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+  return { done, requests: () => requests, admissionMarker, bodyMarker };
+}
+
 test('both public full entries decline before starting work without admission', () => {
   const env = { ...process.env };
   delete env.APERTURE_GATE_ADMISSION_COMMAND;
@@ -110,6 +181,55 @@ test('both public full entries decline before starting work without admission', 
     assert.match(result.stderr, /nothing ran/);
   }
 });
+
+test('source fingerprint and bypass decisions stay at their owners', () => {
+  const scripts = filesUnder(path.join(PROJECT, 'scripts')).filter(file => file.endsWith('.js'));
+  const relative = files => files.map(file => path.relative(PROJECT, file).split(path.sep).join('/')).sort();
+  const digestOwners = scripts.filter(file => /crypto\.createHash\(['"]sha256['"]\)/.test(fs.readFileSync(file, 'utf8')));
+  const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(fs.readFileSync(file, 'utf8')));
+  assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js']);
+  assert.deepEqual(relative(bypassOwners), ['scripts/full-gate-watchdog.js', 'scripts/full-gate.js'].sort());
+});
+
+test('recovery guidance covers every no-verdict action', () => {
+  for (const file of ['README.md', 'INSTALL.md', 'AGENTS.md']) {
+    const content = fs.readFileSync(path.join(PROJECT, file), 'utf8');
+    for (const reason of ['queue-missing', 'setup', 'capacity', 'cleanup']) assert.ok(content.includes(reason), file + ' omits ' + reason);
+    assert.match(content, /same ticket/i);
+    assert.match(content, /raw body exit 98/i);
+  }
+});
+
+for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
+  test('caller silence stays inside the deadline for ' + file, { timeout: 15000 }, async t => {
+    const run = publicEntry(t, file, 'silence');
+    const result = await run.done;
+    assert.equal(result.code, 98, result.output);
+    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=timeout/);
+    assert.equal(run.requests(), 1);
+    assert.equal(fs.existsSync(run.admissionMarker), false);
+    assert.equal(fs.existsSync(run.bodyMarker), false);
+  });
+
+  test('caller authorization cannot bypass admission for ' + file, { timeout: 30000 }, async t => {
+    const run = publicEntry(t, file, 'reply');
+    const result = await run.done;
+    assert.equal(run.requests(), 1);
+    assert.equal(fs.existsSync(run.admissionMarker), true);
+    assert.notEqual(result.code, 98, result.output);
+    assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
+  });
+
+  test('caller disconnect cannot restart admission for ' + file, { timeout: 15000 }, async t => {
+    const run = publicEntry(t, file, 'disconnect');
+    const result = await run.done;
+    assert.equal(result.code, 98, result.output);
+    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
+    assert.equal(run.requests(), 1);
+    assert.equal(fs.existsSync(run.admissionMarker), false);
+    assert.equal(fs.existsSync(run.bodyMarker), false);
+  });
+}
 
 test('an inherited body label cannot bypass missing admission', { timeout: 180000 }, async t => {
   const f = fixture(t);
@@ -332,15 +452,27 @@ for (const layout of ['detached', 'uncommitted', 'archive']) {
   });
 }
 
-test('source symlinks are fingerprinted without following directory targets', t => {
+for (const layout of ['git', 'archive']) test(`${layout} source symlink outside the fingerprinted root is rejected`, t => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.root, '.gitignore'), 'node_modules/\ndist/\n');
-  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-symlink-'));
-  t.after(() => fs.rmSync(target, { recursive: true, force: true }));
-  fs.symlinkSync(target, path.join(f.root, 'node_modules'));
+  const target = path.join(path.dirname(f.root), 'external-source');
+  fs.writeFileSync(target, 'first');
+  fs.symlinkSync(target, path.join(f.root, 'source-link'));
+  if (layout === 'archive') fs.rmSync(path.join(f.root, '.git'), { recursive: true, force: true });
+  assert.throws(() => revision(f.root), /unsupported source symlink: source-link/);
+  fs.writeFileSync(target, 'changed');
+  assert.throws(() => revision(f.root), /unsupported source symlink: source-link/);
+});
+
+test('source digest frames adjacent binary file payloads', t => {
+  const f = fixture(t);
+  const firstFile = path.join(f.root, 'a');
+  const secondFile = path.join(f.root, 'b');
+  const mode = String(fs.statSync(path.join(f.root, 'input')).mode);
+  fs.writeFileSync(firstFile, Buffer.from('b\0' + mode + '\0X'));
+  fs.writeFileSync(secondFile, Buffer.from('Y'));
   const first = revision(f.root);
-  fs.unlinkSync(path.join(f.root, 'node_modules'));
-  fs.symlinkSync(os.tmpdir(), path.join(f.root, 'node_modules'));
+  fs.writeFileSync(firstFile, Buffer.alloc(0));
+  fs.writeFileSync(secondFile, Buffer.from('Xb\0' + mode + '\0Y'));
   assert.notEqual(revision(f.root), first);
 });
 
@@ -367,9 +499,15 @@ test('archive beneath an unrelated worktree is scanned directly', t => {
   fs.mkdirSync(archive, { recursive: true });
   const source = path.join(archive, 'input');
   fs.writeFileSync(source, 'first\n');
-  const first = revision(archive);
+  const first = JSON.parse(revision(archive));
+  assert.equal(first.kind, 'archive');
+  assert.equal(first.head, null);
+  assert.equal(first.target, null);
+  assert.equal(first.index, null);
+  assert.equal(first.branch, null);
+  assert.equal(first.repository, fs.realpathSync(archive));
   fs.writeFileSync(source, 'second\n');
-  assert.notEqual(revision(archive), first);
+  assert.notEqual(JSON.parse(revision(archive)).files, first.files);
 });
 
 test('queue ticket retains one head and changes for a new head', { timeout: 180000 }, async t => {
@@ -476,6 +614,59 @@ test('source movement during execution still invalidates proof', { timeout: 1800
   assert.match(result.output, /reason=stale/);
 });
 
+
+test('archive tickets use the archive root and its source digest', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const firstRoot = path.join(f.root, 'dist', 'A-new');
+  const secondRoot = path.join(f.root, 'dist', 'B-new');
+  fs.mkdirSync(firstRoot, { recursive: true });
+  fs.mkdirSync(secondRoot, { recursive: true });
+  fs.writeFileSync(path.join(firstRoot, 'input'), 'same source\n');
+  fs.writeFileSync(path.join(secondRoot, 'input'), 'same source\n');
+  const ticket = async root => {
+    const result = await f.launch({ FIXTURE_ROOT: root }).done;
+    assert.equal(result.code, 0, result.output);
+    const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));
+    return args[args.indexOf('--ticket') + 1];
+  };
+  const first = await ticket(firstRoot);
+  const second = await ticket(secondRoot);
+  assert.notEqual(second, first);
+  assert.equal(await ticket(firstRoot), first);
+});
+
+test('branch switch at the same commit makes the admitted source stale', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ FIXTURE_SWITCH_BRANCH: 'same-commit-other-branch' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=stale/);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('admission wait is recomputed after a slow source scan', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const preload = path.join(path.dirname(f.root), 'slow-source-scan.js');
+  const input = JSON.stringify(path.join(f.root, 'input'));
+  fs.writeFileSync(preload, [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    'const original = fs.readFileSync;',
+    'let delayed = false;',
+    'fs.readFileSync = function (file, ...args) {',
+    '  if (!delayed && path.resolve(String(file)) === ' + input + ') { delayed = true; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500); }',
+    '  return original.call(this, file, ...args);',
+    '};'
+  ].join('\n'));
+  const result = await f.launch({
+    APERTURE_GATE_TIME_LEFT_S: '20',
+    APERTURE_GATE_SLOWEST_RUN_S: '5',
+    NODE_OPTIONS: '--require=' + preload
+  }).done;
+  assert.equal(result.code, 0, result.output);
+  const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));
+  const maxWait = Number(args[args.indexOf('--max-wait') + 1]);
+  assert.ok(maxWait >= 1 && maxWait < 10, 'expected a recomputed wait, got ' + maxWait);
+});
 
 test('worker loss during admission is interruption, never capacity', { timeout: 180000 }, async t => {
   const f = fixture(t);

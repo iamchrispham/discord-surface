@@ -8,6 +8,7 @@ const { fork, spawnSync } = require('node:child_process');
 const { finished: streamFinished } = require('node:stream/promises');
 
 const BODY_LABEL = 'DISCORD_SURFACE_GATE_BODY';
+const BODY_TOKEN = 'DISCORD_SURFACE_GATE_BODY_TOKEN';
 const SCRATCH_ROOT = 'DISCORD_SURFACE_GATE_SCRATCH';
 const NO_VERDICT = 98;
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
@@ -63,11 +64,20 @@ function git(root, args, optional = false) {
   return result.stdout;
 }
 
+function digestField(digest, value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  const length = Buffer.allocUnsafe(8);
+  length.writeBigUInt64BE(BigInt(bytes.length));
+  digest.update(length);
+  digest.update(bytes);
+}
+
 function revision(root) {
   const digest = crypto.createHash('sha256');
+  const realRoot = fs.realpathSync(root);
   const repositoryRoot = git(root, ['rev-parse', '--show-toplevel'], true);
   const isRepositoryRoot = repositoryRoot !== null
-    && fs.realpathSync(repositoryRoot.replace(/(?:\r?\n)+$/, '')) === fs.realpathSync(root);
+    && fs.realpathSync(repositoryRoot.replace(/(?:\r?\n)+$/, '')) === realRoot;
   const listed = isRepositoryRoot ? git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true) : null;
   const archiveFiles = (directory, prefix = '') => fs.readdirSync(directory, { withFileTypes: true }).flatMap(item => {
     if (item.isDirectory() && item.name === '__pycache__') return [];
@@ -76,28 +86,67 @@ function revision(root) {
     return item.isDirectory() ? archiveFiles(path.join(directory, item.name), name + '/') : [name];
   });
   const files = [...new Set(listed === null ? archiveFiles(root) : listed.split('\0').filter(Boolean))].sort();
+  const fileSet = new Set(files);
   for (const file of files) {
     const absolute = path.join(root, file);
-    digest.update(file + '\0');
+    digestField(digest, 'entry');
+    digestField(digest, file);
     let stat;
     try { stat = fs.lstatSync(absolute); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; digest.update('missing\0'); continue; }
-    digest.update(String(stat.mode) + '\0');
-    if (stat.isSymbolicLink()) digest.update(fs.readlinkSync(absolute));
-    else if (stat.isFile()) digest.update(fs.readFileSync(absolute));
-    else throw new Error('unsupported source path: ' + file);
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      digestField(digest, 'missing');
+      continue;
+    }
+    digestField(digest, String(stat.mode));
+    if (stat.isSymbolicLink()) {
+      let resolved;
+      let targetStat;
+      try {
+        resolved = fs.realpathSync(absolute);
+        targetStat = fs.statSync(absolute);
+      } catch {
+        throw new Error('unsupported source symlink: ' + file);
+      }
+      const relativeTarget = path.relative(realRoot, resolved);
+      const targetName = relativeTarget.split(path.sep).join('/');
+      const remainsInside = relativeTarget !== ''
+        && relativeTarget !== '..'
+        && !relativeTarget.startsWith('..' + path.sep)
+        && !path.isAbsolute(relativeTarget);
+      if (!remainsInside || !targetStat.isFile() || !fileSet.has(targetName)) {
+        throw new Error('unsupported source symlink: ' + file);
+      }
+      digestField(digest, 'symlink');
+      digestField(digest, fs.readlinkSync(absolute));
+      digestField(digest, targetName);
+    } else if (stat.isFile()) {
+      digestField(digest, 'file');
+      digestField(digest, fs.readFileSync(absolute));
+    } else throw new Error('unsupported source path: ' + file);
   }
+  const branch = isRepositoryRoot
+    ? git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], true)?.trim() || null
+    : null;
+  const commonDirectory = isRepositoryRoot
+    ? git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir'], true)?.trim()
+    : null;
+  const repository = commonDirectory ? fs.realpathSync(commonDirectory) : realRoot;
   return JSON.stringify({
-    head: git(root, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || null,
-    target: git(root, ['rev-parse', '--verify', 'origin/main'], true)?.trim() || null,
-    index: git(root, ['ls-files', '--stage', '-z'], true), files: digest.digest('hex')
+    kind: isRepositoryRoot ? 'git' : 'archive',
+    head: isRepositoryRoot ? git(root, ['rev-parse', '--verify', 'HEAD'], true)?.trim() || null : null,
+    target: isRepositoryRoot ? git(root, ['rev-parse', '--verify', 'origin/main'], true)?.trim() || null : null,
+    index: isRepositoryRoot ? git(root, ['ls-files', '--stage', '-z'], true) : null,
+    branch,
+    repository,
+    files: digest.digest('hex')
   });
 }
 
 function sameSource(before, after) {
   const expected = JSON.parse(before);
   const actual = JSON.parse(after);
-  return ['head', 'index', 'files'].every(key => expected[key] === actual[key]);
+  return ['kind', 'head', 'index', 'branch', 'repository', 'files'].every(key => expected[key] === actual[key]);
 }
 
 function groupPeers(group) {
@@ -120,32 +169,42 @@ function relay(source, sink) {
   source.on('end', () => { if (held && !sink.destroyed) sink.write(held); });
 }
 
-function requestBodyAuthorization(label) {
-  if (typeof process.send !== 'function' || !process.connected) return Promise.resolve(false);
-  return new Promise(resolve => {
-    const finish = authorized => {
-      process.removeListener('message', onMessage);
-      process.removeListener('disconnect', onDisconnect);
-      resolve(authorized);
-    };
-    const onMessage = message => {
-      if (message?.kind !== MESSAGES.BODY_AUTHORIZED || message.label !== label) return;
-      finish(message.authorized === true);
-    };
-    const onDisconnect = () => finish(false);
-    process.on('message', onMessage);
-    process.once('disconnect', onDisconnect);
+function requestBodyAuthorization(label, token) {
+  if (!token) return { promise: Promise.resolve({ authorized: false, disconnected: false }), cancel() {} };
+  if (typeof process.send !== 'function' || !process.connected) {
+    return { promise: Promise.resolve({ authorized: false, disconnected: true }), cancel() {} };
+  }
+  let resolvePromise;
+  let settled = false;
+  const promise = new Promise(resolve => { resolvePromise = resolve; });
+  const finish = result => {
+    if (settled) return;
+    settled = true;
+    process.removeListener('message', onMessage);
+    process.removeListener('disconnect', onDisconnect);
+    resolvePromise(result);
+  };
+  const onMessage = message => {
+    if (message?.kind !== MESSAGES.BODY_AUTHORIZED || message.label !== label) return;
+    finish({ authorized: message.authorized === true && message.token === token, disconnected: false });
+  };
+  const onDisconnect = () => finish({ authorized: false, disconnected: true });
+  process.on('message', onMessage);
+  process.once('disconnect', onDisconnect);
+  try {
     process.send({ kind: MESSAGES.BODY_AUTH_REQUEST, label }, error => {
-      if (error) finish(false);
+      if (error) finish({ authorized: false, disconnected: true });
     });
-  });
+  } catch {
+    finish({ authorized: false, disconnected: true });
+  }
+  return {
+    promise,
+    cancel() { finish({ authorized: false, disconnected: true }); }
+  };
 }
 
 async function runFullGate(root, label, entry, args, body) {
-  if (process.env[BODY_LABEL] === label) {
-    delete process.env[BODY_LABEL];
-    if (await requestBodyAuthorization(label)) return await body();
-  }
   let scratch;
   let declined = false;
   const decline = (reason, detail) => {
@@ -163,26 +222,31 @@ async function runFullGate(root, label, entry, args, body) {
     slowest = wholeSeconds(process.env, SETTINGS.SLOWEST, 3600);
   } catch (error) { process.stderr.write(error.message + '\n'); return 4; }
   const deadline = started + budget * 1000 - 5000;
-  const maxWait = Math.floor((deadline - Date.now()) / 1000) - slowest;
-  if (maxWait < 1) return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
   let worker;
   let workerExit;
   let bodyStarted = false;
   let bodyFinished = false;
+  let authorizedBodyStarted = false;
   let stopped;
   let timer;
   let outputDrain;
   let outputTimer;
   let finishOutputWait;
+  let authorizationWait;
+  let ticket;
   const stop = signal => {
     stopped ||= signal;
+    authorizationWait?.();
     finishOutputWait?.(false);
     if (worker?.connected) worker.send({ kind: MESSAGES.STOP });
   };
   const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => {
     const handler = () => stop(signal); process.on(signal, handler); return [signal, handler];
   });
-  const runAdmission = argv => new Promise(resolve => {
+  const onDisconnect = () => stop(REASONS.INTERRUPTED);
+  process.on('disconnect', onDisconnect);
+  timer = setTimeout(() => stop(REASONS.TIMEOUT), Math.max(1, deadline - Date.now()));
+  const runAdmission = () => new Promise(resolve => {
     const received = message => {
       if (message.kind === MESSAGES.ADMISSION_EXIT) {
         worker.removeListener('message', received);
@@ -191,17 +255,53 @@ async function runFullGate(root, label, entry, args, body) {
     };
     worker.on('message', received);
     workerExit.then(() => { worker.removeListener('message', received); resolve({ code: NO_VERDICT, interrupted: true }); });
-    worker.send({ kind: MESSAGES.ADMIT, command, args: argv });
+    const maxWait = Math.floor((deadline - Date.now()) / 1000) - slowest;
+    if (maxWait < 1) {
+      worker.removeListener('message', received);
+      resolve({ capacity: true });
+      return;
+    }
+    worker.send({
+      kind: MESSAGES.ADMIT,
+      command,
+      args: ['discord-surface-' + label, '--full-gate', '--holder', String(worker.pid), '--max-wait', String(maxWait), '--ticket', ticket]
+    });
   });
   try {
+    if (process.env[BODY_LABEL] === label) {
+      const token = process.env[BODY_TOKEN];
+      delete process.env[BODY_LABEL];
+      delete process.env[BODY_TOKEN];
+      if (token) {
+        const authorization = requestBodyAuthorization(label, token);
+        authorizationWait = authorization.cancel;
+        const result = await authorization.promise;
+        authorizationWait = undefined;
+        if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before body authorization');
+        if (result.disconnected) return decline(REASONS.INTERRUPTED, 'parent disconnected before body authorization');
+        if (result.authorized) {
+          clearTimeout(timer);
+          for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+          process.removeListener('disconnect', onDisconnect);
+          authorizedBodyStarted = true;
+          return await body();
+        }
+      }
+    }
+    if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
+    if (Math.floor((deadline - Date.now()) / 1000) - slowest < 1) {
+      return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
+    }
     const premise = revision(root);
     const snapshot = JSON.parse(premise);
-    const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], true)?.trim() || 'detached';
-    const repository = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir'], true)?.trim() || fs.realpathSync(root);
-    const ticket = 'discord:' + label + ':' + crypto.createHash('sha256').update(repository + '\0' + branch + '\0' + (snapshot.head || snapshot.files)).digest('hex').slice(0, 32);
+    const branchIdentity = snapshot.kind === 'archive'
+      ? 'archive'
+      : snapshot.branch === null ? 'detached' : 'branch:' + snapshot.branch;
+    ticket = 'discord:' + label + ':' + crypto.createHash('sha256').update(snapshot.repository + '\0' + branchIdentity + '\0' + (snapshot.head || snapshot.files)).digest('hex').slice(0, 32);
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
+    const bodyToken = crypto.randomBytes(32).toString('hex');
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
-      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc', 2], env: { ...repositoryEnvironment(), [BODY_LABEL]: label, [SCRATCH_ROOT]: scratch }
+      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc', 2], env: { ...repositoryEnvironment(), [BODY_LABEL]: label, [BODY_TOKEN]: bodyToken, [SCRATCH_ROOT]: scratch }
     });
     relay(worker.stdout, process.stdout); relay(worker.stderr, process.stderr);
     outputDrain = Promise.all([streamFinished(worker.stdout, { cleanup: true }), streamFinished(worker.stderr, { cleanup: true })]).then(() => true, () => false);
@@ -209,14 +309,17 @@ async function runFullGate(root, label, entry, args, body) {
       worker.once('error', error => resolve({ error }));
       worker.once('exit', (code, signal) => resolve({ code, signal }));
     });
-    timer = setTimeout(() => stop(REASONS.TIMEOUT), Math.max(1, deadline - Date.now()));
     const ready = await Promise.race([
       new Promise(resolve => worker.on('message', message => { if (message.kind === MESSAGES.READY) resolve(message); })),
       workerExit.then(() => null)
     ]);
-    if (!ready || stopped) return decline(REASONS.INTERRUPTED, stopped || 'watchdog unavailable; nothing ran');
-    const admitted = await runAdmission(['discord-surface-' + label, '--full-gate', '--holder', String(ready.holder), '--max-wait', String(maxWait), '--ticket', ticket]);
+    if (!ready || stopped) {
+      const reason = stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED;
+      return decline(reason, stopped || 'watchdog unavailable; nothing ran');
+    }
+    const admitted = await runAdmission();
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
+    if (admitted.capacity) return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
     if (admitted.interrupted) return decline(REASONS.INTERRUPTED, 'worker exited during admission; nothing ran');
     if (admitted.code === 4) return 4;
     if (admitted.error) return decline(REASONS.SETUP, admitted.error + '; nothing ran');
@@ -237,8 +340,12 @@ async function runFullGate(root, label, entry, args, body) {
     if (stopped || result.workerExited) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker exited before reporting the body result');
     if (!sameSource(premise, revision(root))) return decline(REASONS.STALE, 'source changed during execution');
     return result.code;
-  } catch (error) { return decline(REASONS.SETUP, error.message); }
+  } catch (error) {
+    if (authorizedBodyStarted) throw error;
+    return decline(REASONS.SETUP, error.message);
+  }
   finally {
+    process.removeListener('disconnect', onDisconnect);
     if (worker) {
       if (bodyStarted && !bodyFinished) stop(stopped || REASONS.INTERRUPTED);
       else {
@@ -290,4 +397,4 @@ async function runFullGate(root, label, entry, args, body) {
   }
 }
 
-module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, BODY_LABEL, SCRATCH_ROOT, NO_VERDICT, MESSAGES, revision, relay, groupPeers };
+module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, BODY_LABEL, BODY_TOKEN, SCRATCH_ROOT, NO_VERDICT, MESSAGES, revision, relay, groupPeers };
