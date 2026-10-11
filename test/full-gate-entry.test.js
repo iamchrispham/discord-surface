@@ -37,6 +37,7 @@ function fixture(t) {
     "fs.writeFileSync(process.env.FIXTURE_PROTOCOL, JSON.stringify(process.argv.slice(2)));",
     "if (process.env.FIXTURE_CHANGE) fs.writeFileSync(process.env.FIXTURE_CHANGE, 'changed');",
     "if (process.env.FIXTURE_MOVE_TARGET_WAIT) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
+    "if (process.env.FIXTURE_ADMISSION_SIGNAL) process.kill(process.pid, process.env.FIXTURE_ADMISSION_SIGNAL);",
     "if (process.env.FIXTURE_HOLD_ADMISSION) {",
     "  const argv=process.argv.slice(2); const holder=Number(argv[argv.indexOf('--holder')+1]);",
     "  fs.writeFileSync(process.env.FIXTURE_MARKER,JSON.stringify({pid:process.pid,holder,scratch:process.env.DISCORD_SURFACE_GATE_SCRATCH}));",
@@ -110,6 +111,14 @@ test('both public full entries decline before starting work without admission', 
   }
 });
 
+test('an inherited body label cannot bypass missing admission', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ DISCORD_SURFACE_GATE_BODY: 'fixture', APERTURE_GATE_ADMISSION_COMMAND: '' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /reason=queue-missing/);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
 for (const admission of [3, 4]) {
   test('admission exit ' + admission + ' starts no body', { timeout: 180000 }, async t => {
     const f = fixture(t);
@@ -120,11 +129,32 @@ for (const admission of [3, 4]) {
   });
 }
 
-for (const bodyExit of [0, 17]) {
+for (const admission of [1, 126, 127]) {
+  test('unexpected admission exit ' + admission + ' is a setup hold', { timeout: 180000 }, async t => {
+    const f = fixture(t);
+    const result = await f.launch({ FIXTURE_ADMISSION_EXIT: String(admission) }).done;
+    assert.equal(result.code, 98, result.output);
+    assert.match(result.output, /reason=setup/);
+    assert.equal(result.output.includes('reason=capacity'), false);
+    assert.equal(fs.existsSync(f.marker), false);
+  });
+}
+
+test('signalled admission is an interruption, not a capacity refusal', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ FIXTURE_ADMISSION_SIGNAL: 'SIGTERM' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /reason=interrupted/);
+  assert.equal(result.output.includes('reason=capacity'), false);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+for (const bodyExit of [0, 17, 98]) {
   test('admitted body preserves raw exit ' + bodyExit + ' and completes cleanup', { timeout: 180000 }, async t => {
     const f = fixture(t);
     const result = await f.launch({ FIXTURE_BODY_EXIT: String(bodyExit) }).done;
     assert.equal(result.code, bodyExit, result.output);
+    assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
     const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
     assert.equal(fs.existsSync(body.scratch), false);
     const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));
@@ -328,6 +358,18 @@ for (const layout of ['git', 'archive']) test(`${layout} fingerprint ignores gen
   assert.equal(revision(f.root), first);
   fs.writeFileSync(source, 'value = 2\n');
   assert.notEqual(revision(f.root), first);
+});
+
+test('archive beneath an unrelated worktree is scanned directly', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, '.gitignore'), 'dist/\n');
+  const archive = path.join(f.root, 'dist', 'archive');
+  fs.mkdirSync(archive, { recursive: true });
+  const source = path.join(archive, 'input');
+  fs.writeFileSync(source, 'first\n');
+  const first = revision(archive);
+  fs.writeFileSync(source, 'second\n');
+  assert.notEqual(revision(archive), first);
 });
 
 test('queue ticket retains one head and changes for a new head', { timeout: 180000 }, async t => {

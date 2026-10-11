@@ -1,8 +1,8 @@
 'use strict';
 
-const { spawn, spawnSync } = require('node:child_process');
+const { fork, spawn, spawnSync } = require('node:child_process');
 const os = require('node:os');
-const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, SCRATCH_ROOT } = require('./full-gate');
+const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, BODY_LABEL, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
 let stopping = false;
@@ -41,7 +41,15 @@ process.on('message', message => {
     admission.once('exit', code => { if (process.connected) process.send({ kind: MESSAGES.ADMISSION_EXIT, code }); });
   }
   if (message.kind === MESSAGES.START && !body) {
-    body = spawn(process.execPath, [entry, ...args], { stdio: 'inherit' });
+    body = fork(entry, args, { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
+    body.on('message', message => {
+      if (message?.kind !== MESSAGES.BODY_AUTH_REQUEST) return;
+      body.send({
+        kind: MESSAGES.BODY_AUTHORIZED,
+        label: message.label,
+        authorized: message.label === process.env[BODY_LABEL]
+      });
+    });
     body.once('error', () => { bodyExited = true; if (process.connected) process.send({ kind: MESSAGES.BODY_EXIT, code: 1 }); });
     body.once('close', (code, signal) => {
       bodyExited = true;

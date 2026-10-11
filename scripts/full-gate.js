@@ -11,9 +11,9 @@ const BODY_LABEL = 'DISCORD_SURFACE_GATE_BODY';
 const SCRATCH_ROOT = 'DISCORD_SURFACE_GATE_SCRATCH';
 const NO_VERDICT = 98;
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
-const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
+const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_AUTH_REQUEST: 'body-auth-request', BODY_AUTHORIZED: 'body-authorized', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
-const REASONS = Object.freeze({ CAPACITY: 'capacity', SETUP: 'queue-missing', STALE: 'stale', INTERRUPTED: 'interrupted', TIMEOUT: 'timeout', CLEANUP: 'cleanup' });
+const REASONS = Object.freeze({ CAPACITY: 'capacity', SETUP: 'queue-missing', ADMISSION: 'setup', STALE: 'stale', INTERRUPTED: 'interrupted', TIMEOUT: 'timeout', CLEANUP: 'cleanup' });
 
 function noVerdict(reason, detail, scratch, output = 2) {
   if (scratch) {
@@ -65,7 +65,10 @@ function git(root, args, optional = false) {
 
 function revision(root) {
   const digest = crypto.createHash('sha256');
-  const listed = git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true);
+  const repositoryRoot = git(root, ['rev-parse', '--show-toplevel'], true);
+  const isRepositoryRoot = repositoryRoot !== null
+    && fs.realpathSync(repositoryRoot.replace(/(?:\r?\n)+$/, '')) === fs.realpathSync(root);
+  const listed = isRepositoryRoot ? git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true) : null;
   const archiveFiles = (directory, prefix = '') => fs.readdirSync(directory, { withFileTypes: true }).flatMap(item => {
     if (item.isDirectory() && item.name === '__pycache__') return [];
     if (!prefix && ['.git', 'node_modules', 'dist'].includes(item.name)) return [];
@@ -117,10 +120,31 @@ function relay(source, sink) {
   source.on('end', () => { if (held && !sink.destroyed) sink.write(held); });
 }
 
+function requestBodyAuthorization(label) {
+  if (typeof process.send !== 'function' || !process.connected) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const finish = authorized => {
+      process.removeListener('message', onMessage);
+      process.removeListener('disconnect', onDisconnect);
+      resolve(authorized);
+    };
+    const onMessage = message => {
+      if (message?.kind !== MESSAGES.BODY_AUTHORIZED || message.label !== label) return;
+      finish(message.authorized === true);
+    };
+    const onDisconnect = () => finish(false);
+    process.on('message', onMessage);
+    process.once('disconnect', onDisconnect);
+    process.send({ kind: MESSAGES.BODY_AUTH_REQUEST, label }, error => {
+      if (error) finish(false);
+    });
+  });
+}
+
 async function runFullGate(root, label, entry, args, body) {
   if (process.env[BODY_LABEL] === label) {
     delete process.env[BODY_LABEL];
-    return await body();
+    if (await requestBodyAuthorization(label)) return await body();
   }
   let scratch;
   let declined = false;
@@ -196,7 +220,12 @@ async function runFullGate(root, label, entry, args, body) {
     if (admitted.interrupted) return decline(REASONS.INTERRUPTED, 'worker exited during admission; nothing ran');
     if (admitted.code === 4) return 4;
     if (admitted.error) return decline(REASONS.SETUP, admitted.error + '; nothing ran');
-    if (admitted.code !== 0) return decline(REASONS.CAPACITY, 'not admitted; nothing ran');
+    if (admitted.code === 3) return decline(REASONS.CAPACITY, 'not admitted; nothing ran');
+    if (admitted.code !== 0) {
+      const reason = admitted.code == null ? REASONS.INTERRUPTED : REASONS.ADMISSION;
+      const outcome = admitted.code == null ? 'signal' : 'exit ' + admitted.code;
+      return decline(reason, 'admission ended unexpectedly (' + outcome + '); nothing ran');
+    }
     if (revision(root) !== premise) return decline(REASONS.STALE, 'source changed during admission; nothing ran');
     const captured = JSON.parse(premise);
     process.stdout.write('FULL_GATE_SOURCE=' + JSON.stringify({ head: captured.head, target: captured.target, source: captured.files }) + '\n');
@@ -204,8 +233,8 @@ async function runFullGate(root, label, entry, args, body) {
       if (message.kind === MESSAGES.BODY_EXIT) { bodyFinished = true; resolve(message); }
     }));
     worker.send({ kind: MESSAGES.START }); bodyStarted = true;
-    const result = await Promise.race([finished, workerExit.then(value => ({ code: NO_VERDICT, signal: value.signal }))]);
-    if (stopped || result.signal || result.code === NO_VERDICT) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker did not complete safely');
+    const result = await Promise.race([finished, workerExit.then(value => ({ workerExited: true, signal: value.signal }))]);
+    if (stopped || result.workerExited) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker exited before reporting the body result');
     if (!sameSource(premise, revision(root))) return decline(REASONS.STALE, 'source changed during execution');
     return result.code;
   } catch (error) { return decline(REASONS.SETUP, error.message); }
