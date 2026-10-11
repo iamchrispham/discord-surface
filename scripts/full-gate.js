@@ -11,7 +11,7 @@ const SCRATCH_ROOT = 'DISCORD_SURFACE_GATE_SCRATCH';
 const NO_VERDICT_SECRET = 'DISCORD_SURFACE_GATE_NO_VERDICT_SECRET';
 const NO_VERDICT = 98;
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
-const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
+const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
 const REASONS = Object.freeze({ CAPACITY: 'capacity', SETUP: 'queue-missing', ADMISSION: 'setup', STALE: 'stale', INTERRUPTED: 'interrupted', TIMEOUT: 'timeout', CLEANUP: 'cleanup' });
 
@@ -150,13 +150,15 @@ function revision(root, deadline) {
   checkDeadline();
   const rawPaths = process.platform !== 'win32';
   const listed = isRepositoryRoot ? git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true, deadline, rawPaths) : null;
+  const ignoredBytecode = isRepositoryRoot
+    ? git(root, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', ':(glob)**/__pycache__/*.pyc'], true, deadline, rawPaths)
+    : null;
   const archiveFiles = (directory, prefix = rawPaths ? Buffer.alloc(0) : '') => fs.readdirSync(directory, {
     withFileTypes: true,
     ...(rawPaths ? { encoding: 'buffer' } : {})
   }).flatMap(item => {
     checkDeadline();
     const itemName = rawPaths ? item.name.toString('ascii') : item.name;
-    if (item.isDirectory() && itemName === '__pycache__') return [];
     if (!prefix.length && ['.git', 'node_modules', 'dist'].includes(itemName)) return [];
     const name = rawPaths
       ? Buffer.concat(prefix.length ? [prefix, Buffer.from('/'), item.name] : [item.name])
@@ -171,6 +173,12 @@ function revision(root, deadline) {
     : rawPaths
       ? listed.toString('binary').split('\0').filter(Boolean).map(file => Buffer.from(file, 'binary'))
       : listed.split('\0').filter(Boolean);
+  if (ignoredBytecode !== null) {
+    const bytecodeFiles = rawPaths
+      ? ignoredBytecode.toString('binary').split('\0').filter(Boolean).map(file => Buffer.from(file, 'binary'))
+      : ignoredBytecode.split('\0').filter(Boolean);
+    listedFiles.push(...bytecodeFiles);
+  }
   const uniqueFiles = new Map();
   for (const file of listedFiles) uniqueFiles.set(rawPaths ? file.toString('hex') : file, file);
   const files = [...uniqueFiles.values()].sort(rawPaths ? Buffer.compare : undefined);
@@ -255,15 +263,59 @@ function groupPeers(group, deadline) {
 
 function relay(source, sink) {
   let held = '';
-  source.setEncoding('utf8');
-  source.on('data', chunk => {
-    const text = held + chunk;
-    let suffix = Math.min(text.length, MARKER.length - 1);
-    while (suffix && !MARKER.startsWith(text.slice(-suffix))) suffix -= 1;
-    held = suffix ? text.slice(-suffix) : '';
-    if (!sink.destroyed) sink.write(text.slice(0, text.length - suffix).split(MARKER).join('CHILD-GATE-INDETERMINATE'));
+  return new Promise(resolve => {
+    let ended = false;
+    let waitingForDrain = false;
+    let failed = false;
+    let settled = false;
+    const settle = result => {
+      if (settled) return;
+      settled = true;
+      source.removeListener('error', fail);
+      source.removeListener('close', sourceClosed);
+      sink.removeListener('error', fail);
+      sink.removeListener('close', sinkClosed);
+      resolve(result);
+    };
+    const finish = () => { if (ended && !waitingForDrain) settle(!failed); };
+    const fail = () => { failed = true; settle(false); };
+    const resume = () => {
+      waitingForDrain = false;
+      source.resume();
+      finish();
+    };
+    const write = text => {
+      if (!text) return;
+      if (sink.destroyed) { failed = true; return; }
+      try {
+        if (!sink.write(text)) {
+          waitingForDrain = true;
+          source.pause();
+          sink.once('drain', resume);
+        }
+      } catch { fail(); }
+    };
+    const sourceClosed = () => { if (!ended) fail(); };
+    const sinkClosed = () => { if (!ended || waitingForDrain) fail(); };
+    source.setEncoding('utf8');
+    source.on('data', chunk => {
+      const text = held + chunk;
+      let suffix = Math.min(text.length, MARKER.length - 1);
+      while (suffix && !MARKER.startsWith(text.slice(-suffix))) suffix -= 1;
+      held = suffix ? text.slice(-suffix) : '';
+      write(text.slice(0, text.length - suffix).split(MARKER).join('CHILD-GATE-INDETERMINATE'));
+    });
+    source.on('end', () => {
+      ended = true;
+      if (held) write(held);
+      held = '';
+      finish();
+    });
+    source.on('error', fail);
+    source.on('close', sourceClosed);
+    sink.on('error', fail);
+    sink.on('close', sinkClosed);
   });
-  source.on('end', () => { if (held && !sink.destroyed) sink.write(held); });
 }
 
 async function runFullGate(root, label, entry, args) {
@@ -285,7 +337,8 @@ async function runFullGate(root, label, entry, args) {
     budget = wholeSeconds(process.env, SETTINGS.BUDGET, 7200);
     slowest = wholeSeconds(process.env, SETTINGS.SLOWEST, 3600);
   } catch (error) { process.stderr.write(error.message + '\n'); return 4; }
-  const deadline = started + budget * 1000 - 5000;
+  const callerDeadline = started + budget * 1000;
+  const deadline = callerDeadline - 5000;
   let worker;
   let workerExit;
   let bodyStarted = false;
@@ -301,7 +354,7 @@ async function runFullGate(root, label, entry, args) {
   let finalSnapshotRequired = false;
   const stop = signal => {
     stopped ||= signal;
-    finishOutputWait?.(false);
+    if (signal !== REASONS.TIMEOUT) finishOutputWait?.(false);
     if (worker?.connected) worker.send({ kind: MESSAGES.STOP, reason: signal });
   };
   const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => {
@@ -309,6 +362,10 @@ async function runFullGate(root, label, entry, args) {
   });
   const onDisconnect = () => stop(REASONS.INTERRUPTED);
   process.on('disconnect', onDisconnect);
+  const removeInterruptHandlers = () => {
+    process.removeListener('disconnect', onDisconnect);
+    for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+  };
   timer = setTimeout(() => stop(REASONS.TIMEOUT), Math.max(1, deadline - Date.now()));
   const runAdmission = guardianPid => new Promise(resolve => {
     const received = message => {
@@ -354,8 +411,12 @@ async function runFullGate(root, label, entry, args) {
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
       cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: workerEnvironment
     });
-    relay(worker.stdout, process.stdout); relay(worker.stderr, process.stderr);
-    outputDrain = Promise.all([streamFinished(worker.stdout, { cleanup: true }), streamFinished(worker.stderr, { cleanup: true })]).then(() => true, () => false);
+    outputDrain = Promise.all([
+      relay(worker.stdout, process.stdout),
+      relay(worker.stderr, process.stderr),
+      streamFinished(worker.stdout, { cleanup: true }),
+      streamFinished(worker.stderr, { cleanup: true })
+    ]).then(results => results[0] && results[1], () => false);
     workerExit = new Promise(resolve => {
       worker.once('error', error => resolve({ error }));
       worker.once('exit', (code, signal) => resolve({ code, signal }));
@@ -399,7 +460,6 @@ async function runFullGate(root, label, entry, args) {
     return decline(REASONS.SETUP, error.message);
   }
   finally {
-    process.removeListener('disconnect', onDisconnect);
     if (worker) {
       if (bodyStarted && !bodyFinished) stop(stopped || REASONS.INTERRUPTED);
       else {
@@ -407,60 +467,60 @@ async function runFullGate(root, label, entry, args) {
       }
       const closed = await workerExit;
       let peers;
-      try { peers = groupPeers(worker.pid, deadline); } catch { peers = [null]; }
+      try { peers = groupPeers(worker.pid, callerDeadline); } catch { peers = [null]; }
       const hadPeers = peers.length > 0;
       if (peers.length) {
         try { process.kill(-worker.pid, 'SIGKILL'); } catch {}
-        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, deadline - Date.now()))));
-        try { peers = groupPeers(worker.pid, deadline); } catch { peers = [null]; }
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, callerDeadline - Date.now()))));
+        try { peers = groupPeers(worker.pid, callerDeadline); } catch { peers = [null]; }
       }
       if (peers.length) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.CLEANUP, 'owned process group could not be verified as drained');
-        releaseScratch(scratch, deadline);
+        releaseScratch(scratch, callerDeadline);
         clearTimeout(timer);
-        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+        removeInterruptHandlers();
         return code;
       }
       if (closed.code !== 0 || hadPeers) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
-        releaseScratch(scratch, deadline);
+        releaseScratch(scratch, callerDeadline);
         clearTimeout(timer);
-        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+        removeInterruptHandlers();
         return code;
       }
-      if (!releaseScratch(scratch, deadline)) {
+      if (!releaseScratch(scratch, callerDeadline)) {
         worker.stdout.destroy(); worker.stderr.destroy();
         clearTimeout(timer);
-        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+        removeInterruptHandlers();
         return decline(REASONS.CLEANUP, 'owned scratch removal failed; teardown completed');
       }
       const drained = await Promise.race([outputDrain, new Promise(resolve => {
         finishOutputWait = resolve;
-        outputTimer = setTimeout(() => resolve(false), Math.max(1, deadline - Date.now()));
-        if (stopped) resolve(false);
+        outputTimer = setTimeout(() => resolve(false), Math.max(1, callerDeadline - Date.now()));
+        if (stopped && stopped !== REASONS.TIMEOUT) resolve(false);
       })]);
       clearTimeout(outputTimer); finishOutputWait = undefined;
       if (!drained || Date.now() >= deadline) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const reason = stopped && stopped !== REASONS.TIMEOUT ? REASONS.INTERRUPTED : REASONS.TIMEOUT;
         const code = decline(reason, 'owned output did not finish within the gate deadline');
-        releaseScratch(scratch, deadline);
+        releaseScratch(scratch, callerDeadline);
         clearTimeout(timer);
-        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+        removeInterruptHandlers();
         return code;
       }
     }
-    const released = releaseScratch(scratch, deadline);
+    const released = releaseScratch(scratch, callerDeadline);
     if (!released) {
       clearTimeout(timer);
-      for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+      removeInterruptHandlers();
       return decline(REASONS.CLEANUP, 'owned scratch removal failed; teardown completed');
     }
     if (!finalSnapshotRequired) {
       clearTimeout(timer);
-      for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+      removeInterruptHandlers();
     }
   }
   if (finalSnapshotRequired) {
@@ -480,7 +540,7 @@ async function runFullGate(root, label, entry, args) {
       return decline(REASONS.STALE, 'unable to verify source after execution: ' + error.message);
     } finally {
       clearTimeout(timer);
-      for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+      removeInterruptHandlers();
     }
   }
   return bodyResult;
