@@ -2,10 +2,10 @@
 
 const path = require('node:path');
 const { fork } = require('node:child_process');
-const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, SCRATCH_ROOT } = require('./full-gate');
+const { MESSAGES, NO_VERDICT, canFinish, releaseScratch, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, entry, ...args] = process.argv.slice(2);
 const guard = fork(path.join(__dirname, 'full-gate-watchdog.js'), [deadline, String(process.pid), entry, ...args], {
-  stdio: ['ignore', 'inherit', 'inherit', 'ipc', 4]
+  stdio: ['ignore', 'inherit', 'inherit', 'ipc']
 });
 guard.on('message', message => {
   if (!process.connected) return;
@@ -21,7 +21,6 @@ let stopping = false;
 function stop() {
   if (stopping) return;
   stopping = true;
-  noVerdict(REASONS.INTERRUPTED, 'worker stopping its owned group', process.env[SCRATCH_ROOT], 4);
   try { process.kill(-process.pid, 'SIGTERM'); } catch {}
   setTimeout(() => {
     if (!process.connected) releaseScratch(process.env[SCRATCH_ROOT]);

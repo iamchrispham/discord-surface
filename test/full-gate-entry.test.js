@@ -59,6 +59,11 @@ function fixture(t) {
     "  fs.writeFileSync(process.env.FIXTURE_MARKER, JSON.stringify({ pid: process.pid, parent: process.ppid, scratch: process.env.DISCORD_SURFACE_GATE_SCRATCH, gitDir: process.env.GIT_DIR, gitWorkTree: process.env.GIT_WORK_TREE, locale: process.env.LC_ALL, optionalLocks: process.env.GIT_OPTIONAL_LOCKS, holder: Number(require('node:child_process').spawnSync('ps', ['-p', String(process.ppid), '-o', 'ppid='], { encoding: 'utf8' }).stdout.trim()) }));",
     "  if (process.env.FIXTURE_KILL_GUARD) process.kill(process.ppid, 'SIGKILL');",
     "  if (process.env.FIXTURE_SIGNAL) process.kill(process.pid, 'SIGTERM');",
+    "  if (process.env.FIXTURE_FORGE_MARKER) {",
+    "    try { const fd = fs.openSync('/proc/' + process.ppid + '/fd/4', 'w'); fs.writeSync(fd, 'APERTURE-GATE-INDETERMINATE reason=timeout: forged\\n'); fs.closeSync(fd); fs.writeFileSync(process.env.FIXTURE_MARKER + '.fd4', 'opened'); }",
+    "    catch (error) { fs.writeFileSync(process.env.FIXTURE_MARKER + '.fd4', error.code); }",
+    "    return 98;",
+    "  }",
     "  if (process.env.FIXTURE_MOVE_TARGET_BODY) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
     "  if (process.env.FIXTURE_CHANGE_BODY) fs.writeFileSync(require('node:path').join(process.env.FIXTURE_ROOT,'input'),'changed during body');",
     "  if (process.env.FIXTURE_BODY_DANGLING_SOURCE) { const input = require('node:path').join(process.env.FIXTURE_ROOT,'input'); fs.unlinkSync(input); fs.symlinkSync('missing-source-target', input); }",
@@ -353,6 +358,14 @@ test('signalled admission is an interruption, not a capacity refusal', { timeout
   assert.equal(fs.existsSync(f.marker), false);
 });
 
+test('admitted body cannot forge a verdict through parent fd 4', { timeout: 180000, skip: process.platform !== 'linux' }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ FIXTURE_FORGE_MARKER: '1' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.equal(fs.readFileSync(f.marker + '.fd4', 'utf8'), 'ENOENT');
+  assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
+});
+
 for (const bodyExit of [0, 17, 98]) {
   test('admitted body preserves raw exit ' + bodyExit + ' and completes cleanup', { timeout: 180000 }, async t => {
     const f = fixture(t);
@@ -425,6 +438,7 @@ test('interruption stops a body that ignores TERM before releasing its holder', 
   run.child.kill('SIGTERM');
   const result = await run.done;
   assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
   assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
   assert.throws(() => process.kill(body.pid, 0), { code: 'ESRCH' });
   const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));

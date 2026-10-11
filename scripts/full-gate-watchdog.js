@@ -3,7 +3,7 @@
 const { spawn, spawnSync } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
-const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, NO_VERDICT_SECRET, SCRATCH_ROOT } = require('./full-gate');
+const { MESSAGES, NO_VERDICT, canFinish, releaseScratch, NO_VERDICT_SECRET, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
 let stopping = false;
@@ -13,10 +13,9 @@ let admission;
 let admissionSucceeded = false;
 let bodyExited = false;
 let orphan = false;
-function stop(reason = REASONS.INTERRUPTED, detail = 'watchdog stopping its owned group') {
+function stop() {
   if (stopping) return;
   stopping = true;
-  noVerdict(reason, detail, process.env[SCRATCH_ROOT], 4);
   process.on('SIGTERM', () => {});
   try { process.kill(-group, 'SIGTERM'); } catch {}
   setTimeout(() => {
@@ -27,13 +26,13 @@ function stop(reason = REASONS.INTERRUPTED, detail = 'watchdog stopping its owne
 }
 function check() {
   if (!canFinish(stopping)) return;
-  if (Date.now() >= Number(deadline)) return stop(REASONS.TIMEOUT);
+  if (Date.now() >= Number(deadline)) return stop();
   if (!draining) return;
   const table = spawnSync('ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } });
   if (table.status !== 0) return stop();
   const peers = table.stdout.split('\n').map(line => line.trim().split(/\s+/)).filter(([pid, pgid, state]) =>
     Number(pgid) === group && ![process.pid, group, table.pid].includes(Number(pid)) && !state?.startsWith('Z'));
-  if (peers.length) return stop(REASONS.INTERRUPTED, 'watchdog found remaining owned processes: ' + peers.join(','));
+  if (peers.length) return stop();
   process.exit(0);
 }
 process.on('message', message => {
@@ -67,7 +66,7 @@ process.on('message', message => {
     });
   }
   if (message.kind === MESSAGES.DRAIN && (!body || bodyExited)) { draining = true; check(); }
-  if (message.kind === MESSAGES.STOP) { orphan ||= Boolean(message.orphan); stop(message.reason || REASONS.INTERRUPTED); }
+  if (message.kind === MESSAGES.STOP) { orphan ||= Boolean(message.orphan); stop(); }
 });
 process.on('disconnect', () => { orphan = true; stop(); });
 process.on('SIGTERM', () => stop());

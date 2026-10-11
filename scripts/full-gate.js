@@ -264,7 +264,7 @@ async function runFullGate(root, label, entry, args) {
     if (worker?.connected) worker.send({ kind: MESSAGES.STOP, reason: signal });
   };
   const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => {
-    const handler = () => stop(signal); process.on(signal, handler); return [signal, handler];
+    const handler = () => stop(REASONS.INTERRUPTED); process.on(signal, handler); return [signal, handler];
   });
   const onDisconnect = () => stop(REASONS.INTERRUPTED);
   process.on('disconnect', onDisconnect);
@@ -308,7 +308,7 @@ async function runFullGate(root, label, entry, args) {
     sentinelSecret = crypto.randomBytes(32).toString('hex');
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
-      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc', 2], env: { ...repositoryEnvironment(), [NO_VERDICT_SECRET]: sentinelSecret, [SCRATCH_ROOT]: scratch }
+      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...repositoryEnvironment(), [NO_VERDICT_SECRET]: sentinelSecret, [SCRATCH_ROOT]: scratch }
     });
     relay(worker.stdout, process.stdout); relay(worker.stderr, process.stderr);
     outputDrain = Promise.all([streamFinished(worker.stdout, { cleanup: true }), streamFinished(worker.stderr, { cleanup: true })]).then(() => true, () => false);
