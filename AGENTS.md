@@ -39,6 +39,11 @@ migration is not authorization to redesign delivery or change persisted formats.
   Use it as the final behavior gate. Use `npm run package-smoke` for packaging or
   module-loading changes. Documentation-only changes need path/command and diff
   checks, not invented runtime assertions.
+- Both full entries self-admit through `APERTURE_GATE_ADMISSION_COMMAND`.
+  Configure a supported `--full-gate` executable and execution allowances that
+  fit the caller's remaining timeout. Exit 98 plus
+  `APERTURE-GATE-INDETERMINATE` means no verdict. Recover missing setup before
+  rescheduling. Never replace a held full gate with selected-suite proof.
 - Use disposable databases, temporary transcript roots, and simulated transport
   for automated tests. Never use live credentials, production databases, native
   sessions, or the shared Gateway as test fixtures.

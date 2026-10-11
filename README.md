@@ -407,6 +407,29 @@ Run the simulated consumer and persistence scenarios with:
 npm test
 ```
 
+Full test and package-smoke entries require `APERTURE_GATE_ADMISSION_COMMAND`
+to name the host's supported admission executable with `--full-gate`, `--holder`,
+`--max-wait` and `--ticket`. The gate starts no build, tests or package work
+without admission. Set `APERTURE_GATE_TIME_LEFT_S` to the caller's remaining
+whole-second budget and `APERTURE_GATE_SLOWEST_RUN_S` to its measured execution
+allowance. The defaults are 7200 and 3600 seconds. A shorter outer timeout needs
+shorter values that still cover admission and the full run.
+
+Exit 98 and one `APERTURE-GATE-INDETERMINATE` line mean no verdict. A
+`queue-missing` reason needs setup recovery before rescheduling. Capacity,
+interruption and timeout never establish a pass or a test failure. Raw build,
+typecheck and test failures retain their command exit. The entry does not retry.
+Detached checkouts, private uncommitted Git copies and source archives are
+supported. Archive source fencing excludes `.git`, `node_modules` and `dist`,
+which contain metadata, dependencies and generated output.
+
+The full test entry requires the complete registered list and rejects test
+selection options in arguments or `NODE_OPTIONS`. Use a separately admitted
+`node --test` command for selected drills. Other Node options remain unchanged.
+The gate records its captured head, target and source digest before work.
+Changes during admission invalidate that premise. After execution, source
+changes invalidate proof, while a fetch that only moves `origin/main` does not.
+
 The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex, Claude, or Spark, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.
 
 ## Conductor milestone announcements
@@ -744,3 +767,8 @@ It reads local receipts without network requests, delivery retries, acknowledgme
 or completion. Missing state and older schemas are refused without creation or
 migration. Result text remains peer-provided data. A successful inspection
 does not prove native pickup, active-turn steering or MCP adoption.
+
+
+Full test and package gates use the machine's admission command before starting work. Set `APERTURE_GATE_ADMISSION_COMMAND` to that executable. It must support `LABEL --full-gate --holder PID --max-wait SECONDS --ticket KEY`, returning 0 when admitted, 3 without admission and 4 for invalid input. No command is bundled or configured globally.
+
+`APERTURE_GATE_TIME_LEFT_S` bounds admission and execution together. `APERTURE_GATE_SLOWEST_RUN_S` reserves the measured execution time before calculating the wait. Their defaults are 7200 and 3600 seconds. Configure both to fit a shorter calling timeout. The explicit test list stays in `scripts.test`, and files run serially after build and typecheck. A refused, handled interruption or stale gate starts no further work and exits 98 with a no-verdict line. Unexpected supervisor death keeps the signal exit and the watchdog supplies the no-verdict line. Retry and rescheduling belong to the caller. A raw test failure stays a failure. The gate owns only its private process group and temporary files, and the worker retains admission while its watchdog drains the owned group. Windows execution needs a process-group supervisor before these full gates can run.

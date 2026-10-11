@@ -12,6 +12,16 @@ Before runtime setup obtain the intended guild, operator, category and channel I
 
 ## Build and inspect the package
 
+Before either full gate, obtain the host's supported admission executable from
+its owner and set `APERTURE_GATE_ADMISSION_COMMAND` to its absolute path. It
+must support `--full-gate`, `--holder`, `--max-wait` and `--ticket`. Set
+`APERTURE_GATE_TIME_LEFT_S` to the caller's remaining seconds and
+`APERTURE_GATE_SLOWEST_RUN_S` to the measured full execution allowance. The
+defaults are 7200 and 3600 seconds. Both wait and execution must fit the caller.
+Missing setup returns exit 98 with `APERTURE-GATE-INDETERMINATE
+reason=queue-missing` and starts no work. Recover that setup before rescheduling.
+Never treat no verdict as a package or test pass.
+
 In a new checkout, replace `RELEASE_COMMIT` with the full commit supplied by the release owner, then select it:
 
 ```sh
@@ -25,7 +35,7 @@ npm run package-smoke
 npm pack
 ```
 
-These commands can be entered separately in a POSIX shell or PowerShell. Stop on the first nonzero exit and save the exact command and redacted error. `npm test` runs the registered build, typecheck and test suite. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
+These commands can be entered separately in a POSIX shell. Stop on the first nonzero exit and save the exact command and redacted error. `npm test` runs the registered build, typecheck and test suite after admission. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
 
 Install the resulting tarball into a dedicated prefix with `npm install --prefix <absolute-prefix> <absolute-tarball>`. The CLI is `<absolute-prefix>/node_modules/discord-surface/src/cli.js`. Resolve that absolute path and use it consistently for all callers on this host. Compare the installed package with the frozen artifact before configuring it.
 
@@ -33,7 +43,7 @@ Install the resulting tarball into a dedicated prefix with `npm install --prefix
 
 - macOS: the existing runtime uses `lockf`, POSIX process inspection, signals and Unix sockets. Follow the configuration and attachment steps below after verifying these prerequisites.
 - Linux: build/package checks are a useful starting point, but runtime qualification is not established. The CLI invokes BSD-style `lockf -t ... -k` for binding and Gateway singleton locks. A Linux `flock` executable is not a drop-in replacement. Stop before bind/start if the required command and semantics are absent. Do not rename a binary or call internal unlocked commands to bypass this.
-- Windows: use the build/package steps to report compatibility. Native runtime installation is not qualified. POSIX locking, process identity, permissions, signals and socket behavior need a supported implementation before live setup. PowerShell syntax changes alone do not resolve those dependencies. WSL is a separate Linux environment and cannot be treated as proof of delivery to a Windows-native session.
+- Windows: full-gate execution needs a supported process-group supervisor and otherwise returns no verdict. Standalone build and typecheck can report compiler compatibility. Native runtime installation is not qualified. POSIX locking, process identity, permissions, signals and socket behavior need a supported implementation before live setup. PowerShell syntax changes alone do not resolve those dependencies. WSL is a separate Linux environment and cannot be treated as proof of delivery to a Windows-native session.
 
 The receiving agent should report the first concrete missing prerequisite with OS, architecture, Node version and exact error. Do not create replacement executors or weaken identity/locking checks to get past it.
 

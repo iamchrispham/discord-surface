@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { runFullGate, SCRATCH_ROOT } = require('./full-gate');
 
 const root = path.resolve(__dirname, '..');
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -93,7 +94,9 @@ function main() {
     throw new Error(`package-smoke requires Node 22.13.x or newer Node 22.x; got ${process.version}`);
   }
 
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-package-smoke-'));
+  const scratch = process.env[SCRATCH_ROOT]
+    ? fs.mkdtempSync(path.join(process.env[SCRATCH_ROOT], 'package-'))
+    : fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-package-smoke-'));
   try {
     const home = path.join(scratch, 'home');
     const install = path.join(scratch, 'install');
@@ -113,6 +116,7 @@ function main() {
     assert(fs.existsSync(path.join(packRoot, 'dist')), 'prepack did not restore scratch dist');
     const packagePath = path.join(scratch, pack.filename);
     const files = new Set(pack.files.map(file => file.path));
+    assert(![...files].some(file => file.split('/').includes('__pycache__')), 'packed artifact contains Python bytecode cache');
     for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
       assert(files.has(required), `packed artifact is missing ${required}`);
     }
@@ -130,9 +134,9 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`package-smoke: ${error.message}\n`);
-  process.exitCode = 1;
-}
+runFullGate(root, 'package-smoke', __filename, [], () => { main(); return 0; })
+  .then(code => { process.exitCode = code; })
+  .catch(error => {
+    process.stderr.write('package-smoke: ' + error.message + '\n');
+    process.exitCode = 1;
+  });
