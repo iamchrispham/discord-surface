@@ -28,7 +28,9 @@ function check() {
   if (!canFinish(stopping)) return;
   if (Date.now() >= Number(deadline)) return stop();
   if (!draining) return;
-  const table = spawnSync('ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } });
+  const table = spawnSync('ps', ['-A', '-o', 'pid=,pgid=,stat='], {
+    encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, timeout: Math.max(1, Number(deadline) - Date.now())
+  });
   if (table.status !== 0) return stop();
   const peers = table.stdout.split('\n').map(line => line.trim().split(/\s+/)).filter(([pid, pgid, state]) =>
     Number(pgid) === group && ![process.pid, group, table.pid].includes(Number(pid)) && !state?.startsWith('Z'));

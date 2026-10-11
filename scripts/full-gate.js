@@ -94,9 +94,10 @@ function repositoryEnvironment(deadline) {
   return env;
 }
 
-function git(root, args, optional = false, deadline) {
+function git(root, args, optional = false, deadline, rawOutput = false) {
   const env = { ...repositoryEnvironment(deadline), LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' };
-  const options = { encoding: 'utf8', env };
+  const options = { env };
+  if (!rawOutput) options.encoding = 'utf8';
   if (deadline !== undefined) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw deadlineError();
@@ -106,7 +107,8 @@ function git(root, args, optional = false, deadline) {
   if (result.error?.code === 'ETIMEDOUT') throw result.error;
   if (result.status !== 0) {
     if (optional && !result.error) return null;
-    throw new Error('cannot read the gate repository: ' + (result.stderr || result.error?.message || '').trim());
+    const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : result.stderr;
+    throw new Error('cannot read the gate repository: ' + (stderr || result.error?.message || '').trim());
   }
   if (deadline !== undefined && Date.now() >= deadline) throw deadlineError();
   return result.stdout;
@@ -132,19 +134,38 @@ function revision(root, deadline) {
   const isRepositoryRoot = repositoryRoot !== null
     && fs.realpathSync(repositoryRoot.replace(/(?:\r?\n)+$/, '')) === realRoot;
   checkDeadline();
-  const listed = isRepositoryRoot ? git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true, deadline) : null;
-  const archiveFiles = (directory, prefix = '') => fs.readdirSync(directory, { withFileTypes: true }).flatMap(item => {
+  const rawPaths = process.platform !== 'win32';
+  const listed = isRepositoryRoot ? git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z'], true, deadline, rawPaths) : null;
+  const archiveFiles = (directory, prefix = rawPaths ? Buffer.alloc(0) : '') => fs.readdirSync(directory, {
+    withFileTypes: true,
+    ...(rawPaths ? { encoding: 'buffer' } : {})
+  }).flatMap(item => {
     checkDeadline();
-    if (item.isDirectory() && item.name === '__pycache__') return [];
-    if (!prefix && ['.git', 'node_modules', 'dist'].includes(item.name)) return [];
-    const name = prefix + item.name;
-    return item.isDirectory() ? archiveFiles(path.join(directory, item.name), name + '/') : [name];
+    const itemName = rawPaths ? item.name.toString('ascii') : item.name;
+    if (item.isDirectory() && itemName === '__pycache__') return [];
+    if (!prefix.length && ['.git', 'node_modules', 'dist'].includes(itemName)) return [];
+    const name = rawPaths
+      ? Buffer.concat(prefix.length ? [prefix, Buffer.from('/'), item.name] : [item.name])
+      : prefix + item.name;
+    const child = rawPaths
+      ? Buffer.concat([Buffer.isBuffer(directory) ? directory : Buffer.from(directory), Buffer.from(path.sep), item.name])
+      : path.join(directory, item.name);
+    return item.isDirectory() ? archiveFiles(child, rawPaths ? name : name + '/') : [name];
   });
-  const files = [...new Set(listed === null ? archiveFiles(root) : listed.split('\0').filter(Boolean))].sort();
-  const fileSet = new Set(files);
+  const listedFiles = listed === null
+    ? archiveFiles(rawPaths ? Buffer.from(realRoot) : root)
+    : rawPaths
+      ? listed.toString('binary').split('\0').filter(Boolean).map(file => Buffer.from(file, 'binary'))
+      : listed.split('\0').filter(Boolean);
+  const uniqueFiles = new Map();
+  for (const file of listedFiles) uniqueFiles.set(rawPaths ? file.toString('hex') : file, file);
+  const files = [...uniqueFiles.values()].sort(rawPaths ? Buffer.compare : undefined);
+  const fileKey = file => rawPaths ? file.toString('hex') : file;
+  const fileSet = new Set(files.map(fileKey));
+  const realRootPrefix = rawPaths ? Buffer.from(realRoot + path.sep) : null;
   for (const file of files) {
     checkDeadline();
-    const absolute = path.join(root, file);
+    const absolute = rawPaths ? Buffer.concat([realRootPrefix, file]) : path.join(root, file);
     digestField(digest, 'entry');
     digestField(digest, file);
     let stat;
@@ -159,23 +180,27 @@ function revision(root, deadline) {
       let resolved;
       let targetStat;
       try {
-        resolved = fs.realpathSync(absolute);
+        resolved = rawPaths ? fs.realpathSync(absolute, { encoding: 'buffer' }) : fs.realpathSync(absolute);
         targetStat = fs.statSync(absolute);
       } catch {
-        throw new Error('unsupported source symlink: ' + file);
+        throw new Error('unsupported source symlink: ' + String(file));
       }
-      const relativeTarget = path.relative(realRoot, resolved);
-      const targetName = relativeTarget.split(path.sep).join('/');
-      const remainsInside = relativeTarget !== ''
-        && relativeTarget !== '..'
-        && !relativeTarget.startsWith('..' + path.sep)
-        && !path.isAbsolute(relativeTarget);
+      const relativeTarget = rawPaths
+        ? resolved.subarray(0, realRootPrefix.length).equals(realRootPrefix) ? resolved.subarray(realRootPrefix.length) : null
+        : path.relative(realRoot, resolved);
+      const targetName = rawPaths ? relativeTarget?.toString('hex') : relativeTarget.split(path.sep).join('/');
+      const remainsInside = rawPaths
+        ? relativeTarget !== null && relativeTarget.length > 0
+        : relativeTarget !== ''
+          && relativeTarget !== '..'
+          && !relativeTarget.startsWith('..' + path.sep)
+          && !path.isAbsolute(relativeTarget);
       if (!remainsInside || !targetStat.isFile() || !fileSet.has(targetName)) {
-        throw new Error('unsupported source symlink: ' + file);
+        throw new Error('unsupported source symlink: ' + String(file));
       }
       digestField(digest, 'symlink');
-      digestField(digest, fs.readlinkSync(absolute));
-      digestField(digest, targetName);
+      digestField(digest, rawPaths ? fs.readlinkSync(absolute, { encoding: 'buffer' }) : fs.readlinkSync(absolute));
+      digestField(digest, rawPaths ? relativeTarget : targetName);
     } else if (stat.isFile()) {
       digestField(digest, 'file');
       digestField(digest, fs.readFileSync(absolute));
@@ -205,8 +230,10 @@ function sameSource(before, after) {
   return ['kind', 'head', 'index', 'branch', 'repository', 'files'].every(key => expected[key] === actual[key]);
 }
 
-function groupPeers(group) {
-  const table = spawnSync('ps', ['-A', '-o', 'pid=,pgid=,stat='], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } });
+function groupPeers(group, deadline) {
+  const table = spawnSync('ps', ['-A', '-o', 'pid=,pgid=,stat='], {
+    encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, timeout: Math.max(1, deadline - Date.now())
+  });
   if (table.status !== 0) throw new Error('cannot inspect owned process group');
   return table.stdout.split('\n').map(line => line.trim().split(/\s+/)).filter(([pid, pgid, state]) =>
     Number(pgid) === group && Number(pid) !== table.pid && !state?.startsWith('Z'));
@@ -269,7 +296,7 @@ async function runFullGate(root, label, entry, args) {
   const onDisconnect = () => stop(REASONS.INTERRUPTED);
   process.on('disconnect', onDisconnect);
   timer = setTimeout(() => stop(REASONS.TIMEOUT), Math.max(1, deadline - Date.now()));
-  const runAdmission = () => new Promise(resolve => {
+  const runAdmission = guardianPid => new Promise(resolve => {
     const received = message => {
       if (message.kind === MESSAGES.ADMISSION_EXIT) {
         worker.removeListener('message', received);
@@ -287,7 +314,7 @@ async function runFullGate(root, label, entry, args) {
     worker.send({
       kind: MESSAGES.ADMIT,
       command,
-      args: ['discord-surface-' + label, '--full-gate', '--holder', String(worker.pid), '--max-wait', String(maxWait), '--ticket', ticket]
+      args: ['discord-surface-' + label, '--full-gate', '--holder', String(worker.pid), '--holder', String(guardianPid), '--max-wait', String(maxWait), '--ticket', ticket]
     });
   });
   try {
@@ -308,7 +335,7 @@ async function runFullGate(root, label, entry, args) {
     sentinelSecret = crypto.randomBytes(32).toString('hex');
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
-      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...repositoryEnvironment(), [NO_VERDICT_SECRET]: sentinelSecret, [SCRATCH_ROOT]: scratch }
+      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...repositoryEnvironment(deadline), [NO_VERDICT_SECRET]: sentinelSecret, [SCRATCH_ROOT]: scratch }
     });
     relay(worker.stdout, process.stdout); relay(worker.stderr, process.stderr);
     outputDrain = Promise.all([streamFinished(worker.stdout, { cleanup: true }), streamFinished(worker.stderr, { cleanup: true })]).then(() => true, () => false);
@@ -324,7 +351,10 @@ async function runFullGate(root, label, entry, args) {
       const reason = stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED;
       return decline(reason, stopped || 'watchdog unavailable; nothing ran');
     }
-    const admitted = await runAdmission();
+    if (!Number.isSafeInteger(ready.guardian) || ready.guardian < 1) {
+      return decline(REASONS.SETUP, 'watchdog did not identify its admission holder; nothing ran');
+    }
+    const admitted = await runAdmission(ready.guardian);
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
     if (admitted.capacity) return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
     if (admitted.interrupted) return decline(REASONS.INTERRUPTED, 'worker exited during admission; nothing ran');
@@ -360,16 +390,24 @@ async function runFullGate(root, label, entry, args) {
       }
       const closed = await workerExit;
       let peers;
-      try { peers = groupPeers(worker.pid); } catch { peers = [null]; }
+      try { peers = groupPeers(worker.pid, deadline); } catch { peers = [null]; }
       const hadPeers = peers.length > 0;
       if (peers.length) {
         try { process.kill(-worker.pid, 'SIGKILL'); } catch {}
-        await new Promise(resolve => setTimeout(resolve, 100));
-        try { peers = groupPeers(worker.pid); } catch { peers = [null]; }
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, deadline - Date.now()))));
+        try { peers = groupPeers(worker.pid, deadline); } catch { peers = [null]; }
       }
-      if (closed.code !== 0 || hadPeers || peers.length) {
+      if (peers.length) {
         worker.stdout.destroy(); worker.stderr.destroy();
-        const code = decline(REASONS.INTERRUPTED, 'owned process group did not finish cleanly');
+        const code = decline(REASONS.CLEANUP, 'owned process group could not be verified as drained');
+        releaseScratch(scratch);
+        clearTimeout(timer);
+        for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+        return code;
+      }
+      if (closed.code !== 0 || hadPeers) {
+        worker.stdout.destroy(); worker.stderr.destroy();
+        const code = decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
         releaseScratch(scratch);
         clearTimeout(timer);
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
@@ -411,13 +449,17 @@ async function runFullGate(root, label, entry, args) {
   if (finalSnapshotRequired) {
     try {
       const finalRevision = revision(root, deadline);
+      await new Promise(resolve => setTimeout(resolve, 1));
       const sourceChanged = !sameSource(premise, finalRevision);
       if (stopped === REASONS.TIMEOUT || Date.now() >= deadline) return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
+      if (stopped) return decline(REASONS.INTERRUPTED, 'source verification was interrupted');
       if (sourceChanged) return decline(REASONS.STALE, 'source changed during execution');
     } catch (error) {
+      await new Promise(resolve => setTimeout(resolve, 1));
       if (error.code === 'ETIMEDOUT' || stopped === REASONS.TIMEOUT || Date.now() >= deadline) {
         return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
       }
+      if (stopped) return decline(REASONS.INTERRUPTED, 'source verification was interrupted');
       return decline(REASONS.STALE, 'unable to verify source after execution: ' + error.message);
     } finally {
       clearTimeout(timer);

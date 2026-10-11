@@ -34,18 +34,27 @@ function fixture(t) {
   git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
   const marker = path.join(scratch, 'body.json');
   const protocol = path.join(scratch, 'admission.json');
+  const leaseFile = path.join(scratch, 'admission-lease.json');
+  const emergencyRelease = path.join(scratch, 'process-table-release');
   const admit = path.join(scratch, 'admit');
   fs.writeFileSync(admit, '#!' + process.execPath + '\n' + [
     "const fs = require('node:fs');",
+    "const cp = require('node:child_process');",
     "setTimeout(() => process.exit(3), 120000).unref();",
     "fs.writeFileSync(process.env.FIXTURE_PROTOCOL, JSON.stringify(process.argv.slice(2)));",
+    "if (process.env.FIXTURE_LEASE_ENFORCE) {",
+    "  const args=process.argv.slice(2);const holders=[];for(let i=0;i<args.length-1;i++)if(args[i]==='--holder')holders.push(Number(args[++i]));",
+    "  const start=pid=>{const check=cp.spawnSync('/bin/ps',['-p',String(pid),'-o','lstart=,stat='],{encoding:'utf8',timeout:1000});if(check.status!==0)return null;const fields=check.stdout.trim().split(/\\s+/);const state=fields.pop();return state&&!state.startsWith('Z')?fields.join(' '):null;};",
+    "  if(fs.existsSync(process.env.FIXTURE_LEASE_FILE)){const lease=JSON.parse(fs.readFileSync(process.env.FIXTURE_LEASE_FILE,'utf8'));if(lease.holders.some(holder=>start(holder.pid)===holder.start))process.exit(3);}",
+    "  const owned=holders.map(pid=>({pid,start:start(pid)}));if(owned.some(holder=>!holder.start))process.exit(4);fs.writeFileSync(process.env.FIXTURE_LEASE_FILE,JSON.stringify({holders:owned}));",
+    "}",
     "if (process.env.FIXTURE_CHANGE) fs.writeFileSync(process.env.FIXTURE_CHANGE, 'changed');",
     "if (process.env.FIXTURE_MOVE_TARGET_WAIT) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
     "if (process.env.FIXTURE_SWITCH_BRANCH) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'switch','-c',process.env.FIXTURE_SWITCH_BRANCH]);",
     "if (process.env.FIXTURE_ADMISSION_SIGNAL) process.kill(process.pid, process.env.FIXTURE_ADMISSION_SIGNAL);",
     "if (process.env.FIXTURE_HOLD_ADMISSION) {",
-    "  const argv=process.argv.slice(2); const holder=Number(argv[argv.indexOf('--holder')+1]);",
-    "  fs.writeFileSync(process.env.FIXTURE_MARKER,JSON.stringify({pid:process.pid,holder,scratch:process.env.DISCORD_SURFACE_GATE_SCRATCH}));",
+    "  const argv=process.argv.slice(2);const first=argv.indexOf('--holder');const second=argv.indexOf('--holder',first+1);const holder=Number(argv[first+1]);const guardian=Number(argv[second+1]);",
+    "  fs.writeFileSync(process.env.FIXTURE_MARKER,JSON.stringify({pid:process.pid,holder,guardian,scratch:process.env.DISCORD_SURFACE_GATE_SCRATCH}));",
     "  process.on('SIGTERM',()=>{if(!process.env.FIXTURE_KILL_HOLDER)process.exit(3);}); process.stdout.write('ADMISSION_READY\\n');",
     "  if(process.env.FIXTURE_KILL_HOLDER)process.kill(holder,'SIGKILL');",
     "  setTimeout(()=>process.exit(3),15000);",
@@ -55,9 +64,11 @@ function fixture(t) {
   fs.writeFileSync(entry, [
     "const fs = require('node:fs');",
     "const { runFullGate } = require(" + JSON.stringify(GATE) + ");",
+    "if(process.env.FIXTURE_SIGNAL_RECEIVED)process.on('SIGTERM',()=>fs.writeFileSync(process.env.FIXTURE_SIGNAL_RECEIVED,String(process.pid)));",
     "async function runBody() {",
     "  fs.writeFileSync(process.env.FIXTURE_MARKER, JSON.stringify({ pid: process.pid, parent: process.ppid, scratch: process.env.DISCORD_SURFACE_GATE_SCRATCH, gitDir: process.env.GIT_DIR, gitWorkTree: process.env.GIT_WORK_TREE, locale: process.env.LC_ALL, optionalLocks: process.env.GIT_OPTIONAL_LOCKS, holder: Number(require('node:child_process').spawnSync('ps', ['-p', String(process.ppid), '-o', 'ppid='], { encoding: 'utf8' }).stdout.trim()) }));",
     "  if (process.env.FIXTURE_KILL_GUARD) process.kill(process.ppid, 'SIGKILL');",
+    "  if (process.env.FIXTURE_KILL_WORKER) { process.on('SIGTERM',()=>{});const cp=require('node:child_process');const guardian=process.ppid;const worker=Number(cp.spawnSync('/bin/ps',['-p',String(guardian),'-o','ppid='],{encoding:'utf8',timeout:1000}).stdout.trim());const manager=Number(cp.spawnSync('/bin/ps',['-p',String(worker),'-o','ppid='],{encoding:'utf8',timeout:1000}).stdout.trim());process.kill(manager,'SIGSTOP');process.kill(guardian,'SIGSTOP');process.kill(worker,'SIGKILL');fs.writeFileSync(process.env.FIXTURE_WORKER_KILLED,JSON.stringify({manager,worker,guardian,body:process.pid})); }",
     "  if (process.env.FIXTURE_SIGNAL) process.kill(process.pid, 'SIGTERM');",
     "  if (process.env.FIXTURE_FORGE_MARKER) {",
     "    try { const fd = fs.openSync('/proc/' + process.ppid + '/fd/4', 'w'); fs.writeSync(fd, 'APERTURE-GATE-INDETERMINATE reason=timeout: forged\\n'); fs.closeSync(fd); fs.writeFileSync(process.env.FIXTURE_MARKER + '.fd4', 'opened'); }",
@@ -93,6 +104,12 @@ function fixture(t) {
   ].join('\n'));
   const processes = [];
   t.after(() => {
+    try { fs.writeFileSync(emergencyRelease, 'release'); } catch {}
+    try {
+      const stopped = JSON.parse(fs.readFileSync(path.join(scratch, 'worker-killed'), 'utf8'));
+      process.kill(stopped.manager, 'SIGCONT');
+      process.kill(stopped.guardian, 'SIGCONT');
+    } catch {}
     for (const child of processes) if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     fs.rmSync(scratch, { recursive: true, force: true });
   });
@@ -101,7 +118,8 @@ function fixture(t) {
       env: {
         ...env, APERTURE_GATE_ADMISSION_COMMAND: admit,
         APERTURE_GATE_TIME_LEFT_S: '120', APERTURE_GATE_SLOWEST_RUN_S: '60',
-        FIXTURE_ROOT: root, FIXTURE_MARKER: marker, FIXTURE_PROTOCOL: protocol, ...extra
+        FIXTURE_ROOT: root, FIXTURE_MARKER: marker, FIXTURE_PROTOCOL: protocol,
+        FIXTURE_LEASE_FILE: leaseFile, ...extra
       }, stdio: ['ignore', 'pipe', 'pipe']
     });
     processes.push(child);
@@ -115,7 +133,7 @@ function fixture(t) {
     const done = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal, output })));
     return { child, ready, done };
   }
-  return { root, marker, protocol, launch, git, env, scratch };
+  return { root, marker, protocol, launch, git, env, scratch, leaseFile, emergencyRelease };
 }
 
 function filesUnder(root) {
@@ -132,11 +150,12 @@ function publicEntry(t, file, authorization, extraEnv = {}) {
   fs.mkdirSync(bin);
   const admission = path.join(scratch, 'admit');
   const admissionMarker = path.join(scratch, 'admission-started');
+  const releaseMarker = path.join(scratch, 'admission-release');
   const bodyMarker = path.join(scratch, 'body-started');
   const npm = path.join(bin, process.platform === 'win32' ? 'npm.cmd' : 'npm');
   fs.writeFileSync(admission, '#!' + process.execPath + '\n' + [
     "const fs=require('node:fs');fs.writeFileSync(process.env.FIXTURE_PUBLIC_ADMISSION,'started');",
-    "if(process.env.FIXTURE_PUBLIC_HOLD_ADMISSION){process.on('SIGTERM',()=>{});setInterval(()=>{},1000);}else process.exit(0);"
+    "if(process.env.FIXTURE_PUBLIC_HOLD_ADMISSION){const stop=setTimeout(()=>process.exit(124),20000);const poll=setInterval(()=>{if(fs.existsSync(process.env.FIXTURE_PUBLIC_RELEASE)){clearInterval(poll);clearTimeout(stop);process.exit(0);}},10);}else process.exit(0);"
   ].join('\n') + '\n', { mode: 0o700 });
   fs.writeFileSync(npm, '#!/usr/bin/env node\n' + [
     "const fs=require('node:fs');",
@@ -151,8 +170,9 @@ function publicEntry(t, file, authorization, extraEnv = {}) {
     APERTURE_GATE_ADMISSION_COMMAND: admission,
     APERTURE_GATE_TIME_LEFT_S: authorization === 'silence' ? '8' : '60',
     APERTURE_GATE_SLOWEST_RUN_S: authorization === 'silence' ? '1' : '5',
-    FIXTURE_PUBLIC_HOLD_ADMISSION: ['silence', 'disconnect'].includes(authorization) ? '1' : '',
+    FIXTURE_PUBLIC_HOLD_ADMISSION: ['silence', 'disconnect', 'reply'].includes(authorization) ? '1' : '',
     FIXTURE_PUBLIC_ADMISSION: admissionMarker,
+    FIXTURE_PUBLIC_RELEASE: releaseMarker,
     FIXTURE_PUBLIC_BODY: bodyMarker,
     PATH: bin + path.delimiter + (process.env.PATH || ''),
     NODE_OPTIONS: '',
@@ -180,7 +200,7 @@ function publicEntry(t, file, authorization, extraEnv = {}) {
   child.on('message', message => {
     if (message?.kind !== BODY_AUTH_REQUEST) return;
     requests += 1;
-    if (authorization === 'reply') child.send({ kind: 'body-authorized', label: message.label, authorized: true, token: 'caller-owned-token' });
+    if (authorization === 'reply') child.send({ kind: 'body-authorized', label: message.label, authorized: true, token: env[BODY_TOKEN] });
     if (authorization === 'false') child.send({ kind: 'body-authorized', label: message.label, authorized: false, token: 'caller-owned-token' });
     if (authorization === 'disconnect') child.disconnect();
   });
@@ -209,7 +229,14 @@ function publicEntry(t, file, authorization, extraEnv = {}) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     fs.rmSync(scratch, { recursive: true, force: true });
   });
-  return { done, requests: () => requests, forgedReplySent: () => forgedReplySent, admissionMarker, bodyMarker };
+  return {
+    done,
+    requests: () => requests,
+    forgedReplySent: () => forgedReplySent,
+    admissionMarker,
+    bodyMarker,
+    releaseAdmission: () => fs.writeFileSync(releaseMarker, 'release')
+  };
 }
 
 test('both public full entries decline before starting work without admission', () => {
@@ -282,11 +309,16 @@ for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
 
   test('caller authorization cannot bypass admission for ' + file, { timeout: 30000 }, async t => {
     const run = publicEntry(t, file, 'reply');
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(run.admissionMarker) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(run.admissionMarker), true, 'real admission did not start');
+    assert.equal(fs.existsSync(run.bodyMarker), false, 'caller authorization dispatched the body before admission');
+    run.releaseAdmission();
     const result = await run.done;
     assert.equal(run.forgedReplySent(), true);
-    assert.equal(run.requests(), 0);
-    assert.equal(fs.existsSync(run.admissionMarker), true);
-    assert.notEqual(result.code, 98, result.output);
+    assert.equal(result.code, file === 'scripts/test-gate.js' ? 7 : 1, result.output);
     assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
     assert.deepEqual(JSON.parse(fs.readFileSync(run.bodyMarker, 'utf8')), { admitted: true, secretPresent: false });
   });
@@ -529,8 +561,6 @@ test('watchdog cleans a TERM-resistant body after its supervisor is killed', { t
   run.child.kill('SIGKILL');
   const result = await run.done;
   assert.equal(result.signal, 'SIGKILL');
-  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
-  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
   const active = pid => {
     const state = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' });
     return state.status === 0 && !state.stdout.trim().startsWith('Z');
@@ -606,6 +636,44 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
 });
 
 
+test('an interruption during final source verification is a no-verdict', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const bin = path.join(f.scratch, 'git-wrapper');
+  fs.mkdirSync(bin);
+  const counter = path.join(f.scratch, 'revision-count');
+  const signalMarker = path.join(f.scratch, 'final-snapshot-signal');
+  const receivedMarker = path.join(f.scratch, 'final-snapshot-signal-received');
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const wrapper = path.join(bin, 'git');
+  fs.writeFileSync(wrapper, '#!' + process.execPath + '\n' + [
+    "const fs=require('node:fs');const cp=require('node:child_process');const args=process.argv.slice(2);",
+    "if(args.includes('--show-toplevel')){const file=process.env.FIXTURE_REVISION_COUNTER;const count=Number(fs.existsSync(file)?fs.readFileSync(file,'utf8'):0)+1;fs.writeFileSync(file,String(count));if(count===3){fs.writeFileSync(process.env.FIXTURE_SIGNAL_MARKER,JSON.stringify({manager:process.ppid,count}));const until=Date.now()+10000;while(!fs.existsSync(process.env.FIXTURE_FINAL_RELEASE)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}",
+    "const result=cp.spawnSync(process.env.FIXTURE_REAL_GIT,args,{cwd:process.cwd(),env:process.env,encoding:'buffer'});",
+    "if(result.stdout)process.stdout.write(result.stdout);if(result.stderr)process.stderr.write(result.stderr);process.exit(result.status===null?1:result.status);"
+  ].join('\n') + '\n', { mode: 0o700 });
+  const run = f.launch({
+    PATH: bin + path.delimiter + process.env.PATH,
+    FIXTURE_REAL_GIT: realGit,
+    FIXTURE_REVISION_COUNTER: counter,
+    FIXTURE_SIGNAL_MARKER: signalMarker,
+    FIXTURE_SIGNAL_RECEIVED: receivedMarker,
+    FIXTURE_FINAL_RELEASE: f.emergencyRelease
+  });
+  const signalDeadline = Date.now() + 10000;
+  while (!fs.existsSync(signalMarker) && Date.now() < signalDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(fs.existsSync(signalMarker), true, 'final source verification did not start');
+  const signal = JSON.parse(fs.readFileSync(signalMarker, 'utf8'));
+  assert.equal(signal.manager, run.child.pid);
+  process.kill(run.child.pid, 'SIGTERM');
+  fs.writeFileSync(f.emergencyRelease, 'release');
+  const result = await run.done;
+  assert.equal(fs.readFileSync(counter, 'utf8'), '3');
+  assert.equal(fs.readFileSync(receivedMarker, 'utf8'), String(run.child.pid));
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
+  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+});
+
 for (const layout of ['detached', 'uncommitted', 'archive']) {
   test('source layout ' + layout + ' preserves admitted execution', { timeout: 180000 }, async t => {
     const f = fixture(t);
@@ -642,6 +710,19 @@ test('source digest frames adjacent binary file payloads', t => {
   const first = revision(f.root);
   fs.writeFileSync(firstFile, Buffer.alloc(0));
   fs.writeFileSync(secondFile, Buffer.from('Xb\0' + mode + '\0Y'));
+  assert.notEqual(revision(f.root), first);
+});
+
+test('git revision hashes filenames with invalid UTF-8 bytes', { skip: process.platform !== 'linux' }, t => {
+  const f = fixture(t);
+  const name = Buffer.from([0x62, 0x61, 0x64, 0x2d, 0x80, 0x2e, 0x6a, 0x73]);
+  const directory = Buffer.concat([Buffer.from(f.root + path.sep), name]);
+  const file = Buffer.concat([directory, Buffer.from(path.sep), Buffer.from('source.js')]);
+  fs.mkdirSync(directory);
+  fs.writeFileSync(file, 'first');
+  f.git(['add', '-A']);
+  const first = revision(f.root);
+  fs.writeFileSync(file, 'changed');
   assert.notEqual(revision(f.root), first);
 });
 
@@ -723,6 +804,103 @@ test('watchdog death cleans the body while its worker still owns admission', { t
   assert.equal(fs.existsSync(body.scratch), false);
 });
 
+test('watchdog holds admission through cleanup after worker loss', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const workerKilled = path.join(f.scratch, 'worker-killed');
+  const env = {
+    FIXTURE_LEASE_ENFORCE: '1',
+    FIXTURE_KILL_WORKER: '1',
+    FIXTURE_HANG: '1',
+    FIXTURE_WORKER_KILLED: workerKilled
+  };
+  const first = f.launch(env);
+  const waitDeadline = Date.now() + 10000;
+  while (!fs.existsSync(workerKilled) && Date.now() < waitDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(fs.existsSync(workerKilled), true, 'fixture did not stop the manager and watchdog after worker loss');
+  const stopped = JSON.parse(fs.readFileSync(workerKilled, 'utf8'));
+  const lease = JSON.parse(fs.readFileSync(f.leaseFile, 'utf8'));
+  assert.equal(lease.holders.length, 2);
+  assert.notEqual(lease.holders[0].pid, lease.holders[1].pid);
+
+  const secondMarker = path.join(f.scratch, 'second-body.json');
+  const second = f.launch({ ...env, FIXTURE_KILL_WORKER: '', FIXTURE_HANG: '', FIXTURE_MARKER: secondMarker });
+  const secondResult = await second.done;
+  assert.equal(secondResult.code, 98, secondResult.output);
+  assert.match(secondResult.output, /reason=capacity/);
+  assert.equal(fs.existsSync(secondMarker), false, 'a second body started before the first cleanup finished');
+
+  process.kill(stopped.manager, 'SIGCONT');
+  const firstResult = await first.done;
+  assert.equal(firstResult.code, 98, firstResult.output);
+  const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
+  assert.throws(() => process.kill(body.pid, 0), { code: 'ESRCH' });
+  assert.equal(fs.existsSync(body.scratch), false);
+
+  const resumedMarker = path.join(f.scratch, 'resumed-body.json');
+  const resumed = await f.launch({ FIXTURE_LEASE_ENFORCE: '1', FIXTURE_MARKER: resumedMarker }).done;
+  assert.equal(resumed.code, 0, resumed.output);
+  assert.equal(fs.existsSync(resumedMarker), true, 'admission did not resume after cleanup finished');
+});
+
+test('manager process-group inspection uses its remaining deadline', () => {
+  const vm = require('node:vm');
+  const deadline = Date.now() + 5000;
+  const inspections = [];
+  const moduleFixture = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(GATE, 'utf8'), {
+    Buffer,
+    __dirname: path.join(PROJECT, 'scripts'),
+    process,
+    module: moduleFixture,
+    exports: moduleFixture.exports,
+    require: name => {
+      if (name === 'node:child_process') return { fork: () => {}, spawnSync: (command, args, options) => {
+        inspections.push({ command, args, options });
+        return { status: 0, stdout: '', pid: 23457 };
+      } };
+      return require(name);
+    }
+  }, { timeout: 1000 });
+  moduleFixture.exports.groupPeers(-1, deadline);
+  assert.equal(inspections.length, 1);
+  assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
+});
+
+test('watchdog process-group inspection uses its remaining deadline', () => {
+  const { EventEmitter } = require('node:events');
+  const vm = require('node:vm');
+  const deadline = Date.now() + 5000;
+  const watchdogProcess = new EventEmitter();
+  const inspections = [];
+  const exits = [];
+  Object.assign(watchdogProcess, {
+    argv: ['node', 'watchdog', String(deadline), '12345', 'entry'],
+    pid: 23456,
+    connected: true,
+    send: () => {},
+    kill: () => {},
+    exit: code => exits.push(code)
+  });
+  vm.runInNewContext(fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-watchdog.js'), 'utf8'), {
+    process: watchdogProcess,
+    setTimeout: () => 1,
+    require: name => {
+      if (name === 'node:child_process') return { spawn: () => {}, spawnSync: (command, args, options) => {
+        inspections.push({ command, args, options });
+        return { status: 0, stdout: '', pid: 23457 };
+      } };
+      if (name === 'node:os') return { constants: { signals: {} } };
+      if (name === 'node:path') return path;
+      if (name === './full-gate') return { MESSAGES, NO_VERDICT, canFinish: () => true, releaseScratch: () => true, NO_VERDICT_SECRET: 'secret', SCRATCH_ROOT: 'scratch' };
+      throw new Error('unexpected watchdog import ' + name);
+    }
+  }, { timeout: 1000 });
+  watchdogProcess.emit('message', { kind: MESSAGES.DRAIN });
+  assert.equal(inspections.length, 1);
+  assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
+  assert.deepEqual(exits, [0]);
+});
+
 test('leftover owned child produces exactly one no-verdict line', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const result = await f.launch({ FIXTURE_LEFTOVER: '1' }).done;
@@ -751,11 +929,16 @@ test('manager death during queued admission leaves no live admission or holder',
   assert.equal(result.signal, 'SIGKILL');
   process.stdout.write('QUEUED_CLEANUP_IDENTITIES=' + JSON.stringify(queued) + '\n');
   const active = pid => {
-    const state = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' });
+    const state = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8', timeout: 1000 });
     return state.status === 0 && !state.stdout.trim().startsWith('Z');
   };
+  const cleanupDeadline = Date.now() + 15000;
+  while ([queued.pid, queued.holder, queued.guardian].some(active) && Date.now() < cleanupDeadline) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
   assert.equal(active(queued.pid), false, 'admission subprocess outlived its supervisor');
   assert.equal(active(queued.holder), false);
+  assert.equal(active(queued.guardian), false, 'watchdog outlived its cleanup lease');
   assert.equal(fs.existsSync(queued.scratch), false);
 });
 
