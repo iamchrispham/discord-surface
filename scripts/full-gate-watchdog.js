@@ -1,8 +1,9 @@
 'use strict';
 
-const { fork, spawn, spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const os = require('node:os');
-const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, BODY_LABEL, BODY_TOKEN, SCRATCH_ROOT } = require('./full-gate');
+const path = require('node:path');
+const { MESSAGES, NO_VERDICT, REASONS, noVerdict, canFinish, releaseScratch, NO_VERDICT_SECRET, SCRATCH_ROOT } = require('./full-gate');
 const [deadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
 let stopping = false;
@@ -12,10 +13,10 @@ let admission;
 let admissionSucceeded = false;
 let bodyExited = false;
 let orphan = false;
-function stop(reason = REASONS.INTERRUPTED) {
+function stop(reason = REASONS.INTERRUPTED, detail = 'watchdog stopping its owned group') {
   if (stopping) return;
   stopping = true;
-  noVerdict(reason, 'watchdog stopping its owned group', process.env[SCRATCH_ROOT], 4);
+  noVerdict(reason, detail, process.env[SCRATCH_ROOT], 4);
   process.on('SIGTERM', () => {});
   try { process.kill(-group, 'SIGTERM'); } catch {}
   setTimeout(() => {
@@ -32,7 +33,7 @@ function check() {
   if (table.status !== 0) return stop();
   const peers = table.stdout.split('\n').map(line => line.trim().split(/\s+/)).filter(([pid, pgid, state]) =>
     Number(pgid) === group && ![process.pid, group, table.pid].includes(Number(pid)) && !state?.startsWith('Z'));
-  if (peers.length) return stop();
+  if (peers.length) return stop(REASONS.INTERRUPTED, 'watchdog found remaining owned processes: ' + peers.join(','));
   process.exit(0);
 }
 process.on('message', message => {
@@ -45,28 +46,28 @@ process.on('message', message => {
     });
   }
   if (message.kind === MESSAGES.START && !body) {
-    if (!admissionSucceeded || !process.env[BODY_TOKEN]) return stop(REASONS.ADMISSION);
-    body = fork(entry, args, { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
-    body.on('message', message => {
-      if (message?.kind !== MESSAGES.BODY_AUTH_REQUEST) return;
-      const authorized = admissionSucceeded
-        && Boolean(process.env[BODY_TOKEN])
-        && message.label === process.env[BODY_LABEL];
-      body.send({
-        kind: MESSAGES.BODY_AUTHORIZED,
-        label: message.label,
-        authorized,
-        ...(authorized ? { token: process.env[BODY_TOKEN] } : {})
-      });
+    if (!admissionSucceeded) return stop(REASONS.ADMISSION);
+    const env = { ...process.env };
+    delete env[NO_VERDICT_SECRET];
+    delete env.DISCORD_SURFACE_GATE_BODY;
+    delete env.DISCORD_SURFACE_GATE_BODY_TOKEN;
+    body = spawn(process.execPath, [path.join(__dirname, 'full-gate', 'body-runner.js'), entry, ...args], {
+      stdio: 'inherit', env
     });
-    body.once('error', () => { bodyExited = true; if (process.connected) process.send({ kind: MESSAGES.BODY_EXIT, code: 1 }); });
-    body.once('close', (code, signal) => {
+    let bodyResultSent = false;
+    const reportBodyExit = code => {
+      if (bodyResultSent) return;
+      bodyResultSent = true;
       bodyExited = true;
-      if (process.connected) process.send({ kind: MESSAGES.BODY_EXIT, code: signal ? 128 + os.constants.signals[signal] : code });
+      if (process.connected) process.send({ kind: MESSAGES.BODY_EXIT, code });
+    };
+    body.once('error', () => reportBodyExit(1));
+    body.once('close', (code, signal) => {
+      reportBodyExit(signal ? 128 + os.constants.signals[signal] : code);
     });
   }
   if (message.kind === MESSAGES.DRAIN && (!body || bodyExited)) { draining = true; check(); }
-  if (message.kind === MESSAGES.STOP) { orphan ||= Boolean(message.orphan); stop(); }
+  if (message.kind === MESSAGES.STOP) { orphan ||= Boolean(message.orphan); stop(message.reason || REASONS.INTERRUPTED); }
 });
 process.on('disconnect', () => { orphan = true; stop(); });
 process.on('SIGTERM', () => stop());

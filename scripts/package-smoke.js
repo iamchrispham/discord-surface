@@ -134,9 +134,13 @@ function main() {
   }
 }
 
-runFullGate(root, 'package-smoke', __filename, [], () => { main(); return 0; })
-  .then(code => { process.exitCode = code; })
-  .catch(error => {
-    process.stderr.write('package-smoke: ' + error.message + '\n');
-    process.exitCode = 1;
-  });
+if (require.main === module) {
+  runFullGate(root, 'package-smoke', __filename, [])
+    .then(code => { process.exitCode = code; })
+    .catch(error => {
+      process.stderr.write('package-smoke: ' + error.message + '\n');
+      process.exitCode = 1;
+    });
+}
+
+module.exports = { runBody: main };

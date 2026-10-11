@@ -7,10 +7,9 @@ const { spawnSync } = require('node:child_process');
 const { runFullGate, nodeOptionTokens } = require('./full-gate');
 
 const root = path.resolve(__dirname, '..');
-const suites = process.argv.slice(2);
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-function validSelection() {
+function validSelection(suites) {
   const registered = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
   const selectionOption = /^--test(?:-name-pattern|-skip-pattern|-only|-shard)(?:=|$)/;
   const explicitFiles = suites.every(file => /^test\/.+\.(?:js|cjs)$/.test(file));
@@ -19,7 +18,7 @@ function validSelection() {
   return completeList && !selectionRequested;
 }
 
-async function body() {
+async function body(suites) {
   const commands = [
     [npm, ['run', 'build']],
     [npm, ['run', 'typecheck']],
@@ -37,11 +36,17 @@ async function body() {
   return 0;
 }
 
-if (!validSelection()) {
-  process.stderr.write('test gate requires the complete registered suite list without selection options\n');
-  process.exitCode = 4;
-} else {
-  runFullGate(root, 'test', __filename, suites, body)
+function main(suites = process.argv.slice(2)) {
+  if (!validSelection(suites)) {
+    process.stderr.write('test gate requires the complete registered suite list without selection options\n');
+    process.exitCode = 4;
+    return;
+  }
+  runFullGate(root, 'test', __filename, suites)
     .then(code => { process.exitCode = code; })
     .catch(error => { process.stderr.write(error.message + '\n'); process.exitCode = 1; });
 }
+
+if (require.main === module) main();
+
+module.exports = { runBody: body };
