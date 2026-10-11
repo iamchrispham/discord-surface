@@ -4,7 +4,7 @@ For a new host or OS, start with [the installation handoff](INSTALL.md).
 
 This local adapter keeps Discord transport custody in SQLite and sends accepted messages to an already-owned native Codex task or an explicitly channel-enabled Claude session. It does not start a model executor, resume a history file, change native approval settings, or switch providers.
 
-The runtime needs Node 22.13.0 through Node 22.x for unflagged `node:sqlite`. Run `npm ci` from a clean checkout to install the pinned runtime dependencies locally, then run `npm run build` before starting. The package resolves `discord.js` and the MCP SDK from its local `node_modules`. The running adapter uses emitted JavaScript and does not need the compiler installed. Run `npm run package-smoke` to build, pack, install, and import the artifact in an isolated temporary prefix without starting the adapter.
+The runtime needs Node 22.13.0 through Node 22.x for unflagged `node:sqlite`. Run `npm ci` from a clean checkout to install the pinned runtime dependencies locally, then run `npm run build` before starting. The package resolves `discord.js` and the MCP SDK from its local `node_modules`. The running adapter uses emitted JavaScript and does not need the compiler installed. Run `python3 -I scripts/full-gate/supervisor.py -- npm run package-smoke` to build, pack, install, and import the artifact in an isolated temporary prefix without starting the adapter. Full test and package gates require Linux subreaper and pidfd support, and they require `NODE_OPTIONS` to be unset.
 
 Use a private state directory and an owner-only dotenv file. The secret file must contain a `DISCORD_TOKEN=` assignment and have mode `0600`.
 
@@ -404,10 +404,10 @@ Cswap owns Claude account rotation. The adapter keeps provider plus native UUID 
 Run the simulated consumer and persistence scenarios with:
 
 ```sh
-npm test
+python3 -I scripts/full-gate/supervisor.py -- npm test
 ```
 
-Full test and package-smoke entries require `APERTURE_GATE_ADMISSION_COMMAND`
+Full test and package-smoke entries require `APERTURE_GATE_ADMISSION_COMMAND`. `NODE_OPTIONS` must be unset. Hosts without Linux subreaper and pidfd support return no verdict.
 to name the host's supported admission executable with `--full-gate`, `--holder`,
 `--max-wait` and `--ticket`. The gate starts no build, tests or package work
 without admission. Set `APERTURE_GATE_TIME_LEFT_S` to the caller's remaining

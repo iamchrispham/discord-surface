@@ -10,6 +10,12 @@ const { finished: streamFinished } = require('node:stream/promises');
 const SCRATCH_ROOT = 'DISCORD_SURFACE_GATE_SCRATCH';
 const NO_VERDICT_SECRET = 'DISCORD_SURFACE_GATE_NO_VERDICT_SECRET';
 const NO_VERDICT = 98;
+const SUPERVISOR = Object.freeze({
+  ENVIRONMENT: 'DISCORD_SURFACE_GATE_SUPERVISOR',
+  LINUX_SUBREAPER: 'linux-subreaper-v1',
+  RECEIPT: 'DISCORD_SURFACE_GATE_SUPERVISOR_RECEIPT',
+  TOKEN: 'DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN'
+});
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
 const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
@@ -95,9 +101,32 @@ function releaseScratch(scratch, deadline) {
 }
 
 function wholeSeconds(env, key, fallback) {
-  const raw = env[key] || String(fallback);
+  const raw = Object.prototype.hasOwnProperty.call(env, key) ? env[key] : String(fallback);
   if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error(key + ' must be a positive whole number');
   return Number(raw);
+}
+
+function supervisorSnapshot(root, phase) {
+  const budget = wholeSeconds(process.env, SETTINGS.BUDGET, 7200);
+  const slowest = wholeSeconds(process.env, SETTINGS.SLOWEST, 3600);
+  const deadline = Date.now() + budget * 1000;
+  if (phase === 'before') removeTestBytecode(root);
+  else if (phase !== 'after') throw new Error('unknown supervisor snapshot phase');
+  return JSON.stringify({ snapshot: JSON.parse(revision(root, deadline)), budget, slowest });
+}
+
+function supervisorReceiptValid() {
+  const receiptPath = process.env[SUPERVISOR.RECEIPT];
+  const token = process.env[SUPERVISOR.TOKEN];
+  if (!receiptPath || !token) return false;
+  try {
+    const stat = fs.lstatSync(receiptPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) return false;
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return false;
+    return fs.readFileSync(receiptPath, 'utf8') === token + '\n';
+  } catch {
+    return false;
+  }
 }
 
 function deadlineError() {
@@ -341,6 +370,12 @@ async function runFullGate(root, label, entry, args) {
     return NO_VERDICT;
   };
   const started = Date.now();
+  if (process.env[SUPERVISOR.ENVIRONMENT] !== SUPERVISOR.LINUX_SUBREAPER) {
+    return decline(REASONS.ADMISSION, 'full gates require the pre-Node Linux descendant supervisor; admission and body did not start');
+  }
+  if (!supervisorReceiptValid()) {
+    return decline(REASONS.ADMISSION, 'full gate supervisor could not verify this launch; admission and body did not start');
+  }
   if (hasNodePreload(process.env.NODE_OPTIONS || '')) return decline(REASONS.ADMISSION, 'NODE_OPTIONS loaders and module preloads are unsupported for full gates; admission and body did not start');
   const command = process.env[SETTINGS.COMMAND];
   if (!command) return decline(REASONS.SETUP, SETTINGS.COMMAND + ' is unset; nothing ran');
@@ -423,6 +458,8 @@ async function runFullGate(root, label, entry, args) {
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
     const workerEnvironment = repositoryEnvironment(deadline);
     delete workerEnvironment[NO_VERDICT_SECRET];
+    delete workerEnvironment[SUPERVISOR.RECEIPT];
+    delete workerEnvironment[SUPERVISOR.TOKEN];
     workerEnvironment[SCRATCH_ROOT] = scratch;
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
       cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: workerEnvironment
@@ -562,4 +599,4 @@ async function runFullGate(root, label, entry, args) {
   return bodyResult;
 }
 
-module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, SCRATCH_ROOT, NO_VERDICT_SECRET, NO_VERDICT, MESSAGES, revision, relay, groupPeers, nodeOptionTokens };
+module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, SCRATCH_ROOT, NO_VERDICT_SECRET, NO_VERDICT, MESSAGES, revision, relay, groupPeers, nodeOptionTokens, supervisorSnapshot, SUPERVISOR };

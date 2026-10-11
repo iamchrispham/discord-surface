@@ -1,26 +1,39 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { fork, spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { PassThrough } = require('node:stream');
-const { relay, revision, noVerdict, MESSAGES, NO_VERDICT } = require('../scripts/full-gate');
+const { relay, revision, noVerdict, MESSAGES, NO_VERDICT, SUPERVISOR } = require('../scripts/full-gate');
 
 const PROJECT = path.resolve(__dirname, '..');
 const GATE = path.join(PROJECT, 'scripts/full-gate.js');
+const SUPERVISOR_SCRIPT = path.join(PROJECT, 'scripts/full-gate/supervisor.py');
 const BODY_LABEL = 'DISCORD_SURFACE_GATE_BODY';
 const BODY_TOKEN = 'DISCORD_SURFACE_GATE_BODY_TOKEN';
 const BODY_AUTH_REQUEST = 'body-auth-request';
+
+function createSupervisorReceipt(directory) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const receipt = path.join(directory, 'supervisor.receipt');
+  fs.writeFileSync(receipt, token + '\n', { flag: 'wx', mode: 0o600 });
+  return { receipt, token };
+}
 
 function fixture(t) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-entry-fixture-'));
   const root = path.join(scratch, 'repo');
   fs.mkdirSync(root);
+  const supervisor = createSupervisorReceipt(scratch);
   const env = { ...process.env };
   env.NODE_OPTIONS = '';
+  env[SUPERVISOR.ENVIRONMENT] = SUPERVISOR.LINUX_SUBREAPER;
+  env[SUPERVISOR.RECEIPT] = supervisor.receipt;
+  env[SUPERVISOR.TOKEN] = supervisor.token;
   const local = spawnSync('git', ['rev-parse', '--local-env-vars'], { encoding: 'utf8' });
   for (const key of local.stdout.trim().split('\n')) delete env[key];
   const git = args => {
@@ -166,6 +179,7 @@ function filesUnder(root) {
 
 function publicEntry(t, file, authorization, extraEnv = {}) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-public-entry-'));
+  const supervisor = createSupervisorReceipt(scratch);
   const bin = path.join(scratch, 'bin');
   fs.mkdirSync(bin);
   const admission = path.join(scratch, 'admit');
@@ -196,12 +210,20 @@ function publicEntry(t, file, authorization, extraEnv = {}) {
     FIXTURE_PUBLIC_BODY: bodyMarker,
     PATH: bin + path.delimiter + (process.env.PATH || ''),
     NODE_OPTIONS: '',
+    [SUPERVISOR.ENVIRONMENT]: SUPERVISOR.LINUX_SUBREAPER,
+    [SUPERVISOR.RECEIPT]: supervisor.receipt,
+    [SUPERVISOR.TOKEN]: supervisor.token,
     ...extraEnv
   };
   delete env.NODE_TEST_CONTEXT;
   const registered = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
-  const args = file === 'scripts/test-gate.js' ? registered : [];
-  const child = spawn(process.execPath, [path.join(PROJECT, file), ...args], {
+  const entryArgs = file === 'scripts/test-gate.js' ? registered : [];
+  const usePreNodeSupervisor = Boolean(env.NODE_OPTIONS);
+  const command = usePreNodeSupervisor ? 'python3' : process.execPath;
+  const commandArgs = usePreNodeSupervisor
+    ? ['-I', SUPERVISOR_SCRIPT, '--', process.execPath, path.join(PROJECT, file), ...entryArgs]
+    : [path.join(PROJECT, file), ...entryArgs];
+  const child = spawn(command, commandArgs, {
     cwd: PROJECT,
     env,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc']
@@ -617,6 +639,78 @@ test('insufficient caller budget starts neither admission nor the body', { timeo
   assert.equal(result.code, 98);
   assert.equal(fs.existsSync(f.protocol), false);
   assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('explicitly empty caller budget is rejected before admission or the body', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ APERTURE_GATE_TIME_LEFT_S: '' }).done;
+  assert.equal(result.code, 4, result.output);
+  assert.match(result.output, /APERTURE_GATE_TIME_LEFT_S must be a positive whole number/);
+  assert.equal(fs.existsSync(f.protocol), false);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('full gate rejects callers without the pre-Node supervisor before admission', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ [SUPERVISOR.ENVIRONMENT]: '' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /reason=setup/);
+  assert.equal(fs.existsSync(f.protocol), false);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('a caller-supplied supervisor mode cannot replace the launcher receipt', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ [SUPERVISOR.RECEIPT]: '', [SUPERVISOR.TOKEN]: '' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /full gate supervisor could not verify this launch/);
+  assert.equal(fs.existsSync(f.protocol), false);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('pre-Node supervisor refuses NODE_OPTIONS before a preload can clear it', { timeout: 15000 }, t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-supervisor-preload-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const preload = path.join(scratch, 'preload.cjs');
+  const preloadMarker = path.join(scratch, 'preload-ran');
+  const bodyMarker = path.join(scratch, 'body-ran');
+  fs.writeFileSync(preload, "delete process.env.NODE_OPTIONS; require('node:fs').writeFileSync(process.env.FIXTURE_PRELOAD_MARKER, 'ran');\n");
+  const env = { ...process.env, NODE_OPTIONS: '--require=' + preload, FIXTURE_PRELOAD_MARKER: preloadMarker };
+  const result = spawnSync('python3', [
+    '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e',
+    "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
+  ], { cwd: PROJECT, env, encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 98, result.stderr + result.stdout);
+  assert.match(result.stderr, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.equal(fs.existsSync(preloadMarker), false);
+  assert.equal(fs.existsSync(bodyMarker), false);
+});
+
+test('supervisor fails closed before the body on hosts without Linux subreaper support', { skip: process.platform === 'linux', timeout: 15000 }, t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-supervisor-platform-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const bodyMarker = path.join(scratch, 'body-ran');
+  const result = spawnSync('python3', [
+    '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e',
+    "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
+  ], { cwd: PROJECT, env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 98, result.stderr + result.stdout);
+  assert.match(result.stderr, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.equal(fs.existsSync(bodyMarker), false);
+});
+
+test('Linux supervisor waits for a detached descendant before final fingerprint', { skip: process.platform !== 'linux', timeout: 30000 }, t => {
+  const f = fixture(t);
+  const source = path.join(f.root, 'input');
+  const grandchild = "setTimeout(() => require('node:fs').writeFileSync(" + JSON.stringify(source) + ", 'late'), 250)";
+  const body = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e'," + JSON.stringify(grandchild) + "],{detached:true,stdio:'ignore'});child.unref();";
+  const env = { ...process.env, NODE_OPTIONS: '', APERTURE_GATE_TIME_LEFT_S: '30', APERTURE_GATE_SLOWEST_RUN_S: '2' };
+  const result = spawnSync('python3', [
+    '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e', body
+  ], { cwd: f.root, env, encoding: 'utf8', timeout: 15000 });
+  assert.equal(result.status, 98, result.stderr + result.stdout);
+  assert.match(result.stderr, /reason=stale/);
+  assert.equal(fs.readFileSync(source, 'utf8'), 'late');
 });
 
 test('final source snapshot timeout is a no-verdict result', { timeout: 180000 }, async t => {
@@ -1212,7 +1306,7 @@ for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
       assert.equal(run.requests(), 0);
       assert.equal(fs.existsSync(run.admissionMarker), false);
       assert.equal(fs.existsSync(run.bodyMarker), false);
-      assert.equal(fs.readFileSync(marker, 'utf8').trim().split(/\r?\n/).length, 1);
+      assert.equal(fs.existsSync(marker), false, 'the launcher must reject preloads before Node starts');
     });
   }
 }

@@ -34,12 +34,12 @@ cd discord-surface
 git checkout --detach RELEASE_COMMIT
 node --version
 npm ci
-npm test
-npm run package-smoke
+python3 -I scripts/full-gate/supervisor.py -- npm test
+python3 -I scripts/full-gate/supervisor.py -- npm run package-smoke
 npm pack
 ```
 
-These commands can be entered separately in a POSIX shell. Stop on the first nonzero exit and save the exact command and redacted error. `npm test` runs the registered build, typecheck and test suite after admission. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
+These commands can be entered separately from the repository root. Stop on the first nonzero exit and save the exact command and redacted error. The supervisor requires `NODE_OPTIONS` to be unset, tracks Linux descendants when subreaper and pidfd support are available, and compares the source fingerprint after they exit. Unsupported hosts return no verdict. Add support for another host only when its supervisor accounts for every descendant before the final fingerprint. `npm test` runs the registered build, typecheck and test suite after admission. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
 
 Install the resulting tarball into a dedicated prefix with `npm install --prefix <absolute-prefix> <absolute-tarball>`. The CLI is `<absolute-prefix>/node_modules/discord-surface/src/cli.js`. Resolve that absolute path and use it consistently for all callers on this host. Compare the installed package with the frozen artifact before configuring it.
 

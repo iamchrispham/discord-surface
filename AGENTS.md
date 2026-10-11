@@ -35,11 +35,18 @@ migration is not authorization to redesign delivery or change persisted formats.
 
 - Start with the owner test, for example `node --test test/direct-post.test.js`.
   Run `npm run build` first when the test consumes generated TypeScript output.
-- `npm test` builds, typechecks, and runs the explicitly registered suites serially.
-  Use it as the final behavior gate. Use `npm run package-smoke` for packaging or
-  module-loading changes. Documentation-only changes need path/command and diff
-  checks, not invented runtime assertions.
-- Both full entries self-admit through `APERTURE_GATE_ADMISSION_COMMAND`.
+- Run full commands through `python3 -I scripts/full-gate/supervisor.py -- <command>`
+  from the repository root. It requires `NODE_OPTIONS` to be unset, tracks
+  Linux descendants when subreaper and pidfd support are available, and compares
+  the source fingerprint after they exit. Unsupported hosts return no verdict.
+  Enable another host only after its supervisor accounts for every descendant
+  before the final source fingerprint.
+  The wrapped `npm test` builds, typechecks,
+  and runs the registered suites serially. Use the wrapped `npm run package-smoke`
+  for packaging or module-loading changes. Documentation-only changes need
+  path/command and diff checks, not invented runtime assertions.
+- Both full entries self-admit through `APERTURE_GATE_ADMISSION_COMMAND` after
+  the external supervisor starts them.
   Configure a supported `--full-gate` executable and execution allowances that
   fit the caller's remaining timeout. Exit 98 with one
   `APERTURE-GATE-INDETERMINATE` line means no verdict. The `setup` and
