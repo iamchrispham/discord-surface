@@ -43,13 +43,13 @@ function hasNodePreload(value) {
   return nodeOptionTokens(value).some(token => preloadOptions.some(option => token === option || token.startsWith(option + '=')));
 }
 
-function noVerdict(reason, detail, scratch, output = 2, secret = process.env[NO_VERDICT_SECRET]) {
+function noVerdict(reason, detail, scratch, output = 2, secret) {
   if (scratch && secret) {
     const sentinel = path.join(scratch, 'declined-' + crypto.createHmac('sha256', secret).update('gate-no-verdict').digest('hex'));
     try { fs.closeSync(fs.openSync(sentinel, 'wx', 0o600)); }
     catch (error) { if (error.code === 'EEXIST') return NO_VERDICT; }
   }
-  try { fs.writeSync(output, MARKER + ' reason=' + reason + ': ' + String(detail).replace(/[\r\n]+/g, ' ') + '\n'); } catch {}
+  try { fs.writeSync(output, '\n' + MARKER + ' reason=' + reason + ': ' + String(detail).replace(/[\r\n]+/g, ' ') + '\n'); } catch {}
   return NO_VERDICT;
 }
 
@@ -57,13 +57,27 @@ function canFinish(stopping) {
   return !stopping;
 }
 
-function releaseScratch(scratch) {
+function releaseScratch(scratch, deadline) {
   if (!scratch) return true;
-  try { fs.rmSync(scratch, { recursive: true, force: true }); return true; }
-  catch (error) {
-    try { fs.writeSync(2, 'GATE_SCRATCH_CLEANUP_FAILED ' + (error.code || 'UNKNOWN') + '\n'); } catch {}
+  const endTime = Number(deadline);
+  const remaining = endTime - Date.now();
+  if (!Number.isFinite(endTime) || remaining <= 0) {
+    try { fs.writeSync(2, 'GATE_SCRATCH_CLEANUP_FAILED ETIMEDOUT\n'); } catch {}
     return false;
   }
+  let result;
+  try {
+    result = spawnSync(process.execPath, ['-e', "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })", scratch], {
+      encoding: 'utf8', timeout: Math.max(1, Math.floor(remaining)), killSignal: 'SIGKILL'
+    });
+  } catch (error) { result = { error }; }
+  if (!result.error && result.status === 0) return true;
+  let code = 'UNKNOWN';
+  if (result.error?.code) code = result.error.code;
+  else if (result.status === null || result.signal === 'SIGKILL') code = 'ETIMEDOUT';
+  else if (result.status !== undefined) code = String(result.status);
+  try { fs.writeSync(2, 'GATE_SCRATCH_CLEANUP_FAILED ' + code + '\n'); } catch {}
+  return false;
 }
 
 function wholeSeconds(env, key, fallback) {
@@ -334,8 +348,11 @@ async function runFullGate(root, label, entry, args) {
     ticket = 'discord:' + label + ':' + crypto.createHash('sha256').update(snapshot.repository + '\0' + branchIdentity + '\0' + (snapshot.head || snapshot.files)).digest('hex').slice(0, 32);
     sentinelSecret = crypto.randomBytes(32).toString('hex');
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
+    const workerEnvironment = repositoryEnvironment(deadline);
+    delete workerEnvironment[NO_VERDICT_SECRET];
+    workerEnvironment[SCRATCH_ROOT] = scratch;
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
-      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...repositoryEnvironment(deadline), [NO_VERDICT_SECRET]: sentinelSecret, [SCRATCH_ROOT]: scratch }
+      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: workerEnvironment
     });
     relay(worker.stdout, process.stdout); relay(worker.stderr, process.stderr);
     outputDrain = Promise.all([streamFinished(worker.stdout, { cleanup: true }), streamFinished(worker.stderr, { cleanup: true })]).then(() => true, () => false);
@@ -400,7 +417,7 @@ async function runFullGate(root, label, entry, args) {
       if (peers.length) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.CLEANUP, 'owned process group could not be verified as drained');
-        releaseScratch(scratch);
+        releaseScratch(scratch, deadline);
         clearTimeout(timer);
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
         return code;
@@ -408,12 +425,12 @@ async function runFullGate(root, label, entry, args) {
       if (closed.code !== 0 || hadPeers) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
-        releaseScratch(scratch);
+        releaseScratch(scratch, deadline);
         clearTimeout(timer);
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
         return code;
       }
-      if (!releaseScratch(scratch)) {
+      if (!releaseScratch(scratch, deadline)) {
         worker.stdout.destroy(); worker.stderr.destroy();
         clearTimeout(timer);
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
@@ -429,13 +446,13 @@ async function runFullGate(root, label, entry, args) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const reason = stopped && stopped !== REASONS.TIMEOUT ? REASONS.INTERRUPTED : REASONS.TIMEOUT;
         const code = decline(reason, 'owned output did not finish within the gate deadline');
-        releaseScratch(scratch);
+        releaseScratch(scratch, deadline);
         clearTimeout(timer);
         for (const [signal, handler] of handlers) process.removeListener(signal, handler);
         return code;
       }
     }
-    const released = releaseScratch(scratch);
+    const released = releaseScratch(scratch, deadline);
     if (!released) {
       clearTimeout(timer);
       for (const [signal, handler] of handlers) process.removeListener(signal, handler);

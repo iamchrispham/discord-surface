@@ -66,7 +66,8 @@ function fixture(t) {
     "const { runFullGate } = require(" + JSON.stringify(GATE) + ");",
     "if(process.env.FIXTURE_SIGNAL_RECEIVED)process.on('SIGTERM',()=>fs.writeFileSync(process.env.FIXTURE_SIGNAL_RECEIVED,String(process.pid)));",
     "async function runBody() {",
-    "  fs.writeFileSync(process.env.FIXTURE_MARKER, JSON.stringify({ pid: process.pid, parent: process.ppid, scratch: process.env.DISCORD_SURFACE_GATE_SCRATCH, gitDir: process.env.GIT_DIR, gitWorkTree: process.env.GIT_WORK_TREE, locale: process.env.LC_ALL, optionalLocks: process.env.GIT_OPTIONAL_LOCKS, holder: Number(require('node:child_process').spawnSync('ps', ['-p', String(process.ppid), '-o', 'ppid='], { encoding: 'utf8' }).stdout.trim()) }));",
+    "  const watchdogEnvironment = process.platform === 'linux' ? fs.readFileSync('/proc/' + process.ppid + '/environ') : Buffer.alloc(0);",
+    "  fs.writeFileSync(process.env.FIXTURE_MARKER, JSON.stringify({ pid: process.pid, parent: process.ppid, scratch: process.env.DISCORD_SURFACE_GATE_SCRATCH, gitDir: process.env.GIT_DIR, gitWorkTree: process.env.GIT_WORK_TREE, locale: process.env.LC_ALL, optionalLocks: process.env.GIT_OPTIONAL_LOCKS, secretPresent: Object.prototype.hasOwnProperty.call(process.env, 'DISCORD_SURFACE_GATE_NO_VERDICT_SECRET'), parentSecretPresent: watchdogEnvironment.includes(Buffer.from('DISCORD_SURFACE_GATE_NO_VERDICT_SECRET=')), holder: Number(require('node:child_process').spawnSync('ps', ['-p', String(process.ppid), '-o', 'ppid='], { encoding: 'utf8' }).stdout.trim()) }));",
     "  if (process.env.FIXTURE_KILL_GUARD) process.kill(process.ppid, 'SIGKILL');",
     "  if (process.env.FIXTURE_KILL_WORKER) { process.on('SIGTERM',()=>{});const cp=require('node:child_process');const guardian=process.ppid;const worker=Number(cp.spawnSync('/bin/ps',['-p',String(guardian),'-o','ppid='],{encoding:'utf8',timeout:1000}).stdout.trim());const manager=Number(cp.spawnSync('/bin/ps',['-p',String(worker),'-o','ppid='],{encoding:'utf8',timeout:1000}).stdout.trim());process.kill(manager,'SIGSTOP');process.kill(guardian,'SIGSTOP');process.kill(worker,'SIGKILL');fs.writeFileSync(process.env.FIXTURE_WORKER_KILLED,JSON.stringify({manager,worker,guardian,body:process.pid})); }",
     "  if (process.env.FIXTURE_SIGNAL) process.kill(process.pid, 'SIGTERM');",
@@ -76,6 +77,7 @@ function fixture(t) {
     "    return 98;",
     "  }",
     "  if (process.env.FIXTURE_MOVE_TARGET_BODY) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
+    "  if (process.env.FIXTURE_STDERR_FRAGMENT) process.stderr.write('checking');",
     "  if (process.env.FIXTURE_CHANGE_BODY) fs.writeFileSync(require('node:path').join(process.env.FIXTURE_ROOT,'input'),'changed during body');",
     "  if (process.env.FIXTURE_BODY_DANGLING_SOURCE) { const input = require('node:path').join(process.env.FIXTURE_ROOT,'input'); fs.unlinkSync(input); fs.symlinkSync('missing-source-target', input); }",
     "  if (process.env.FIXTURE_LATE_WRITE) {",
@@ -392,10 +394,30 @@ test('signalled admission is an interruption, not a capacity refusal', { timeout
 
 test('admitted body cannot forge a verdict through parent fd 4', { timeout: 180000, skip: process.platform !== 'linux' }, async t => {
   const f = fixture(t);
-  const result = await f.launch({ FIXTURE_FORGE_MARKER: '1' }).done;
+  const result = await f.launch({ FIXTURE_FORGE_MARKER: '1', DISCORD_SURFACE_GATE_NO_VERDICT_SECRET: 'caller-secret' }).done;
   assert.equal(result.code, 98, result.output);
-  assert.equal(fs.readFileSync(f.marker + '.fd4', 'utf8'), 'ENOENT');
+  assert.equal(fs.readFileSync(f.marker + '.fd4', 'utf8'), 'opened');
+  const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
+  assert.equal(body.secretPresent, false);
+  assert.equal(body.parentSecretPresent, false);
   assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
+});
+
+test('sentinel secret stays out of admitted body environments', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ DISCORD_SURFACE_GATE_NO_VERDICT_SECRET: 'caller-secret' }).done;
+  assert.equal(result.code, 0, result.output);
+  const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
+  assert.equal(body.secretPresent, false);
+  assert.equal(body.parentSecretPresent, false);
+});
+
+test('no-verdict marker starts on a new line after body stderr fragment', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ FIXTURE_STDERR_FRAGMENT: '1', FIXTURE_CHANGE_BODY: '1' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /checking\nAPERTURE-GATE-INDETERMINATE reason=stale/);
+  assert.equal(result.output.includes('checkingAPERTURE-GATE-INDETERMINATE'), false);
 });
 
 for (const bodyExit of [0, 17, 98]) {
@@ -864,6 +886,55 @@ test('manager process-group inspection uses its remaining deadline', () => {
   moduleFixture.exports.groupPeers(-1, deadline);
   assert.equal(inspections.length, 1);
   assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
+});
+
+test('worker replaces watchdog fd 4 before starting the gate supervisor', () => {
+  const { EventEmitter } = require('node:events');
+  const vm = require('node:vm');
+  const workerProcess = new EventEmitter();
+  Object.assign(workerProcess, { argv: ['node', 'worker', '5000', 'entry'], pid: 23456, connected: true, send: () => {}, kill: () => {}, exit: () => {} });
+  const guard = new EventEmitter();
+  Object.assign(guard, { connected: true, pid: 23457, send: () => {} });
+  let options;
+  vm.runInNewContext(fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-worker.js'), 'utf8'), {
+    __dirname: path.join(PROJECT, 'scripts'),
+    process: workerProcess,
+    require: name => {
+      if (name === 'node:path') return path;
+      if (name === 'node:child_process') return { fork: (_file, _args, spawnOptions) => { options = spawnOptions; return guard; } };
+      if (name === './full-gate') return { MESSAGES, NO_VERDICT, canFinish: () => true, noVerdict: () => NO_VERDICT, releaseScratch: () => true, REASONS: { INTERRUPTED: 'interrupted' }, SCRATCH_ROOT: 'scratch' };
+      throw new Error('unexpected worker import ' + name);
+    }
+  }, { timeout: 1000 });
+  assert.equal(options.stdio[3], 'ipc');
+  assert.equal(options.stdio[4], 'ignore');
+});
+
+test('scratch cleanup subprocess is bounded by the gate deadline', () => {
+  const vm = require('node:vm');
+  const deadline = Date.now() + 5000;
+  const cleanups = [];
+  const moduleFixture = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(GATE, 'utf8'), {
+    Buffer,
+    __dirname: path.join(PROJECT, 'scripts'),
+    process,
+    module: moduleFixture,
+    exports: moduleFixture.exports,
+    require: name => {
+      if (name === 'node:child_process') return { fork: () => {}, spawnSync: (command, args, options) => {
+        cleanups.push({ command, args, options });
+        return { status: 0 };
+      } };
+      return require(name);
+    }
+  }, { timeout: 1000 });
+  assert.equal(moduleFixture.exports.releaseScratch('/tmp/gate-scratch', deadline), true);
+  assert.equal(cleanups.length, 1);
+  assert.equal(cleanups[0].command, process.execPath);
+  assert.equal(cleanups[0].args[0], '-e');
+  assert.ok(cleanups[0].options.timeout > 0 && cleanups[0].options.timeout <= 5000);
+  assert.equal(cleanups[0].options.killSignal, 'SIGKILL');
 });
 
 test('watchdog process-group inspection uses its remaining deadline', () => {

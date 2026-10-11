@@ -19,7 +19,7 @@ function stop() {
   process.on('SIGTERM', () => {});
   try { process.kill(-group, 'SIGTERM'); } catch {}
   setTimeout(() => {
-    if (orphan) releaseScratch(process.env[SCRATCH_ROOT]);
+    if (orphan) releaseScratch(process.env[SCRATCH_ROOT], Number(deadline));
     try { process.kill(-group, 'SIGKILL'); } catch {}
     process.exit(NO_VERDICT);
   }, 2000);
@@ -53,7 +53,7 @@ process.on('message', message => {
     delete env.DISCORD_SURFACE_GATE_BODY;
     delete env.DISCORD_SURFACE_GATE_BODY_TOKEN;
     body = spawn(process.execPath, [path.join(__dirname, 'full-gate', 'body-runner.js'), entry, ...args], {
-      stdio: 'inherit', env
+      stdio: ['ignore', 'inherit', 'inherit', 'ignore', 'ignore'], env
     });
     let bodyResultSent = false;
     const reportBodyExit = code => {
