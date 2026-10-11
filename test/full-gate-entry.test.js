@@ -17,6 +17,7 @@ function fixture(t) {
   const root = path.join(scratch, 'repo');
   fs.mkdirSync(root);
   const env = { ...process.env };
+  env.NODE_OPTIONS = '';
   const local = spawnSync('git', ['rev-parse', '--local-env-vars'], { encoding: 'utf8' });
   for (const key of local.stdout.trim().split('\n')) delete env[key];
   const git = args => {
@@ -58,6 +59,13 @@ function fixture(t) {
     "  if (process.env.FIXTURE_SIGNAL) process.kill(process.pid, 'SIGTERM');",
     "  if (process.env.FIXTURE_MOVE_TARGET_BODY) require('node:child_process').spawnSync('git',['-C',process.env.FIXTURE_ROOT,'update-ref','-d','refs/remotes/origin/main']);",
     "  if (process.env.FIXTURE_CHANGE_BODY) fs.writeFileSync(require('node:path').join(process.env.FIXTURE_ROOT,'input'),'changed during body');",
+    "  if (process.env.FIXTURE_BODY_DANGLING_SOURCE) { const input = require('node:path').join(process.env.FIXTURE_ROOT,'input'); fs.unlinkSync(input); fs.symlinkSync('missing-source-target', input); }",
+    "  if (process.env.FIXTURE_LATE_WRITE) {",
+    "    const cp=require('node:child_process');",
+    "    const program=\"const fs=require('node:fs');const deadline=Date.now()+10000;fs.writeFileSync(process.env.FIXTURE_LATE_ARMED,'armed');const poll=setInterval(()=>{if(fs.existsSync(process.env.FIXTURE_LATE_TRIGGER)){clearInterval(poll);fs.writeFileSync(require('node:path').join(process.env.FIXTURE_ROOT,'input'),'changed by late descendant');fs.writeFileSync(process.env.FIXTURE_LATE_DONE,'done');process.exit(0);}if(Date.now()>=deadline)process.exit(1);},5);\";",
+    "    cp.spawn(process.execPath,['-e',program],{stdio:'ignore'}).unref();",
+    "    const deadline=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_LATE_ARMED)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_LATE_ARMED))throw new Error('late descendant did not start');",
+    "  }",
     "  if (process.env.FIXTURE_ESCAPE_PIPE) {",
     "    const cp=require('node:child_process');const marker=process.env.FIXTURE_MARKER+'.escape-signalled';",
     "    const program=\"const fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_MARKER+'.escape-signalled','terminated');process.exit(0);});setTimeout(()=>process.exit(0),90000);\";",
@@ -106,7 +114,7 @@ function filesUnder(root) {
   });
 }
 
-function publicEntry(t, file, authorization) {
+function publicEntry(t, file, authorization, extraEnv = {}) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-public-entry-'));
   const bin = path.join(scratch, 'bin');
   fs.mkdirSync(bin);
@@ -127,7 +135,8 @@ function publicEntry(t, file, authorization) {
     FIXTURE_PUBLIC_ADMISSION: admissionMarker,
     FIXTURE_PUBLIC_BODY: bodyMarker,
     PATH: bin + path.delimiter + (process.env.PATH || ''),
-    NODE_OPTIONS: ''
+    NODE_OPTIONS: '',
+    ...extraEnv
   };
   delete env.NODE_TEST_CONTEXT;
   const registered = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
@@ -170,6 +179,7 @@ function publicEntry(t, file, authorization) {
 
 test('both public full entries decline before starting work without admission', () => {
   const env = { ...process.env };
+  env.NODE_OPTIONS = '';
   delete env.APERTURE_GATE_ADMISSION_COMMAND;
   delete env.DISCORD_SURFACE_GATE_BODY;
   for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
@@ -185,10 +195,15 @@ test('both public full entries decline before starting work without admission', 
 test('source fingerprint and bypass decisions stay at their owners', () => {
   const scripts = filesUnder(path.join(PROJECT, 'scripts')).filter(file => file.endsWith('.js'));
   const relative = files => files.map(file => path.relative(PROJECT, file).split(path.sep).join('/')).sort();
-  const digestOwners = scripts.filter(file => /crypto\.createHash\(['"]sha256['"]\)/.test(fs.readFileSync(file, 'utf8')));
-  const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(fs.readFileSync(file, 'utf8')));
+  const contents = new Map(scripts.map(file => [file, fs.readFileSync(file, 'utf8')]));
+  const digestOwners = scripts.filter(file => /crypto\.createHash\(['"]sha256['"]\)/.test(contents.get(file)));
+  const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(contents.get(file)));
+  const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && /runFullGate\(root,/.test(contents.get(file)));
+  const nodeOptionOwners = scripts.filter(file => /\bNODE_OPTIONS\b/.test(contents.get(file)));
   assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js']);
   assert.deepEqual(relative(bypassOwners), ['scripts/full-gate-watchdog.js', 'scripts/full-gate.js'].sort());
+  assert.deepEqual(relative(gateEntrypoints), ['scripts/package-smoke.js', 'scripts/test-gate.js']);
+  assert.deepEqual(relative(nodeOptionOwners), ['scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/test-gate.js']);
 });
 
 test('recovery guidance covers every no-verdict action', () => {
@@ -295,6 +310,44 @@ test('queued source change refuses the old premise without running the body', { 
   assert.equal(fs.existsSync(f.marker), false);
 });
 
+test('post-body source snapshot errors are stale no-verdicts', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const result = await f.launch({ FIXTURE_BODY_DANGLING_SOURCE: '1' }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /reason=stale/);
+  assert.match(result.output, /unable to verify source after execution/);
+});
+
+test('a late descendant source write is checked after the owned group drains', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  const scratch = path.dirname(f.root);
+  const bin = path.join(scratch, 'late-write-bin');
+  const realPath = f.env.PATH || process.env.PATH || '';
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'ps'), [
+    '#!/bin/sh',
+    'if [ "$1" = "-A" ] && [ "$2" = "-o" ]; then',
+    '  : > "$FIXTURE_LATE_TRIGGER"',
+    '  attempts=0',
+    '  while [ ! -e "$FIXTURE_LATE_DONE" ] && [ "$attempts" -lt 200 ]; do',
+    '    sleep 0.01',
+    '    attempts=$((attempts + 1))',
+    '  done',
+    'fi',
+    'exec /bin/ps "$@"'
+  ].join('\n'), { mode: 0o700 });
+  const result = await f.launch({
+    FIXTURE_LATE_WRITE: '1',
+    FIXTURE_LATE_ARMED: path.join(scratch, 'late-write-armed'),
+    FIXTURE_LATE_TRIGGER: path.join(scratch, 'late-write-trigger'),
+    FIXTURE_LATE_DONE: path.join(scratch, 'late-write-done'),
+    PATH: bin + path.delimiter + realPath
+  }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /reason=stale/);
+  assert.equal(fs.readFileSync(path.join(f.root, 'input'), 'utf8'), 'changed by late descendant');
+});
+
 test('interruption stops a body that ignores TERM before releasing its holder', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const run = f.launch({ FIXTURE_HANG: '1' });
@@ -397,7 +450,7 @@ const pipelineScenarios = [
   { name: 'Node options escaped only selector', nodeOptions: String.raw`"--te\st-only"`, exit: 4, stages: [] },
   { name: 'Node options concatenated skip selector', nodeOptions: '"--test-skip"-pattern=.', exit: 4, stages: [] },
   { name: 'Node options concatenated name selector', nodeOptions: '--test-name-"pattern"=^none$', exit: 4, stages: [] },
-  { name: 'Node options quoted preload path', preload: true, exit: 0, stages: ['run build', 'run typecheck', 'test'] },
+  { name: 'Node options quoted preload path', preload: true, exit: 98, noVerdict: true, stages: [] },
   { name: 'Node options compatible heap limit', nodeOptions: '--max-old-space-size=128', exit: 0, stages: ['run build', 'run typecheck', 'test'] },
   { name: 'argument selection filter', suites: ['test/selected.test.js', '--test-name-pattern=^none$'], exit: 4, stages: [] },
   { name: 'missing registered suite', suites: [], exit: 4, stages: [] },
@@ -431,8 +484,12 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
   const result=spawnSync(process.execPath,[path.join(root,'scripts/test-gate.js'),...(scenario.suites || ['test/selected.test.js'])],{cwd:root,env,encoding:'utf8',timeout:150000});
   assert.equal(result.status,scenario.exit,result.stdout+'\n'+result.stderr);
   if (scenario.exit === 4) assert.equal(fs.existsSync(admitMarker), false, 'caller errors must precede admission');
+  if (scenario.noVerdict) {
+    assert.match(result.stderr,/APERTURE-GATE-INDETERMINATE reason=setup/);
+    assert.equal(fs.existsSync(admitMarker), false, 'preloads must be refused before admission');
+  }
   assert.deepEqual(fs.existsSync(log) ? fs.readFileSync(log,'utf8').trim().split('\n') : [],scenario.stages);
-  assert.equal(result.stderr.includes('APERTURE-GATE-INDETERMINATE'),false);
+  assert.equal(result.stderr.includes('APERTURE-GATE-INDETERMINATE'),Boolean(scenario.noVerdict));
   if (scenario.stages.includes('test')) assert.match(result.stdout,/FULL_GATE_TEST_ARGUMENTS=\["test\/selected.test.js"\]/);
 });
 
@@ -645,28 +702,69 @@ test('branch switch at the same commit makes the admitted source stale', { timeo
 
 test('admission wait is recomputed after a slow source scan', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const preload = path.join(path.dirname(f.root), 'slow-source-scan.js');
-  const input = JSON.stringify(path.join(f.root, 'input'));
-  fs.writeFileSync(preload, [
-    "const fs = require('node:fs');",
-    "const path = require('node:path');",
-    'const original = fs.readFileSync;',
-    'let delayed = false;',
-    'fs.readFileSync = function (file, ...args) {',
-    '  if (!delayed && path.resolve(String(file)) === ' + input + ') { delayed = true; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500); }',
-    '  return original.call(this, file, ...args);',
-    '};'
-  ].join('\n'));
+  const scratch = path.dirname(f.root);
+  const bin = path.join(scratch, 'slow-git-bin');
+  const realPath = f.env.PATH || process.env.PATH || '';
+  const realGit = realPath.split(path.delimiter).map(directory => path.join(directory, 'git')).find(file => fs.existsSync(file));
+  assert.ok(realGit, 'git must be available to the test fixture');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'case "$*" in',
+    '  *"rev-parse --show-toplevel"*)',
+    '    if [ ! -e "$FIXTURE_GIT_DELAYED" ]; then',
+    '      : > "$FIXTURE_GIT_DELAYED"',
+    '      sleep 2.5',
+    '    fi',
+    '    ;;',
+    'esac',
+    'exec ' + JSON.stringify(realGit) + ' "$@"'
+  ].join('\n'), { mode: 0o700 });
   const result = await f.launch({
     APERTURE_GATE_TIME_LEFT_S: '20',
     APERTURE_GATE_SLOWEST_RUN_S: '5',
-    NODE_OPTIONS: '--require=' + preload
+    FIXTURE_GIT_DELAYED: path.join(scratch, 'slow-git-delayed'),
+    PATH: bin + path.delimiter + realPath
   }).done;
   assert.equal(result.code, 0, result.output);
   const args = JSON.parse(fs.readFileSync(f.protocol, 'utf8'));
   const maxWait = Number(args[args.indexOf('--max-wait') + 1]);
   assert.ok(maxWait >= 1 && maxWait < 10, 'expected a recomputed wait, got ' + maxWait);
 });
+
+for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
+  for (const option of [
+    {
+      flag: '--require',
+      extension: 'cjs',
+      source: "require('node:fs').appendFileSync(process.env.FIXTURE_PRELOAD_MARKER, process.pid + '\\n');"
+    },
+    {
+      flag: '--import',
+      extension: 'mjs',
+      source: "import { appendFileSync } from 'node:fs'; appendFileSync(process.env.FIXTURE_PRELOAD_MARKER, process.pid + '\\n');"
+    }
+  ]) {
+    test(option.flag + ' NODE_OPTIONS preload is rejected before admission for ' + file, { timeout: 180000 }, async t => {
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-preload-fixture-'));
+      t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+      const preload = path.join(scratch, 'preload.' + option.extension);
+      const marker = path.join(scratch, 'preload-runs');
+      fs.writeFileSync(preload, option.source);
+      const run = publicEntry(t, file, 'reply', {
+        NODE_OPTIONS: option.flag + '="' + preload + '"',
+        FIXTURE_PRELOAD_MARKER: marker
+      });
+      const result = await run.done;
+      assert.equal(result.code, 98, result.output);
+      assert.match(result.output, /reason=setup/);
+      assert.equal(run.requests(), 0);
+      assert.equal(fs.existsSync(run.admissionMarker), false);
+      assert.equal(fs.existsSync(run.bodyMarker), false);
+      assert.equal(fs.readFileSync(marker, 'utf8').trim().split(/\r?\n/).length, 1);
+    });
+  }
+}
 
 test('worker loss during admission is interruption, never capacity', { timeout: 180000 }, async t => {
   const f = fixture(t);

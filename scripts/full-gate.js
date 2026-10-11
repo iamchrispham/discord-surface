@@ -16,6 +16,34 @@ const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT:
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
 const REASONS = Object.freeze({ CAPACITY: 'capacity', SETUP: 'queue-missing', ADMISSION: 'setup', STALE: 'stale', INTERRUPTED: 'interrupted', TIMEOUT: 'timeout', CLEANUP: 'cleanup' });
 
+function nodeOptionTokens(value) {
+  const tokens = [];
+  let quoted = false;
+  let fresh = true;
+  for (let index = 0; index < value.length; index += 1) {
+    let character = value[index];
+    if (character === '\\' && quoted) {
+      if (++index === value.length) throw new Error('invalid escape in NODE_OPTIONS');
+      character = value[index];
+    } else if (character === ' ' && !quoted) {
+      fresh = true;
+      continue;
+    } else if (character === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (fresh) { tokens.push(character); fresh = false; }
+    else tokens[tokens.length - 1] += character;
+  }
+  if (quoted) throw new Error('unterminated string in NODE_OPTIONS');
+  return tokens;
+}
+
+function hasNodePreload(value) {
+  const preloadOptions = ['--require', '--import', '-r'];
+  return nodeOptionTokens(value).some(token => preloadOptions.some(option => token === option || token.startsWith(option + '=')));
+}
+
 function noVerdict(reason, detail, scratch, output = 2) {
   if (scratch) {
     try { fs.closeSync(fs.openSync(path.join(scratch, 'declined'), 'wx', 0o600)); }
@@ -212,6 +240,7 @@ async function runFullGate(root, label, entry, args, body) {
     return NO_VERDICT;
   };
   const started = Date.now();
+  if (hasNodePreload(process.env.NODE_OPTIONS || '')) return decline(REASONS.ADMISSION, 'NODE_OPTIONS module preloads are unsupported for full gates; admission and body did not start');
   const command = process.env[SETTINGS.COMMAND];
   if (!command) return decline(REASONS.SETUP, SETTINGS.COMMAND + ' is unset; nothing ran');
   if (process.platform === 'win32') return decline(REASONS.SETUP, 'a process-group gate supervisor is required on this host');
@@ -234,6 +263,9 @@ async function runFullGate(root, label, entry, args, body) {
   let finishOutputWait;
   let authorizationWait;
   let ticket;
+  let premise;
+  let bodyResult;
+  let finalSnapshotRequired = false;
   const stop = signal => {
     stopped ||= signal;
     authorizationWait?.();
@@ -292,7 +324,7 @@ async function runFullGate(root, label, entry, args, body) {
     if (Math.floor((deadline - Date.now()) / 1000) - slowest < 1) {
       return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
     }
-    const premise = revision(root);
+    premise = revision(root);
     const snapshot = JSON.parse(premise);
     const branchIdentity = snapshot.kind === 'archive'
       ? 'archive'
@@ -338,8 +370,8 @@ async function runFullGate(root, label, entry, args, body) {
     worker.send({ kind: MESSAGES.START }); bodyStarted = true;
     const result = await Promise.race([finished, workerExit.then(value => ({ workerExited: true, signal: value.signal }))]);
     if (stopped || result.workerExited) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker exited before reporting the body result');
-    if (!sameSource(premise, revision(root))) return decline(REASONS.STALE, 'source changed during execution');
-    return result.code;
+    bodyResult = result.code;
+    finalSnapshotRequired = true;
   } catch (error) {
     if (authorizedBodyStarted) throw error;
     return decline(REASONS.SETUP, error.message);
@@ -395,6 +427,14 @@ async function runFullGate(root, label, entry, args, body) {
     for (const [signal, handler] of handlers) process.removeListener(signal, handler);
     if (!released) return decline(REASONS.CLEANUP, 'owned scratch removal failed; teardown completed');
   }
+  if (finalSnapshotRequired) {
+    try {
+      if (!sameSource(premise, revision(root))) return decline(REASONS.STALE, 'source changed during execution');
+    } catch (error) {
+      return decline(REASONS.STALE, 'unable to verify source after execution: ' + error.message);
+    }
+  }
+  return bodyResult;
 }
 
-module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, BODY_LABEL, BODY_TOKEN, SCRATCH_ROOT, NO_VERDICT, MESSAGES, revision, relay, groupPeers };
+module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, BODY_LABEL, BODY_TOKEN, SCRATCH_ROOT, NO_VERDICT, MESSAGES, revision, relay, groupPeers, nodeOptionTokens };

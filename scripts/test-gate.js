@@ -4,34 +4,11 @@ const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
-const { runFullGate } = require('./full-gate');
+const { runFullGate, nodeOptionTokens } = require('./full-gate');
 
 const root = path.resolve(__dirname, '..');
 const suites = process.argv.slice(2);
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-
-function nodeOptionTokens(value) {
-  const tokens = [];
-  let quoted = false;
-  let fresh = true;
-  for (let index = 0; index < value.length; index += 1) {
-    let character = value[index];
-    if (character === '\\' && quoted) {
-      if (++index === value.length) throw new Error('invalid escape in NODE_OPTIONS');
-      character = value[index];
-    } else if (character === ' ' && !quoted) {
-      fresh = true;
-      continue;
-    } else if (character === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (fresh) { tokens.push(character); fresh = false; }
-    else tokens[tokens.length - 1] += character;
-  }
-  if (quoted) throw new Error('unterminated string in NODE_OPTIONS');
-  return tokens;
-}
 
 function validSelection() {
   const registered = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
