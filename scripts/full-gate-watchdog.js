@@ -31,11 +31,33 @@ class ProcBsdInfo(ctypes.Structure):
 proc_pidinfo = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo
 proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
 proc_pidinfo.restype = ctypes.c_int
+
+def unique_identity(pid):
+    buffer = ctypes.create_string_buffer(56)
+    if proc_pidinfo(pid, 17, 0, buffer, 56) != 56:
+        return None
+    unique_id = int.from_bytes(buffer.raw[16:24], byteorder=sys.byteorder)
+    pid_version = int.from_bytes(buffer.raw[32:36], byteorder=sys.byteorder, signed=True)
+    if unique_id <= 0 or pid_version <= 0:
+        return None
+    return unique_id, pid_version
+
 identities = {}
 for raw_pid in sys.argv[1:]:
+    pid = int(raw_pid)
+    before = unique_identity(pid)
+    if before is None:
+        continue
     info = ProcBsdInfo()
-    if proc_pidinfo(int(raw_pid), 3, 0, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info):
-        identities[raw_pid] = str(info.pbi_start_tvsec) + ':' + str(info.pbi_start_tvusec)
+    if proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+        continue
+    after = unique_identity(pid)
+    if (before != after or info.pbi_pid != pid or info.pbi_start_tvsec <= 0
+            or info.pbi_start_tvusec >= 1000000):
+        continue
+    identities[raw_pid] = ':'.join(map(str, (
+        info.pbi_start_tvsec, info.pbi_start_tvusec, before[0], before[1]
+    )))
 print(json.dumps(identities))
 `;
 let stopping = false;

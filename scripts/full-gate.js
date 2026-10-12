@@ -18,6 +18,11 @@ const SUPERVISOR = Object.freeze({
 });
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
 const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
+const DARWIN_LAUNCHD = 'darwin-launchd-v1';
+const SUPERVISOR_HOLDER_ENVIRONMENTS = Object.freeze([
+  'DISCORD_SURFACE_GATE_SUPERVISOR_PID',
+  'DISCORD_SURFACE_GATE_JOB_PID'
+]);
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
 const REASONS = Object.freeze({ CAPACITY: 'capacity', SETUP: 'queue-missing', ADMISSION: 'setup', STALE: 'stale', INTERRUPTED: 'interrupted', TIMEOUT: 'timeout', CLEANUP: 'cleanup' });
 
@@ -59,20 +64,6 @@ function noVerdict(reason, detail, scratch, output = 2, secret) {
   return NO_VERDICT;
 }
 
-function removeTestBytecode(root) {
-  const cacheDirectory = path.join(root, 'src', '__pycache__');
-  let directory;
-  try { directory = fs.lstatSync(cacheDirectory); }
-  catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('test bytecode directory is not a regular directory');
-  for (const name of fs.readdirSync(cacheDirectory)) {
-    if (!/^conductor_worker_proof\..*\.pyc$/.test(name)) continue;
-    const cachePath = path.join(cacheDirectory, name);
-    const file = fs.lstatSync(cachePath);
-    if (file.isFile() || file.isSymbolicLink()) fs.rmSync(cachePath, { force: true });
-  }
-}
-
 function canFinish(stopping) {
   return !stopping;
 }
@@ -110,8 +101,7 @@ function supervisorSnapshot(root, phase) {
   const budget = wholeSeconds(process.env, SETTINGS.BUDGET, 7200);
   const slowest = wholeSeconds(process.env, SETTINGS.SLOWEST, 3600);
   const deadline = Date.now() + budget * 1000;
-  if (phase === 'before') removeTestBytecode(root);
-  else if (phase !== 'after') throw new Error('unknown supervisor snapshot phase');
+  if (phase !== 'before' && phase !== 'after') throw new Error('unknown supervisor snapshot phase');
   return JSON.stringify({ snapshot: JSON.parse(revision(root, deadline)), budget, slowest });
 }
 
@@ -370,8 +360,9 @@ async function runFullGate(root, label, entry, args) {
     return NO_VERDICT;
   };
   const started = Date.now();
-  if (process.env[SUPERVISOR.ENVIRONMENT] !== SUPERVISOR.LINUX_SUBREAPER) {
-    return decline(REASONS.ADMISSION, 'full gates require the pre-Node Linux descendant supervisor; admission and body did not start');
+  const supervisorKind = process.env[SUPERVISOR.ENVIRONMENT];
+  if (supervisorKind !== SUPERVISOR.LINUX_SUBREAPER && supervisorKind !== DARWIN_LAUNCHD) {
+    return decline(REASONS.ADMISSION, 'full gates require a verified pre-Node process supervisor; admission and body did not start');
   }
   if (!supervisorReceiptValid()) {
     return decline(REASONS.ADMISSION, 'full gate supervisor could not verify this launch; admission and body did not start');
@@ -431,15 +422,28 @@ async function runFullGate(root, label, entry, args) {
       resolve({ capacity: true });
       return;
     }
+    const holders = [worker.pid, guardianPid];
+    if (supervisorKind === DARWIN_LAUNCHD) {
+      for (const name of SUPERVISOR_HOLDER_ENVIRONMENTS) {
+        const holder = Number(process.env[name]);
+        if (Number.isSafeInteger(holder) && holder > 1 && !holders.includes(holder)) holders.push(holder);
+      }
+    }
+    if (supervisorKind === DARWIN_LAUNCHD && holders.length < 4) {
+      worker.removeListener('message', received);
+      resolve({ error: 'launchd supervisor holders are incomplete' });
+      return;
+    }
+    const args = ['discord-surface-' + label, '--full-gate'];
+    for (const holder of holders) args.push('--holder', String(holder));
+    args.push('--max-wait', String(maxWait), '--ticket', ticket);
     worker.send({
       kind: MESSAGES.ADMIT,
       command,
-      args: ['discord-surface-' + label, '--full-gate', '--holder', String(worker.pid), '--holder', String(guardianPid), '--max-wait', String(maxWait), '--ticket', ticket]
+      args
     });
   });
   try {
-    try { removeTestBytecode(root); }
-    catch (error) { return decline(REASONS.SETUP, 'test bytecode cleanup failed: ' + error.message); }
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
     if (Math.floor((deadline - Date.now()) / 1000) - slowest < 1) {
       return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');

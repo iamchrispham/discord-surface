@@ -18,6 +18,18 @@ function validSelection(suites) {
   return completeList && !selectionRequested;
 }
 
+function pythonTestEnvironment(environment = process.env) {
+  const isolated = { ...environment, PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
+  for (const name of ['PYTHONPATH', 'PYTHONUSERBASE', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONEXECUTABLE', 'PYTHONINSPECT']) {
+    delete isolated[name];
+  }
+  delete isolated.PYTHONPYCACHEPREFIX;
+  if (environment.DISCORD_SURFACE_GATE_SCRATCH) {
+    isolated.PYTHONPYCACHEPREFIX = path.join(environment.DISCORD_SURFACE_GATE_SCRATCH, 'python-pycache');
+  }
+  return isolated;
+}
+
 async function body(suites) {
   if (!validSelection(suites)) {
     process.stderr.write('test gate requires the complete registered suite list without selection options\n');
@@ -33,7 +45,7 @@ async function body(suites) {
     const env = { ...process.env };
     if (command === process.execPath) {
       delete env.NODE_TEST_CONTEXT;
-      env.PYTHONDONTWRITEBYTECODE = '1';
+      Object.assign(env, pythonTestEnvironment(env));
     }
     const result = spawnSync(command, args, { cwd: root, stdio: 'inherit', env });
     if (result.error) throw result.error;
@@ -56,4 +68,4 @@ function main(suites = process.argv.slice(2)) {
 
 if (require.main === module) main();
 
-module.exports = { runBody: body };
+module.exports = { runBody: body, pythonTestEnvironment };
