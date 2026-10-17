@@ -1,4 +1,6 @@
 const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('../agent-message');
+const { AGENT_PRESENTATIONS } = require('../../dist/agent-presentation');
+const { currentPeerDestination } = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION } = require('./agent-routing');
 const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice } = require('../watcher-notice');
 const { normalizeAttachments } = require('../attachments');
@@ -229,6 +231,9 @@ function createMessageIntakeHandlers({
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');
       }
+      const agentPresentation = agent?.kind === 'request' && currentPeerDestination(this, agent.source)
+        ? AGENT_PRESENTATIONS.ATTACHMENT
+        : null;
       const timestamp = now();
       this.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -243,7 +248,10 @@ function createMessageIntakeHandlers({
             .run(event.id, timestamp, authorityChannelId);
         }
       }
-      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId, routingVersion: AGENT_ROUTING_VERSION });
+      if (agent) this.receipt(event.id, 'agent-message', {
+        packet: agent, authorId: event.authorId, routingVersion: AGENT_ROUTING_VERSION,
+        ...(agentPresentation ? { agentPresentation } : {})
+      });
       if (notice) {
         this.receipt(event.id, WATCHER_NOTICE_RECEIPTS.PROVENANCE, {
           journal: WATCHER_NOTICE_JOURNAL, packet: notice, authorId: event.authorId,
