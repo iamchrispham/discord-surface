@@ -142,7 +142,7 @@ const EXPECTED_MESSAGES_FETCH = [
 
 const EXPECTED_FETCH_HISTORY = [
   'src/discord/live-checkpoint.js|checkpointHealthyIntake|this',
-  'src/discord.js|recoverInbound|this',
+  'src/discord/inbound-recovery.js|recoverInbound|this',
   'src/discord/thread-enrollment.ts|readHistory|gateway'
 ];
 
