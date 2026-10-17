@@ -426,32 +426,60 @@ test('T4: stop returns without awaiting a stuck lookup and later settlement is i
 });
 
 const T5_AGGREGATE_DEADLINE_MS = 4000;
-const t5DeadlineController = new AbortController();
-let t5DeadlineTimer;
+const t5AggregateDeadline = {
+  controller: new AbortController(),
+  timer: undefined
+};
 
-function startT5AggregateDeadline() {
-  if (t5DeadlineTimer) return;
-  t5DeadlineTimer = setTimeout(() => {
-    t5DeadlineController.abort(new Error('T5 aggregate deadline exceeded'));
-  }, T5_AGGREGATE_DEADLINE_MS);
+function startT5AggregateDeadline(deadline = t5AggregateDeadline, timeoutMs = T5_AGGREGATE_DEADLINE_MS) {
+  if (deadline.timer) return;
+  deadline.timer = setTimeout(() => {
+    deadline.controller.abort(new Error('T5 aggregate deadline exceeded'));
+  }, timeoutMs);
 }
 
-function stopT5AggregateDeadline() {
-  clearTimeout(t5DeadlineTimer);
+function stopT5AggregateDeadline(deadline = t5AggregateDeadline) {
+  clearTimeout(deadline.timer);
+  deadline.timer = undefined;
 }
+
+require('node:test').after(stopT5AggregateDeadline);
 
 function t5Test(name, run) {
-  test(name, { signal: t5DeadlineController.signal }, async t => {
+  test(name, { signal: t5AggregateDeadline.controller.signal }, async t => {
     startT5AggregateDeadline();
     await run(t);
   });
 }
 
-test('new T5 scenarios must use the shared deadline owner', () => {
+test('new T5 scenarios must use the shared deadline owner', async () => {
   const source = require('node:fs').readFileSync(__filename, 'utf8');
   assert.match(source, /const T5_AGGREGATE_DEADLINE_MS = 4000;/);
-  assert.match(source, /function t5Test\(name, run\)\s*\{\s*test\(name,\s*\{\s*signal:\s*t5DeadlineController\.signal\s*\},\s*async t => \{\s*startT5AggregateDeadline\(\);/);
-  assert.doesNotMatch(source, /^\s*test\(['"`]T5\./m);
+  assert.match(source, /function t5Test\(name, run\)\s*\{\s*test\(name,\s*\{\s*signal:\s*t5AggregateDeadline\.controller\.signal\s*\},\s*async t => \{\s*startT5AggregateDeadline\(\);/);
+  assert.doesNotMatch(source, /^\s*test\s*\(\s*(['"`])T5\./m);
+
+  const probeDeadline = {
+    controller: new AbortController(),
+    timer: undefined
+  };
+  const abortObserved = new Promise(resolve => {
+    probeDeadline.controller.signal.addEventListener('abort', resolve, { once: true });
+  });
+  let boundTimer;
+  const abortBound = new Promise(resolve => {
+    boundTimer = setTimeout(() => resolve(false), 100);
+  });
+
+  try {
+    startT5AggregateDeadline(probeDeadline, 1);
+    assert.equal(await Promise.race([abortObserved.then(() => true), abortBound]), true,
+      'T5 deadline expiry must abort its shared test signal');
+    assert.equal(probeDeadline.controller.signal.aborted, true,
+      'T5 deadline expiry must leave the shared test signal aborted');
+  } finally {
+    clearTimeout(boundTimer);
+    stopT5AggregateDeadline(probeDeadline);
+  }
 });
 
 // T5.1: the adopted-waiter defect. The first pass starts the lookup and gives up
@@ -606,7 +634,6 @@ t5Test('T5.5: repeated deadlines share one lookup', async t => {
 // the original promise settles must deliver exactly once with no second
 // speculative fetch.
 t5Test('T5.6: timely adopted success replies once', async t => {
-  t.after(stopT5AggregateDeadline);
   const f = fixture(t);
   seedReplyReady(f, '106', '1000');
   f.enableDelivery();
