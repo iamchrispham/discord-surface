@@ -148,9 +148,9 @@ function fixture(t) {
     "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
     "}",
+    "setTimeout(() => process.exit(98), 120000).unref();",
     "module.exports = { runBody };",
     "if (require.main === module) {",
-    "  setTimeout(() => process.exit(98), 120000).unref();",
     "  runFullGate(process.env.FIXTURE_ROOT, 'fixture', __filename, []).then(code => { process.exitCode = code; });",
     "}"
   ].join('\n'));
@@ -1832,3 +1832,82 @@ for (const connected of [true, false]) {
     assert.equal(releases, connected ? 0 : 1, 'cleanup failure must not skip group termination');
   });
 }
+
+
+test('generated fixture entry expires imported and direct bodies independently', async t => {
+  const vm = require('node:vm');
+  const f = fixture(t);
+  const entry = path.join(f.scratch, 'entry.js');
+  const source = fs.readFileSync(entry, 'utf8');
+  for (const scenario of [
+    { name: 'imported hanging body', env: { FIXTURE_HANG: '1' } },
+    { name: 'imported killed-worker body', env: { FIXTURE_KILL_WORKER: '1' } },
+    { name: 'direct main', env: {}, direct: true }
+  ]) {
+    const timers = [];
+    const events = [];
+    const exits = [];
+    const handlers = new Map();
+    const actors = { manager: { pid: 12340 }, worker: { pid: 12341 }, guardian: { pid: 12342 }, extraHolders: [] };
+    let clock = 0;
+    const processFixture = {
+      pid: 12345, ppid: 12344, platform: 'darwin',
+      env: { ...scenario.env, FIXTURE_ROOT: 'root', FIXTURE_MARKER: 'body.json', FIXTURE_ROLE_FILE: 'roles.json', FIXTURE_WORKER_KILLED: 'worker.json' },
+      on: (event, handler) => handlers.set(event, handler),
+      stdout: { write: value => events.push(value) },
+      exit: code => exits.push(code)
+    };
+    const moduleFixture = { exports: {} };
+    const requireFixture = name => {
+      if (name === 'node:fs') return {
+        readFileSync: file => { assert.equal(file, 'roles.json'); return JSON.stringify(actors); },
+        writeFileSync: () => events.push('body write')
+      };
+      if (name === ROLE_FIXTURE) return {
+        captureIdentity: pid => ({ kind: 'present', pid }),
+        signalOwned: (identity, signal) => {
+          assert.ok([12340, 12341, 12342].includes(identity.pid));
+          events.push(signal);
+          return true;
+        }
+      };
+      if (name === GATE) return { runFullGate: () => { events.push('direct main'); return Promise.resolve(0); } };
+      throw new Error('unexpected fixture import ' + name);
+    };
+    requireFixture.main = scenario.direct ? moduleFixture : {};
+    vm.runInNewContext(source, {
+      Buffer, __filename: entry, module: moduleFixture, require: requireFixture, process: processFixture,
+      setTimeout: (callback, delay) => {
+        const timer = { callback, at: clock + delay, delay, unrefed: false, fired: false, unref() { this.unrefed = true; return this; } };
+        timers.push(timer);
+        events.push('deadline armed');
+        return timer;
+      },
+      setInterval: () => 1
+    }, { timeout: 1000 });
+    assert.equal(timers.length, 1, scenario.name);
+    assert.equal(timers[0].delay, 120000, scenario.name);
+    assert.equal(timers[0].unrefed, true, scenario.name);
+    assert.equal(events[0], 'deadline armed', scenario.name);
+    if (!scenario.direct) {
+      const body = moduleFixture.exports.runBody();
+      if (scenario.env.FIXTURE_HANG) assert.ok(events.includes('BODY_READY\n'));
+      else {
+        assert.equal(await body, 0);
+        assert.ok(events.includes('SIGKILL'));
+        handlers.get('SIGTERM')();
+      }
+    } else assert.ok(events.includes('direct main'));
+    const advance = milliseconds => {
+      clock += milliseconds;
+      for (const timer of timers) if (!timer.fired && timer.at <= clock) {
+        timer.fired = true;
+        timer.callback();
+      }
+    };
+    advance(119999);
+    assert.deepEqual(exits, [], scenario.name);
+    advance(1);
+    assert.deepEqual(exits, [98], scenario.name);
+  }
+});
