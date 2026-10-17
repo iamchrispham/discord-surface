@@ -959,21 +959,29 @@ test('pre-Node supervisor refuses NODE_OPTIONS before a preload can clear it', {
     "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
   ], { cwd: PROJECT, env, encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 98, result.stderr + result.stdout);
-  assert.match(result.stderr, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.match(result.stdout, /APERTURE-GATE-INDETERMINATE reason=setup/);
   assert.equal(fs.existsSync(preloadMarker), false);
   assert.equal(fs.existsSync(bodyMarker), false);
 });
 
-test('supervisor fails closed before the body on hosts without Linux subreaper support', { skip: process.platform === 'linux', timeout: 15000 }, t => {
+test('supervisor fails closed before the body on an unsupported platform', { timeout: 15000 }, t => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-supervisor-platform-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
   const bodyMarker = path.join(scratch, 'body-ran');
+  const script = [
+    'import importlib.util,sys',
+    'spec=importlib.util.spec_from_file_location("gate_supervisor",sys.argv[1])',
+    'module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)',
+    'module.sys.platform="unsupported-fixture"',
+    'raise SystemExit(module.run(["--",*sys.argv[2:]]))'
+  ].join('\n');
   const result = spawnSync('python3', [
-    '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e',
+    '-I', '-c', script, SUPERVISOR_SCRIPT, process.execPath, '-e',
     "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
   ], { cwd: PROJECT, env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 98, result.stderr + result.stdout);
-  assert.match(result.stderr, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.match(result.stdout, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.match(result.stdout, /kernel-backed process ownership is unavailable on this host/);
   assert.equal(fs.existsSync(bodyMarker), false);
 });
 
@@ -987,7 +995,7 @@ test('Linux supervisor waits for a detached descendant before final fingerprint'
     '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e', body
   ], { cwd: f.root, env, encoding: 'utf8', timeout: 15000 });
   assert.equal(result.status, 98, result.stderr + result.stdout);
-  assert.match(result.stderr, /reason=stale/);
+  assert.match(result.stdout, /reason=stale/);
   assert.equal(fs.readFileSync(source, 'utf8'), 'late');
 });
 
@@ -1063,6 +1071,7 @@ const pipelineScenarios = [
 for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.name, { timeout: 180000 }, t => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-pipeline-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const supervisor = createSupervisorReceipt(scratch);
   const root = path.join(scratch, 'repo'); const bin = path.join(scratch, 'bin');
   fs.mkdirSync(root); fs.mkdirSync(bin); fs.mkdirSync(path.join(root, 'scripts')); fs.mkdirSync(path.join(root, 'test'));
   for (const file of ['test-gate.js','full-gate.js','full-gate-worker.js','full-gate-watchdog.js']) fs.copyFileSync(path.join(PROJECT,'scripts',file),path.join(root,'scripts',file));
@@ -1078,6 +1087,9 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
   const admit = path.join(bin,'admit'); fs.writeFileSync(admit,'#!'+process.execPath+'\nrequire(\"node:fs\").writeFileSync('+JSON.stringify(admitMarker)+',\"started\");process.exit(0);\n',{mode:0o700});
   fs.writeFileSync(path.join(root,'test','selected.test.js'), "const test=require('node:test');const fs=require('node:fs');const assert=require('node:assert/strict');setTimeout(()=>process.exit(98),120000).unref();test('actual selected test executes',()=>{fs.appendFileSync(process.env.PIPELINE_LOG,'test\\n');assert.notEqual(process.env.PIPELINE_FAIL,'test');});\n");
   const env={...process.env,PATH:bin+path.delimiter+process.env.PATH,APERTURE_GATE_ADMISSION_COMMAND:admit,APERTURE_GATE_TIME_LEFT_S:'120',APERTURE_GATE_SLOWEST_RUN_S:'60',PIPELINE_LOG:log,PIPELINE_FAIL:scenario.fail||'',PIPELINE_EXIT:String(scenario.value||0)};
+  env[SUPERVISOR.ENVIRONMENT] = SUPERVISOR.LINUX_SUBREAPER;
+  env[SUPERVISOR.RECEIPT] = supervisor.receipt;
+  env[SUPERVISOR.TOKEN] = supervisor.token;
   const nodeOptions = scenario.preload ? '--require ' + JSON.stringify(preload) : scenario.nodeOptions;
   if (nodeOptions) env.NODE_OPTIONS=nodeOptions; else delete env.NODE_OPTIONS;
   delete env.DISCORD_SURFACE_GATE_BODY;
