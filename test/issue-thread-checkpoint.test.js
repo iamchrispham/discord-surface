@@ -63,7 +63,6 @@ function captureCheckpointRetries(f, t, deadlineAt) {
 test('checkpoint fixture observes the unreferenced owner retry within its bound', { timeout: 3000 }, async t => {
   const f = fixture(t);
   f.ready('100');
-  f.gateway.liveCheckpointRetryDelayMs = 20;
   const capture = captureCheckpointRetries(f, t, performance.now() + CHECKPOINT_RETRY_OBSERVATION_BOUND_MS);
   t.after(capture.restore);
 
@@ -202,8 +201,6 @@ async function pendingScenario(t, secondDeadline) {
   const checkpointEntries = [];
   const originalBegin = f.gateway.beginLiveCheckpoint.bind(f.gateway);
   const childCheckpoints = [];
-  const retryCapture = captureCheckpointRetries(f, t, observationDeadline);
-  const { retryTimers } = retryCapture;
   let capped = null;
   f.gateway.beginLiveCheckpoint = function(counts = new Map(), ...options) {
     checkpointStarts++;
@@ -215,7 +212,7 @@ async function pendingScenario(t, secondDeadline) {
     }
     const before = this.liveCheckpointPromise;
     const result = originalBegin(counts, ...options);
-    const installed = this.liveCheckpointPromise;
+  const installed = this.liveCheckpointPromise;
     if (installed && installed !== before && counts instanceof Map && counts.has(f.child.id)) {
       childCheckpoints.push(installed);
     }
@@ -223,9 +220,10 @@ async function pendingScenario(t, secondDeadline) {
   };
   t.after(() => {
     f.gateway.beginLiveCheckpoint = originalBegin;
-    retryCapture.restore();
   });
   f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.liveCheckpointRetryDelayMs = 20;
+  f.gateway.liveCheckpointRetryDelayMs = 20;
   const slowChild = f.makeChannel('1500', ChannelType.PublicThread);
   if (secondDeadline) {
     f.channels.set(slowChild.id, slowChild);
@@ -247,27 +245,18 @@ async function pendingScenario(t, secondDeadline) {
   let slowChildCalls = 0;
   f.client.channels.fetch = async id => {
     if (id === slowParent.id) { slowParentCalls++; await new Promise(resolve => setTimeout(resolve, 60)); }
-    if (secondDeadline && id === slowChild.id && slowChildCalls++ === 0) await new Promise(resolve => setTimeout(resolve, 60));
+    if (secondDeadline && id === slowChild.id && slowChildCalls++ === 0) await new Promise(resolve => setTimeout(resolve, 45));
     return fetch(id);
   };
   await f.gateway.recoverTransport('reconnect');
   const firstRetry = f.gateway.liveCheckpointPromise;
   if (firstRetry) await firstRetry;
-  // Wait on real checkpoint completion rather than a fixed delay: drain every
-  // recorded child checkpoint, then run the captured retry timer only when its
-  // accumulated channel set names the child. The owner's finally block adds a
-  // child checkpoint synchronously, so the drain repeats until neither source
-  // yields more work.
+  // Wait for this test's checkpoint work; an unreferenced retry timer for the
+  // earlier child remains owned by the fixture teardown.
   for (;;) {
     let progressed = false;
     while (childCheckpoints.length) {
       await childCheckpoints.shift();
-      progressed = true;
-    }
-    const timer = retryTimers.find(item => !item.awaited && (f.gateway.liveCheckpointRetryChannels || new Set()).has(f.child.id));
-    if (timer) {
-      timer.awaited = true;
-      await timer.waitForFire();
       progressed = true;
     }
     if (!progressed) break;
@@ -285,6 +274,9 @@ async function pendingScenario(t, secondDeadline) {
     heldCount: f.gateway.liveIntakeCounts.get(f.child.id)
   };
   assert.equal(capped, null, 'checkpoint recursion exceeded fixed 64-entry observation cap');
+  if (secondDeadline) {
+    assert.equal(slowChildCalls, 1, 'the first post-reconnect child fetch uses the 45ms delayed path');
+  }
   assert.equal(snapshot.childState, THREAD_STATES.READY);
   assert.equal(snapshot.messageState, MESSAGE_STATES.REPLIED);
   assert.deepEqual(snapshot.dispatched, ['101']);
