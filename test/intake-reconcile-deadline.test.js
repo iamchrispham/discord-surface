@@ -425,11 +425,40 @@ test('T4: stop returns without awaiting a stuck lookup and later settlement is i
   assert.equal(reconcileCalls, 1, 'a settlement after stop must not enqueue reconciliation');
 });
 
+const T5_AGGREGATE_DEADLINE_MS = 4000;
+const t5DeadlineController = new AbortController();
+let t5DeadlineTimer;
+
+function startT5AggregateDeadline() {
+  if (t5DeadlineTimer) return;
+  t5DeadlineTimer = setTimeout(() => {
+    t5DeadlineController.abort(new Error('T5 aggregate deadline exceeded'));
+  }, T5_AGGREGATE_DEADLINE_MS);
+}
+
+function stopT5AggregateDeadline() {
+  clearTimeout(t5DeadlineTimer);
+}
+
+function t5Test(name, run) {
+  test(name, { signal: t5DeadlineController.signal }, async t => {
+    startT5AggregateDeadline();
+    await run(t);
+  });
+}
+
+test('new T5 scenarios must use the shared deadline owner', () => {
+  const source = require('node:fs').readFileSync(__filename, 'utf8');
+  assert.match(source, /const T5_AGGREGATE_DEADLINE_MS = 4000;/);
+  assert.match(source, /function t5Test\(name, run\)\s*\{\s*test\(name,\s*\{\s*signal:\s*t5DeadlineController\.signal\s*\},\s*async t => \{\s*startT5AggregateDeadline\(\);/);
+  assert.doesNotMatch(source, /^\s*test\(['"`]T5\./m);
+});
+
 // T5.1: the adopted-waiter defect. The first pass starts the lookup and gives up
 // at its deadline; a reconnect pass adopts the SAME unresolved promise, gives up
 // again, and then the original promise settles. The adopted waiter must still
 // retain late-settlement interest and deliver once.
-test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t => {
+t5Test('T5.1: adopted late settlement replies once', async t => {
   const f = fixture(t);
   seedReplyReady(f, '101', '1000');
   f.enableDelivery();
@@ -469,7 +498,7 @@ test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t =>
 // T5.2: stale-only settlement. After the original wait expires and the gateway
 // reopens, the promise settles while NO new pass has attached a current waiter,
 // so nothing may act and no retry storm may start.
-test('T5.2: stale-only settlement preserves custody', { timeout: 4000 }, async t => {
+t5Test('T5.2: stale-only settlement preserves custody', async t => {
   const f = fixture(t);
   seedReplyReady(f, '102', '1000');
   f.enableDelivery();
@@ -496,7 +525,7 @@ test('T5.2: stale-only settlement preserves custody', { timeout: 4000 }, async t
 // T5.3: authority fencing by binding generation. An adopted waiter is current,
 // but the fixture binding generation moves +1 before settlement, so the late
 // continuation must refuse without sending or dispatching.
-test('T5.3: changed generation refuses late settlement', { timeout: 4000 }, async t => {
+t5Test('T5.3: changed generation refuses late settlement', async t => {
   const f = fixture(t);
   seedReplyReady(f, '103', '1000');
   f.enableDelivery();
@@ -526,7 +555,7 @@ test('T5.3: changed generation refuses late settlement', { timeout: 4000 }, asyn
 // T5.4: authority fencing by revoked permission. The adopted waiter is current,
 // but the fixture destination stops granting send permission before settlement,
 // so the late continuation must refuse.
-test('T5.4: revoked permission refuses late settlement', { timeout: 4000 }, async t => {
+t5Test('T5.4: revoked permission refuses late settlement', async t => {
   const f = fixture(t);
   seedReplyReady(f, '104', '1000');
   f.enableDelivery();
@@ -555,7 +584,7 @@ test('T5.4: revoked permission refuses late settlement', { timeout: 4000 }, asyn
 
 // T5.5: repeated-deadline guard. Two consecutive adopted deadline expiries must
 // keep charging the same single unresolved lookup, not start a new one.
-test('T5.5: repeated deadlines share one lookup', { timeout: 4000 }, async t => {
+t5Test('T5.5: repeated deadlines share one lookup', async t => {
   const f = fixture(t);
   seedReplyReady(f, '105', '1000');
   f.enableDelivery();
@@ -576,7 +605,8 @@ test('T5.5: repeated deadlines share one lookup', { timeout: 4000 }, async t => 
 // T5.6: success guard. An adopted pass that is still within its deadline when
 // the original promise settles must deliver exactly once with no second
 // speculative fetch.
-test('T5.6: timely adopted success replies once', { timeout: 4000 }, async t => {
+t5Test('T5.6: timely adopted success replies once', async t => {
+  t.after(stopT5AggregateDeadline);
   const f = fixture(t);
   seedReplyReady(f, '106', '1000');
   f.enableDelivery();
