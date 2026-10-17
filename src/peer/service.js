@@ -5,49 +5,15 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
-const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
+const {
+  canonicalNativeId, currentPeerDestination, resolvePeerBinding, samePeerBinding,
+  validatePeerSelector, requireReadyPeer
+} = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
 const { inspectPeerResult, validPeerId } = require('./result');
 const { encodeAgentMessage, issueAgentAddress, sameAddress, KINDS } = require('../agent-message');
-const { READINESS } = require('../state');
-const { THREAD_STATES } = require('../state/thread-enrollment');
-
-function canonicalNativeId(value) {
-  return typeof value === 'string' ? value.toLowerCase() : value;
-}
-
-function samePeerBinding(left, right) {
-  return left.active && left.guildId === right.guildId && left.channelId === right.channelId &&
-    left.provider === right.provider && canonicalNativeId(left.nativeId) === canonicalNativeId(right.nativeId) &&
-    left.generation === right.generation && (left.conductorId ?? null) === (right.conductorId ?? null) &&
-    (left.repoKey ?? null) === (right.repoKey ?? null);
-}
-
-function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null, allowUnreadyChild = false) {
-  if (!target || typeof target !== 'object') return false;
-  const { guildId } = state.requireConfig();
-  const candidates = state.listBindings().filter(binding =>
-    binding.active && binding.guildId === guildId && binding.guildId === target.guildId &&
-    binding.provider === target.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(target.nativeId) &&
-    binding.generation === target.generation && (!expectedBinding || samePeerBinding(binding, expectedBinding))
-  );
-  const routes = candidates.filter(binding => {
-    const children = state.listThreadEnrollments(binding.channelId).filter(child =>
-      child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId
-    );
-    const watermark = state.getIntakeWatermark(binding.channelId);
-    const parentRoute = binding.channelId === target.channelId &&
-      (!expectedBinding || samePeerBinding(binding, expectedBinding));
-    const childRoute = children.some(child => (allowUnreadyChild || child.state === THREAD_STATES.READY) &&
-      child.threadId === target.channelId &&
-      (expectedChildId === null || expectedChildId === child.threadId));
-    return binding.readiness === READINESS.READY &&
-      (!watermark || watermark.state === READINESS.READY) && (parentRoute || childRoute);
-  });
-  return routes.length === 1;
-}
 
 function requireReadyReplyPeer(state, binding) {
   try {

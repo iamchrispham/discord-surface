@@ -6,8 +6,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
-const { SurfaceState } = require('../src/state');
+const { SurfaceState, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
+const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
+const { currentPeerDestination } = require('../dist/peer/resolution');
 const { agentCompletionCommand, codexPrompt, claudeEvent, messageRequest } = require('../src/native');
 const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 const { source, target, packet, token, enrollChild } = require('./agent-message-fixtures');
@@ -33,12 +35,148 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
     state = new SurfaceState(db);
     const restored = state.getMessage(event.id);
     assert.deepEqual(restored.agentMessage, addressed);
+    assert.equal(restored.agentPresentation, undefined);
     assert.equal(state.currentMessageBinding(restored).current, true);
     assert.match(codexPrompt(restored), /not as the operator/);
     assert.match(claudeEvent(restored).content, /not as the operator/);
     assert.ok(codexPrompt(restored).includes(packet.text));
     assert.equal(state.acceptDiscordMessage({ ...event, id: '1003', content: 'Ordinary bot milestone' }, { agentToken: token }).accepted, false);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('authenticated request freezes readable presentation for a local source through reopen and all native callers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-readable-request-'));
+  const db = path.join(dir, 'surface.sqlite');
+  let state = new SurfaceState(db);
+  const stdout = new EventEmitter();
+  const events = [];
+  stdout.write = (chunk, callback) => {
+    events.push(JSON.parse(String(chunk)));
+    callback?.();
+    return true;
+  };
+  try {
+    state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') }, { intakeCutoff: '100' });
+    const destination = enrollChild(state, target, '103', null);
+    state.bind({ ...source, workspace: dir, endpoint: path.join(dir, 'source.sock') }, { intakeCutoff: '100' });
+    const sourceBinding = state.getBinding(source.channelId);
+    state.setBindingReadiness(source.channelId, READINESS.READY, 'local requester ready', sourceBinding);
+    assert.equal(state.acceptDiscordMessage({
+      id: '1090', guildId: sourceBinding.guildId, channelId: sourceBinding.channelId,
+      authorId: '900', isBot: false, attachments: [], content: 'Requester route is ready.'
+    }).accepted, true);
+    const localSource = {
+      guildId: sourceBinding.guildId,
+      channelId: sourceBinding.channelId,
+      provider: sourceBinding.provider,
+      nativeId: sourceBinding.nativeId,
+      generation: sourceBinding.generation
+    };
+    const addressed = { ...packet, source: localSource, target: destination };
+    assert.equal(addressed.kind, KINDS.REQUEST);
+    assert.equal(currentPeerDestination(state, localSource), true);
+    const event = {
+      id: '1101', guildId: destination.guildId, channelId: destination.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(addressed, token)
+    };
+
+    assert.equal(state.acceptDiscordMessage(event, { agentToken: 'wrong' }).accepted, false);
+    state.failNextIntakeFlag = true;
+    assert.throws(() => state.acceptDiscordMessage({ ...event, id: '1100' }, { agentToken: token }), /injected intake transaction failure/);
+    assert.equal(state.getMessage('1100'), null);
+    assert.equal(state.getAgentMessage('1100'), null);
+    assert.equal(state.acceptDiscordMessage(event, { agentToken: token }).accepted, true);
+    const firstReceipt = state.getAgentMessage(event.id);
+    assert.equal(firstReceipt.agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+    assert.equal(firstReceipt.packet.agentPresentation, undefined);
+
+    state.setBindingReadiness(source.channelId, Object.values(READINESS).find(value => value !== READINESS.READY),
+      'requester route changed after acceptance', state.getBinding(source.channelId));
+    assert.equal(state.acceptDiscordMessage({ ...event, id: '1102' }, { agentToken: token }).reason, 'agent-message-duplicate');
+    assert.equal(state.getAgentMessage(event.id).agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+
+    state.close();
+    state = new SurfaceState(db);
+    const restored = state.getMessage(event.id);
+    assert.equal(restored.agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+    assert.equal(state.claimDispatch(event.id).claimed, true);
+    state.markSubmitted(event.id);
+    const completion = agentCompletionCommand(restored, db, path.resolve(path.join(__dirname, '../src/cli.js')), dir);
+
+    const codexText = codexPrompt(restored, null, completion);
+    const claudeText = claudeEvent(restored, completion).content;
+    for (const text of [codexText, claudeText]) {
+      assert.match(text, /agent-send --agent-presentation attachment-v1 --agent-reply-to/);
+      const argv = JSON.parse(text.match(/with exact argv (\[[^\n]*\])\./)[1]);
+      assert.equal(argv[argv.indexOf('--agent-presentation') + 1], AGENT_PRESENTATIONS.ATTACHMENT);
+    }
+
+    const monitor = createMonitorMcp({ state, stateDir: dir, dbPath: db, stdout });
+    try {
+      await monitor.notification({
+        method: 'notifications/claude/channel',
+        params: { content: 'ignored monitor content', meta: {
+          messageId: event.id, nativeId: restored.nativeId, generation: String(restored.generation)
+        } }
+      });
+    } finally { await monitor.close(); }
+    assert.equal(events.length, 1);
+    const monitorPayload = JSON.parse(fs.readFileSync(events[0].payloadPath, 'utf8'));
+    assert.equal(monitorPayload.content, messageRequest(restored, completion));
+    assert.match(monitorPayload.content, /agent-send --agent-presentation attachment-v1 --agent-reply-to/);
+    assert.doesNotMatch(monitorPayload.content, /ignored monitor content/);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('current peer destination accepts only a unique ready local route', () => {
+  const route = {
+    guildId: source.guildId,
+    channelId: source.channelId,
+    provider: source.provider,
+    nativeId: source.nativeId,
+    generation: source.generation
+  };
+  const binding = {
+    ...route, active: true, readiness: READINESS.READY, conductorId: null, repoKey: null
+  };
+  const unready = Object.values(READINESS).find(value => value !== READINESS.READY);
+  const makeState = ({ bindings = [binding], children = new Map(), watermarks = new Map() } = {}) => ({
+    requireConfig: () => ({ guildId: route.guildId }),
+    listBindings: () => bindings,
+    listThreadEnrollments: channelId => children.get(channelId) || [],
+    getIntakeWatermark: channelId => watermarks.get(channelId) || null,
+    getBindingReadinessReceipt: () => null
+  });
+
+  assert.equal(currentPeerDestination(makeState(), route), true);
+  assert.equal(currentPeerDestination(makeState({ bindings: [] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ bindings: [{ ...binding, generation: route.generation + 1 }] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ bindings: [{ ...binding, readiness: unready }] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ watermarks: new Map([[route.channelId, { state: unready }]]) }), route), false);
+  assert.equal(currentPeerDestination(makeState(), { ...route, channelId: 'unmatched-channel' }), false);
+
+  const second = { ...binding, channelId: 'second-parent' };
+  const ambiguousChildren = new Map([['second-parent', [{
+    threadId: route.channelId, parentChannelId: 'second-parent', guildId: route.guildId,
+    active: true, state: THREAD_STATES.READY
+  }]]]);
+  assert.equal(currentPeerDestination(makeState({ bindings: [binding, second], children: ambiguousChildren }), route), false);
+});
+
+test('current peer destination keeps one source owner and the declared consumers', () => {
+  const root = path.join(__dirname, '..', 'src');
+  const counts = {};
+  for (const file of fs.readdirSync(root, { recursive: true }).filter(entry => /\.[cm]?[jt]sx?$/.test(entry))) {
+    const content = fs.readFileSync(path.join(root, file), 'utf8');
+    const count = [...content.matchAll(/\bcurrentPeerDestination\b/g)].length;
+    if (count) counts[file] = count;
+  }
+  assert.deepEqual(counts, {
+    'peer/resolution.ts': 1,
+    'peer/service.js': 2,
+    'state/message-intake.js': 2
+  });
 });
 
 test('agent packet dedupe compares the full source and target route', () => {

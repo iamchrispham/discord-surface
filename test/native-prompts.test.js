@@ -9,6 +9,7 @@ const prompts = require('../dist/native/prompts.js');
 const { createWatcherNotice } = require('../src/watcher-notice');
 const { ENVELOPE_TYPE } = require('../dist/state/courier-route/constants.js');
 const { KINDS } = require('../src/agent-message');
+const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
 const { parseArgs } = require('../src/cli');
 const fs = require('node:fs');
 const ts = require('typescript');
@@ -253,6 +254,21 @@ test('generated agent result commands keep legacy presentation for both vendors'
     assert.equal(parsed.args['agent-reply-to'], message.agentMessage.id);
     assert.equal(parsed.args['dedupe-key'], `agent-result-${message.id}`);
     assert.match(facade.messageRequest(message), /agent-send --agent-presentation legacy --agent-reply-to/);
+  }
+});
+
+test('generated agent result commands use the frozen attachment presentation for both vendors', () => {
+  for (const provider of ['codex', 'claude']) {
+    const message = { ...agentRequest, provider, agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT,
+      agentMessage: { ...agentRequest.agentMessage, target: { ...agentRequest.agentMessage.target, provider } } };
+    const text = provider === 'codex'
+      ? facade.codexPrompt(message, null, completion)
+      : facade.claudeEvent(message, completion).content;
+    const argv = JSON.parse(text.match(/with exact argv (\[[^\n]*\])\./)[1]);
+    const parsed = parseArgs(argv.slice(2));
+    assert.equal(parsed.command, 'agent-send');
+    assert.equal(parsed.args['agent-presentation'], AGENT_PRESENTATIONS.ATTACHMENT);
+    assert.match(facade.messageRequest(message), /agent-send --agent-presentation attachment-v1 --agent-reply-to/);
   }
 });
 

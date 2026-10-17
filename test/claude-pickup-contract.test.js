@@ -18,6 +18,7 @@ const { z } = require('zod');
 const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { KINDS, encodeAgentMessage } = require('../src/agent-message');
+const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
 const { runWatcherNoticePost } = require('../src/direct-post');
 const { createDefaultMcp, CLAUDE_PICKUP_ACKNOWLEDGMENT } = require('../src/claude-channel');
 const { createMonitorMcp } = require('../src/claude-monitor');
@@ -384,7 +385,7 @@ test('legacy request Monitor payload keeps its frozen child after another child 
       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       id, GUILD_ID, OWNER_CHANNEL, OWNER_CHANNEL, '901', encodeAgentMessage(packet, TOKEN), '[]',
       'claude', CLAUDE_ID, f.dir, f.binding.endpoint, f.binding.generation, MESSAGE_STATES.ACCEPTED, stamp, stamp);
-    f.state.receipt(id, 'agent-message', { packet, authorId: '901' });
+    f.state.receipt(id, 'agent-message', { packet, authorId: '901', agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT });
     assert.equal(f.state.claimDispatch(id).message.agentRoute, CHILD_CHANNEL);
     f.state.markSubmitted(id);
     const emit = async () => {
@@ -399,6 +400,7 @@ test('legacy request Monitor payload keeps its frozen child after another child 
       return fs.readFileSync(pointers[0].payloadPath, 'utf8');
     };
     const first = await emit();
+    assert.match(first, /agent-send --agent-presentation legacy --agent-reply-to legacy-2201/);
     assert.match(first, /--agent-thread-id/);
     assert.match(first, /102/);
     f.state.enrollThread({ threadId: '103', parentChannelId: OWNER_CHANNEL, guildId: GUILD_ID,
