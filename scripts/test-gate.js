@@ -1,0 +1,71 @@
+'use strict';
+
+const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const { runFullGate, nodeOptionTokens } = require('./full-gate');
+
+const root = path.resolve(__dirname, '..');
+const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
+function validSelection(suites) {
+  const registered = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
+  const selectionOption = /^--test(?:-name-pattern|-skip-pattern|-only|-shard)(?:=|$)/;
+  const explicitFiles = suites.every(file => /^test\/.+\.(?:js|cjs)$/.test(file));
+  const completeList = suites.length > 0 && explicitFiles && new Set(suites).size === suites.length && JSON.stringify(suites) === JSON.stringify(registered);
+  const selectionRequested = nodeOptionTokens(process.env.NODE_OPTIONS || '').some(token => selectionOption.test(token.replace(/_/g, '-')));
+  return completeList && !selectionRequested;
+}
+
+function pythonTestEnvironment(environment = process.env) {
+  const isolated = { ...environment, PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
+  for (const name of ['PYTHONPATH', 'PYTHONUSERBASE', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONEXECUTABLE', 'PYTHONINSPECT']) {
+    delete isolated[name];
+  }
+  delete isolated.PYTHONPYCACHEPREFIX;
+  if (environment.DISCORD_SURFACE_GATE_SCRATCH) {
+    isolated.PYTHONPYCACHEPREFIX = path.join(environment.DISCORD_SURFACE_GATE_SCRATCH, 'python-pycache');
+  }
+  return isolated;
+}
+
+async function body(suites) {
+  if (!validSelection(suites)) {
+    process.stderr.write('test gate requires the complete registered suite list without selection options\n');
+    return 4;
+  }
+  const commands = [
+    [npm, ['run', 'build']],
+    [npm, ['run', 'typecheck']],
+    [process.execPath, ['--test', '--test-concurrency=1', ...suites]]
+  ];
+  for (const [command, args] of commands) {
+    if (command === process.execPath) process.stdout.write('FULL_GATE_TEST_ARGUMENTS=' + JSON.stringify(suites) + '\n');
+    const env = { ...process.env };
+    if (command === process.execPath) {
+      delete env.NODE_TEST_CONTEXT;
+      Object.assign(env, pythonTestEnvironment(env));
+    }
+    const result = spawnSync(command, args, { cwd: root, stdio: 'inherit', env });
+    if (result.error) throw result.error;
+    if (result.signal) return 128 + os.constants.signals[result.signal];
+    if (result.status !== 0) return result.status;
+  }
+  return 0;
+}
+
+function main(suites = process.argv.slice(2)) {
+  if (!validSelection(suites)) {
+    process.stderr.write('test gate requires the complete registered suite list without selection options\n');
+    process.exitCode = 4;
+    return;
+  }
+  runFullGate(root, 'test', __filename, suites)
+    .then(code => { process.exitCode = code; })
+    .catch(error => { process.stderr.write(error.message + '\n'); process.exitCode = 1; });
+}
+
+if (require.main === module) main();
+
+module.exports = { runBody: body, pythonTestEnvironment };
