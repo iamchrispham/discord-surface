@@ -170,11 +170,11 @@ function staticFragmentsFromExpression(expression, context, seen = new Set()) {
     }
     return fragments;
   }
-  if (!ts.isIdentifier(current)) return [];
+  if (!ts.isIdentifier(current)) return [undefined];
   const declarations = declarationsAt(context.checker, current, context.sourceFile);
-  if (!declarations || declarations.length !== 1) return [];
+  if (!declarations || declarations.length !== 1) return [undefined];
   const initializer = constInitializerFor(declarations[0]);
-  if (!initializer || seen.has(declarations[0])) return [];
+  if (!initializer || seen.has(declarations[0])) return [undefined];
   seen.add(declarations[0]);
   const fragments = staticFragmentsFromExpression(initializer, context, seen);
   seen.delete(declarations[0]);
@@ -183,10 +183,84 @@ function staticFragmentsFromExpression(expression, context, seen = new Set()) {
 
 function mayNameCodec(expression, context) {
   const fragments = staticFragmentsFromExpression(expression, context);
-  const combined = fragments.join('');
-  return /town-hall-child/.test(combined) ||
-    /(?:^|[^a-z0-9_-])town-hall-(?:c(?:h(?:i(?:l(?:d)?)?)?)?)?(?:$|[^a-z0-9_-])/i.test(combined) ||
+  const knownText = fragments.filter((fragment) => typeof fragment === 'string').join('');
+  return /town-hall-child/.test(knownText) ||
+    /(?:^|[^a-z0-9_-])town-hall-(?:c(?:h(?:i(?:l(?:d)?)?)?)?)?(?:$|[^a-z0-9_-])/i.test(knownText) ||
+    hasUnresolvedTownHallChildPattern(fragments) ||
     /town-hall-child/.test(expression.getText(context.sourceFile));
+}
+
+function hasUnresolvedTownHallChildPattern(fragments) {
+  const unresolvedSegment = 'hall';
+  const ordered = [];
+  for (const fragment of fragments) {
+    const previous = ordered[ordered.length - 1];
+    if (typeof fragment === 'string' && typeof previous === 'string') {
+      ordered[ordered.length - 1] += fragment;
+    } else {
+      ordered.push(fragment);
+    }
+  }
+
+  for (let startIndex = 0; startIndex < ordered.length; startIndex += 1) {
+    const startFragment = ordered[startIndex];
+    if (typeof startFragment !== 'string') continue;
+    const lowerStart = startFragment.toLowerCase();
+    let startAt = lowerStart.indexOf('town-');
+    while (startAt !== -1) {
+      const previousCharacter = startAt > 0 ? startFragment[startAt - 1] : undefined;
+      const previousFragment = ordered[startIndex - 1];
+      const hasPathBoundary = startAt > 0
+        ? previousCharacter === '/' || previousCharacter === '\\'
+        : startIndex === 0 || previousFragment === undefined;
+
+      if (hasPathBoundary) {
+        for (let endIndex = startIndex + 1; endIndex < ordered.length; endIndex += 1) {
+          const endFragment = ordered[endIndex];
+          if (typeof endFragment !== 'string') continue;
+          const lowerEnd = endFragment.toLowerCase();
+          let endAt = lowerEnd.indexOf('-child');
+          while (endAt !== -1) {
+            const trailing = endFragment.slice(endAt + '-child'.length);
+            const supportedSuffix = /^(?:\.(?:[cm]?[jt]sx?))?(?:[?#].*)?$/i.test(trailing);
+            const suffixMayBeEmpty = ordered.slice(endIndex + 1).every((part) => part === undefined);
+            const middle = [startFragment.slice(startAt + 'town-'.length)];
+            middle.push(...ordered.slice(startIndex + 1, endIndex));
+            middle.push(endFragment.slice(0, endAt));
+
+            if (supportedSuffix && suffixMayBeEmpty && middle.includes(undefined)) {
+              let positions = new Set([0]);
+              let sawUnknown = false;
+              for (const part of middle) {
+                const nextPositions = new Set();
+                for (const position of positions) {
+                  if (part === undefined) {
+                    sawUnknown = true;
+                    for (let next = position; next <= unresolvedSegment.length; next += 1) {
+                      nextPositions.add(next);
+                    }
+                    continue;
+                  }
+                  const literal = part.toLowerCase();
+                  if (unresolvedSegment.startsWith(literal, position)) {
+                    nextPositions.add(position + literal.length);
+                  }
+                }
+                positions = nextPositions;
+                if (positions.size === 0) break;
+              }
+              if (sawUnknown && positions.has(unresolvedSegment.length)) return true;
+            }
+            endAt = lowerEnd.indexOf('-child', endAt + 1);
+          }
+        }
+      }
+
+      startAt = lowerStart.indexOf('town-', startAt + 1);
+    }
+  }
+
+  return false;
 }
 
 function staticStringFromExpression(expression, context, seen = new Set()) {
@@ -251,11 +325,18 @@ function loaderFromExpression(expression, context, seen = new Set()) {
     seen.add(declarations[0]);
     return loaderFromExpression(initializer, context, seen);
   }
-  if (ts.isPropertyAccessExpression(current) && current.name.text === 'require' &&
-      ts.isIdentifier(current.expression) && current.expression.text === 'module') {
+  const memberName = moduleMemberNameFromExpression(current, context);
+  if (memberName === 'require' && ts.isIdentifier(current.expression) &&
+      current.expression.text === 'module') {
     return declarationsAt(context.checker, current.expression, context.sourceFile) ? 'none' : 'loader';
   }
   return 'none';
+}
+
+function moduleMemberNameFromExpression(expression, context) {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (!ts.isElementAccessExpression(expression)) return undefined;
+  return staticStringFromExpression(expression.argumentExpression, context).value;
 }
 
 function moduleReferenceExpression(node, siteKind) {
@@ -624,6 +705,87 @@ test('consumer inventory folds static string concatenations and template substit
   }
 });
 
+test('consumer inventory recognizes statically named bracketed module require calls', () => {
+  const positiveControls = [
+    ['src/bracket-require-single-source.js', "module['require']('./town-hall-child.ts');"],
+    ['src/bracket-require-double-emitted.js', 'module["require"]("../dist/town-hall-child.js");'],
+    ['src/bracket-require-template-source.js', "module[`require`]('./town-hall-child');"],
+    ['src/bracket-require-constant-alias.js', `
+      const member = ('require');
+      const load = module[(member)];
+      const codec = load('../dist/town-hall-child.js');
+    `],
+  ];
+
+  for (const [relativePath, source] of positiveControls) {
+    assert.equal(
+      productionFileLoadsCodec(relativePath, source),
+      true,
+      'bracketed module require was not recognized: ' + relativePath,
+    );
+  }
+
+  const negativeControls = [
+    ['src/bracket-unrelated-module-member.js', "module['resolve']('../dist/town-hall-child.js');"],
+    ['src/bracket-unknown-module-member.js', "module[getMemberName()]('../dist/town-hall-child.js');"],
+    ['src/bracket-unrelated-target.js', "module['require']('./unrelated-module');"],
+    ['src/bracket-shadowed-module-class.js', `
+      class module { static require(value) { return value; } }
+      module.require('../dist/town-hall-child.js');
+    `],
+  ];
+
+  for (const [relativePath, source] of negativeControls) {
+    assert.equal(
+      productionFileLoadsCodec(relativePath, source),
+      false,
+      'non-global or unrelated bracketed member was treated as a codec consumer: ' + relativePath,
+    );
+  }
+});
+
+test('consumer inventory refuses unresolved split codec path fragments', () => {
+  const unresolvedControls = [
+    ['src/split-source-dynamic.js', "function load(runtimePart) { return require('./town-' + runtimePart + '-child'); }"],
+    ['src/split-emitted-dynamic.js', "function load(runtimePart) { return require('../dist/town-' + runtimePart + '-child.js'); }"],
+    ['src/split-source-template-dynamic.js', "function load(runtimePart) { return require(`./town-${runtimePart}-child.ts`); }"],
+    ['src/split-emitted-template-alias-dynamic.js', "const prefix = '../dist/town-'; const suffix = '-child.js'; function load(runtimePart) { return require(`${prefix}${runtimePart}${suffix}`); }"],
+    ['src/split-source-const-alias-dynamic.js', `
+      const prefix = './town-';
+      const suffix = '-child';
+      function load(runtimePart) {
+        const codecPath = prefix + runtimePart + suffix;
+        return require(codecPath);
+      }
+    `],
+  ];
+
+  for (const [relativePath, source] of unresolvedControls) {
+    assert.throws(
+      () => productionFileLoadsCodec(relativePath, source),
+      /Unclassified codec loader syntax/,
+      'unresolved codec-shaped path was not refused: ' + relativePath,
+    );
+  }
+
+  assert.equal(
+    productionFileLoadsCodec(
+      'src/split-source-static-constant.js',
+      "const runtimePart = 'hall'; require('./town-' + runtimePart + '-child');",
+    ),
+    true,
+    'a constant split codec path should resolve normally',
+  );
+  assert.equal(
+    productionFileLoadsCodec(
+      'src/unrelated-dynamic-path.js',
+      "function load(runtimePart) { return require('./config-' + runtimePart + '.json'); }",
+    ),
+    false,
+    'an unrelated unresolved path should remain compatible',
+  );
+});
+
 test('consumer inventory refuses recognized codec expressions outside the finite evaluator', () => {
   assert.throws(
     () => productionFileLoadsCodec(
@@ -693,17 +855,77 @@ test('consumer inventory pins the supported module-reader syntax sites', () => {
     return [...new Set(predicates)].sort();
   }
 
+  function callsFor(name) {
+    const target = functionNamed(name);
+    assert.ok(target, name + ' is present');
+    const calls = [];
+    function collect(node) {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        calls.push(node.expression.text);
+      }
+      ts.forEachChild(node, collect);
+    }
+    collect(target);
+    return calls.sort();
+  }
+
+  function memberReadsFor(name, receiver) {
+    const target = functionNamed(name);
+    assert.ok(target, name + ' is present');
+    const reads = [];
+    function collect(node) {
+      if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
+          node.expression.text === receiver) {
+        reads.push('property:' + node.name.text);
+      }
+      if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) &&
+          node.expression.text === receiver) {
+        const argument = node.argumentExpression;
+        reads.push('element:' + (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument)
+          ? argument.text
+          : 'computed'));
+      }
+      ts.forEachChild(node, collect);
+    }
+    collect(target);
+    return reads.sort();
+  }
+
   assert.deepEqual(predicatesFor('moduleReferenceSiteKind'), [
     'isCallExpression', 'isExportDeclaration', 'isImportDeclaration', 'isImportEqualsDeclaration',
   ]);
   assert.deepEqual(predicatesFor('moduleReferenceExpression'), ['isExternalModuleReference']);
+  assert.deepEqual(predicatesFor('staticFragmentsFromExpression'), [
+    'isBinaryExpression', 'isIdentifier', 'isNoSubstitutionTemplateLiteral',
+    'isParenthesizedExpression', 'isStringLiteral', 'isTemplateExpression',
+  ]);
   assert.deepEqual(predicatesFor('loaderFromExpression'), [
-    'isIdentifier', 'isParenthesizedExpression', 'isPropertyAccessExpression',
+    'isIdentifier', 'isParenthesizedExpression',
+  ]);
+  assert.deepEqual(predicatesFor('moduleMemberNameFromExpression'), [
+    'isElementAccessExpression', 'isPropertyAccessExpression',
   ]);
   assert.deepEqual(predicatesFor('staticStringFromExpression'), [
     'isBinaryExpression', 'isIdentifier', 'isNoSubstitutionTemplateLiteral',
     'isParenthesizedExpression', 'isStringLiteral', 'isTemplateExpression',
   ]);
+  assert.deepEqual(predicatesFor('hasUnresolvedTownHallChildPattern'), []);
+  assert.deepEqual(callsFor('mayNameCodec'), [
+    'hasUnresolvedTownHallChildPattern', 'staticFragmentsFromExpression',
+  ]);
+  assert.deepEqual(callsFor('staticFragmentsFromExpression'), [
+    'constInitializerFor', 'declarationsAt', 'staticFragmentsFromExpression',
+  ]);
+  assert.deepEqual(callsFor('loaderFromExpression'), [
+    'constInitializerFor', 'declarationsAt', 'declarationsAt', 'loaderFromExpression',
+    'moduleMemberNameFromExpression',
+  ]);
+  assert.deepEqual(callsFor('moduleMemberNameFromExpression'), ['staticStringFromExpression']);
+  assert.deepEqual(memberReadsFor('moduleMemberNameFromExpression', 'expression'), [
+    'property:argumentExpression', 'property:name',
+  ]);
+  assert.deepEqual(memberReadsFor('hasUnresolvedTownHallChildPattern', 'fragments'), []);
+  assert.deepEqual(callsFor('hasUnresolvedTownHallChildPattern'), []);
 
   const productionClassifier = functionNamed('productionFileLoadsCodec');
   assert.ok(productionClassifier, 'production classifier is present');
