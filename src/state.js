@@ -1043,18 +1043,6 @@ class SurfaceState {
     return decisionHandlers.admitClickAndBeginCallback(this, input);
   }
 
-  admitDecisionClickAndBeginAuthorization(input) {
-    return decisionHandlers.admitClickAndBeginAuthorization(this, input);
-  }
-
-  recordDecisionAuthorizationOutcome(interactionId, outcome) {
-    return decisionHandlers.recordAuthorizationOutcome(this, interactionId, outcome);
-  }
-
-  reconcileDecisionClickBinding(interactionId) {
-    return decisionHandlers.reconcileClickBinding(this, interactionId);
-  }
-
   getDecisionClick(interactionId) {
     return decisionHandlers.getClick(this, interactionId);
   }
@@ -1065,14 +1053,6 @@ class SurfaceState {
 
   recordDecisionCallbackOutcome(interactionId, outcome) {
     return decisionHandlers.recordCallbackOutcome(this, interactionId, outcome);
-  }
-
-  beginDecisionRejectionFollowup(interactionId) {
-    return decisionHandlers.beginRejectionFollowup(this, interactionId);
-  }
-
-  recordDecisionRejectionOutcome(interactionId, outcome) {
-    return decisionHandlers.recordRejectionOutcome(this, interactionId, outcome);
   }
 
   importDecisionWinner(interactionId, result) {

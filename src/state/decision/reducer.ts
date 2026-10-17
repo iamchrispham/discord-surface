@@ -49,6 +49,34 @@ const WINNER_SOURCE_VALUES = Object.values(DECISION_WINNER_SOURCES) as DecisionW
 const NATIVE_OUTCOME_VALUES = Object.values(DECISION_NATIVE_OUTCOMES) as DecisionNativeOutcome[];
 const CANONICAL_ROUTE_PATH_MAX = 4096;
 const CANONICAL_CONTENT_MAX = 2000;
+const READ_COMPATIBILITY_KINDS: ReadonlySet<string> = new Set([
+  DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME,
+  DECISION_RECEIPT_KINDS.CLICK_STALE,
+  DECISION_RECEIPT_KINDS.REJECTION_ATTEMPT,
+  DECISION_RECEIPT_KINDS.REJECTION_OUTCOME,
+  DECISION_RECEIPT_KINDS.TOKEN_RELEASE
+]);
+const readCompatibilityClicks = new WeakSet<MutableClick>();
+
+function readCompatibilityInteractions(rows: readonly Pick<JournalRow, 'kind' | 'detail'>[]): Set<string> {
+  const interactions = new Set<string>();
+  for (const row of rows) {
+    const detail = parseDetail(row.detail);
+    if (!detail || typeof detail.interactionId !== 'string') continue;
+    if (READ_COMPATIBILITY_KINDS.has(row.kind) ||
+      (row.kind === DECISION_RECEIPT_KINDS.CLICK && detail.authorizationPending === true)) {
+      interactions.add(detail.interactionId);
+    }
+  }
+  return interactions;
+}
+
+export function decisionCompatibilityHeld(
+  rows: readonly Pick<JournalRow, 'kind' | 'detail'>[],
+  interactionId: string
+): boolean {
+  return readCompatibilityInteractions(rows).has(interactionId);
+}
 const PROJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
   DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
   DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
@@ -60,6 +88,12 @@ const REJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
 ]);
 
 function projectionStateAfterOutcome(click: MutableClick): DecisionState {
+  if (!readCompatibilityClicks.has(click)) {
+    if (click.nativeReturn) return click.nativeReturn.state;
+    return click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN
+      ? DECISION_STATES.UNKNOWN
+      : DECISION_STATES.TERMINAL;
+  }
   const native = click.nativeReturn;
   if (!native) return PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome as DecisionTransportOutcome)
     ? DECISION_STATES.UNKNOWN
@@ -76,6 +110,11 @@ function projectionStateAfterOutcome(click: MutableClick): DecisionState {
 }
 
 function nativeStateAfterOutcome(click: MutableClick, nextOutcome: DecisionNativeOutcome): DecisionState {
+  if (!readCompatibilityClicks.has(click)) {
+    if (nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) return DECISION_STATES.TERMINAL;
+    if (nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT) return DECISION_STATES.NATIVE_RETURN_PENDING;
+    return DECISION_STATES.UNKNOWN;
+  }
   if (nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
     if (click.canonical?.materialized && click.projectionOutcome !== null &&
       PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
@@ -244,18 +283,28 @@ export function mutablePresentationOutput(presentation: MutablePresentation): De
 }
 
 export function mutableClickOutput(click: MutableClick): DecisionClick {
-  return {
+  const output: DecisionClick = {
     ...click,
     binding: { ...click.binding },
     canonical: click.canonical ? { ...click.canonical } : null,
     nativeReturn: click.nativeReturn ? { ...click.nativeReturn } : null
   };
+  delete output.token;
+  if (!readCompatibilityClicks.has(click)) {
+    delete output.applicationId;
+    delete output.authorizationOutcome;
+    delete output.rejectionAttempted;
+    delete output.rejectionOutcome;
+  }
+  return output;
 }
 
 export function snapshot(state: DecisionStateStore): Snapshot {
   const presentations = new Map<string, MutablePresentation>();
   const clicks = new Map<string, MutableClick>();
-  for (const row of journal(state)) {
+  const rows = journal(state);
+  const compatibilityInteractions = readCompatibilityInteractions(rows);
+  for (const row of rows) {
     const detail = parseDetail(row.detail);
     if (!detail) continue;
     const presentationId = typeof detail.presentationId === 'string' ? detail.presentationId : null;
@@ -310,7 +359,8 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     }
     if (row.kind === DECISION_RECEIPT_KINDS.CLICK && presentation && interactionId) {
       if (clicks.has(interactionId)) continue;
-      clicks.set(interactionId, {
+      const readCompatibility = compatibilityInteractions.has(interactionId);
+      const click: MutableClick = {
         interactionId,
         presentationId: presentation.presentationId,
         selectedKey: text(detail.selectedKey, 'selectedKey', 128),
@@ -318,8 +368,8 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         guildId: text(detail.guildId, 'guildId', 128),
         channelId: text(detail.channelId, 'channelId', 128),
         messageId: text(detail.messageId, 'messageId', 256),
-        applicationId: optionalText(detail.applicationId, 'applicationId', 256),
-        token: optionalText(detail.token, 'token', 512),
+        applicationId: readCompatibility ? optionalText(detail.applicationId, 'applicationId', 256) : null,
+        token: readCompatibility ? optionalText(detail.token, 'token', 512) : null,
         binding: normalizeBinding(detail.binding),
         state: detail.authorizationPending === true ? DECISION_STATES.AUTHORIZATION_PENDING : DECISION_STATES.CLICK_ADMITTED,
         authorizationOutcome: null,
@@ -332,7 +382,9 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         nativeReturn: null,
         createdAt: row.created_at,
         updatedAt: row.created_at
-      });
+      };
+      if (readCompatibility) readCompatibilityClicks.add(click);
+      clicks.set(interactionId, click);
       presentation.clickIds.push(interactionId);
       if (presentation.state === DECISION_STATES.PRESENTED_UNANSWERED) presentation.state = DECISION_STATES.CLICK_ADMITTED;
       presentation.updatedAt = row.created_at;
@@ -503,10 +555,7 @@ export function sameClickInput(click: MutableClick, input: Omit<DecisionClickInp
     click.messageId === input.messageId && bindingMatches(click.binding, binding);
 }
 
-export function currentBinding(
-  state: DecisionStateStore,
-  binding: DecisionBinding,
-  current = state.getBinding(binding.channelId)
-): boolean {
+export function currentBinding(state: DecisionStateStore, binding: DecisionBinding): boolean {
+  const current = state.getBinding(binding.channelId);
   return Boolean(current && current.active !== false && bindingMatches(normalizeBinding(current), binding));
 }
