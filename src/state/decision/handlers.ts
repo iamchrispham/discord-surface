@@ -186,7 +186,6 @@ function admitClickInTransaction(
     messageId: input.messageId,
     binding: presentation.binding,
     ...(input.applicationId ? { applicationId: input.applicationId } : {}),
-    ...(input.token ? { token: input.token } : {}),
     ...(authorizationPending ? { authorizationPending: true } : {})
   });
   if (beginCallback) append(state, DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT, { interactionId: input.interactionId });
@@ -417,7 +416,8 @@ export function createDecisionHandlers(): DecisionHandlers {
           };
         }
         if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED ||
-          (click.nativeReturn && click.nativeReturn.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
+          (click.nativeReturn && click.nativeReturn.outcome !== null &&
+            click.nativeReturn.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
           return { binding: null, click: mutableClickOutput(click) };
         }
         append(state, DECISION_RECEIPT_KINDS.CLICK_STALE, { interactionId: id });

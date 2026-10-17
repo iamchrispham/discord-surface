@@ -50,8 +50,7 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
 const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
 const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
 const DECISION_RECOVERY_DEFAULT_DELAY_MS = 1000;
-const DECISION_PROJECTION_RETRY_MAX_DELAY_MS = 30_000;
-const DECISION_PROJECTION_RETRY_LIMIT = 5;
+const DECISION_PROJECTION_RETRY_LIMIT = 1;
 
 function decisionRecoveryDelayMs(value: unknown): number {
   const delay = Number(value);
@@ -563,10 +562,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         projectionRetryAttempts.set(click.interactionId, attempts);
         if (attempts <= DECISION_PROJECTION_RETRY_LIMIT) {
           const requestedDelay = decisionRecoveryDelayMs((error as { retryAfterMs?: unknown })?.retryAfterMs);
-          const exponentialDelay = DECISION_RECOVERY_DEFAULT_DELAY_MS * (2 ** (attempts - 1));
           scheduleRecovery(new Set([click.channelId]), {
             decisionId: click.interactionId,
-            delayMs: Math.min(DECISION_PROJECTION_RETRY_MAX_DELAY_MS, Math.max(requestedDelay, exponentialDelay))
+            delayMs: Math.max(requestedDelay, DECISION_RECOVERY_DEFAULT_DELAY_MS)
           });
         }
       } else {
@@ -698,10 +696,12 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
             reason: String((error as Error)?.message || error).slice(0, 200)
           } as InteractionCallbackResult;
         }
-        state.recordDecisionCallbackOutcome(parsed.id, transportOutcome(result.outcome));
+        try {
+          state.recordDecisionCallbackOutcome(parsed.id, transportOutcome(result.outcome));
+        } catch {}
         return result;
       })();
-      const waiter = callbackWork.then(() => undefined);
+      const waiter = callbackWork.then(() => undefined, () => undefined);
       callbackWaiters.set(parsed.id, waiter);
       try {
         callback = await callbackWork;

@@ -193,7 +193,7 @@ test('denied rejection follow-up stays pending across restart until sent', () =>
   }
 });
 
-test('authorized interaction releases its callback token custody', () => {
+test('decision click receipts do not persist callback tokens', () => {
   const fixtureState = fixture();
   try {
     const { state } = fixtureState;
@@ -203,7 +203,8 @@ test('authorized interaction releases its callback token custody', () => {
     }).accepted, true);
     assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
     assert.equal(state.getDecisionClick('interaction-1')?.token, null);
-    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 0);
+    assert.equal(state.db.prepare('SELECT detail FROM receipts WHERE detail LIKE ?').all('%authorized-token%').length, 0);
     assert.equal(state.listReceipts().some(row => String(row.detail).includes('authorized-token')), false);
   } finally {
     closeFixture(fixtureState);
@@ -250,7 +251,7 @@ test('permanent projection outcomes terminalize submitted native custody', () =>
       assert.equal(terminal?.state, DECISION_STATES.TERMINAL);
       assert.equal(terminal?.token, null);
       assert.equal(state.listDecisionPendingWork().length, 0);
-      assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 0);
       assert.equal(state.listReceipts().some(row => String(row.detail).includes(`token-${initialOutcome}`)), false);
     } finally {
       closeFixture(fixtureState);

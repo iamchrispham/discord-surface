@@ -59,6 +59,7 @@ const RECOVERY_POLICIES = Object.freeze({
   UNRESOLVED: 'unresolved'
 });
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
+  'presentation-not-admissible': 'This decision cannot be accepted in this channel.',
   'inactive-binding': 'This channel is not connected to an active status session.',
   'binding-not-ready': 'The status session is still recovering. Try again shortly.',
   'handoff-intake-paused': 'Status intake is paused during handoff. Try again shortly.',
@@ -535,7 +536,8 @@ class DiscordGateway {
       throw Object.assign(new Error('decision projection Embed Links permission is unknown'), { outcome: 'not_sent', retryable: true });
     }
     const inline = answer.length <= 4096;
-    const prompt = presentation?.content || '';
+    const original = presentation || this.state.getDecisionPresentation(click.presentationId);
+    const prompt = original?.content || '';
     const promptSeparator = prompt.length > 0 ? '\n\n' : '';
     const plainProjection = `${prompt}${promptSeparator}Selected action:\n${answer}`;
     const plainFits = inline && plainProjection.length <= 2000;
@@ -568,7 +570,6 @@ class DiscordGateway {
         throw new Error('decision projection authorization is no longer valid');
       }
     }
-    const original = presentation || this.state.getDecisionPresentation(click.presentationId);
     return message.edit(renderDecisionProjection(original, answer, {
       embed: embedPermission.allowed,
       attach: needsFile

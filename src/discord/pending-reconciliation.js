@@ -367,7 +367,8 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             if (pendingDecisions.has(message.id)) await settleDecisionRecovery();
             const decisionClick = this.state.getDecisionClick?.(message.id) || pendingDecisions.get(message.id);
             if (decisionClick && (decisionClick.state === DECISION_STATES.STALE ||
-              decisionClick.nativeReturn?.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
+              (decisionClick.nativeReturn && decisionClick.nativeReturn.outcome !== null &&
+                decisionClick.nativeReturn.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED))) {
               blockedOwners.add(key);
               continue;
             }

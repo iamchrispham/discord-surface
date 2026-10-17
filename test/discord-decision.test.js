@@ -11,8 +11,8 @@ const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
 const { createDecisionConsumer } = require('../src/discord/decision');
 const { encodeDecisionCustomId, sendInteractionFollowup } = require('../src/discord-interaction');
+const { DECISION_AUTHORIZATION_OUTCOMES } = require('../src/state/decision/types.ts');
 const {
-  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
   DECISION_STATES,
@@ -1822,6 +1822,7 @@ test('unknown projection remains retryable after native submission and closes cu
   assert.equal(f.state.getDecisionClick('projection-unknown-replay')?.state, 'terminal');
   assert.equal(f.state.listDecisionPendingWork().length, 0);
   assert.equal(f.state.getDecisionClick('projection-unknown-replay')?.token, null);
+  assert.equal(f.state.db.prepare('SELECT detail FROM receipts WHERE detail LIKE ?').all('%projection-token%').length, 0);
   assert.equal(f.state.listReceipts().some(row => String(row.detail).includes('projection-token')), false);
 });
 
@@ -1937,7 +1938,8 @@ test('restart retains custody for an interrupted rejection followup', { timeout:
   const pending = recovered.listDecisionPendingWork();
   assert.equal(pending.length, 1);
   assert.equal(pending[0]?.rejectionOutcome, 'unknown');
-  assert.equal(pending[0]?.token, 'rejection-token');
+  assert.equal(pending[0]?.token, null);
+  assert.equal(recovered.db.prepare('SELECT detail FROM receipts WHERE detail LIKE ?').all('%rejection-token%').length, 0);
   assert.equal(recovered.listReceipts().some(row => String(row.detail).includes('rejection-token')), false);
   recovered.close();
 });
@@ -1962,7 +1964,7 @@ test('unknown rejection followup retries once and clears custody after delivery'
   const pending = f.state.listDecisionPendingWork();
   assert.equal(pending.length, 1);
   assert.equal(pending[0]?.rejectionOutcome, 'unknown');
-  assert.equal(pending[0]?.token, 'token-rejection-timeout');
+  assert.equal(pending[0]?.token, null);
 
   await waitForCondition(() => calls === 3, 'unknown rejection followup was not retried');
   assert.equal(f.state.listDecisionPendingWork().length, 0);
@@ -1982,6 +1984,7 @@ test('permanent rejection drains denied custody and does not retry', { timeout: 
   assert.equal(f.state.listDecisionPendingWork().length, 0);
   assert.equal(f.state.beginDecisionRejectionFollowup('rejection-permanent').accepted, false);
   assert.equal(f.state.listReceipts().some(row => String(row.detail).includes('rejected-token')), false);
+  assert.equal(f.state.db.prepare('SELECT detail FROM receipts WHERE detail LIKE ?').all('%rejected-token%').length, 0);
 });
 
 test('rejection followup distinguishes pre-send and post-send cancellation', { timeout: 30000 }, async t => {
