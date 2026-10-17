@@ -12,6 +12,68 @@ const { GATEWAY_CAPABILITIES, gatewayProcessStatus, main, pathsFor, threadEnroll
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { startReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
 const { fixture, NATIVE, SUCCESSOR } = require('./issue-thread-fixture');
+
+const CHECKPOINT_RETRY_OBSERVATION_BOUND_MS = 2_800;
+
+function captureCheckpointRetries(f, t, deadlineAt) {
+  const originalSchedule = f.gateway.scheduleLiveCheckpointRetry.bind(f.gateway);
+  const retryTimers = [];
+  const waitForFire = captured => {
+    const remainingMs = deadlineAt - performance.now();
+    assert.ok(remainingMs > 0, 'checkpoint retry exceeded its fixture observation bound');
+    let observationTimer;
+    const cleanup = () => {
+      if (observationTimer) {
+        clearTimeout(observationTimer);
+        observationTimer = null;
+      }
+    };
+    t.after(cleanup);
+    const bound = new Promise((_, reject) => {
+      observationTimer = setTimeout(() => reject(new Error('checkpoint retry exceeded its fixture observation bound')), remainingMs);
+    });
+    return Promise.race([captured.fired, bound]).finally(cleanup);
+  };
+  f.gateway.scheduleLiveCheckpointRetry = function(deferredCounts) {
+    let captured = null;
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = (callback, delay, ...rest) => {
+      let markFired;
+      const fired = new Promise(resolve => { markFired = resolve; });
+      const timer = realSetTimeout(function(...args) {
+        try { return callback.apply(this, args); } finally { markFired(); }
+      }, delay, ...rest);
+      captured = { timer, fired };
+      return timer;
+    };
+    let result;
+    try { result = originalSchedule(deferredCounts); }
+    finally { globalThis.setTimeout = realSetTimeout; }
+    if (captured && this.liveCheckpointRetryTimer === captured.timer) {
+      retryTimers.push({ timer: captured.timer, awaited: false, waitForFire: () => waitForFire(captured) });
+    }
+    return result;
+  };
+  return {
+    retryTimers,
+    restore: () => { f.gateway.scheduleLiveCheckpointRetry = originalSchedule; }
+  };
+}
+
+test('checkpoint fixture observes the unreferenced owner retry within its bound', { timeout: 3000 }, async t => {
+  const f = fixture(t);
+  f.ready('100');
+  const capture = captureCheckpointRetries(f, t, performance.now() + CHECKPOINT_RETRY_OBSERVATION_BOUND_MS);
+  t.after(capture.restore);
+
+  f.gateway.scheduleLiveCheckpointRetry(new Map([[f.child.id, f.gateway.liveCheckpointThreshold]]));
+  const retry = capture.retryTimers[0];
+  assert.ok(retry);
+  assert.equal(retry.timer.hasRef(), false);
+  await retry.waitForFire();
+  if (f.gateway.liveCheckpointPromise) await f.gateway.liveCheckpointPromise;
+});
+
 test('old enrolled receipt cannot finish under a new direct binding', { timeout: 5000 }, async t => {
   const f = fixture(t); f.ready('100');
   f.gateway.boundMessage(f.message('101'));
@@ -134,9 +196,13 @@ test('bounded child checkpoint does not complete a short page before its tail', 
 
 async function pendingScenario(t, secondDeadline) {
   const f = fixture(t);
+  const observationDeadline = performance.now() + CHECKPOINT_RETRY_OBSERVATION_BOUND_MS;
+  const retryCapture = captureCheckpointRetries(f, t, observationDeadline);
+  t.after(retryCapture.restore);
   let checkpointStarts = 0;
   const checkpointEntries = [];
   const originalBegin = f.gateway.beginLiveCheckpoint.bind(f.gateway);
+  const childCheckpoints = [];
   let capped = null;
   f.gateway.beginLiveCheckpoint = function(counts = new Map(), ...options) {
     checkpointStarts++;
@@ -146,9 +212,20 @@ async function pendingScenario(t, secondDeadline) {
       capped = { counts: [...counts], live: [...this.liveIntakeCounts], recovery: Boolean(this.recoveryPromise) };
       return;
     }
-    return originalBegin(counts, ...options);
+    const before = this.liveCheckpointPromise;
+    const result = originalBegin(counts, ...options);
+  const installed = this.liveCheckpointPromise;
+    if (installed && installed !== before && counts instanceof Map && counts.has(f.child.id)) {
+      childCheckpoints.push(installed);
+    }
+    return result;
   };
+  t.after(() => {
+    f.gateway.beginLiveCheckpoint = originalBegin;
+  });
   f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.liveCheckpointRetryDelayMs = 20;
+  f.gateway.liveCheckpointRetryDelayMs = 20;
   const slowChild = f.makeChannel('1500', ChannelType.PublicThread);
   if (secondDeadline) {
     f.channels.set(slowChild.id, slowChild);
@@ -170,15 +247,33 @@ async function pendingScenario(t, secondDeadline) {
   let slowChildCalls = 0;
   f.client.channels.fetch = async id => {
     if (id === slowParent.id) { slowParentCalls++; await new Promise(resolve => setTimeout(resolve, 60)); }
-    if (secondDeadline && id === slowChild.id && slowChildCalls++ === 0) await new Promise(resolve => setTimeout(resolve, 60));
+    if (secondDeadline && id === slowChild.id && slowChildCalls++ === 0) await new Promise(resolve => setTimeout(resolve, 45));
     return fetch(id);
   };
   await f.gateway.recoverTransport('reconnect');
   const firstRetry = f.gateway.liveCheckpointPromise;
   if (firstRetry) await firstRetry;
-  await new Promise(resolve => setTimeout(resolve, 120));
-  await f.gateway.consumer.waitForReceipts();
-  await f.gateway.consumer.waitForNativeWork();
+  const retry = retryCapture.retryTimers[0];
+  if (secondDeadline) {
+    assert.ok(retry, 'the deadline case schedules an owned retry');
+    const checkpointBeforeRetry = f.gateway.liveCheckpointPromise;
+    await retry.waitForFire();
+    retry.awaited = true;
+    const retryCheckpoint = f.gateway.liveCheckpointPromise;
+    if (retryCheckpoint && retryCheckpoint !== checkpointBeforeRetry) await retryCheckpoint;
+  }
+  for (;;) {
+    let progressed = false;
+    while (childCheckpoints.length) {
+      await childCheckpoints.shift();
+      progressed = true;
+    }
+    if (progressed) continue;
+    await f.gateway.consumer.waitForReceipts();
+    await f.gateway.consumer.waitForNativeWork();
+    if (childCheckpoints.length) continue;
+    break;
+  }
   const snapshot = {
     secondDeadline, checkpointStarts, checkpointEntries, capped, slowParentCalls, slowChildCalls, firstRetryStarted: Boolean(firstRetry),
     parentState: f.state.getBinding(f.parent.id).readiness,
@@ -190,6 +285,10 @@ async function pendingScenario(t, secondDeadline) {
     heldCount: f.gateway.liveIntakeCounts.get(f.child.id)
   };
   assert.equal(capped, null, 'checkpoint recursion exceeded fixed 64-entry observation cap');
+  if (secondDeadline) {
+    assert.equal(slowChildCalls, 1, 'the first post-reconnect child fetch uses the 45ms delayed path');
+    assert.equal(retry.awaited, true, 'the deadline retry fires before readiness is checked');
+  }
   assert.equal(snapshot.childState, THREAD_STATES.READY);
   assert.equal(snapshot.messageState, MESSAGE_STATES.REPLIED);
   assert.deepEqual(snapshot.dispatched, ['101']);
