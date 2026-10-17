@@ -47,166 +47,213 @@ function moduleReferenceSiteKind(node) {
   return undefined;
 }
 
-function bindingNames(name) {
-  if (ts.isIdentifier(name)) return [name];
-  if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
-    return name.elements.flatMap((element) =>
-      ts.isOmittedExpression(element) ? [] : bindingNames(element.name));
-  }
-  return [];
-}
-
-function isFunctionLikeNode(node) {
-  return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
-    ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node);
-}
-
-function lexicalBindingsFor(sourceFile) {
-  const scopeByNode = new WeakMap();
-  const rootScope = { parent: undefined, functionScope: undefined, bindings: new Map() };
-  rootScope.functionScope = rootScope;
-
-  function createScope(parent, functionScope = false) {
-    const scope = { parent, functionScope: undefined, bindings: new Map() };
-    scope.functionScope = functionScope ? scope : parent.functionScope;
-    return scope;
-  }
-
-  function addBinding(scope, name, binding) {
-    const declarations = scope.bindings.get(name) || [];
-    declarations.push(binding);
-    scope.bindings.set(name, declarations);
-  }
-
-  function addPattern(scope, name, binding) {
-    for (const identifier of bindingNames(name)) {
-      addBinding(scope, identifier.text, ts.isIdentifier(name) ? binding : { kind: 'other' });
-    }
-  }
-
-  function visit(node, parentScope) {
-    let scope = parentScope;
-    if (node === sourceFile) scope = rootScope;
-    else if (isFunctionLikeNode(node)) scope = createScope(parentScope, true);
-    else if (ts.isClassExpression(node)) scope = createScope(parentScope);
-    else if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node) ||
-        ts.isCatchClause(node) || ts.isForStatement(node) ||
-        ts.isForInStatement(node) || ts.isForOfStatement(node)) {
-      scope = createScope(parentScope);
-    }
-    scopeByNode.set(node, scope);
-
-    if (isFunctionLikeNode(node)) {
-      for (const parameter of node.parameters) addPattern(scope, parameter.name, { kind: 'other' });
-      if (ts.isFunctionDeclaration(node) && node.name && scope.parent) {
-        addBinding(scope.parent, node.name.text, { kind: 'other' });
-      } else if (ts.isFunctionExpression(node) && node.name) {
-        addBinding(scope, node.name.text, { kind: 'other' });
+function compilerContextFor(relativePath, source) {
+  const sourceFileName = path.resolve(repositoryRoot, relativePath);
+  const isTypeScript = /\.(?:[cm]?ts|tsx)$/i.test(relativePath);
+  const scriptKind = /\.tsx$/i.test(relativePath)
+    ? ts.ScriptKind.TSX
+    : isTypeScript ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const compilerOptions = {
+    allowJs: true,
+    checkJs: false,
+    target: ts.ScriptTarget.Latest,
+    module: ts.ModuleKind.CommonJS,
+    moduleResolution: ts.ModuleResolutionKind.None,
+    noEmit: true,
+    noResolve: true,
+    noLib: true,
+    types: [],
+  };
+  const sourceFile = ts.createSourceFile(
+    sourceFileName,
+    source,
+    compilerOptions.target,
+    true,
+    scriptKind,
+  );
+  const effects = {
+    sourceReads: 0,
+    externalReadAttempts: [],
+    externalSourceRequests: [],
+    moduleResolutionRequests: [],
+    typeReferenceResolutionRequests: [],
+    writes: 0,
+  };
+  const isSuppliedFile = (fileName) => path.resolve(fileName) === sourceFileName;
+  const host = {
+    getSourceFile(fileName) {
+      if (!isSuppliedFile(fileName)) {
+        effects.externalSourceRequests.push(fileName);
+        return undefined;
       }
-    }
-    if (ts.isCatchClause(node) && node.variableDeclaration) {
-      addPattern(scope, node.variableDeclaration.name, { kind: 'other' });
-    }
-    if (ts.isVariableDeclaration(node)) {
-      const declarationList = node.parent;
-      const isConst = ts.isVariableDeclarationList(declarationList) &&
-        (declarationList.flags & ts.NodeFlags.Const) !== 0;
-      const targetScope = ts.isVariableDeclarationList(declarationList) &&
-        (declarationList.flags & ts.NodeFlags.BlockScoped) === 0
-        ? scope.functionScope
-        : scope;
-      const binding = isConst && ts.isIdentifier(node.name) && node.initializer
-        ? { kind: 'const', initializer: node.initializer, scope, node }
-        : { kind: 'other' };
-      addPattern(targetScope, node.name, binding);
-    }
-    if (ts.isClassDeclaration(node) && node.name) {
-      addBinding(scope, node.name.text, { kind: 'other' });
-    }
-    if (ts.isClassExpression(node) && node.name) {
-      addBinding(scope, node.name.text, { kind: 'other' });
-    }
-    if ((ts.isEnumDeclaration(node) || ts.isModuleDeclaration(node)) && ts.isIdentifier(node.name)) {
-      addBinding(scope, node.name.text, { kind: 'other' });
-    }
-    if (ts.isImportDeclaration(node) && node.importClause) {
-      const clause = node.importClause;
-      if (clause.name) addBinding(scope, clause.name.text, { kind: 'other' });
-      if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
-        addBinding(scope, clause.namedBindings.name.text, { kind: 'other' });
+      effects.sourceReads += 1;
+      return sourceFile;
+    },
+    getDefaultLibFileName: () => '',
+    writeFile() {
+      effects.writes += 1;
+      throw new Error('Compiler output is disabled');
+    },
+    getCurrentDirectory: () => repositoryRoot,
+    getDirectories: () => [],
+    fileExists: (fileName) => isSuppliedFile(fileName),
+    readFile(fileName) {
+      if (!isSuppliedFile(fileName)) {
+        effects.externalReadAttempts.push(fileName);
+        return undefined;
       }
-      if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-        for (const element of clause.namedBindings.elements) {
-          addBinding(scope, element.name.text, { kind: 'other' });
-        }
-      }
-    }
-    if (ts.isImportEqualsDeclaration(node)) {
-      addBinding(scope, node.name.text, { kind: 'other' });
-    }
-
-    ts.forEachChild(node, (child) => visit(child, scope));
-  }
-  visit(sourceFile, undefined);
-  return { rootScope, scopeByNode };
+      return source;
+    },
+    getCanonicalFileName: (fileName) => fileName,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => '\n',
+    directoryExists: () => false,
+    realpath: (fileName) => fileName,
+    resolveModuleNames(moduleNames) {
+      effects.moduleResolutionRequests.push(...moduleNames);
+      return moduleNames.map(() => undefined);
+    },
+    resolveTypeReferenceDirectives(typeReferenceDirectiveNames) {
+      effects.typeReferenceResolutionRequests.push(...typeReferenceDirectiveNames);
+      return typeReferenceDirectiveNames.map(() => undefined);
+    },
+  };
+  const program = ts.createProgram([sourceFileName], compilerOptions, host);
+  const programSourceFile = program.getSourceFile(sourceFileName);
+  if (!programSourceFile) throw new Error('Compiler did not load the supplied source file');
+  return {
+    program,
+    sourceFile: programSourceFile,
+    checker: program.getTypeChecker(),
+    host,
+    effects,
+  };
 }
 
-function bindingAt(scope, name) {
-  for (let current = scope; current; current = current.parent) {
-    const declarations = current.bindings.get(name);
-    if (declarations) return declarations;
-  }
-  return undefined;
+function constInitializerFor(declaration) {
+  if (!ts.isVariableDeclaration(declaration) || !ts.isIdentifier(declaration.name) ||
+      !declaration.initializer) return undefined;
+  const declarationList = declaration.parent;
+  if (!ts.isVariableDeclarationList(declarationList) ||
+      (declarationList.flags & ts.NodeFlags.Const) === 0) return undefined;
+  return declaration.initializer;
 }
 
-function staticStringFromExpression(expression, scope, seen = new Set()) {
+function declarationsAt(checker, identifier, sourceFile) {
+  const symbol = checker.getSymbolAtLocation(identifier);
+  if (!symbol) return undefined;
+  const declarations = symbol.getDeclarations() || [];
+  if (declarations.length === 0) return undefined;
+  if (declarations.some((declaration) => declaration.getSourceFile() !== sourceFile)) {
+    return [];
+  }
+  return declarations;
+}
+
+function staticFragmentsFromExpression(expression, context, seen = new Set()) {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) {
+    return [current.text];
+  }
+  if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    return [
+      ...staticFragmentsFromExpression(current.left, context, seen),
+      ...staticFragmentsFromExpression(current.right, context, seen),
+    ];
+  }
+  if (ts.isTemplateExpression(current)) {
+    const fragments = [current.head.text];
+    for (const span of current.templateSpans) {
+      fragments.push(...staticFragmentsFromExpression(span.expression, context, seen));
+      fragments.push(span.literal.text);
+    }
+    return fragments;
+  }
+  if (!ts.isIdentifier(current)) return [];
+  const declarations = declarationsAt(context.checker, current, context.sourceFile);
+  if (!declarations || declarations.length !== 1) return [];
+  const initializer = constInitializerFor(declarations[0]);
+  if (!initializer || seen.has(declarations[0])) return [];
+  seen.add(declarations[0]);
+  const fragments = staticFragmentsFromExpression(initializer, context, seen);
+  seen.delete(declarations[0]);
+  return fragments;
+}
+
+function mayNameCodec(expression, context) {
+  const fragments = staticFragmentsFromExpression(expression, context);
+  const combined = fragments.join('');
+  return /town-hall-child/.test(combined) ||
+    /(?:^|[^a-z0-9_-])town-hall-(?:c(?:h(?:i(?:l(?:d)?)?)?)?)?(?:$|[^a-z0-9_-])/i.test(combined) ||
+    /town-hall-child/.test(expression.getText(context.sourceFile));
+}
+
+function staticStringFromExpression(expression, context, seen = new Set()) {
   let current = expression;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
   if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) {
     return { value: current.text, mayBeCodec: false };
   }
+  if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticStringFromExpression(current.left, context, seen);
+    const right = staticStringFromExpression(current.right, context, seen);
+    if (left.value !== undefined && right.value !== undefined) {
+      return { value: left.value + right.value, mayBeCodec: false };
+    }
+    return {
+      value: undefined,
+      mayBeCodec: left.mayBeCodec || right.mayBeCodec || mayNameCodec(current, context),
+    };
+  }
+  if (ts.isTemplateExpression(current)) {
+    let value = current.head.text;
+    for (const span of current.templateSpans) {
+      const substitution = staticStringFromExpression(span.expression, context, seen);
+      if (substitution.value === undefined) {
+        return { value: undefined, mayBeCodec: mayNameCodec(current, context) };
+      }
+      value += substitution.value + span.literal.text;
+    }
+    return { value, mayBeCodec: false };
+  }
   if (!ts.isIdentifier(current)) {
-    return { value: undefined, mayBeCodec: /town-hall-child/.test(current.getText()) };
+    return { value: undefined, mayBeCodec: mayNameCodec(current, context) };
   }
 
-  const declarations = bindingAt(scope, current.text);
-  if (!declarations) return { value: undefined, mayBeCodec: false };
-  const candidates = declarations.filter((binding) => binding.kind === 'const');
-  const mayBeCodec = declarations.some((binding) =>
-    binding.initializer && /town-hall-child/.test(binding.initializer.getText()));
-  if (declarations.length !== 1 || candidates.length !== 1) {
-    return { value: undefined, mayBeCodec };
+  const declarations = declarationsAt(context.checker, current, context.sourceFile);
+  if (!declarations || declarations.length !== 1) {
+    return { value: undefined, mayBeCodec: mayNameCodec(current, context) };
   }
-
-  const binding = candidates[0];
-  if (seen.has(binding.node)) return { value: undefined, mayBeCodec };
-  seen.add(binding.node);
-  const value = staticStringFromExpression(
-    binding.initializer,
-    binding.scope,
-    seen,
-  );
-  return { value: value.value, mayBeCodec: value.mayBeCodec || mayBeCodec };
+  const initializer = constInitializerFor(declarations[0]);
+  if (!initializer || seen.has(declarations[0])) {
+    return { value: undefined, mayBeCodec: mayNameCodec(current, context) };
+  }
+  seen.add(declarations[0]);
+  const value = staticStringFromExpression(initializer, context, seen);
+  seen.delete(declarations[0]);
+  return {
+    value: value.value,
+    mayBeCodec: value.mayBeCodec || (value.value === undefined && mayNameCodec(initializer, context)),
+  };
 }
 
-function loaderFromExpression(expression, scope, seen = new Set()) {
+function loaderFromExpression(expression, context, seen = new Set()) {
   let current = expression;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
   if (ts.isIdentifier(current)) {
-    const declarations = bindingAt(scope, current.text);
+    const declarations = declarationsAt(context.checker, current, context.sourceFile);
     if (!declarations) return current.text === 'require' ? 'loader' : 'none';
     if (declarations.length !== 1) return 'ambiguous';
-    if (declarations[0].kind !== 'const') return 'none';
-    const binding = declarations[0];
-    if (!binding.initializer) return 'none';
-    if (seen.has(binding.node)) return 'ambiguous';
-    seen.add(binding.node);
-    return loaderFromExpression(binding.initializer, binding.scope, seen);
+    const initializer = constInitializerFor(declarations[0]);
+    if (!initializer) return 'none';
+    if (seen.has(declarations[0])) return 'ambiguous';
+    seen.add(declarations[0]);
+    return loaderFromExpression(initializer, context, seen);
   }
   if (ts.isPropertyAccessExpression(current) && current.name.text === 'require' &&
       ts.isIdentifier(current.expression) && current.expression.text === 'module') {
-    return bindingAt(scope, 'module') ? 'none' : 'loader';
+    return declarationsAt(context.checker, current.expression, context.sourceFile) ? 'none' : 'loader';
   }
   return 'none';
 }
@@ -220,22 +267,17 @@ function moduleReferenceExpression(node, siteKind) {
 }
 
 function productionFileLoadsCodec(relativePath, source) {
-  const isTypeScript = /\.(?:[cm]?ts|tsx)$/i.test(relativePath);
-  const scriptKind = /\.tsx$/i.test(relativePath)
-    ? ts.ScriptKind.TSX
-    : isTypeScript ? ts.ScriptKind.TS : ts.ScriptKind.JS;
-  const sourceFile = ts.createSourceFile(relativePath, source, ts.ScriptTarget.Latest, true, scriptKind);
-  const { rootScope, scopeByNode } = lexicalBindingsFor(sourceFile);
+  const context = compilerContextFor(relativePath, source);
+  const { sourceFile } = context;
 
   let found = false;
   function visit(node) {
     if (found) return;
     const siteKind = moduleReferenceSiteKind(node);
-    const scope = scopeByNode.get(node) || rootScope;
     if (siteKind === 'import' || siteKind === 'export' || siteKind === 'import-equals') {
       const expression = moduleReferenceExpression(node, siteKind);
       if (expression) {
-        const specifier = staticStringFromExpression(expression, scope);
+        const specifier = staticStringFromExpression(expression, context);
         if (specifier.value !== undefined && resolvesToCodec(specifier.value, relativePath)) {
           found = true;
           return;
@@ -248,11 +290,11 @@ function productionFileLoadsCodec(relativePath, source) {
 
     if (siteKind === 'call') {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const loader = isDynamicImport ? 'loader' : loaderFromExpression(node.expression, scope);
+      const loader = isDynamicImport ? 'loader' : loaderFromExpression(node.expression, context);
       if (loader === 'loader' || loader === 'ambiguous') {
         const argument = node.arguments[0];
         if (argument) {
-          const specifier = staticStringFromExpression(argument, scope);
+          const specifier = staticStringFromExpression(argument, context);
           if (specifier.value !== undefined && resolvesToCodec(specifier.value, relativePath)) {
             found = true;
             return;
@@ -317,13 +359,14 @@ test('consumer inventory catches source and emitted loader forms and ignores unr
     ['src/import-equals-emitted.ts', "import codec = require('../dist/town-hall-child.js');"],
   ];
 
-  for (const [relativePath, source] of controls) {
-    assert.equal(
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
       productionFileLoadsCodec(relativePath, source),
-      true,
-      'consumer control was missed: ' + relativePath,
-    );
-  }
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'consumer controls must all be recognized',
+  );
 
   assert.equal(
     productionFileLoadsCodec('src/unrelated.js', "const config = require('./unrelated-module');"),
@@ -337,13 +380,14 @@ test('consumer inventory recognizes static template loaders for source and emitt
     ['src/template-emitted.js', 'const codec = require(`../dist/town-hall-child.js`);'],
   ];
 
-  for (const [relativePath, source] of controls) {
-    assert.equal(
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
       productionFileLoadsCodec(relativePath, source),
-      true,
-      'template consumer control was missed: ' + relativePath,
-    );
-  }
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'template consumer controls must all be recognized',
+  );
 });
 
 test('consumer inventory follows direct loader aliases and static paths through them', () => {
@@ -354,13 +398,14 @@ test('consumer inventory follows direct loader aliases and static paths through 
     ['src/module-require-path-alias-emitted.js', "const load = module . require ;\nconst codecPath = `../dist/town-hall-child.js` ;\nconst codec = load ( codecPath ) ;"],
   ];
 
-  for (const [relativePath, source] of controls) {
-    assert.equal(
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
       productionFileLoadsCodec(relativePath, source),
-      true,
-      'aliased consumer control was missed: ' + relativePath,
-    );
-  }
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'aliased consumer controls must all be recognized',
+  );
 });
 
 test('consumer inventory resolves supported bindings at their lexical use', () => {
@@ -391,13 +436,14 @@ test('consumer inventory resolves supported bindings at their lexical use', () =
     ['src/path-before-loader.js', "const codecPath = './town-hall-child.ts';\nconst load = require;\nconst codec = load(codecPath);"],
   ];
 
-  for (const [relativePath, source] of positiveControls) {
-    assert.equal(
+  assert.deepEqual(
+    positiveControls.map(([relativePath, source]) => [
+      relativePath,
       productionFileLoadsCodec(relativePath, source),
-      true,
-      'lexical consumer control was missed: ' + relativePath,
-    );
-  }
+    ]),
+    positiveControls.map(([relativePath]) => [relativePath, true]),
+    'lexical consumer controls must all be recognized',
+  );
 
   const negativeControls = [
     ['src/nested-unrelated-shadow.js', `
@@ -423,6 +469,23 @@ test('consumer inventory resolves supported bindings at their lexical use', () =
         return require('./town-hall-child.ts');
       }
     `],
+    ['src/shadowed-path-parameter.js', `
+      function ignoreCodec(codecPath) {
+        return require(codecPath);
+      }
+    `],
+    ['src/shadowed-import-require.ts', `
+      import require from './unrelated-loader';
+      require('./town-hall-child.ts');
+    `],
+    ['src/shadowed-import-module.ts', `
+      import module from './unrelated-module';
+      module.require('../dist/town-hall-child.js');
+    `],
+    ['src/shadowed-function-require.js', `
+      function require() { return null; }
+      require('./town-hall-child.ts');
+    `],
     ['src/shadowed-class-expression-require.js', `
       const loader = class require {
         load() {
@@ -440,6 +503,166 @@ test('consumer inventory resolves supported bindings at their lexical use', () =
       'shadowed loader was treated as a codec consumer: ' + relativePath,
     );
   }
+});
+
+test('consumer inventory resolves outer paths in default parameter initializers', () => {
+  const controls = [
+    ['src/default-path-source.js', `
+      const codecPath = './town-hall-child.ts';
+      function consume(codec = require(codecPath)) {
+        var codecPath = '../unrelated.js';
+        return codec;
+      }
+      consume();
+    `],
+    ['src/default-path-emitted.js', `
+      const codecPath = '../dist/town-hall-child.js';
+      function consume(codec = module.require(codecPath)) {
+        var codecPath = '../unrelated.js';
+        return codec;
+      }
+      consume();
+    `],
+    ['src/default-require-body-shadow.js', `
+      const codecPath = './town-hall-child.ts';
+      function consume(codec = require(codecPath)) {
+        var require = () => null;
+        return codec;
+      }
+      consume();
+    `],
+    ['src/default-module-body-shadow.js', `
+      const codecPath = '../dist/town-hall-child.js';
+      function consume(codec = module.require(codecPath)) {
+        var module = { require: () => null };
+        return codec;
+      }
+      consume();
+    `],
+  ];
+
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
+      productionFileLoadsCodec(relativePath, source),
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'default-parameter path consumers must all be recognized',
+  );
+});
+
+test('consumer inventory resolves outer loader aliases in default parameter initializers', () => {
+  const controls = [
+    ['src/default-alias-source.js', `
+      const load = require;
+      function consume(codec = load('./town-hall-child.ts')) {
+        var load = () => null;
+        return codec;
+      }
+      consume();
+    `],
+    ['src/default-module-alias-emitted.js', `
+      const load = module.require;
+      function consume(codec = load('../dist/town-hall-child.js')) {
+        var load = () => null;
+        return codec;
+      }
+      consume();
+    `],
+  ];
+
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
+      productionFileLoadsCodec(relativePath, source),
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'default-parameter loader consumers must all be recognized',
+  );
+});
+
+test('consumer inventory folds static string concatenations and template substitutions', () => {
+  const positiveControls = [
+    ['src/split-source-concatenation.js', "const codec = require('./town-hall-' + 'child');"],
+    ['src/split-emitted-const-chain.js', `
+      const prefix = '../dist/town-hall-';
+      const suffix = 'child.js';
+      const codec = require(prefix + suffix);
+    `],
+    ['src/reused-const-fragment.js', `
+      const prefix = './town-hall-';
+      const empty = '';
+      const codec = require(prefix + 'child' + empty + empty);
+    `],
+    ['src/template-source-substitution.js', "const codec = require(`./town-hall-${'child.ts'}`);"],
+    ['src/template-emitted-substitution.js', `
+      const suffix = 'child.js';
+      const codec = require(` + '`../dist/town-hall-${suffix}`' + `);
+    `],
+  ];
+
+  assert.deepEqual(
+    positiveControls.map(([relativePath, source]) => [
+      relativePath,
+      productionFileLoadsCodec(relativePath, source),
+    ]),
+    positiveControls.map(([relativePath]) => [relativePath, true]),
+    'static expression consumers must all be recognized',
+  );
+
+  const negativeControls = [
+    ['src/unrelated-static-concatenation.js', "require('./unrelated-' + 'module');"],
+    ['src/unrelated-static-template.js', "require(`./unrelated-${'module'}`);"],
+  ];
+
+  for (const [relativePath, source] of negativeControls) {
+    assert.equal(
+      productionFileLoadsCodec(relativePath, source),
+      false,
+      'unrelated static expression was treated as a codec consumer: ' + relativePath,
+    );
+  }
+});
+
+test('consumer inventory refuses recognized codec expressions outside the finite evaluator', () => {
+  assert.throws(
+    () => productionFileLoadsCodec(
+      'src/partial-computed-codec-path.js',
+      "const suffix = getCodecSuffix(); require('./town-hall-' + suffix);",
+    ),
+    /Unclassified codec loader syntax/,
+  );
+});
+
+test('consumer classifier uses one isolated read-only compiler Program per source', () => {
+  const relativePath = 'src/compiler-isolation.js';
+  const context = compilerContextFor(relativePath, 'const load = require; load("./unrelated");');
+  const sourceFileName = path.resolve(repositoryRoot, relativePath);
+
+  assert.deepEqual(context.program.getSourceFiles().map((sourceFile) => sourceFile.fileName), [
+    sourceFileName,
+  ]);
+  assert.ok(context.effects.sourceReads > 0);
+  assert.equal(context.program.getCompilerOptions().allowJs, true);
+  assert.equal(context.program.getCompilerOptions().target, ts.ScriptTarget.Latest);
+  assert.equal(context.program.getCompilerOptions().noEmit, true);
+  assert.equal(context.program.getCompilerOptions().noResolve, true);
+  assert.equal(context.program.getCompilerOptions().noLib, true);
+  assert.deepEqual(context.program.getCompilerOptions().types, []);
+  assert.deepEqual(context.effects.externalSourceRequests, []);
+  assert.deepEqual(context.effects.moduleResolutionRequests, []);
+  assert.deepEqual(context.effects.typeReferenceResolutionRequests, []);
+  assert.equal(context.effects.writes, 0);
+  assert.equal(context.host.readFile(path.join(repositoryRoot, 'types', 'ambient.d.ts')), undefined);
+  assert.equal(context.host.fileExists(path.join(repositoryRoot, 'types', 'ambient.d.ts')), false);
+  assert.deepEqual(context.effects.externalReadAttempts, [
+    path.join(repositoryRoot, 'types', 'ambient.d.ts'),
+  ]);
+  assert.throws(
+    () => context.host.writeFile(path.join(repositoryRoot, 'output.js'), 'source'),
+    /Compiler output is disabled/,
+  );
+  assert.equal(context.effects.writes, 1);
 });
 
 test('consumer inventory pins the supported module-reader syntax sites', () => {
@@ -478,15 +701,25 @@ test('consumer inventory pins the supported module-reader syntax sites', () => {
     'isIdentifier', 'isParenthesizedExpression', 'isPropertyAccessExpression',
   ]);
   assert.deepEqual(predicatesFor('staticStringFromExpression'), [
-    'isIdentifier', 'isNoSubstitutionTemplateLiteral', 'isParenthesizedExpression', 'isStringLiteral',
+    'isBinaryExpression', 'isIdentifier', 'isNoSubstitutionTemplateLiteral',
+    'isParenthesizedExpression', 'isStringLiteral', 'isTemplateExpression',
   ]);
 
   const productionClassifier = functionNamed('productionFileLoadsCodec');
   assert.ok(productionClassifier, 'production classifier is present');
   let siteDispatches = 0;
+  const resolverSites = {
+    loaderFromExpression: 0,
+    moduleReferenceExpression: 0,
+    staticStringFromExpression: 0,
+  };
   function inspectProductionClassifier(node) {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
         node.expression.text === 'moduleReferenceSiteKind') siteDispatches += 1;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+        Object.hasOwn(resolverSites, node.expression.text)) {
+      resolverSites[node.expression.text] += 1;
+    }
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
         ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'ts' &&
         /^is[A-Z]/.test(node.expression.name.text)) {
@@ -496,6 +729,11 @@ test('consumer inventory pins the supported module-reader syntax sites', () => {
   }
   inspectProductionClassifier(productionClassifier);
   assert.equal(siteDispatches, 1);
+  assert.deepEqual(resolverSites, {
+    loaderFromExpression: 1,
+    moduleReferenceExpression: 1,
+    staticStringFromExpression: 2,
+  });
 });
 
 test('consumer inventory fails closed on an unclassified static codec loader site', () => {
