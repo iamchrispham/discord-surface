@@ -197,6 +197,8 @@ test('bounded child checkpoint does not complete a short page before its tail', 
 async function pendingScenario(t, secondDeadline) {
   const f = fixture(t);
   const observationDeadline = performance.now() + CHECKPOINT_RETRY_OBSERVATION_BOUND_MS;
+  const retryCapture = captureCheckpointRetries(f, t, observationDeadline);
+  t.after(retryCapture.restore);
   let checkpointStarts = 0;
   const checkpointEntries = [];
   const originalBegin = f.gateway.beginLiveCheckpoint.bind(f.gateway);
@@ -251,18 +253,27 @@ async function pendingScenario(t, secondDeadline) {
   await f.gateway.recoverTransport('reconnect');
   const firstRetry = f.gateway.liveCheckpointPromise;
   if (firstRetry) await firstRetry;
-  // Wait for this test's checkpoint work; an unreferenced retry timer for the
-  // earlier child remains owned by the fixture teardown.
+  const retry = retryCapture.retryTimers[0];
+  if (secondDeadline) {
+    assert.ok(retry, 'the deadline case schedules an owned retry');
+    const checkpointBeforeRetry = f.gateway.liveCheckpointPromise;
+    await retry.waitForFire();
+    retry.awaited = true;
+    const retryCheckpoint = f.gateway.liveCheckpointPromise;
+    if (retryCheckpoint && retryCheckpoint !== checkpointBeforeRetry) await retryCheckpoint;
+  }
   for (;;) {
     let progressed = false;
     while (childCheckpoints.length) {
       await childCheckpoints.shift();
       progressed = true;
     }
-    if (!progressed) break;
+    if (progressed) continue;
+    await f.gateway.consumer.waitForReceipts();
+    await f.gateway.consumer.waitForNativeWork();
+    if (childCheckpoints.length) continue;
+    break;
   }
-  await f.gateway.consumer.waitForReceipts();
-  await f.gateway.consumer.waitForNativeWork();
   const snapshot = {
     secondDeadline, checkpointStarts, checkpointEntries, capped, slowParentCalls, slowChildCalls, firstRetryStarted: Boolean(firstRetry),
     parentState: f.state.getBinding(f.parent.id).readiness,
@@ -276,6 +287,7 @@ async function pendingScenario(t, secondDeadline) {
   assert.equal(capped, null, 'checkpoint recursion exceeded fixed 64-entry observation cap');
   if (secondDeadline) {
     assert.equal(slowChildCalls, 1, 'the first post-reconnect child fetch uses the 45ms delayed path');
+    assert.equal(retry.awaited, true, 'the deadline retry fires before readiness is checked');
   }
   assert.equal(snapshot.childState, THREAD_STATES.READY);
   assert.equal(snapshot.messageState, MESSAGE_STATES.REPLIED);
