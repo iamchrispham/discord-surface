@@ -744,8 +744,8 @@ repair, resume or replace a session.
   the same authenticated agent path as `peer_send`. Raw human text is never a
   fallback for a child packet.
 
-Decoded town-hall child packets are not delivery authorization. A valid
-signature, strict packet shape, derived identifiers, and matching expected
+Codec validity does not authorize delivery of a town-hall child packet. A valid
+signature, strict packet shape, derived identifiers, and a matching expected
 target do not establish persisted journal authorization. Receiving intake must
 verify the persisted broadcast and recipient context before authorizing delivery.
 
