@@ -15,7 +15,7 @@ const PROJECT_ROOT = path.join(__dirname, '..');
 const OWNER_RELATIVE = 'src/peer/town-hall-room-identity.ts';
 const TYPE_FIXTURE_RELATIVE = 'test/types/town-hall-room-identity-types.ts';
 const TEST_RELATIVE = 'test/town-hall-room-identity.test.js';
-const POLICY_TEST_RELATIVE = 'test/town-hall-room-identity/policy-inventory.test.js';
+const GUARD_TEST_RELATIVE = 'test/town-hall-room-identity-guards.test.js';
 const OWNER_BUILT = path.join(PROJECT_ROOT, 'dist/peer/town-hall-room-identity.js');
 const AGENT_MESSAGE_BUILT = path.join(PROJECT_ROOT, 'dist/agent-message.js');
 
@@ -301,10 +301,8 @@ test('14 identity owner and test registration assertions', () => {
   const tokens = pkg.scripts.test.trim().split(/\s+/);
   assert.equal(tokens.filter(entry => entry === TEST_RELATIVE).length, 1,
     'the new suite must be registered exactly once');
-  assert.equal(tokens.filter(entry => entry === POLICY_TEST_RELATIVE).length, 1,
-    'the policy inventory companion must be registered exactly once');
-  assert.equal(pkg.scripts['test:town-hall-room-policy'],
-    'node --test --test-concurrency=1 test/town-hall-room-identity/policy-inventory.test.js test/town-hall-room-identity/policy-reference-analysis.test.js test/town-hall-room-identity/policy-inventory-regressions.test.js test/town-hall-room-identity/policy-reference-analysis-order.test.js');
+  assert.equal(tokens.filter(entry => entry === GUARD_TEST_RELATIVE).length, 1,
+    'the guard companion must be registered exactly once');
 
   const tsconfig = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'tsconfig.json'), 'utf8'));
   assert.equal(tsconfig.include.filter(entry => entry === OWNER_RELATIVE).length, 1,
