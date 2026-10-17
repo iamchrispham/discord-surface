@@ -1,3 +1,4 @@
+import { decisionCompatibilityHeld } from '../state/decision/reducer';
 import { PROVIDERS, type AgentProvider } from '../agent-message';
 import {
   decodeDecisionCustomId,
@@ -44,6 +45,27 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
   }>;
 };
 
+const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
+const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
+
+export function renderDecisionProjection(presentation: Pick<DecisionPresentation, 'content'>, answer: string) {
+  const inline = answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT;
+  const prompt = presentation.content || '';
+  const separator = prompt.length > 0 ? '\n\n' : '';
+  const attachmentNotice = `${prompt}${separator}Selected action is attached in selected-action.txt.`;
+  return {
+    content: inline ? prompt : attachmentNotice.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? attachmentNotice : prompt,
+    embeds: [{
+      title: 'Selected action',
+      description: inline ? answer : 'Full answer attached in selected-action.txt.'
+    }],
+    components: [],
+    attachments: [],
+    allowedMentions: { parse: [] },
+    ...(inline ? {} : { files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }] })
+  };
+}
+
 export interface DecisionMessage {
   id: string;
   guildId: string;
@@ -57,6 +79,7 @@ export interface DecisionMessage {
 }
 
 export interface DecisionConsumerState {
+  listReceipts(): Array<{ kind: string; detail: string }>;
   getBinding(channelId: string): DecisionBinding | null;
   getDecisionPresentation(presentationId: string): DecisionPresentation | null;
   admitDecisionClickAndBeginCallback(input: {
@@ -237,6 +260,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   const resolveRoute = options.resolveRoute || resolveCanonicalRoute;
   const runCanonical = options.runCanonical || runCanonicalOperation;
 
+  function heldCompatibilityResult(interactionId: string, click: DecisionClick | null): DecisionConsumerResult {
+    return {
+      handled: true,
+      accepted: false,
+      continuing: true,
+      click,
+      canonical: click?.canonical || null,
+      message: safeMessage(state, interactionId)
+    };
+  }
+
   async function routeFor(presentation: DecisionPresentation, signal?: AbortSignal): Promise<CanonicalRoute | null> {
     const saved = presentation.canonicalRoute;
     const environment = routeEnvironment(saved);
@@ -329,10 +363,16 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const presentation = state.getDecisionPresentation(click.presentationId);
     if (!presentation) return invalidResult(DECISION_REASONS.UNKNOWN_PRESENTATION);
     let current = state.getDecisionClick(click.interactionId) || click;
+    if (decisionCompatibilityHeld(state.listReceipts(), click.interactionId)) {
+      return heldCompatibilityResult(click.interactionId, current);
+    }
     let canonical: DecisionCanonicalResult | null = null;
     try {
       canonical = await settleAndRead(current, presentation, signal);
       current = state.getDecisionClick(click.interactionId) || current;
+      if (decisionCompatibilityHeld(state.listReceipts(), click.interactionId)) {
+        return heldCompatibilityResult(click.interactionId, current);
+      }
     } catch {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, click.interactionId) };
     }
@@ -342,6 +382,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
+    if (decisionCompatibilityHeld(state.listReceipts(), click.interactionId)) {
+      return heldCompatibilityResult(click.interactionId, current);
+    }
     const nativeResult = await native(current, signal);
     return { handled: true, accepted: true, click: state.getDecisionClick(click.interactionId) || current, canonical: current.canonical, message: safeMessage(state, click.interactionId), native: nativeResult };
   }
@@ -354,6 +397,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const binding = bindingInput(state.getBinding(parsed.channelId));
     const selectedKey = presentation.keys[decoded.selectedIndex];
     if (!binding || !selectedKey) return invalidResult(DECISION_REASONS.PRESENTATION_IDENTITY_MISMATCH);
+    if (decisionCompatibilityHeld(state.listReceipts(), parsed.id)) {
+      return heldCompatibilityResult(parsed.id, state.getDecisionClick(parsed.id));
+    }
     const admission = state.admitDecisionClickAndBeginCallback({
       interactionId: parsed.id,
       presentationId: presentation.presentationId,
@@ -399,6 +445,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const remaining: DecisionClick[] = [];
     for (const pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
+      if (decisionCompatibilityHeld(state.listReceipts(), pendingClick.interactionId)) {
+        remaining.push(pendingClick);
+        continue;
+      }
       if (!bindingInput(state.getBinding(pendingClick.channelId))) {
         remaining.push(pendingClick);
         continue;

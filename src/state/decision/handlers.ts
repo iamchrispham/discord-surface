@@ -1,4 +1,5 @@
 import {
+  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
   DECISION_REASONS,
@@ -26,6 +27,8 @@ import {
   bindingMatches,
   clickFor,
   currentBinding,
+  decisionCompatibilityHeld,
+  journal,
   findPresentation,
   mutableClickOutput,
   mutablePresentationOutput,
@@ -99,6 +102,17 @@ function requireClickInput(input: DecisionClickInput): NormalizedClickInput {
   };
 }
 
+function pending(click: MutableClick): boolean {
+  return PENDING_STATES.has(click.state) ||
+    (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED && !rejectionTerminal(click));
+}
+
+function rejectionTerminal(click: MutableClick, outcomeValue = click.rejectionOutcome): boolean {
+  return outcomeValue === DECISION_TRANSPORT_OUTCOMES.SENT ||
+    outcomeValue === DECISION_TRANSPORT_OUTCOMES.REJECTED ||
+    (outcomeValue === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT);
+}
+
 function admitClickInTransaction(
   state: DecisionStateStore,
   input: NormalizedClickInput,
@@ -112,7 +126,7 @@ function admitClickInTransaction(
     return {
       accepted: false,
       duplicate: true,
-      continuing: PENDING_STATES.has(existing.state),
+      continuing: pending(existing),
       click: mutableClickOutput(existing)
     };
   }
@@ -151,6 +165,9 @@ function admitClickInTransaction(
 }
 
 function queueNativeReturnInTransaction(state: DecisionStateStore, interactionId: string): DecisionTransitionResult {
+  if (decisionCompatibilityHeld(journal(state), interactionId)) {
+    throw new DecisionError('historical decision is read-only');
+  }
   const click = clickFor(state, interactionId);
   if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
   const canonical = click.canonical;
@@ -323,7 +340,7 @@ export function createDecisionHandlers(): DecisionHandlers {
 
     getClick(state, interactionId) {
       const click = clickFor(state, interactionId);
-      return click ? mutableClickOutput(click) : null;
+      return click && click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED ? mutableClickOutput(click) : null;
     },
 
     beginCallback(state, interactionId) {
@@ -387,6 +404,9 @@ export function createDecisionHandlers(): DecisionHandlers {
       }
       if (result.materialized && !result.answer) return { accepted: false, reason: DECISION_REASONS.MATERIALIZED_WINNER_ANSWER_MISSING, click: null };
       return state.transaction(() => {
+        if (decisionCompatibilityHeld(journal(state), id)) {
+          throw new DecisionError('historical decision is read-only');
+        }
         const click = clickFor(state, id);
         if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
         const presentation = presentationFor(state, click.presentationId);
@@ -468,7 +488,7 @@ export function createDecisionHandlers(): DecisionHandlers {
 
     pendingWork(state) {
       const current = snapshot(state);
-      return [...current.clicks.values()].filter(click => PENDING_STATES.has(click.state)).map(mutableClickOutput);
+      return [...current.clicks.values()].filter(pending).map(mutableClickOutput);
     }
   };
 }

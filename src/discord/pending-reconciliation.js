@@ -1,5 +1,7 @@
 'use strict';
 
+const { decisionCompatibilityHeld } = require('../state/decision/reducer');
+
 function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES }) {
   return {
     async reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
@@ -320,6 +322,7 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             ).finally(() => signal?.removeEventListener('abort', relayAbort));
           };
           if (message.state === 'accepted') {
+            if (decisionCompatibilityHeld(this.state.listReceipts(), message.id)) continue;
             for (let attempt = 0; attempt < 2; attempt += 1) {
               recoveryOperationStarted = false;
               result = await waitForRecoveryOperation(
