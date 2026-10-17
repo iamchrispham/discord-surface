@@ -72,6 +72,7 @@ function fixture(t) {
     "  const args=process.argv.slice(2);const gateRoles=roles.rolesFromAdmission(args);const admission=roles.captureIdentity(process.pid);if(!gateRoles||admission.kind!=='present')process.exit(4);const holder=gateRoles.worker;const guardian=gateRoles.guardian;",
     "  fs.writeFileSync(process.env.FIXTURE_MARKER,JSON.stringify({pid:process.pid,admission,holder:holder.pid,holderIdentity:holder,guardian:guardian.pid,guardianIdentity:guardian,scratch:process.env.DISCORD_SURFACE_GATE_SCRATCH}));",
     "  process.on('SIGTERM',()=>{if(!process.env.FIXTURE_KILL_HOLDER)process.exit(3);}); process.stdout.write('ADMISSION_READY\\n');",
+    "  setInterval(() => { if (fs.existsSync(" + JSON.stringify(emergencyRelease) + ")) process.exit(3); }, 25);",
     "  if(process.env.FIXTURE_KILL_HOLDER&&!roles.signalOwned(holder,'SIGKILL'))process.exit(4);",
     "  setTimeout(()=>process.exit(3),15000);",
     "} else process.exit(Number(process.env.FIXTURE_ADMISSION_EXIT || 0));"
@@ -481,7 +482,7 @@ test('Darwin cleanup retains a bootstrapped service when readiness identity is m
     'result=module._darwin_cleanup(Owner(),"launchctl","gui/501/com.discordsurface.fullgate.fixture",None,time.monotonic()+1,sys.argv[2],False)',
     'print("retained" if result is False else "released")'
   ].join('\n');
-  const result = spawnSync('python3', ['-I', '-c', script, SUPERVISOR_SCRIPT, path.join(os.tmpdir(), 'missing-gate-state.json')], {
+  const result = spawnSync('python3', ['-I', '-B', '-c', script, SUPERVISOR_SCRIPT, path.join(os.tmpdir(), 'missing-gate-state.json')], {
     encoding: 'utf8', timeout: 5000
   });
   assert.equal(result.status, 0, result.stderr);
@@ -501,7 +502,7 @@ test('Python supervisor verdict uses the channel separate from saturated stderr'
     '    except BlockingIOError: break',
     'os._exit(module.no_verdict("timeout","bounded fixture"))'
   ].join('\n');
-  const child = spawn('python3', ['-I', '-c', script, SUPERVISOR_SCRIPT], {
+  const child = spawn('python3', ['-I', '-B', '-c', script, SUPERVISOR_SCRIPT], {
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';
@@ -976,7 +977,7 @@ test('supervisor fails closed before the body on an unsupported platform', { tim
     'raise SystemExit(module.run(["--",*sys.argv[2:]]))'
   ].join('\n');
   const result = spawnSync('python3', [
-    '-I', '-c', script, SUPERVISOR_SCRIPT, process.execPath, '-e',
+    '-I', '-B', '-c', script, SUPERVISOR_SCRIPT, process.execPath, '-e',
     "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
   ], { cwd: PROJECT, env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 98, result.stderr + result.stdout);
@@ -2205,4 +2206,38 @@ test('Darwin disappearing PID observer inventory rejects unclassified sites', { 
   const report = JSON.parse(line.slice('DARWIN_SOURCE_MOCK_RESULT='.length));
   assert.equal(report.inventoryAccepted, true);
   assert.equal(report.addedObserverRejected, true);
+});
+
+
+test('source-import fixtures disable bytecode at every named Python boundary', () => {
+  const entrySource = fs.readFileSync(__filename, 'utf8');
+  const identitySource = fs.readFileSync(ROLE_FIXTURE, 'utf8');
+  const importMarker = 'spec.loader.' + 'exec_module(';
+  const importTests = [
+    'Darwin cleanup retains a bootstrapped service when readiness identity is missing',
+    'Python supervisor verdict uses the channel separate from saturated stderr',
+    'supervisor fails closed before the body on an unsupported platform'
+  ];
+  const verify = (entry, identity) => {
+    assert.equal(entry.split(importMarker).length - 1, 3, 'unclassified supervisor source import');
+    for (const name of importTests) {
+      const begin = entry.indexOf("test('" + name + "',");
+      assert.ok(begin >= 0, name);
+      const next = entry.indexOf('\ntest(', begin + 1);
+      const body = entry.slice(begin, next < 0 ? undefined : next);
+      assert.equal(body.split(importMarker).length - 1, 1, name);
+      assert.match(body, /spawn(?:Sync)?\('python3', \[\s*'-I', '-B', '-c', script, SUPERVISOR_SCRIPT/);
+    }
+    assert.equal(identity.split(importMarker).length - 1, 2, 'unclassified identity source import');
+    assert.match(identity, /spawn\('python3', \['-I', '-B', '-c', program, DARWIN_OWNER,/);
+  };
+  verify(entrySource, identitySource);
+  assert.throws(() => verify(entrySource + '\n' + importMarker + 'module)\n', identitySource));
+  assert.throws(() => verify(entrySource, identitySource + '\n' + importMarker + 'owner)\n'));
+  const withoutSupervisorFlag = entrySource.replace("['-I', '-B', '-c', script", "['-I', '-c', script");
+  assert.notEqual(withoutSupervisorFlag, entrySource);
+  assert.throws(() => verify(withoutSupervisorFlag, identitySource));
+  const withoutIdentityFlag = identitySource.replace("['-I', '-B', '-c', program", "['-I', '-c', program");
+  assert.notEqual(withoutIdentityFlag, identitySource);
+  assert.throws(() => verify(entrySource, withoutIdentityFlag));
 });

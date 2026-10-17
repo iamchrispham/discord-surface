@@ -104,7 +104,7 @@ finally:
 function runPython(program, args, timeout = 1000, spawn = spawnSync) {
   let result;
   try {
-    result = spawn('python3', ['-I', '-c', program, DARWIN_OWNER, ...args], {
+    result = spawn('python3', ['-I', '-B', '-c', program, DARWIN_OWNER, ...args], {
       encoding: 'utf8', timeout,
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1' }
     });
