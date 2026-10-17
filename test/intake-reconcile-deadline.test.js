@@ -443,7 +443,7 @@ function stopT5AggregateDeadline(deadline = t5AggregateDeadline) {
   deadline.timer = undefined;
 }
 
-require('node:test').after(stopT5AggregateDeadline);
+require('node:test').after(() => stopT5AggregateDeadline());
 
 function t5Test(name, run) {
   test(name, { signal: t5AggregateDeadline.controller.signal }, async t => {
