@@ -431,19 +431,27 @@ const t5AggregateDeadline = {
   timer: undefined
 };
 
-function startT5AggregateDeadline(deadline = t5AggregateDeadline, timeoutMs = T5_AGGREGATE_DEADLINE_MS) {
+function startT5AggregateDeadline(
+  deadline = t5AggregateDeadline,
+  timeoutMs = T5_AGGREGATE_DEADLINE_MS,
+  schedule = setTimeout
+) {
   if (deadline.timer) return;
-  deadline.timer = setTimeout(() => {
+  deadline.timer = schedule(() => {
     deadline.controller.abort(new Error('T5 aggregate deadline exceeded'));
   }, timeoutMs);
 }
 
-function stopT5AggregateDeadline(deadline = t5AggregateDeadline) {
-  clearTimeout(deadline.timer);
+function stopT5AggregateDeadline(deadline = t5AggregateDeadline, cancel = clearTimeout) {
+  cancel(deadline.timer);
   deadline.timer = undefined;
 }
 
-require('node:test').after(() => stopT5AggregateDeadline());
+function makeT5AggregateDeadlineCleanup(deadline = t5AggregateDeadline, cancel = clearTimeout) {
+  return () => stopT5AggregateDeadline(deadline, cancel);
+}
+
+require('node:test').after(makeT5AggregateDeadlineCleanup());
 
 function t5Test(name, run) {
   test(name, { signal: t5AggregateDeadline.controller.signal }, async t => {
@@ -456,30 +464,51 @@ test('new T5 scenarios must use the shared deadline owner', async () => {
   const source = require('node:fs').readFileSync(__filename, 'utf8');
   assert.match(source, /const T5_AGGREGATE_DEADLINE_MS = 4000;/);
   assert.match(source, /function t5Test\(name, run\)\s*\{\s*test\(name,\s*\{\s*signal:\s*t5AggregateDeadline\.controller\.signal\s*\},\s*async t => \{\s*startT5AggregateDeadline\(\);/);
-  assert.doesNotMatch(source, /^\s*test\s*\(\s*(['"`])T5\./m);
+  assert.match(source, /require\('node:test'\)\.after\(makeT5AggregateDeadlineCleanup\(\)\);/);
+  assert.equal(t5AggregateDeadline.timer, undefined,
+    'the shared clock starts only when a selected T5 body runs');
+  const unguardedT5Registration = /^\s*test(?:\s*\.\s*(?:only|skip|todo))?\s*\(\s*(['"`])T5\./m;
+  assert.doesNotMatch(source, unguardedT5Registration,
+    'bare, .only, .skip, and .todo calls on test must use t5Test for literal T5 names');
+
+  const unguardedRegistrationControls = [
+    ['test', ' \n ', '(', "'T5.7: whitespace control', () => {})"].join(''),
+    ['test.', 'only(', "'T5.7: only control', () => {})"].join('')
+  ];
+  for (const control of unguardedRegistrationControls) {
+    assert.match(control, unguardedT5Registration);
+  }
 
   const probeDeadline = {
     controller: new AbortController(),
     timer: undefined
   };
-  const abortObserved = new Promise(resolve => {
-    probeDeadline.controller.signal.addEventListener('abort', resolve, { once: true });
-  });
-  let boundTimer;
-  const abortBound = new Promise(resolve => {
-    boundTimer = setTimeout(() => resolve(false), 100);
+  const probeTimer = {};
+  let expireProbeDeadline;
+  let scheduledTimeoutMs;
+  let cancelledProbeTimer;
+  const cleanupProbe = makeT5AggregateDeadlineCleanup(probeDeadline, timer => {
+    cancelledProbeTimer = timer;
   });
 
   try {
-    startT5AggregateDeadline(probeDeadline, 1);
-    assert.equal(await Promise.race([abortObserved.then(() => true), abortBound]), true,
-      'T5 deadline expiry must abort its shared test signal');
+    assert.equal(probeDeadline.timer, undefined);
+    startT5AggregateDeadline(probeDeadline, T5_AGGREGATE_DEADLINE_MS, (callback, timeoutMs) => {
+      expireProbeDeadline = callback;
+      scheduledTimeoutMs = timeoutMs;
+      return probeTimer;
+    });
+    assert.equal(scheduledTimeoutMs, T5_AGGREGATE_DEADLINE_MS);
+    assert.equal(typeof expireProbeDeadline, 'function');
+    assert.equal(probeDeadline.controller.signal.aborted, false);
+    expireProbeDeadline();
     assert.equal(probeDeadline.controller.signal.aborted, true,
       'T5 deadline expiry must leave the shared test signal aborted');
   } finally {
-    clearTimeout(boundTimer);
-    stopT5AggregateDeadline(probeDeadline);
+    cleanupProbe();
   }
+  assert.equal(cancelledProbeTimer, probeTimer);
+  assert.equal(probeDeadline.timer, undefined);
 });
 
 // T5.1: the adopted-waiter defect. The first pass starts the lookup and gives up
