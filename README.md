@@ -744,6 +744,11 @@ repair, resume or replace a session.
   the same authenticated agent path as `peer_send`. Raw human text is never a
   fallback for a child packet.
 
+Decoded town-hall child packets are not delivery authorization. A valid
+signature, strict packet shape, derived identifiers, and matching expected
+target do not establish persisted journal authorization. Receiving intake must
+verify the persisted broadcast and recipient context before authorizing delivery.
+
 `text_file` on `peer_send` file input and on `post` file input exports local
 UTF-8 file contents to Discord. Relative paths resolve from the MCP process
 working directory. Native host tool approval governs invocation. For a child
