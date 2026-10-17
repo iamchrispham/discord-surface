@@ -15,6 +15,38 @@ const SOCKET_OWNERSHIP_MODULE = path.resolve(__dirname, '../../src/claude/socket
 const CHILD_DEADLINE_MS = 10000;
 const GATE_TIMEOUT_MS = 4000;
 
+function waitForFileAsync(dir, name, boundMs) {
+  const target = path.join(dir, name);
+  if (fs.existsSync(target)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let watcher;
+    let settled = false;
+    const finish = error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { watcher?.close(); } catch (closeError) { reject(error || closeError); return; }
+      if (error) reject(error);
+      else resolve();
+    };
+    const onEvent = () => {
+      if (watcher && fs.existsSync(target)) finish();
+    };
+    const timer = setTimeout(() => {
+      if (fs.existsSync(target)) finish();
+      else finish(new Error('gate timeout ' + target));
+    }, boundMs);
+    try {
+      watcher = fs.watch(dir, onEvent);
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    watcher.on('error', error => finish(error));
+    onEvent();
+  });
+}
+
 function ownerNameFor(owner) {
   return owner === undefined ? 'shared' : String(owner);
 }
@@ -73,16 +105,7 @@ async function armGateWorker(gateDir, fileName, boundMs) {
   await new Promise(resolve => worker.once('message', resolve));
   return { park: () => { Atomics.wait(flags, 0, 0, boundMs); }, dispose: () => worker.terminate() };
 }
-function waitForFileAsync(dir, name, boundMs) {
-  const target = path.join(dir, name);
-  if (fs.existsSync(target)) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { watcher.close(); reject(new Error('gate timeout ' + target)); }, boundMs);
-    const watcher = fs.watch(dir, () => {
-      if (fs.existsSync(target)) { clearTimeout(timer); watcher.close(); resolve(); }
-    });
-  });
-}
+${waitForFileAsync.toString()}
 const [role, modulePath, root, rendezvousName, missingHome, gateDir, markerName] = process.argv.slice(2);
 const electionPrefix = path.join(root, rendezvousName + '-fallback-election-');
 const foreign = new Set([
@@ -238,4 +261,4 @@ async function runElectionContenders(t) {
   return { sharedRoot, earlyResult: { ...earlyCommitted, ...earlyResult }, lateResult };
 }
 
-module.exports = { runElectionContenders };
+module.exports = { runElectionContenders, waitForFileAsync };
