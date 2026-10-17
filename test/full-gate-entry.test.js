@@ -10,12 +10,12 @@ const test = require('node:test');
 const { PassThrough } = require('node:stream');
 const { relay, revision, noVerdict, MESSAGES, NO_VERDICT, SUPERVISOR } = require('../scripts/full-gate');
 const { pythonTestEnvironment } = require('../scripts/test-gate');
-const roleFixture = require('./successor-authority-fixture');
+const roleFixture = require('./successor-authority/process-identity');
 
 const PROJECT = path.resolve(__dirname, '..');
 const GATE = path.join(PROJECT, 'scripts/full-gate.js');
 const SUPERVISOR_SCRIPT = path.join(PROJECT, 'scripts/full-gate/supervisor.py');
-const ROLE_FIXTURE = path.join(PROJECT, 'test/successor-authority-fixture.js');
+const ROLE_FIXTURE = path.join(PROJECT, 'test/successor-authority/process-identity.js');
 
 function createSupervisorReceipt(directory) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -443,7 +443,7 @@ test('identity reader inventory and absence decisions stay at their owners', () 
     path.join(PROJECT, 'scripts', 'full-gate'),
     path.join(PROJECT, 'scripts', 'full-gate.js'),
     path.join(PROJECT, 'scripts', 'full-gate-watchdog.js'),
-    path.join(PROJECT, 'test', 'successor-authority-fixture.js')
+    path.join(PROJECT, 'test', 'successor-authority', 'process-identity.js')
   ];
   const files = roots.flatMap(root => {
     try { return fs.statSync(root).isDirectory() ? filesUnder(root) : [root]; }
@@ -457,7 +457,7 @@ test('identity reader inventory and absence decisions stay at their owners', () 
     'scripts/full-gate-watchdog.js',
     'scripts/full-gate/darwin.py',
     'scripts/full-gate/supervisor.py',
-    'test/successor-authority-fixture.js'
+    'test/successor-authority/process-identity.js'
   ]);
   const tests = fs.readFileSync(path.join(PROJECT, 'test', 'full-gate-entry.test.js'), 'utf8');
   assert.doesNotMatch(tests, /process\.kill\([^,\n]+,\s*0\)/);
@@ -584,7 +584,7 @@ test('outer supervisor bounds source preflight by the caller deadline', { timeou
     cwd: PROJECT, env, encoding: 'utf8', timeout: 12000
   });
   assert.equal(result.status, 98, result.stderr);
-  assert.match(result.stderr, /reason=timeout/);
+  assert.match(result.stdout, /reason=timeout/);
   assert.ok(Date.now() - started < 8000, 'preflight exceeded its caller deadline');
 });
 
