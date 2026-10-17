@@ -150,6 +150,28 @@ function declarationsAt(checker, identifier, sourceFile) {
   return declarations;
 }
 
+function nodeModuleImportKindForBinding(declaration) {
+  let importClause;
+  if (ts.isImportSpecifier(declaration)) {
+    if (declaration.isTypeOnly) return undefined;
+    const namedImports = declaration.parent;
+    if (!ts.isNamedImports(namedImports) ||
+        (declaration.propertyName || declaration.name).text !== 'createRequire') return undefined;
+    importClause = namedImports.parent;
+  } else if (ts.isNamespaceImport(declaration)) {
+    importClause = declaration.parent;
+  } else {
+    return undefined;
+  }
+
+  if (!ts.isImportClause(importClause) || importClause.isTypeOnly) return undefined;
+  const importDeclaration = importClause.parent;
+  if (!ts.isImportDeclaration(importDeclaration) ||
+      !ts.isStringLiteral(importDeclaration.moduleSpecifier) ||
+      !['module', 'node:module'].includes(importDeclaration.moduleSpecifier.text)) return undefined;
+  return ts.isImportSpecifier(declaration) ? 'named' : 'namespace';
+}
+
 function staticFragmentsFromExpression(expression, context, seen = new Set()) {
   let current = expression;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
@@ -190,6 +212,21 @@ function mayNameCodec(expression, context) {
     /town-hall-child/.test(expression.getText(context.sourceFile));
 }
 
+function suffixCanNameCodec(fragments) {
+  const supportedSuffix = /^(?:\.(?:[cm]?[jt]sx?))?(?:[?#].*)?$/i;
+  const supportedSuffixPrefix = /^(?:\.(?:[cm]?(?:[jt](?:s(?:x)?)?)?)?)?$/i;
+  let suffix = '';
+  for (const fragment of fragments) {
+    if (fragment === undefined) return supportedSuffixPrefix.test(suffix);
+    const queryAt = fragment.search(/[?#]/);
+    if (queryAt !== -1) {
+      return supportedSuffix.test(suffix + fragment.slice(0, queryAt));
+    }
+    suffix += fragment;
+  }
+  return supportedSuffix.test(suffix);
+}
+
 function hasUnresolvedTownHallChildPattern(fragments) {
   const unresolvedSegment = 'hall';
   const ordered = [];
@@ -222,13 +259,12 @@ function hasUnresolvedTownHallChildPattern(fragments) {
           let endAt = lowerEnd.indexOf('-child');
           while (endAt !== -1) {
             const trailing = endFragment.slice(endAt + '-child'.length);
-            const supportedSuffix = /^(?:\.(?:[cm]?[jt]sx?))?(?:[?#].*)?$/i.test(trailing);
-            const suffixMayBeEmpty = ordered.slice(endIndex + 1).every((part) => part === undefined);
+            const suffixFragments = [trailing, ...ordered.slice(endIndex + 1)];
             const middle = [startFragment.slice(startAt + 'town-'.length)];
             middle.push(...ordered.slice(startIndex + 1, endIndex));
             middle.push(endFragment.slice(0, endAt));
 
-            if (supportedSuffix && suffixMayBeEmpty && middle.includes(undefined)) {
+            if (suffixCanNameCodec(suffixFragments) && middle.includes(undefined)) {
               let positions = new Set([0]);
               let sawUnknown = false;
               for (const part of middle) {
@@ -312,6 +348,44 @@ function staticStringFromExpression(expression, context, seen = new Set()) {
   };
 }
 
+function nodeCreateRequireFactoryFromExpression(expression, context, seen = new Set()) {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (ts.isIdentifier(current)) {
+    const declarations = declarationsAt(context.checker, current, context.sourceFile);
+    if (!declarations) return 'none';
+    if (declarations.length !== 1) return 'ambiguous';
+    const declaration = declarations[0];
+    if (nodeModuleImportKindForBinding(declaration) === 'named') return 'factory';
+    const initializer = constInitializerFor(declaration);
+    if (!initializer) return 'none';
+    if (seen.has(declaration)) return 'ambiguous';
+    seen.add(declaration);
+    const result = nodeCreateRequireFactoryFromExpression(initializer, context, seen);
+    seen.delete(declaration);
+    return result;
+  }
+
+  if (!ts.isPropertyAccessExpression(current) && !ts.isElementAccessExpression(current)) {
+    return 'none';
+  }
+  if (moduleMemberNameFromExpression(current, context) !== 'createRequire' ||
+      !ts.isIdentifier(current.expression)) return 'none';
+  const declarations = declarationsAt(context.checker, current.expression, context.sourceFile);
+  if (!declarations) return 'none';
+  if (declarations.length !== 1) return 'ambiguous';
+  return nodeModuleImportKindForBinding(declarations[0]) === 'namespace' ? 'factory' : 'none';
+}
+
+function isImporterMetaUrl(expression) {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (!ts.isPropertyAccessExpression(current) || current.name.text !== 'url') return false;
+  const meta = current.expression;
+  return ts.isMetaProperty(meta) && meta.keywordToken === ts.SyntaxKind.ImportKeyword &&
+    meta.name.text === 'meta';
+}
+
 function loaderFromExpression(expression, context, seen = new Set()) {
   let current = expression;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
@@ -329,6 +403,15 @@ function loaderFromExpression(expression, context, seen = new Set()) {
   if (memberName === 'require' && ts.isIdentifier(current.expression) &&
       current.expression.text === 'module') {
     return declarationsAt(context.checker, current.expression, context.sourceFile) ? 'none' : 'loader';
+  }
+  if (ts.isCallExpression(current)) {
+    const factory = nodeCreateRequireFactoryFromExpression(current.expression, context, seen);
+    if (factory === 'none') return 'none';
+    if (factory === 'ambiguous') return 'ambiguous';
+    if (current.arguments.length !== 1 || !isImporterMetaUrl(current.arguments[0])) {
+      return 'ambiguous';
+    }
+    return 'loader';
   }
   return 'none';
 }
@@ -376,11 +459,16 @@ function productionFileLoadsCodec(relativePath, source) {
         const argument = node.arguments[0];
         if (argument) {
           const specifier = staticStringFromExpression(argument, context);
-          if (specifier.value !== undefined && resolvesToCodec(specifier.value, relativePath)) {
+          if (loader === 'loader' && specifier.value !== undefined &&
+              resolvesToCodec(specifier.value, relativePath)) {
             found = true;
             return;
           }
-          if (specifier.value === undefined && (specifier.mayBeCodec || loader === 'ambiguous')) {
+          if (loader === 'ambiguous' && mayNameCodec(argument, context)) {
+            throw new Error('Unclassified codec loader syntax in ' + relativePath + ': ' +
+              argument.getText(sourceFile));
+          }
+          if (specifier.value === undefined && specifier.mayBeCodec) {
             throw new Error('Unclassified codec loader syntax in ' + relativePath + ': ' +
               argument.getText(sourceFile));
           }
@@ -453,6 +541,104 @@ test('consumer inventory catches source and emitted loader forms and ignores unr
     productionFileLoadsCodec('src/unrelated.js', "const config = require('./unrelated-module');"),
     false,
   );
+});
+
+test('consumer inventory recognizes declaration-proven Node createRequire loaders', () => {
+  const controls = [
+    ['src/create-require-source.mjs', `
+      import { createRequire } from 'node:module';
+      const require = createRequire(import.meta.url);
+      require('./town-hall-child.ts');
+    `],
+    ['src/create-require-alias-emitted.mjs', `
+      import { createRequire as fromNodeModule } from 'module';
+      const factory = fromNodeModule;
+      const create = factory;
+      const localRequire = create(import.meta.url);
+      const load = localRequire;
+      load('../dist/town-hall-child.js');
+    `],
+    ['src/create-require-namespace-emitted.mjs', `
+      import * as nodeModule from 'node:module';
+      const factory = nodeModule['createRequire'];
+      const localRequire = factory(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/create-require-direct-source.mjs', `
+      import { createRequire as makeRequire } from 'module';
+      makeRequire(import.meta.url)('./town-hall-child.ts');
+    `],
+  ];
+
+  assert.deepEqual(
+    controls.map(([relativePath, source]) => [
+      relativePath,
+      productionFileLoadsCodec(relativePath, source),
+    ]),
+    controls.map(([relativePath]) => [relativePath, true]),
+    'Node createRequire declarations and their loader aliases must be recognized',
+  );
+
+  const negativeControls = [
+    ['src/local-create-require-function.mjs', `
+      function createRequire() { return require; }
+      const localRequire = createRequire(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/local-create-require-parameter.mjs', `
+      function load(createRequire) {
+        const localRequire = createRequire(import.meta.url);
+        localRequire('../dist/town-hall-child.js');
+      }
+    `],
+    ['src/local-create-require-variable.mjs', `
+      const createRequire = makeLocalFactory();
+      const localRequire = createRequire(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/type-only-create-require.ts', `
+      import type { createRequire } from 'node:module';
+      const localRequire = createRequire(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/unrelated-create-require-export.mjs', `
+      import { createRequire } from './unrelated-module.js';
+      const localRequire = createRequire(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/unrelated-create-require-namespace.mjs', `
+      import * as nodeModule from './unrelated-module.js';
+      const localRequire = nodeModule.createRequire(import.meta.url);
+      localRequire('../dist/town-hall-child.js');
+    `],
+    ['src/create-require-unrelated-target.mjs', `
+      import { createRequire } from 'node:module';
+      const localRequire = createRequire(import.meta.url);
+      localRequire('../unrelated-module.js');
+    `],
+  ];
+
+  for (const [relativePath, source] of negativeControls) {
+    assert.equal(
+      productionFileLoadsCodec(relativePath, source),
+      false,
+      'non-Node createRequire origin or unrelated target was treated as a codec consumer: ' +
+        relativePath,
+    );
+  }
+
+  for (const base of ["'/tmp/receiver.mjs'", 'getBase()']) {
+    assert.throws(
+      () => productionFileLoadsCodec(
+        'src/create-require-unknown-base.mjs',
+        `import { createRequire } from 'node:module';\n` +
+          `const localRequire = createRequire(${base});\n` +
+          "localRequire('../dist/town-hall-child.js');",
+      ),
+      /Unclassified codec loader syntax/,
+      'a non-importer createRequire base must not resolve a codec path',
+    );
+  }
 });
 
 test('consumer inventory recognizes static template loaders for source and emitted codecs', () => {
@@ -758,6 +944,19 @@ test('consumer inventory refuses unresolved split codec path fragments', () => {
         return require(codecPath);
       }
     `],
+    ['src/ordered-template-suffix-hole-source.mjs',
+      'function load(runtimePart, extension) { return require(`./town-${runtimePart}-child${extension}.js`); }'],
+    ['src/ordered-template-suffix-hole-emitted.mjs',
+      'function load(runtimePart, extension) { return import(`../dist/town-${runtimePart}-child${extension}.js`); }'],
+    ['src/ordered-const-suffix-hole-emitted.mjs', `
+      const prefix = '../dist/town-';
+      const suffix = '-child';
+      const ending = '.js';
+      function load(runtimePart, extension) {
+        const codecPath = prefix + runtimePart + suffix + extension + ending;
+        return module.require(codecPath);
+      }
+    `],
   ];
 
   for (const [relativePath, source] of unresolvedControls) {
@@ -900,7 +1099,7 @@ test('consumer inventory pins the supported module-reader syntax sites', () => {
     'isParenthesizedExpression', 'isStringLiteral', 'isTemplateExpression',
   ]);
   assert.deepEqual(predicatesFor('loaderFromExpression'), [
-    'isIdentifier', 'isParenthesizedExpression',
+    'isCallExpression', 'isIdentifier', 'isParenthesizedExpression',
   ]);
   assert.deepEqual(predicatesFor('moduleMemberNameFromExpression'), [
     'isElementAccessExpression', 'isPropertyAccessExpression',
@@ -909,23 +1108,46 @@ test('consumer inventory pins the supported module-reader syntax sites', () => {
     'isBinaryExpression', 'isIdentifier', 'isNoSubstitutionTemplateLiteral',
     'isParenthesizedExpression', 'isStringLiteral', 'isTemplateExpression',
   ]);
+  assert.deepEqual(predicatesFor('nodeModuleImportKindForBinding'), [
+    'isImportClause', 'isImportDeclaration', 'isImportSpecifier', 'isNamedImports',
+    'isNamespaceImport', 'isStringLiteral',
+  ]);
+  assert.deepEqual(predicatesFor('suffixCanNameCodec'), []);
+  assert.deepEqual(predicatesFor('nodeCreateRequireFactoryFromExpression'), [
+    'isElementAccessExpression', 'isIdentifier', 'isParenthesizedExpression',
+    'isPropertyAccessExpression',
+  ]);
+  assert.deepEqual(predicatesFor('isImporterMetaUrl'), [
+    'isMetaProperty', 'isParenthesizedExpression', 'isPropertyAccessExpression',
+  ]);
   assert.deepEqual(predicatesFor('hasUnresolvedTownHallChildPattern'), []);
   assert.deepEqual(callsFor('mayNameCodec'), [
     'hasUnresolvedTownHallChildPattern', 'staticFragmentsFromExpression',
   ]);
   assert.deepEqual(callsFor('staticFragmentsFromExpression'), [
     'constInitializerFor', 'declarationsAt', 'staticFragmentsFromExpression',
+    'staticFragmentsFromExpression', 'staticFragmentsFromExpression',
+    'staticFragmentsFromExpression',
   ]);
+  assert.deepEqual(callsFor('nodeModuleImportKindForBinding'), []);
+  assert.deepEqual(callsFor('suffixCanNameCodec'), []);
+  assert.deepEqual(callsFor('nodeCreateRequireFactoryFromExpression'), [
+    'constInitializerFor', 'declarationsAt', 'declarationsAt',
+    'moduleMemberNameFromExpression', 'nodeCreateRequireFactoryFromExpression',
+    'nodeModuleImportKindForBinding', 'nodeModuleImportKindForBinding',
+  ]);
+  assert.deepEqual(callsFor('isImporterMetaUrl'), []);
   assert.deepEqual(callsFor('loaderFromExpression'), [
-    'constInitializerFor', 'declarationsAt', 'declarationsAt', 'loaderFromExpression',
-    'moduleMemberNameFromExpression',
+    'constInitializerFor', 'declarationsAt', 'declarationsAt', 'isImporterMetaUrl',
+    'loaderFromExpression', 'moduleMemberNameFromExpression',
+    'nodeCreateRequireFactoryFromExpression',
   ]);
   assert.deepEqual(callsFor('moduleMemberNameFromExpression'), ['staticStringFromExpression']);
   assert.deepEqual(memberReadsFor('moduleMemberNameFromExpression', 'expression'), [
     'property:argumentExpression', 'property:name',
   ]);
   assert.deepEqual(memberReadsFor('hasUnresolvedTownHallChildPattern', 'fragments'), []);
-  assert.deepEqual(callsFor('hasUnresolvedTownHallChildPattern'), []);
+  assert.deepEqual(callsFor('hasUnresolvedTownHallChildPattern'), ['suffixCanNameCodec']);
 
   const productionClassifier = functionNamed('productionFileLoadsCodec');
   assert.ok(productionClassifier, 'production classifier is present');
