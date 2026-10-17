@@ -1923,3 +1923,286 @@ test('generated fixture entry expires imported and direct bodies independently',
     assert.deepEqual(exits, [98], scenario.name);
   }
 });
+
+
+const darwinDisappearingPidProgram = String.raw`import ast,errno,io,json,struct,sys,types
+import signal as fixture_signal
+from pathlib import Path
+fixture_signal.signal(fixture_signal.SIGALRM,fixture_signal.SIG_DFL)
+fixture_signal.alarm(25)
+SOURCE=Path(sys.argv[1]).read_text(encoding='utf-8')
+RUNNER_SOURCE=Path(sys.argv[2]).read_text(encoding='utf-8')
+MODE=sys.argv[3]
+OWNER_NAMES={'CapabilityError','CoalitionGone','process_identity','process_start','coalition_id','joined_identity','identity_if_present','same_process','task_counts','_coalition_members','_signal','signal_identity','_signal_members','_drained','drain'}
+results=[]
+
+class FakeArrayType:
+    def __mul__(self, count):
+        return lambda: [0] * count
+
+class FakeClock:
+    def __init__(self): self.value = 0
+    def monotonic(self):
+        self.value += 0.01
+        assert self.value < 100, 'unexpected unbounded mock loop'
+        return self.value
+    def sleep(self, delay): self.value += max(0, delay)
+
+class FakeCtypes:
+    c_uint64 = FakeArrayType()
+    c_uint32 = FakeArrayType()
+    def __init__(self): self.error = 0
+    def set_errno(self, value): self.error = value
+    def get_errno(self): return self.error
+    def create_string_buffer(self, size): return types.SimpleNamespace(raw=bytes(size))
+    def byref(self, value): return value
+
+def ident(pid=101, coalition=700, unique=900):
+    return dict(pid=pid, unique_id=unique, pid_version=20, start_sec=1000, start_usec=7, coalition_id=coalition)
+
+def gone(): return ProcessLookupError(errno.ESRCH, 'mock disappeared')
+
+def throw(error): raise error
+
+def raises(call, expected):
+    try: call()
+    except expected: return
+    raise AssertionError('expected ' + expected.__name__)
+
+def extract(source, names, namespace):
+    tree = ast.parse(source)
+    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+    assert {node.name for node in nodes} == names
+    assert all(not node.decorator_list for node in nodes)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<allowlisted declarations>', 'exec'), namespace)
+    return namespace
+
+def owner(source):
+    fake_ctypes = FakeCtypes()
+    namespace = dict(errno=errno, struct=struct, ctypes=fake_ctypes,
+        os=types.SimpleNamespace(getpid=lambda:500, strerror=lambda value:'mock errno '+str(value), environ={}),
+        subprocess=types.SimpleNamespace(run=lambda *args,**kwargs:throw(AssertionError('unconfigured fake enumeration'))),
+        signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9),time=FakeClock(),
+        IDENTITY_SIZE=56,COALITION_SIZE=40,BSD_INFO_SIZE=136,PROC_PIDUNIQIDENTIFIERINFO=17,PROC_PIDTBSDINFO=3,PROC_PIDCOALITIONINFO=20,
+        BSD_PID_OFFSET=12,BSD_START_SECONDS_OFFSET=120,BSD_START_MICROSECONDS_OFFSET=128,RESOURCE_COALITION_INDEX=0,RESOURCE_USAGE_SIZE=512,POLL_SECONDS=.025,TERM_SECONDS=1)
+    namespace['_apis']=lambda:throw(AssertionError('unconfigured fake API'))
+    names=OWNER_NAMES if 'def identity_if_present(' in source else OWNER_NAMES-{'identity_if_present'}
+    return extract(source,names,namespace)
+
+def fake_lookup(namespace, responses):
+    responses=list(responses)
+    def lookup(pid):
+        assert responses, 'unexpected identity observation'
+        value=responses.pop(0)
+        if isinstance(value,BaseException):raise value
+        return value
+    namespace['joined_identity']=lookup
+
+def fake_enum(namespace, pids):
+    calls=[]
+    def run(argv,**kwargs):
+        calls.append((argv,kwargs))
+        assert argv==['ps','-A','-o','pid='] and kwargs['timeout']>0
+        return types.SimpleNamespace(returncode=0,stdout=' '.join(map(str,pids)))
+    namespace['subprocess']=types.SimpleNamespace(run=run)
+    return calls
+
+def fake_signal_api(namespace, result):
+    calls=[]
+    def send(token,number):calls.append((list(token),number));return result
+    namespace['_apis']=lambda:(None,None,send)
+    return calls
+
+def low_level(name, api_result, api_errno, expected):
+    namespace=owner(SOURCE)
+    def pidinfo(*args):
+        assert namespace['ctypes'].get_errno()==0
+        namespace['ctypes'].set_errno(api_errno)
+        return api_result
+    namespace['_apis']=lambda:(pidinfo,None,None)
+    raises(lambda:namespace[name](101),namespace[expected] if isinstance(expected,str) else expected)
+
+def inventory(source, runner):
+    sites=[]
+    for prefix,body in [('owner',source),('runner',runner)]:
+        for fn in ast.parse(body).body:
+            if not isinstance(fn,ast.FunctionDef):continue
+            for node in ast.walk(fn):
+                if not isinstance(node,ast.Call):continue
+                name=node.func.id if isinstance(node.func,ast.Name) else node.func.attr if isinstance(node.func,ast.Attribute) else None
+                if name in {'joined_identity','identity_if_present'}:sites.append((prefix,fn.name,name))
+    expected=sorted([('owner','identity_if_present','joined_identity'),('owner','_coalition_members','identity_if_present'),('owner','_signal','identity_if_present'),('owner','_signal','identity_if_present'),('owner','_drained','identity_if_present'),('runner','controller_alive','identity_if_present'),('runner','run','joined_identity')])
+    assert sorted(sites)==expected, sites
+
+def case(name,call):
+    try:call();results.append({'case':name,'pass':True})
+    except BaseException as error:results.append({'case':name,'pass':False,'errorType':type(error).__name__,'error':str(error)[:300]})
+
+def helper_unknown():
+    namespace=owner(SOURCE);fake_lookup(namespace,[namespace['CapabilityError']('unknown')]);raises(lambda:namespace['identity_if_present'](101),namespace['CapabilityError'])
+
+def helper_other_errno():
+    namespace=owner(SOURCE);fake_lookup(namespace,[ProcessLookupError(errno.EPERM,'not ESRCH')]);raises(lambda:namespace['identity_if_present'](101),ProcessLookupError)
+
+def signal_case(responses,result,expected,expected_calls,expect_error=False):
+    namespace=owner(SOURCE);fake_lookup(namespace,responses);calls=fake_signal_api(namespace,result)
+    if expect_error:raises(lambda:namespace['_signal'](ident(),15),namespace['CapabilityError'])
+    else:assert namespace['_signal'](ident(),15) is expected
+    assert len(calls)==expected_calls
+    if calls:assert calls[0][0][5]==101 and calls[0][0][7]==20 and calls[0][1]==15
+
+def signal_unknown():
+    namespace=owner(SOURCE);fake_lookup(namespace,[namespace['CapabilityError']('unknown')]);calls=fake_signal_api(namespace,0);raises(lambda:namespace['_signal'](ident(),15),namespace['CapabilityError']);assert calls==[]
+
+def drained_case(identity,counts,expected,preserve=True):
+    namespace=owner(SOURCE);namespace['task_counts']=lambda coalition:counts
+    if identity=='unknown':identity=namespace['CapabilityError']('unknown')
+    fake_lookup(namespace,[identity]);assert namespace['_drained'](700,ident() if preserve else None,False) is expected
+
+def reaped_case(allowed):
+    namespace=owner(SOURCE);namespace['task_counts']=lambda coalition:throw(namespace['CoalitionGone']('mock reaped'))
+    if allowed:assert namespace['_drained'](700,None,True) is True
+    else:raises(lambda:namespace['_drained'](700,None,False),namespace['CoalitionGone'])
+
+if MODE=='inventory':
+    inventory(SOURCE,RUNNER_SOURCE)
+    raises(lambda:inventory(SOURCE+'\ndef unclassified_new_consumer(pid):\n    return joined_identity(pid)\n',RUNNER_SOURCE),AssertionError)
+    print('DARWIN_SOURCE_MOCK_RESULT='+json.dumps({'mode':MODE,'inventoryAccepted':True,'addedObserverRejected':True}))
+    raise SystemExit(0)
+assert MODE=='behavior'
+namespace=owner(SOURCE);member=ident(102)
+fake_enum(namespace,[101,102]);fake_lookup(namespace,[gone(),member])
+try:
+    observed=namespace['_coalition_members'](700,1)
+except ProcessLookupError as error:
+    observed={'escapedException':type(error).__name__,'errno':error.errno}
+assert observed==[member], 'DARWIN_ENUMERATION_LOST_LATER_MEMBER: '+repr(observed)
+results.append({'case':'enumeration preserves later owned member after ESRCH','pass':True})
+def unknown_enumeration():
+    namespace=owner(SOURCE);member=ident(102)
+    fake_enum(namespace,[101,102]);fake_lookup(namespace,[namespace['CapabilityError']('unknown'),member])
+    assert namespace['_coalition_members'](700,1)==[member]
+case('unknown enumeration does not hide a later proved member',unknown_enumeration)
+for name in ['process_identity','process_start','coalition_id']:
+    case(name+' exact ESRCH',lambda name=name:low_level(name,0,errno.ESRCH,ProcessLookupError))
+    case(name+' permission remains unknown',lambda name=name:low_level(name,0,errno.EPERM,'CapabilityError'))
+    case(name+' short result remains unknown',lambda name=name:low_level(name,1,errno.ESRCH,'CapabilityError'))
+case('coalition minus-one ESRCH',lambda:low_level('coalition_id',-1,errno.ESRCH,ProcessLookupError))
+case('central classifier preserves capability error',helper_unknown)
+case('central classifier rejects non-ESRCH lookup error',helper_other_errno)
+case('pre-signal ESRCH sends nothing',lambda:signal_case([gone()],0,False,0))
+case('reused PID sends nothing',lambda:signal_case([ident(unique=901)],0,False,0))
+case('failed audited signal then ESRCH is false',lambda:signal_case([ident(),gone()],1,False,1))
+case('failed audited signal with same identity remains error',lambda:signal_case([ident(),ident()],1,None,1,True))
+case('successful signal uses audited PID-version token',lambda:signal_case([ident()],0,True,1))
+case('unknown pre-signal identity sends nothing',signal_unknown)
+case('gone preserve and active1 is not drained',lambda:drained_case(gone(),(1,0),False))
+case('unknown preserve and active1 is not drained',lambda:drained_case('unknown',(1,0),False))
+case('reused preserve and active1 is not drained',lambda:drained_case(ident(unique=901),(1,0),False))
+case('exact preserve and active1 is drained',lambda:drained_case(ident(),(1,0),True))
+case('active0 is drained',lambda:drained_case(None,(2,2),True,False))
+case('active1 without preserve is not drained',lambda:drained_case(None,(1,0),False,False))
+case('active2 is not drained',lambda:drained_case(None,(2,0),False,False))
+case('authenticated reaping is accepted',lambda:reaped_case(True))
+case('unverified reaping is not accepted',lambda:reaped_case(False))
+def counters(values,result=0,error=0,expected=None):
+    namespace=owner(SOURCE)
+    def usage(resource,buffer,size):
+        assert resource==700 and size==512
+        namespace['ctypes'].set_errno(error)
+        buffer.raw=struct.pack('=QQ',*values)+bytes(496)
+        return result
+    namespace['_apis']=lambda:(None,usage,None)
+    if expected:raises(lambda:namespace['task_counts'](700),namespace[expected])
+    else:assert namespace['task_counts'](700)==values
+case('trusted counters preserve started and exited',lambda:counters((3,2)))
+case('inconsistent counters are unknown',lambda:counters((1,2),expected='CapabilityError'))
+case('counter ESRCH is coalition reaping',lambda:counters((0,0),-1,errno.ESRCH,'CoalitionGone'))
+case('counter permission error is unknown',lambda:counters((0,0),-1,errno.EPERM,'CapabilityError'))
+case('counter short result is unknown',lambda:counters((0,0),1,errno.ESRCH,'CapabilityError'))
+def guardian(scenario):
+    namespace=owner(SOURCE);states=[];spawns=[];drains=[];clock=FakeClock()
+    controller=ident(301,300);guardian=ident(401,400)
+    before=scenario in ['before-gone','before-unknown']
+    response=namespace['CapabilityError']('unknown') if scenario=='before-unknown' else gone()
+    fake_lookup(namespace,[guardian,response] if before else [guardian,controller,gone()])
+    owner_api=types.SimpleNamespace(**{key:value for key,value in namespace.items() if key in ['joined_identity','identity_if_present','same_process','CapabilityError']})
+    def drain(resource,deadline,preserve):
+        drains.append((resource,deadline,preserve))
+        assert resource==400 and deadline==10 and preserve==guardian
+        if scenario=='drain-gone':raise gone()
+        return scenario=='drain-true'
+    owner_api.drain=drain
+    spec={'state_path':'state','deadline':10,'run_deadline':5,'controller':controller,'ack_path':'ack','launch_token':'token','environment':{},'command':['fake-child'],'cwd':'fake-root'}
+    def fake_open(path,*args,**kwargs):
+        assert path in ['spec','ack']
+        return io.StringIO(json.dumps(spec) if path=='spec' else 'token\n')
+    polls=[]
+    def popen(*args,**kwargs):
+        spawns.append((args,kwargs))
+        assert args==(['fake-child'],) and kwargs['start_new_session'] is False
+        def poll():
+            polls.append(None);assert len(polls)<=10,'unbounded fake guardian polling'
+            return None
+        return types.SimpleNamespace(pid=402,poll=poll)
+    target=dict(json=json,open=fake_open,time=clock,os=types.SimpleNamespace(getpid=lambda:401),interrupted=False,receive_signal=lambda *args:None,
+        signal=types.SimpleNamespace(SIGINT=2,SIGTERM=15,SIGHUP=1,signal=lambda *args:None),subprocess=types.SimpleNamespace(Popen=popen),
+        write_state=lambda path,value:states.append(dict(value)),DARWIN=owner_api)
+    extract(RUNNER_SOURCE,{'controller_alive','run'},target)
+    assert target['run']('spec')==98
+    if before:
+        assert len(spawns)==0 and drains==[]
+        assert states[-1]['state']=='interrupted' and states[-1]['reason']=='guardian-lost-before-dispatch'
+    else:
+        assert len(spawns)==1 and len(drains)==1 and len(states)==3
+        assert states[-1]['reason']=='guardian-lost'
+        assert states[-1]['state']==('interrupted' if scenario=='drain-true' else 'cleanup-failed')
+case('controller gone prevents dispatch',lambda:guardian('before-gone'))
+case('controller unknown prevents dispatch',lambda:guardian('before-unknown'))
+case('guardian drain ESRCH records cleanup-failed98',lambda:guardian('drain-gone'))
+case('guardian false drain stays cleanup-failed98',lambda:guardian('drain-false'))
+case('guardian proved drain remains interrupted98',lambda:guardian('drain-true'))
+def finite_deadline():
+    namespace=owner(SOURCE);signals=[]
+    namespace['task_counts']=lambda resource:(2,0)
+    def signal_members(resource,number,deadline,excluded):
+        signals.append(number)
+        assert len(signals)<=100 and resource==700 and deadline==1.2 and excluded==(101,)
+    namespace['_signal_members']=signal_members
+    assert namespace['drain'](700,1.2,preserve=ident()) is False
+    assert 15 in signals and 9 in signals
+case('unchanged finite deadline escalates without accepting positive counts',finite_deadline)
+print('DARWIN_SOURCE_MOCK_RESULT='+json.dumps({'mode':MODE,'results':results,'failed':sum(not row['pass'] for row in results),'nativeQueries':0,'realProcessStarts':0,'sourceFilesRead':2,'realStateFileWrites':0,'hostCausalityProved':False}))
+raise SystemExit(0 if all(row['pass'] for row in results) else 1)
+`;
+
+function runDarwinDisappearingPidMock(mode) {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) {
+    if (name === 'NODE_OPTIONS' || name === 'NODE_PATH' || /(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY)$/.test(name)) delete env[name];
+  }
+  return spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-c', darwinDisappearingPidProgram,
+    path.join(PROJECT, 'scripts/full-gate/darwin.py'),
+    path.join(PROJECT, 'scripts/full-gate/darwin-runner.py'), mode
+  ], { cwd: PROJECT, env, encoding: 'utf8', timeout: 30000 });
+}
+
+test('Darwin disappearing PID behavior keeps cleanup bounded and unknown ownership closed', { timeout: 40000 }, () => {
+  const result = runDarwinDisappearingPidMock('behavior');
+  assert.equal(result.status, 0, result.stdout + '\n' + result.stderr);
+  const line = result.stdout.split('\n').find(value => value.startsWith('DARWIN_SOURCE_MOCK_RESULT='));
+  assert.ok(line, result.stdout);
+  const report = JSON.parse(line.slice('DARWIN_SOURCE_MOCK_RESULT='.length));
+  assert.equal(report.failed, 0);
+  assert.equal(report.hostCausalityProved, false);
+});
+
+test('Darwin disappearing PID observer inventory rejects unclassified sites', { timeout: 40000 }, () => {
+  const result = runDarwinDisappearingPidMock('inventory');
+  assert.equal(result.status, 0, result.stdout + '\n' + result.stderr);
+  const line = result.stdout.split('\n').find(value => value.startsWith('DARWIN_SOURCE_MOCK_RESULT='));
+  assert.ok(line, result.stdout);
+  const report = JSON.parse(line.slice('DARWIN_SOURCE_MOCK_RESULT='.length));
+  assert.equal(report.inventoryAccepted, true);
+  assert.equal(report.addedObserverRejected, true);
+});

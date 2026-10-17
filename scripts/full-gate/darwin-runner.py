@@ -39,10 +39,10 @@ def write_state(path, value):
 
 def controller_alive(identity):
     try:
-        current = DARWIN.joined_identity(identity["pid"])
+        current = DARWIN.identity_if_present(identity["pid"])
     except (DARWIN.CapabilityError, KeyError, TypeError):
         return False
-    return DARWIN.same_process(identity, current)
+    return current is not None and DARWIN.same_process(identity, current)
 
 
 def run(spec_path):
@@ -117,7 +117,7 @@ def run(spec_path):
         if reason:
             try:
                 drained = DARWIN.drain(identity["coalition_id"], deadline, preserve=identity)
-            except DARWIN.CapabilityError as error:
+            except (DARWIN.CapabilityError, ProcessLookupError) as error:
                 write_state(state_path, {"state": "cleanup-failed", "identity": identity, "reason": reason, "detail": str(error)})
                 return 98
             write_state(state_path, {"state": "interrupted" if drained else "cleanup-failed", "identity": identity, "reason": reason})

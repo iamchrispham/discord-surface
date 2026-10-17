@@ -91,8 +91,12 @@ def process_start(pid):
 def coalition_id(pid):
     proc_pidinfo, _, _ = _apis()
     values = (ctypes.c_uint64 * 5)()
+    ctypes.set_errno(0)
     result = proc_pidinfo(pid, PROC_PIDCOALITIONINFO, 0, values, COALITION_SIZE)
     if result != COALITION_SIZE:
+        error = ctypes.get_errno()
+        if result in (-1, 0) and error == errno.ESRCH:
+            raise ProcessLookupError(error, os.strerror(error), pid)
         raise CapabilityError("resource coalition could not be established for pid " + str(pid))
     value = int(values[RESOURCE_COALITION_INDEX])
     if value <= 0:
@@ -111,6 +115,15 @@ def joined_identity(pid):
         "start_sec": before[1][0], "start_usec": before[1][1],
         "coalition_id": resource_id,
     }
+
+
+def identity_if_present(pid):
+    try:
+        return joined_identity(pid)
+    except ProcessLookupError as error:
+        if error.errno != errno.ESRCH:
+            raise
+        return None
 
 
 def same_process(expected, actual):
@@ -151,18 +164,18 @@ def _coalition_members(resource_id, timeout, excluded=()):
         if pid <= 1 or pid == os.getpid() or pid in excluded:
             continue
         try:
-            identity = joined_identity(pid)
+            identity = identity_if_present(pid)
         except CapabilityError:
             continue
-        if identity["coalition_id"] == resource_id:
+        if identity is not None and identity["coalition_id"] == resource_id:
             members.append(identity)
     return members
 
 
 def _signal(identity, signal_number):
     _, _, signal_with_token = _apis()
-    current = joined_identity(identity["pid"])
-    if not same_process(identity, current):
+    current = identity_if_present(identity["pid"])
+    if current is None or not same_process(identity, current):
         return False
     token = (ctypes.c_uint32 * 8)()
     token[5] = identity["pid"]
@@ -171,8 +184,10 @@ def _signal(identity, signal_number):
     if result == 0:
         return True
     try:
-        current = joined_identity(identity["pid"])
+        current = identity_if_present(identity["pid"])
     except CapabilityError:
+        return False
+    if current is None:
         return False
     if same_process(identity, current):
         raise CapabilityError("identity-safe signal failed for an owned coalition process: " + str(result))
@@ -202,10 +217,10 @@ def _drained(resource_id, preserve, allow_reaped):
     if active != 1 or preserve is None:
         return False
     try:
-        actual = joined_identity(preserve["pid"])
+        actual = identity_if_present(preserve["pid"])
     except CapabilityError:
         return False
-    return same_process(preserve, actual) and actual["coalition_id"] == resource_id
+    return actual is not None and same_process(preserve, actual) and actual["coalition_id"] == resource_id
 
 
 def drain(resource_id, deadline, preserve=None, allow_reaped=False):
