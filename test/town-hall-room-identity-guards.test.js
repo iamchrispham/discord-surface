@@ -11,6 +11,7 @@ const ROOM_CHANNEL = '333333333333333333';
 const TARGET_CHANNEL = '444444444444444444';
 const OTHER_GUILD = '555555555555555555';
 const OTHER_CHANNEL = '666666666666666666';
+const FIRST_UINT64_OVERFLOW = '18446744073709551616';
 
 function room(overrides = {}) {
   return { guildId: GUILD, channelId: CHANNEL, ...overrides };
@@ -119,6 +120,12 @@ test('room identity consistency guards cover every observable field', () => {
     );
   }
 });
+
+for (const key of ['guildId', 'channelId']) {
+  test(`room guard rejects the first uint64 overflow in ${key}`, () => {
+    assert.equal(isTownHallRoom(room({ [key]: FIRST_UINT64_OVERFLOW })), false);
+  });
+}
 
 test('room and identity validators reject inherited descriptor values for each field', () => {
   for (const [key, value] of [['guildId', GUILD], ['channelId', CHANNEL]]) {

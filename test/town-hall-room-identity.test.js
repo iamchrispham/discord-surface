@@ -23,6 +23,7 @@ const GUILD = '111111111111111111';
 const CHANNEL = '222222222222222222';
 const OTHER_GUILD = '333333333333333333';
 const OTHER_CHANNEL = '444444444444444444';
+const FIRST_UINT64_OVERFLOW = '18446744073709551616';
 
 // Synthetic Discord-shaped responses only; no observed Discord identifiers.
 function room(overrides = {}) {
@@ -385,6 +386,28 @@ test('room identifier length boundaries preserve valid matches', () => {
     assert.doesNotThrow(() => planTownHallBroadcast({ broadcastId: 'valid_room', townHall: room({ guildId: id, channelId: id }), source: { guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', generation: 1 }, recipients: [{ guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', generation: 1 }], text: 'fixture' }));
   }
 });
+
+for (const [roomKey, responseKey] of [['guildId', 'guild_id'], ['channelId', 'id']]) {
+  test(`response validator rejects the first uint64 overflow in ${roomKey}`, () => {
+    const expected = room({ [roomKey]: FIRST_UINT64_OVERFLOW });
+    assert.equal(validateTownHallRoomIdentity(response({ [responseKey]: FIRST_UINT64_OVERFLOW }), expected), false);
+  });
+}
+
+for (const key of ['guildId', 'channelId']) {
+  test(`planner rejects the first uint64 overflow in town-hall ${key}`, () => {
+    const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
+    const townHall = room({ [key]: FIRST_UINT64_OVERFLOW });
+    const guildId = townHall.guildId;
+    assert.throws(() => planTownHallBroadcast({
+      broadcastId: 'overflow_room',
+      townHall,
+      source: { guildId, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', generation: 1 },
+      recipients: [{ guildId, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', generation: 1 }],
+      text: 'fixture'
+    }), /invalid town-hall broadcast plan/);
+  });
+}
 
 test('response validator uses the shared room identity owner', () => {
   const planBuilt = path.join(PROJECT_ROOT, 'dist/peer/town-hall-plan.js');
