@@ -9,6 +9,8 @@ const DIRECT_HANDOFF_FLAGS = Object.freeze(['ordinary', 'from-lock', 'provider',
   'from-generation', 'endpoint', 'workspace', 'channel-id', 'handoff-id', 'category-id']);
 const ORDINARY_HANDOFF_FLAGS = Object.freeze(['ordinary', 'provider', 'from-native-id', 'native-id',
   'from-generation', 'workspace', 'channel-id', 'handoff-id', 'session-root']);
+const ORDINARY_CLAUDE_HANDOFF_FLAGS = Object.freeze(['ordinary', 'provider', 'from-native-id', 'native-id',
+  'from-generation', 'workspace', 'channel-id', 'handoff-id', 'endpoint', 'transcript']);
 const LOCK_HANDOFF_FLAGS = Object.freeze(['from-lock', 'repo', 'provider', 'conductor-id', 'repo-key',
   'native-id', 'endpoint', 'workspace', 'session-file', 'worker-file', 'category-id']);
 const LOCAL_HANDOFF_FLAGS = Object.freeze(['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
@@ -105,7 +107,9 @@ function allowedFlags(command, subcommand, args) {
   if (command === 'liaison' && subcommand === 'draft') return SUBCOMMAND_FLAGS['liaison draft'];
   if (command === 'recover') return RECOVER_FLAGS[recoverMode(args)];
   if (command === 'handoff' || command === 'handoff-run') {
-    if (args?.ordinary === true || args?.ordinary === 'true') return ORDINARY_HANDOFF_FLAGS;
+    if (args?.ordinary === true || args?.ordinary === 'true') {
+      return args.provider === 'claude' ? ORDINARY_CLAUDE_HANDOFF_FLAGS : ORDINARY_HANDOFF_FLAGS;
+    }
     if (args?.['from-lock'] === true || args?.['from-lock'] === 'true') return LOCK_HANDOFF_FLAGS;
   }
   const entry = Object.hasOwn(COMMAND_FLAGS, command) ? COMMAND_FLAGS[command] : null;

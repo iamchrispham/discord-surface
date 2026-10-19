@@ -8,8 +8,9 @@ const { assertGatewayWakeCompatible } = require('../ordinary-bind/gateway-capabi
 const { GATEWAY_CAPABILITIES } = require('../ordinary-bind/constants');
 const { completeCommandCleanup } = require('./command-cleanup');
 
-function createOrdinaryHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable }) {
+function createOrdinaryHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable, ordinaryClaudeHandoffInternal }) {
   return async function ordinaryHandoffInternal(args, dependencies = {}) {
+    if (args.provider === PROVIDERS.CLAUDE) return ordinaryClaudeHandoffInternal(args, dependencies);
     const environment = dependencies.environment || process.env;
     const install = dependencies.requireInstalled || requireInstalled;
     const read = dependencies.readSecret || readSecret;

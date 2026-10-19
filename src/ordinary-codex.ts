@@ -165,18 +165,17 @@ export function ordinaryBindingDecision(
     const owner = conductorOwned ? 'a conductor' : 'an incompatible owner';
     throw new Error(`channel is already bound to ${owner}; drain and unbind the existing binding before retrying ordinary-bind`);
   }
-  if (request.provider === 'claude') {
-    throw new Error('channel is already bound to another owner; Claude owner replacement requires an explicit supported handoff');
-  }
   const handoffCommand = [
-    'handoff --ordinary --provider codex',
+    `handoff --ordinary --provider ${request.provider}`,
     `--channel-id ${request.channelId}`,
     `--from-native-id ${existing.nativeId}`,
     `--from-generation ${existing.generation}`,
     `--native-id ${request.nativeId}`,
-    `--workspace ${request.workspace}`
+    `--workspace ${request.workspace}`,
+    ...(request.provider === 'claude' ? [`--endpoint ${request.endpoint}`, '--transcript <exact-current-session.jsonl>'] : [])
   ].join(' ');
-  throw new Error(`channel is already bound to another owner; run ${handoffCommand} --handoff-id <unique-id>`);
+  const direction = request.provider === 'claude' ? 'Claude owner replacement requires an explicit supported handoff; run' : 'run';
+  throw new Error(`channel is already bound to another owner; ${direction} ${handoffCommand} --handoff-id <unique-id>`);
 }
 
 export function createOrdinaryCodexRequest(input: {

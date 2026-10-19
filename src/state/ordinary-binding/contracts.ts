@@ -41,6 +41,7 @@ type OrdinaryMessageStates = {
 
 type OrdinaryProviders = {
   CODEX: OrdinaryProvider;
+  CLAUDE: Extract<AgentProvider, 'claude'>;
 };
 
 type OrdinaryReadinessValues = {
@@ -92,6 +93,7 @@ export interface OrdinaryHandoffRecord {
   generation: number;
   workspace: string;
   sessionRoot?: string | null;
+  endpoint?: string;
 }
 
 export interface OrdinaryBindOptions {
@@ -161,21 +163,35 @@ export interface OrdinaryBindingDependencies {
   now(): string;
 }
 
-export interface OrdinaryHandoffInput {
+interface OrdinaryHandoffBaseInput {
   channelId: string;
-  provider: OrdinaryProvider;
   fromNativeId: string;
   fromGeneration: number;
   nativeId: string;
   workspace: string;
-  sessionRoot?: string | null;
   handoffId: string;
   identity: OrdinaryBindingIdentity;
   nativeProof: OrdinaryNativeProof;
-  intakeCutoff?: string | null;
-  enrollmentProof?: ThreadEnrollmentCoverageProof | null;
   beforeMutation?: () => void;
 }
+
+export type OrdinaryHandoffInput =
+  | (OrdinaryHandoffBaseInput & {
+      provider: OrdinaryProvider;
+      sessionRoot?: string | null;
+      endpoint?: never;
+      intakeCutoff?: string | null;
+      enrollmentProof?: ThreadEnrollmentCoverageProof | null;
+    })
+  | (OrdinaryHandoffBaseInput & {
+      provider: Extract<AgentProvider, 'claude'>;
+      endpoint: string;
+      sessionRoot?: never;
+      intakeCutoff?: never;
+      enrollmentProof?: never;
+      identity: OrdinaryBindingIdentity & { harness: 'claude-code' };
+      nativeProof: OrdinaryNativeProof & { harness: 'claude-code'; endpoint: string };
+    });
 
 export interface OrdinaryHandoffResult extends OrdinaryBindingRecord {
   handoffReconciled?: boolean;

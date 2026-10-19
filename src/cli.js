@@ -19,6 +19,7 @@ if (require.main === module && startup.command === 'courier-guard' && startup.ar
 
 const { createGatewayProcessInspection } = require('./cli/gateway-process');
 const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
+const { createOrdinaryClaudeHandoff } = require('./cli/ordinary-claude-handoff');
 const { createConductorHandoff } = require('./cli/conductor-handoff');
 const { createDirectPostCommands } = require('./cli/direct-post-commands');
 const { createProvisionCommands } = require('./cli/provision-commands');
@@ -163,7 +164,8 @@ function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-const ordinaryHandoffInternal = createOrdinaryHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable });
+const ordinaryClaudeHandoffInternal = createOrdinaryClaudeHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable });
+const ordinaryHandoffInternal = createOrdinaryHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable, ordinaryClaudeHandoffInternal });
 
 const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 
@@ -176,6 +178,11 @@ native-reply-file-cleanup,
 decision-present, courier-guard, liaison draft
 
 Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
+
+Ordinary Claude handoff: handoff --ordinary --provider claude --channel-id CHANNEL_ID
+  --from-native-id OLD_UUID --from-generation GENERATION --native-id CURRENT_UUID
+  [--workspace DIR] --endpoint SOCKET --transcript EXACT_CURRENT_TRANSCRIPT --handoff-id ID
+Run from the successor Claude session. History remains pending until recovered.
 
 Use \"discord-surface agent-send --help\" for addressed agent-message options.
 `;
@@ -534,7 +541,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, agentSend, agentWithdraw, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, recoverCourier, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, agentSend, agentWithdraw, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryClaudeHandoffInternal, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, recoverCourier, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {
