@@ -24,7 +24,7 @@ function setup(t) {
       GATEWAY_CAPABILITIES.ordinaryClaudeBind]
   };
   const channel = {
-    id: args['channel-id'], guildId: 'guild', isTextBased: () => true,
+    id: args['channel-id'], name: args['channel-id'], guildId: 'guild', isTextBased: () => true,
     send: () => { throw new Error('preserving handoff must not publish a cutoff fence'); },
     messages: { fetch: () => { throw new Error('handoff must leave history for bounded recovery'); } }
   };
@@ -67,7 +67,7 @@ function history(f) {
   return {
     watermark: f.state.getIntakeWatermark(f.binding.channelId),
     children: f.state.listThreadEnrollments(f.binding.channelId),
-    messages: f.state.db.prepare('SELECT * FROM messages ORDER BY id').all()
+    messages: f.state.db.prepare('SELECT * FROM messages ORDER BY discord_id').all()
   };
 }
 
