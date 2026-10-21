@@ -10,8 +10,8 @@ const { READINESS } = require('../src/state');
 const { ordinaryBindingDecision } = require('../src/ordinary-codex');
 const { CLAUDE, OTHER, fixture, transcript } = require('./ordinary-claude-scenarios/fixture.cjs');
 
-const SRC_ROOT = path.resolve(__dirname, '..');
-const REPO_ROOT = path.resolve(SRC_ROOT, '..');
+const REPO_ROOT = path.resolve(__dirname, '..');
+const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const ORDINARY_CALLSITE_COUNTS = new Map([
   ['src/cli/ordinary-handoff.js\u0000handoffOrdinary', 2],
   ['src/cli/ordinary-claude-handoff.js\u0000handoffOrdinary', 1],
@@ -138,8 +138,12 @@ function history(f) {
 test('ordinary handoff and binding decision callsites stay finite', () => {
   const baseline = enumerateOrdinaryCallsites();
   classifyOrdinaryCallsites(baseline);
-  const synthetic = parseOrdinaryCallsites('src/ordinary-bind/new-owner.js', 'state.handoffOrdinary({});');
-  assert.throws(() => classifyOrdinaryCallsites([...baseline, ...synthetic]), /unclassified ordinary callsite/);
+  const syntheticHandoff = parseOrdinaryCallsites('src/ordinary-bind/new-owner.js', 'state.handoffOrdinary({});');
+  assert.equal(syntheticHandoff.length, 1);
+  assert.throws(() => classifyOrdinaryCallsites([...baseline, ...syntheticHandoff]), /unclassified ordinary callsite/);
+  const syntheticDecision = parseOrdinaryCallsites('src/ordinary-bind/new-decision-owner.js', 'ordinaryBindingDecision(null, null);');
+  assert.equal(syntheticDecision.length, 1);
+  assert.throws(() => classifyOrdinaryCallsites([...baseline, ...syntheticDecision]), /unclassified ordinary callsite/);
 });
 
 test('runtime PID advertisement includes ordinary Claude handoff capability', t => {
