@@ -25,6 +25,7 @@ function createOrdinaryClaudeHandoff({ required, openState, requestGatewayRecove
     for (const [label, value] of evidencePaths) {
       if (!path.isAbsolute(value)) throw new Error(`Claude ${label} must be absolute`);
     }
+    const resolvedEndpoint = path.resolve(endpoint);
     const channelId = required(args, 'channel-id');
     const handoffId = required(args, 'handoff-id');
     const { paths, state } = openState(args);
@@ -53,7 +54,8 @@ function createOrdinaryClaudeHandoff({ required, openState, requestGatewayRecove
       const assertCapabilities = snapshot => {
         if (snapshot.state === 'running' && (!snapshot.pid ||
           !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock) ||
-          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryClaudeBind))) {
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryClaudeBind) ||
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryClaudeHandoff))) {
           throw new Error('running Gateway does not support ordinary Claude handoff');
         }
       };
@@ -91,7 +93,7 @@ function createOrdinaryClaudeHandoff({ required, openState, requestGatewayRecove
       }
       const request = createOrdinaryClaudeRequest({
         channelId, guildId: config.guildId, nativeId, workspace: proof.workspace,
-        endpoint, identity: { sessionId: caller.sessionId, threadId: caller.sessionId, harness: 'claude-code' }
+        endpoint: resolvedEndpoint, identity: { sessionId: caller.sessionId, threadId: caller.sessionId, harness: 'claude-code' }
       });
       const previousHandoff = state.findOrdinaryHandoff(handoffId);
       if (!previousHandoff) {

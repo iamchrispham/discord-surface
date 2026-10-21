@@ -5,6 +5,7 @@ const test = require('node:test');
 const { EventEmitter } = require('node:events');
 const ts = require('typescript');
 const { handoffInternal, parseArgs, GATEWAY_CAPABILITIES } = require('../src/cli');
+const { writePid } = require('../src/cli/runtime-custody');
 const { READINESS } = require('../src/state');
 const { ordinaryBindingDecision } = require('../src/ordinary-codex');
 const { CLAUDE, OTHER, fixture, transcript } = require('./ordinary-claude-scenarios/fixture.cjs');
@@ -66,6 +67,11 @@ function enumerateOrdinaryCallsites() {
   });
 }
 
+function supportedHandoffCapabilities() {
+  return [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock,
+    GATEWAY_CAPABILITIES.ordinaryClaudeBind, GATEWAY_CAPABILITIES.ordinaryClaudeHandoff];
+}
+
 function setup(t) {
   const f = fixture(t);
   const successor = transcript(t, f.dir, OTHER);
@@ -79,8 +85,7 @@ function setup(t) {
   const signals = new EventEmitter();
   let runtime = {
     state: 'running', pid: 42,
-    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock,
-      GATEWAY_CAPABILITIES.ordinaryClaudeBind]
+    capabilities: supportedHandoffCapabilities()
   };
   const channel = {
     id: args['channel-id'], name: args['channel-id'], guildId: 'guild', isTextBased: () => true,
@@ -135,6 +140,31 @@ test('ordinary handoff and binding decision callsites stay finite', () => {
   classifyOrdinaryCallsites(baseline);
   const synthetic = parseOrdinaryCallsites('src/ordinary-bind/new-owner.js', 'state.handoffOrdinary({});');
   assert.throws(() => classifyOrdinaryCallsites([...baseline, ...synthetic]), /unclassified ordinary callsite/);
+});
+
+test('runtime PID advertisement includes ordinary Claude handoff capability', t => {
+  const f = fixture(t, { bind: false });
+  const pidFile = path.join(f.dir, 'runtime.pid');
+  writePid(pidFile, 'guild', f.dir, f.db);
+  const record = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+  assert.equal(GATEWAY_CAPABILITIES.ordinaryClaudeHandoff, 'ordinary-claude-handoff-v1');
+  assert.ok(record.capabilities.includes(GATEWAY_CAPABILITIES.ordinaryClaudeHandoff));
+});
+
+test('ordinary Claude handoff canonicalizes an absolute endpoint', async t => {
+  const f = setup(t);
+  const endpoint = `${f.dir}/nested/../successor.sock`;
+  const result = await handoffInternal({ ...f.args, endpoint }, f.dependencies);
+  assert.equal(result.binding.endpoint, path.resolve(endpoint));
+});
+
+test('ordinary Claude handoff refuses a relative endpoint', async t => {
+  const f = setup(t);
+  const before = history(f);
+  await assert.rejects(() => handoffInternal({ ...f.args, endpoint: 'successor.sock' }, f.dependencies), /absolute/);
+  assert.equal(f.calls.login, 0);
+  assert.equal(f.state.getBinding(f.binding.channelId).generation, 1);
+  assert.deepEqual(history(f), before);
 });
 
 test('public ordinary Claude handoff preserves an unavailable parent and child history gap', async t => {
@@ -221,23 +251,67 @@ test('ordinary Claude handoff retains accepted old-generation work', async t => 
   assert.equal(f.calls.wakes.length, 0);
 });
 
-test('ordinary Claude handoff refuses missing runtime lock capability before identity or network work', async t => {
+test('ordinary Claude handoff refuses old, missing, and empty running capabilities', async t => {
+  const supported = supportedHandoffCapabilities();
+  const runtimes = [
+    { state: 'running', pid: 42, capabilities: supported.filter(capability => capability !== GATEWAY_CAPABILITIES.ordinaryClaudeHandoff) },
+    { state: 'running', pid: 42, capabilities: supported.filter(capability => capability !== GATEWAY_CAPABILITIES.runtimeBindLock) },
+    { state: 'running', pid: 42, capabilities: supported.filter(capability => capability !== GATEWAY_CAPABILITIES.ordinaryClaudeBind) },
+    { state: 'running', pid: 42 },
+    { state: 'running', pid: 42, capabilities: [] }
+  ];
+  for (const runtime of runtimes) {
+    const f = setup(t);
+    f.setRuntime(runtime);
+    f.dependencies.resolveClaudeCaller = async () => { throw new Error('must not resolve caller'); };
+    await assert.rejects(() => handoffInternal(f.args, f.dependencies), /does not support ordinary (binding wake|Claude handoff)/);
+    assert.equal(f.calls.acquired, 0);
+    assert.equal(f.calls.login, 0);
+    assert.equal(f.calls.wakes.length, 0);
+    assert.equal(f.state.getBinding(f.binding.channelId).generation, 1);
+  }
+});
+
+test('ordinary Claude handoff refuses same-PID capability loss under the lock', async t => {
   const f = setup(t);
-  f.setRuntime({ state: 'running', pid: 42,
-    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.ordinaryClaudeBind] });
+  const acquire = f.dependencies.acquireHeldLockUntilAvailable;
+  f.dependencies.acquireHeldLockUntilAvailable = async (lockPath, stopped) => {
+    const lock = await acquire(lockPath, stopped);
+    f.setRuntime({ state: 'running', pid: 42, capabilities: supportedHandoffCapabilities().slice(0, -1) });
+    return lock;
+  };
   f.dependencies.resolveClaudeCaller = async () => { throw new Error('must not resolve caller'); };
   await assert.rejects(() => handoffInternal(f.args, f.dependencies), /does not support ordinary Claude handoff/);
-  assert.equal(f.calls.acquired, 0);
+  assert.equal(f.calls.acquired, 1);
+  assert.equal(f.calls.released, 1);
   assert.equal(f.calls.login, 0);
   assert.equal(f.state.getBinding(f.binding.channelId).generation, 1);
+});
+
+test('stopped Gateway needs no handoff capability', async t => {
+  const f = setup(t);
+  f.setRuntime({ state: 'stopped', pid: null, capabilities: [] });
+  f.dependencies.acquireHeldLockUntilAvailable = async (lockPath, stopped) => {
+    assert.equal(lockPath, path.join(f.dir, 'runtime.lock'));
+    assert.equal(stopped(), false);
+    f.calls.acquired += 1;
+    return { release() { f.calls.released += 1; } };
+  };
+  f.dependencies.requestGatewayRecovery = (_paths, options) => {
+    assert.equal(options.expectedPid, undefined);
+    return { requested: true };
+  };
+  const result = await handoffInternal(f.args, f.dependencies);
+  assert.equal(result.binding.generation, 2);
+  assert.equal(f.calls.acquired, 1);
+  assert.equal(f.calls.released, 1);
 });
 
 test('ordinary Claude handoff rechecks the Gateway PID after channel access', async t => {
   const f = setup(t);
   f.setFetchChannel(async () => {
     f.setRuntime({ state: 'running', pid: 43,
-      capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock,
-        GATEWAY_CAPABILITIES.ordinaryClaudeBind] });
+      capabilities: supportedHandoffCapabilities() });
     return f.channel;
   });
   const before = history(f);
@@ -318,4 +392,37 @@ test('ordinary binding advice refuses cross-provider handoffs', () => {
       return true;
     });
   }
+});
+
+test('ordinary binding advice rejects same-UUID mismatches after valid identity decisions', () => {
+  const claudeExisting = { provider: 'claude', nativeId: CLAUDE, channelId: 'channel', guildId: 'guild',
+    workspace: '/workspace', endpoint: '/tmp/old.sock', active: true, generation: 1 };
+  const claudeRequest = { provider: 'claude', nativeId: CLAUDE, channelId: 'channel', guildId: 'guild',
+    workspace: '/workspace', endpoint: '/tmp/new.sock', identity: { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' } };
+  assert.throws(() => ordinaryBindingDecision(claudeExisting, claudeRequest, true), /same native session/);
+
+  const codexExisting = { provider: 'codex', nativeId: OTHER, channelId: 'channel', guildId: 'guild',
+    workspace: '/workspace', sessionRoot: '/workspace/.codex', active: true, generation: 1 };
+  const codexRequest = { provider: 'codex', nativeId: OTHER, channelId: 'channel', guildId: 'guild',
+    workspace: '/other-workspace', sessionRoot: '/workspace/.codex', identity: { sessionId: OTHER, threadId: OTHER } };
+  assert.throws(() => ordinaryBindingDecision(codexExisting, codexRequest, true), /same native session/);
+  assert.throws(() => ordinaryBindingDecision(codexExisting, {
+    ...codexRequest, workspace: codexExisting.workspace, sessionRoot: '/workspace/.next-codex'
+  }, true), /same native session/);
+
+  const reuse = ordinaryBindingDecision(claudeExisting, {
+    ...claudeRequest, endpoint: claudeExisting.endpoint
+  }, true);
+  assert.equal(reuse, 'reuse');
+  const rebind = ordinaryBindingDecision({ ...claudeExisting, active: false }, {
+    ...claudeRequest, endpoint: claudeExisting.endpoint
+  }, true);
+  assert.equal(rebind, 'rebind');
+  const relocation = ordinaryBindingDecision(codexExisting, {
+    ...codexRequest, workspace: codexExisting.workspace, sessionRoot: '/workspace/.next-codex'
+  }, true, {
+    file: '/tmp/codex-session.jsonl', sessionId: OTHER, threadId: OTHER,
+    workspace: codexExisting.workspace, sessionRoot: '/workspace/.next-codex'
+  });
+  assert.equal(relocation, 'rebind');
 });

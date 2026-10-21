@@ -14,6 +14,7 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
     GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
     GATEWAY_CAPABILITIES.runtimeBindLock,
     GATEWAY_CAPABILITIES.ordinaryClaudeBind,
+    GATEWAY_CAPABILITIES.ordinaryClaudeHandoff,
     GATEWAY_CAPABILITIES.agentHandledWithoutPost,
     GATEWAY_CAPABILITIES.agentRequestWithdrawal,
     GATEWAY_CAPABILITIES.watcherNoticeIngress,

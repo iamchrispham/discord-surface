@@ -165,6 +165,9 @@ export function ordinaryBindingDecision(
     const owner = conductorOwned ? 'a conductor' : 'an incompatible owner';
     throw new Error(`channel is already bound to ${owner}; drain and unbind the existing binding before retrying ordinary-bind`);
   }
+  if (existing.nativeId === request.nativeId) {
+    throw new Error('channel is already bound to the same native session; use the existing binding or a different native UUID');
+  }
   const handoffCommand = [
     `handoff --ordinary --provider ${request.provider}`,
     `--channel-id ${request.channelId}`,
