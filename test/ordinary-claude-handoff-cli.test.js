@@ -81,7 +81,7 @@ function setup(t) {
     'native-id': OTHER, workspace: f.dir, endpoint: path.join(f.dir, 'successor.sock'),
     transcript: successor.file, 'handoff-id': 'claude-successor'
   };
-  const calls = { acquired: 0, released: 0, login: 0, destroyed: 0, wakes: [], outputs: [] };
+  const calls = { acquired: 0, released: 0, login: 0, destroyed: 0, resolvedCaller: 0, wakes: [], outputs: [] };
   const signals = new EventEmitter();
   let runtime = {
     state: 'running', pid: 42,
@@ -109,7 +109,10 @@ function setup(t) {
       calls.acquired += 1;
       return { release() { calls.released += 1; } };
     },
-    resolveClaudeCaller: async () => ({ harness: 'claude-code', sessionId: OTHER }),
+    resolveClaudeCaller: async () => {
+      calls.resolvedCaller += 1;
+      return { harness: 'claude-code', sessionId: OTHER };
+    },
     requireInstalled: name => {
       assert.equal(name, 'discord.js');
       return { Client, GatewayIntentBits: { Guilds: 1 } };
@@ -166,9 +169,22 @@ test('ordinary Claude handoff refuses a relative endpoint', async t => {
   const f = setup(t);
   const before = history(f);
   await assert.rejects(() => handoffInternal({ ...f.args, endpoint: 'successor.sock' }, f.dependencies), /absolute/);
+  assert.equal(f.calls.resolvedCaller, 0);
   assert.equal(f.calls.login, 0);
   assert.equal(f.state.getBinding(f.binding.channelId).generation, 1);
   assert.deepEqual(history(f), before);
+});
+
+test('ordinary Claude handoff refuses missing and empty endpoints before caller resolution', async t => {
+  for (const endpoint of [undefined, '']) {
+    const f = setup(t);
+    const before = history(f);
+    await assert.rejects(() => handoffInternal({ ...f.args, endpoint }, f.dependencies), /missing --endpoint/);
+    assert.equal(f.calls.resolvedCaller, 0);
+    assert.equal(f.calls.login, 0);
+    assert.equal(f.state.getBinding(f.binding.channelId).generation, 1);
+    assert.deepEqual(history(f), before);
+  }
 });
 
 test('public ordinary Claude handoff preserves an unavailable parent and child history gap', async t => {
