@@ -1,11 +1,70 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { EventEmitter } = require('node:events');
+const ts = require('typescript');
 const { handoffInternal, parseArgs, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { READINESS } = require('../src/state');
 const { ordinaryBindingDecision } = require('../src/ordinary-codex');
 const { CLAUDE, OTHER, fixture, transcript } = require('./ordinary-claude-scenarios/fixture.cjs');
+
+const SRC_ROOT = path.resolve(__dirname, '..');
+const REPO_ROOT = path.resolve(SRC_ROOT, '..');
+const ORDINARY_CALLSITE_COUNTS = new Map([
+  ['src/cli/ordinary-handoff.js\u0000handoffOrdinary', 2],
+  ['src/cli/ordinary-claude-handoff.js\u0000handoffOrdinary', 1],
+  ['src/ordinary-bind/index.js\u0000ordinaryBindingDecision', 3],
+  ['src/ordinary-bind/codex.js\u0000ordinaryBindingDecision', 3]
+]);
+
+function parseOrdinaryCallsites(file, source) {
+  const kind = file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, kind);
+  const callsites = [];
+  const visit = node => {
+    if (ts.isCallExpression(node)) {
+      const expression = node.expression;
+      if (ts.isPropertyAccessExpression(expression) && expression.name.text === 'handoffOrdinary' &&
+        ts.isIdentifier(expression.expression) && expression.expression.text === 'state') {
+        callsites.push({ file, kind: 'handoffOrdinary' });
+      }
+      if (ts.isIdentifier(expression) && expression.text === 'ordinaryBindingDecision') {
+        callsites.push({ file, kind: 'ordinaryBindingDecision' });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return callsites;
+}
+
+function sourceFiles(root) {
+  return fs.readdirSync(root, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap(entry => {
+      const full = path.join(root, entry.name);
+      if (entry.isDirectory()) return sourceFiles(full);
+      return /\.(?:js|ts)$/.test(entry.name) ? [full] : [];
+    });
+}
+
+function classifyOrdinaryCallsites(callsites) {
+  const counts = new Map();
+  for (const callsite of callsites) {
+    const key = `${callsite.file}\u0000${callsite.kind}`;
+    if (!ORDINARY_CALLSITE_COUNTS.has(key)) throw new Error(`unclassified ordinary callsite: ${key}`);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  assert.deepEqual(counts, ORDINARY_CALLSITE_COUNTS, 'ordinary callsites classify exactly');
+}
+
+function enumerateOrdinaryCallsites() {
+  return sourceFiles(SRC_ROOT).flatMap(full => {
+    const file = path.relative(REPO_ROOT, full).split(path.sep).join('/');
+    return parseOrdinaryCallsites(file, fs.readFileSync(full, 'utf8'));
+  });
+}
 
 function setup(t) {
   const f = fixture(t);
@@ -70,6 +129,13 @@ function history(f) {
     messages: f.state.db.prepare('SELECT * FROM messages ORDER BY discord_id').all()
   };
 }
+
+test('ordinary handoff and binding decision callsites stay finite', () => {
+  const baseline = enumerateOrdinaryCallsites();
+  classifyOrdinaryCallsites(baseline);
+  const synthetic = parseOrdinaryCallsites('src/ordinary-bind/new-owner.js', 'state.handoffOrdinary({});');
+  assert.throws(() => classifyOrdinaryCallsites([...baseline, ...synthetic]), /unclassified ordinary callsite/);
+});
 
 test('public ordinary Claude handoff preserves an unavailable parent and child history gap', async t => {
   const f = setup(t);
@@ -208,9 +274,13 @@ test('ordinary Claude handoff wake failure retains its committed successor for e
   assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
   assert.deepEqual(history(f), before);
   f.dependencies.requestGatewayRecovery = wake;
+  f.dependencies.requireInstalled = () => { throw new Error('Discord unavailable during exact retry'); };
+  f.setFetchChannel(() => { throw new Error('Discord channel unavailable during exact retry'); });
   const result = await handoffInternal(f.args, f.dependencies);
   assert.equal(result.handoffReconciled, true);
   assert.equal(result.binding.generation, 2);
+  assert.equal(f.calls.login, 1);
+  assert.deepEqual(history(f), before);
 });
 
 test('ordinary handoff flag policy keeps Claude evidence separate from Codex session-root', () => {
@@ -232,4 +302,20 @@ test('ordinary Claude bind refusal points to the explicit proof-bearing handoff'
     assert.match(error.message, /--endpoint \/tmp\/new.sock --transcript/);
     return true;
   });
+});
+
+test('ordinary binding advice refuses cross-provider handoffs', () => {
+  const claudeExisting = { provider: 'claude', nativeId: CLAUDE, channelId: 'channel', guildId: 'guild',
+    workspace: '/workspace', endpoint: '/tmp/old.sock', active: true, generation: 1 };
+  const codexExisting = { ...claudeExisting, provider: 'codex', endpoint: undefined };
+  const claudeRequest = { provider: 'claude', nativeId: OTHER, channelId: 'channel', guildId: 'guild',
+    workspace: '/workspace', endpoint: '/tmp/new.sock', identity: { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' } };
+  const codexRequest = { ...claudeRequest, provider: 'codex', endpoint: undefined, sessionRoot: '/workspace/.codex' };
+  for (const [existing, request] of [[codexExisting, claudeRequest], [claudeExisting, codexRequest]]) {
+    assert.throws(() => ordinaryBindingDecision(existing, request, true), error => {
+      assert.match(error.message, /incompatible owner/);
+      assert.doesNotMatch(error.message, /handoff --ordinary/);
+      return true;
+    });
+  }
 });

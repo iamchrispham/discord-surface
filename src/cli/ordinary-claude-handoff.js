@@ -93,19 +93,22 @@ function createOrdinaryClaudeHandoff({ required, openState, requestGatewayRecove
         channelId, guildId: config.guildId, nativeId, workspace: proof.workspace,
         endpoint, identity: { sessionId: caller.sessionId, threadId: caller.sessionId, harness: 'claude-code' }
       });
-      const { Client, GatewayIntentBits } = install('discord.js');
-      client = new Client({ intents: [GatewayIntentBits.Guilds] });
-      await client.login(read(config.secretFile));
-      assertNotStopping();
-      const guild = await client.guilds.fetch(config.guildId);
-      assertNotStopping();
-      const channel = await guild.channels.fetch(channelId);
-      assertNotStopping();
-      resolveExistingChannel(channelId, config.guildId, [{
-        id: channel?.id, guildId: channel?.guildId,
-        name: channel?.name || null,
-        messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
-      }]);
+      const previousHandoff = state.findOrdinaryHandoff(handoffId);
+      if (!previousHandoff) {
+        const { Client, GatewayIntentBits } = install('discord.js');
+        client = new Client({ intents: [GatewayIntentBits.Guilds] });
+        await client.login(read(config.secretFile));
+        assertNotStopping();
+        const guild = await client.guilds.fetch(config.guildId);
+        assertNotStopping();
+        const channel = await guild.channels.fetch(channelId);
+        assertNotStopping();
+        resolveExistingChannel(channelId, config.guildId, [{
+          id: channel?.id, guildId: channel?.guildId,
+          name: channel?.name || null,
+          messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
+        }]);
+      }
       assertGatewayCompatible();
       const binding = state.handoffOrdinary({
         channelId, provider: PROVIDERS.CLAUDE, fromNativeId, fromGeneration,
