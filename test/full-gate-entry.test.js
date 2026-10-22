@@ -605,16 +605,16 @@ test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 
   assert.equal(fs.existsSync(f.marker), true, 'the admitted body did not run');
 });
 
-test('source fingerprint and bypass decisions stay at their owners', () => {
+test('gate and artifact digests and bypass decisions stay at their owners', () => {
   const scripts = filesUnder(path.join(PROJECT, 'scripts')).filter(file => file.endsWith('.js'));
   const relative = files => files.map(file => path.relative(PROJECT, file).split(path.sep).join('/')).sort();
   const contents = new Map(scripts.map(file => [file, fs.readFileSync(file, 'utf8')]));
-  const digestOwners = scripts.filter(file => /crypto\.createHash\(['"]sha256['"]\)/.test(contents.get(file)));
+  const digestOwners = scripts.flatMap(file => [...contents.get(file).matchAll(/crypto\.createHash\(['"]sha256['"]\)/g)].map(() => file));
   const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(contents.get(file)));
   const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && /runFullGate\(root,/.test(contents.get(file)));
   const bodyDispatchers = scripts.filter(file => /body-runner\.js/.test(contents.get(file)));
   const nodeOptionOwners = scripts.filter(file => /\bNODE_OPTIONS\b/.test(contents.get(file)));
-  assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js']);
+  assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js', 'scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/package-smoke.js']);
   assert.deepEqual(relative(bypassOwners), []);
   assert.deepEqual(relative(gateEntrypoints), ['scripts/package-smoke.js', 'scripts/test-gate.js']);
   assert.deepEqual(relative(bodyDispatchers), ['scripts/full-gate-watchdog.js']);
@@ -646,8 +646,9 @@ test('package smoke forwards retained artifact arguments through the existing ga
 });
 
 test('retained artifact destination containment follows parent symlinks', t => {
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-destination-'));
-  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const rawDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-destination-'));
+  t.after(() => fs.rmSync(rawDirectory, { recursive: true, force: true }));
+  const scratch = fs.realpathSync.native(rawDirectory);
   const checkout = path.join(scratch, 'checkout');
   const gateScratch = path.join(scratch, 'gate-scratch');
   const outside = path.join(scratch, 'outside');
@@ -664,8 +665,9 @@ test('retained artifact destination containment follows parent symlinks', t => {
 });
 
 test('retained artifact uses canonical destination after alias retarget', t => {
-  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-canonical-'));
-  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const rawDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-canonical-'));
+  t.after(() => fs.rmSync(rawDirectory, { recursive: true, force: true }));
+  const fixture = fs.realpathSync.native(rawDirectory);
   const checkout = path.join(fixture, 'checkout');
   const gateScratch = path.join(fixture, 'gate-scratch');
   const target = path.join(fixture, 'target');
