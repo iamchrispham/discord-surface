@@ -611,7 +611,10 @@ test('gate and artifact digests and bypass decisions stay at their owners', () =
   const contents = new Map(scripts.map(file => [file, fs.readFileSync(file, 'utf8')]));
   const digestOwners = scripts.flatMap(file => [...contents.get(file).matchAll(/crypto\.createHash\(['"]sha256['"]\)/g)].map(() => file));
   const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(contents.get(file)));
-  const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && /runFullGate\(root,/.test(contents.get(file)));
+  const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && (
+    /runFullGate\(root,/.test(contents.get(file))
+    || (/\bgate\s*=\s*runFullGate\b/.test(contents.get(file)) && /\bgate\(root,/.test(contents.get(file)))
+  ));
   const bodyDispatchers = scripts.filter(file => /body-runner\.js/.test(contents.get(file)));
   const nodeOptionOwners = scripts.filter(file => /\bNODE_OPTIONS\b/.test(contents.get(file)));
   assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js', 'scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/package-smoke.js']);
