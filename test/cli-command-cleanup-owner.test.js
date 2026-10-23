@@ -20,6 +20,7 @@ const CLIENT_COMMANDS = [
   { file: 'src/cli/conductor-handoff.js', name: 'handoffInternal' },
   { file: 'src/cli/conductor-handoff.js', name: 'handoffFromLockInternal' },
   { file: 'src/cli/ordinary-handoff.js', name: 'ordinaryHandoffInternal' },
+  { file: 'src/cli/ordinary-claude-handoff.js', name: 'ordinaryClaudeHandoffInternal' },
   { file: 'src/ordinary-bind/index.js', name: 'ordinaryClaudeBind' },
   { file: 'src/ordinary-bind/codex.js', name: 'ordinaryBind' }
 ];
@@ -224,7 +225,7 @@ function delegationCalls(fn) {
   return calls;
 }
 
-test('all nine client command exits delegate to the cleanup owner', () => {
+test('all ten client command exits delegate to the cleanup owner', () => {
   const observed = [];
   for (const file of sourceFiles('src')) {
     const source = sourceFileFor(file);

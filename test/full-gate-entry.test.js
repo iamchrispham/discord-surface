@@ -8,7 +8,8 @@ const path = require('node:path');
 const { fork, spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { PassThrough } = require('node:stream');
-const { relay, revision, noVerdict, MESSAGES, NO_VERDICT, SUPERVISOR } = require('../scripts/full-gate');
+const { relay, revision, noVerdict, MESSAGES, NO_VERDICT, SUPERVISOR, SCRATCH_ROOT } = require('../scripts/full-gate');
+const { parseRetainArtifactArgs, retainArtifact, runBody, runPackageSmokeEntry, validateRetainArtifactDestination } = require('../scripts/package-smoke');
 const { pythonTestEnvironment } = require('../scripts/test-gate');
 const roleFixture = require('./successor-authority/process-identity');
 
@@ -604,20 +605,303 @@ test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 
   assert.equal(fs.existsSync(f.marker), true, 'the admitted body did not run');
 });
 
-test('source fingerprint and bypass decisions stay at their owners', () => {
+test('gate and artifact digests and bypass decisions stay at their owners', () => {
   const scripts = filesUnder(path.join(PROJECT, 'scripts')).filter(file => file.endsWith('.js'));
   const relative = files => files.map(file => path.relative(PROJECT, file).split(path.sep).join('/')).sort();
   const contents = new Map(scripts.map(file => [file, fs.readFileSync(file, 'utf8')]));
-  const digestOwners = scripts.filter(file => /crypto\.createHash\(['"]sha256['"]\)/.test(contents.get(file)));
+  const digestOwners = scripts.flatMap(file => [...contents.get(file).matchAll(/crypto\.createHash\(['"]sha256['"]\)/g)].map(() => file));
   const bypassOwners = scripts.filter(file => /\bBODY_LABEL\b/.test(contents.get(file)));
-  const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && /runFullGate\(root,/.test(contents.get(file)));
+  const gateEntrypoints = scripts.filter(file => file !== path.join(PROJECT, 'scripts/full-gate.js') && (
+    /runFullGate\(root,/.test(contents.get(file))
+    || (/\bgate\s*=\s*runFullGate\b/.test(contents.get(file)) && /\bgate\(root,/.test(contents.get(file)))
+  ));
   const bodyDispatchers = scripts.filter(file => /body-runner\.js/.test(contents.get(file)));
   const nodeOptionOwners = scripts.filter(file => /\bNODE_OPTIONS\b/.test(contents.get(file)));
-  assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js']);
+  assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js', 'scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/package-smoke.js']);
   assert.deepEqual(relative(bypassOwners), []);
   assert.deepEqual(relative(gateEntrypoints), ['scripts/package-smoke.js', 'scripts/test-gate.js']);
   assert.deepEqual(relative(bodyDispatchers), ['scripts/full-gate-watchdog.js']);
   assert.deepEqual(relative(nodeOptionOwners), ['scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/test-gate.js']);
+});
+
+test('retained artifact arguments preserve default and reject malformed destinations', () => {
+  const destination = path.join(os.tmpdir(), 'discord-surface-retained.tgz');
+  assert.equal(parseRetainArtifactArgs([]), null);
+  assert.equal(parseRetainArtifactArgs(['--retain-artifact', destination]), destination);
+  for (const args of [
+    ['--unknown', destination],
+    ['--retain-artifact'],
+    ['--retain-artifact', ''],
+    ['--retain-artifact', 'relative.tgz'],
+    ['--retain-artifact', destination, '--retain-artifact', destination]
+  ]) assert.throws(() => parseRetainArtifactArgs(args), /retain-artifact/);
+});
+
+test('package smoke forwards retained artifact arguments through the existing gate entry', async () => {
+  const destination = path.join(os.tmpdir(), 'discord-surface-forwarded.tgz');
+  let forwarded;
+  const result = await runPackageSmokeEntry(['--retain-artifact', destination], (...args) => {
+    forwarded = args;
+    return Promise.resolve(0);
+  });
+  assert.equal(result, 0);
+  assert.deepEqual(forwarded, [PROJECT, 'package-smoke', path.join(PROJECT, 'scripts/package-smoke.js'), ['--retain-artifact', destination]]);
+});
+
+test('retained artifact destination containment follows parent symlinks', t => {
+  const rawDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-destination-'));
+  t.after(() => fs.rmSync(rawDirectory, { recursive: true, force: true }));
+  const scratch = fs.realpathSync.native(rawDirectory);
+  const checkout = path.join(scratch, 'checkout');
+  const gateScratch = path.join(scratch, 'gate-scratch');
+  const outside = path.join(scratch, 'outside');
+  fs.mkdirSync(checkout);
+  fs.mkdirSync(gateScratch);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(checkout, path.join(outside, 'checkout-link'), 'dir');
+  fs.symlinkSync(gateScratch, path.join(outside, 'scratch-link'), 'dir');
+  assert.throws(() => validateRetainArtifactDestination(path.join(checkout, 'artifact.tgz'), checkout, gateScratch), /outside/);
+  assert.throws(() => validateRetainArtifactDestination(path.join(outside, 'checkout-link', 'artifact.tgz'), checkout, gateScratch), /outside/);
+  assert.throws(() => validateRetainArtifactDestination(path.join(outside, 'scratch-link', 'artifact.tgz'), checkout, gateScratch), /outside/);
+  assert.throws(() => validateRetainArtifactDestination(path.join(outside, 'missing', 'artifact.tgz'), checkout, gateScratch), /parent must exist/);
+  assert.equal(validateRetainArtifactDestination(path.join(outside, 'artifact.tgz'), checkout, gateScratch), path.join(outside, 'artifact.tgz'));
+});
+
+test('retained artifact uses canonical destination after alias retarget', t => {
+  const rawDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-canonical-'));
+  t.after(() => fs.rmSync(rawDirectory, { recursive: true, force: true }));
+  const fixture = fs.realpathSync.native(rawDirectory);
+  const checkout = path.join(fixture, 'checkout');
+  const gateScratch = path.join(fixture, 'gate-scratch');
+  const target = path.join(fixture, 'target');
+  const replacement = path.join(fixture, 'replacement');
+  const alias = path.join(fixture, 'alias');
+  const source = path.join(fixture, 'source.tgz');
+  fs.mkdirSync(checkout);
+  fs.mkdirSync(gateScratch);
+  fs.mkdirSync(target);
+  fs.mkdirSync(replacement);
+  fs.writeFileSync(source, 'canonical bytes');
+  fs.symlinkSync(target, alias, 'dir');
+  const requested = path.join(alias, 'candidate.tgz');
+  const canonical = validateRetainArtifactDestination(requested, checkout, gateScratch);
+  assert.equal(canonical, path.join(target, 'candidate.tgz'));
+  fs.unlinkSync(alias);
+  fs.symlinkSync(replacement, alias, 'dir');
+  const retained = retainArtifact(source, canonical);
+  assert.equal(retained.path, canonical);
+  assert.deepEqual(fs.readFileSync(path.join(target, 'candidate.tgz')), Buffer.from('canonical bytes'));
+  assert.equal(fs.existsSync(path.join(replacement, 'candidate.tgz')), false);
+});
+
+test('retained artifact preserves exact bytes, hash, mode and scratch independence', t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-artifact-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const scratch = path.join(fixture, 'scratch');
+  fs.mkdirSync(scratch);
+  const source = path.join(scratch, 'package.tgz');
+  const destination = path.join(fixture, 'retained-package.tgz');
+  const bytes = Buffer.from('smoke-tested package bytes\n');
+  fs.writeFileSync(source, bytes);
+  const retained = retainArtifact(source, destination);
+  const expectedHash = crypto.createHash('sha256').update(bytes).digest('hex');
+  assert.deepEqual(fs.readFileSync(destination), bytes);
+  assert.deepEqual(retained, { path: destination, bytes: bytes.length, sha256: expectedHash, mode: 0o400, candidate: true });
+  assert.equal(fs.statSync(destination).mode & 0o777, 0o400);
+  assert.throws(() => retainArtifact(source, destination), /already exists/);
+  assert.deepEqual(fs.readFileSync(destination), bytes);
+  fs.rmSync(scratch, { recursive: true, force: true });
+  assert.deepEqual(fs.readFileSync(destination), bytes);
+});
+
+test('retained artifact failure cleans only owned staging bytes', t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-artifact-failure-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const scratch = path.join(fixture, 'scratch');
+  const destination = path.join(fixture, 'candidate.tgz');
+  const source = path.join(scratch, 'source.tgz');
+  fs.mkdirSync(scratch);
+  fs.writeFileSync(source, 'failure bytes');
+  const stageFiles = () => fs.readdirSync(path.dirname(destination)).filter(file => file.startsWith(path.basename(destination) + '.partial-'));
+  assert.throws(() => retainArtifact(source, destination, {
+    afterWrite: ({ fd }) => fs.writeSync(fd, Buffer.from('x'), 0, 1, 0)
+  }), /verification failed/);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(stageFiles(), []);
+  assert.throws(() => retainArtifact(source, destination, {
+    publish: () => { throw new Error('injected publication failure'); }
+  }), /injected publication failure/);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(stageFiles(), []);
+  assert.throws(() => retainArtifact(source, destination, {
+    afterPublish: () => { throw new Error('injected post-link failure'); }
+  }), /injected post-link failure/);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(stageFiles(), []);
+  const replacement = Buffer.from('foreign replacement');
+  assert.throws(() => retainArtifact(source, destination, {
+    afterPublish: ({ destination: publishedDestination }) => {
+      fs.unlinkSync(publishedDestination);
+      fs.writeFileSync(publishedDestination, replacement);
+    }
+  }), /verification failed/);
+  assert.deepEqual(fs.readFileSync(destination), replacement);
+  assert.deepEqual(stageFiles(), []);
+  fs.unlinkSync(destination);
+  const existing = Buffer.from('pre-existing bytes');
+  fs.writeFileSync(destination, existing);
+  assert.throws(() => retainArtifact(source, destination), /already exists/);
+  assert.deepEqual(fs.readFileSync(destination), existing);
+  assert.deepEqual(stageFiles(), []);
+});
+
+test('package body publishes after installed smoke and keeps candidate after scratch cleanup', t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'package-body-retain-'));
+  const gateScratch = path.join(fixture, 'gate-scratch');
+  const destination = path.join(fixture, 'candidate.tgz');
+  const previousScratch = process.env[SCRATCH_ROOT];
+  fs.mkdirSync(gateScratch);
+  process.env[SCRATCH_ROOT] = gateScratch;
+  t.after(() => {
+    if (previousScratch === undefined) delete process.env[SCRATCH_ROOT];
+    else process.env[SCRATCH_ROOT] = previousScratch;
+    fs.rmSync(fixture, { recursive: true, force: true });
+  });
+  const bytes = Buffer.from('fake smoke-tested tarball');
+  const files = [
+    'package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts',
+    'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts',
+    'src/state/thread-enrollment.js', 'dist/state/thread-enrollment.js', 'dist/state/thread-enrollment.d.ts',
+    'src/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.d.ts'
+  ].map(file => ({ path: file }));
+  const calls = [];
+  const sequence = [];
+  const execute = (_command, args, options = {}) => {
+    calls.push(args);
+    sequence.push(args[0]);
+    if (args[0] === 'pack') {
+      const destinationIndex = args.indexOf('--pack-destination') + 1;
+      const packDestination = args[destinationIndex];
+      const filename = 'fixture-package.tgz';
+      fs.mkdirSync(path.join(options.cwd, 'dist'), { recursive: true });
+      fs.writeFileSync(path.join(packDestination, filename), bytes);
+      return JSON.stringify([{ filename, files }], null, 2);
+    }
+    assert.equal(args[0], 'install');
+    return '';
+  };
+  const quiet = process.stdout.write;
+  process.stdout.write = () => true;
+  try {
+    runBody(['--retain-artifact', destination], { run: execute, runInstalledSmoke: () => sequence.push('smoke') });
+  } finally {
+    process.stdout.write = quiet;
+  }
+  assert.equal(calls.length, 2);
+  assert.deepEqual(sequence, ['pack', 'install', 'smoke']);
+  assert.deepEqual(fs.readFileSync(destination), bytes);
+  assert.equal(fs.statSync(destination).mode & 0o777, 0o400);
+  assert.deepEqual(fs.readdirSync(gateScratch), []);
+  assert.throws(() => runBody(['--retain-artifact', destination], { run: execute, runInstalledSmoke: () => {} }), /already exists/);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(fs.readFileSync(destination), bytes);
+});
+
+test('package body does not retain before installed smoke succeeds', t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'package-body-failure-'));
+  const gateScratch = path.join(fixture, 'gate-scratch');
+  const destination = path.join(fixture, 'candidate.tgz');
+  const previousScratch = process.env[SCRATCH_ROOT];
+  fs.mkdirSync(gateScratch);
+  process.env[SCRATCH_ROOT] = gateScratch;
+  t.after(() => {
+    if (previousScratch === undefined) delete process.env[SCRATCH_ROOT];
+    else process.env[SCRATCH_ROOT] = previousScratch;
+    fs.rmSync(fixture, { recursive: true, force: true });
+  });
+  const files = [
+    'package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts',
+    'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts',
+    'src/state/thread-enrollment.js', 'dist/state/thread-enrollment.js', 'dist/state/thread-enrollment.d.ts',
+    'src/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.d.ts'
+  ].map(file => ({ path: file }));
+  const execute = (_command, args, options = {}) => {
+    if (args[0] === 'pack') {
+      const packDestination = args[args.indexOf('--pack-destination') + 1];
+      const filename = 'fixture-package.tgz';
+      fs.mkdirSync(path.join(options.cwd, 'dist'), { recursive: true });
+      fs.writeFileSync(path.join(packDestination, filename), 'fake tarball');
+      return JSON.stringify([{ filename, files }], null, 2);
+    }
+    assert.equal(args[0], 'install');
+    return '';
+  };
+  const quiet = process.stdout.write;
+  process.stdout.write = () => true;
+  try {
+    assert.throws(() => runBody(['--retain-artifact', destination], {
+      run: execute,
+      runInstalledSmoke: () => { throw new Error('injected smoke failure'); }
+    }), /injected smoke failure/);
+  } finally {
+    process.stdout.write = quiet;
+  }
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(fs.readdirSync(gateScratch), []);
+});
+
+test('package body does not retain when install fails', t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'package-body-install-failure-'));
+  const gateScratch = path.join(fixture, 'gate-scratch');
+  const destination = path.join(fixture, 'candidate.tgz');
+  const previousScratch = process.env[SCRATCH_ROOT];
+  fs.mkdirSync(gateScratch);
+  process.env[SCRATCH_ROOT] = gateScratch;
+  t.after(() => {
+    if (previousScratch === undefined) delete process.env[SCRATCH_ROOT];
+    else process.env[SCRATCH_ROOT] = previousScratch;
+    fs.rmSync(fixture, { recursive: true, force: true });
+  });
+  const files = [
+    'package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts',
+    'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts',
+    'src/state/thread-enrollment.js', 'dist/state/thread-enrollment.js', 'dist/state/thread-enrollment.d.ts',
+    'src/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.js', 'dist/discord/thread-enrollment.d.ts'
+  ].map(file => ({ path: file }));
+  const sequence = [];
+  const execute = (_command, args, options = {}) => {
+    sequence.push(args[0]);
+    if (args[0] === 'pack') {
+      const packDestination = args[args.indexOf('--pack-destination') + 1];
+      const filename = 'fixture-package.tgz';
+      fs.mkdirSync(path.join(options.cwd, 'dist'), { recursive: true });
+      fs.writeFileSync(path.join(packDestination, filename), 'fake tarball');
+      return JSON.stringify([{ filename, files }], null, 2);
+    }
+    assert.equal(args[0], 'install');
+    throw new Error('injected install failure');
+  };
+  const quiet = process.stdout.write;
+  process.stdout.write = () => true;
+  try {
+    assert.throws(() => runBody(['--retain-artifact', destination], {
+      run: execute,
+      runInstalledSmoke: () => { throw new Error('smoke should not run'); }
+    }), /injected install failure/);
+  } finally {
+    process.stdout.write = quiet;
+  }
+  assert.deepEqual(sequence, ['pack', 'install']);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(fs.readdirSync(gateScratch), []);
+});
+
+test('retained artifact missing source leaves no destination', t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-artifact-missing-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const destination = path.join(scratch, 'candidate.tgz');
+  assert.throws(() => retainArtifact(path.join(scratch, 'missing.tgz'), destination));
+  assert.equal(fs.existsSync(destination), false);
 });
 
 test('recovery guidance covers every no-verdict action', () => {

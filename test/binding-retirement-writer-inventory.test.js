@@ -21,7 +21,7 @@ const RETIRING_OWNERS = new Map([
   ['state/binding-lifecycle.js\u0000unbind', 1],
   ['state/binding-lifecycle.js\u0000handoffConductor', 1],
   ['state/ordinary-binding.ts\u0000rebindOrdinary', 1],
-  ['state/ordinary-binding.ts\u0000handoffOrdinary', 1]
+  ['state/ordinary-binding.ts\u0000handoffOrdinary', 2]
 ]);
 
 // Initial bind refuses any existing row before and inside its transaction, so it
@@ -150,7 +150,7 @@ function classifyWriters(writers) {
 
 test('writer inventory pins the five retiring owners, first-bind, and six readiness writes', () => {
   const writers = enumerateWriters(SRC_ROOT);
-  assert.equal(writers.length, 12, 'exactly twelve baseline bindings writers');
+  assert.equal(writers.length, 13, 'exactly thirteen baseline bindings writers');
   const { retiring, firstBind, readiness } = classifyWriters(writers);
   assert.deepEqual(retiring, RETIRING_OWNERS, 'retiring owners classify exactly');
   assert.deepEqual(firstBind, FIRST_BIND_OWNERS, 'first-bind owner classifies exactly');

@@ -1354,7 +1354,8 @@ class DiscordGateway {
             failure ||= { ready: false, state: current?.state || 'unavailable', error };
             continue;
           }
-          const preflightReason = ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(baseReason);
+          const preflightReason = ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(baseReason) ||
+            (baseReason === 'ordinary-handoff' && binding.provider === 'claude');
           const classified = classifyRecoveryFailure(error);
           let detail = classified.detail;
           if (kind !== CODEX_VALIDATION_KINDS.DEADLINE && preflightReason && binding.provider === 'claude') {

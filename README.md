@@ -272,6 +272,24 @@ The command imports the current local `~/.claude/hooks/session-chat-binding.mjs`
 
 The bind result reports the binding, generation, transcript proof, and a Monitor-pending state. It does not prove that the native session is listening or that Discord intake is ready. If a running Gateway does not advertise ordinary-bind wake support, the bind must be retried after that Gateway is stopped or restarted with the supported build.
 
+To transfer an ordinary channel from another Claude session, run the explicit handoff from the successor session's own command context:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js handoff \
+  --ordinary \
+  --provider claude \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --native-id CURRENT_CLAUDE_SESSION_UUID \
+  --from-native-id PREDECESSOR_CLAUDE_SESSION_UUID \
+  --from-generation PREDECESSOR_GENERATION \
+  --handoff-id STABLE_HANDOFF_ID \
+  --endpoint SHORT_OWNER_ONLY_SOCKET_PATH \
+  --transcript /absolute/path/to/the/exact/current/session.jsonl
+```
+
+The command checks the successor's current caller and transcript, then compares the exact predecessor UUID and generation before changing the binding. Unresolved messages, publication custody, native ownership collisions, and an incompatible Gateway still block the transfer. The predecessor's socket need not be available. The handoff preserves parent and enrolled-thread history cursors, cutoffs, and gaps, and leaves the successor pending until its listener and normal history recovery succeed. It starts no native session and discards no unrecovered history. Retry only with the same handoff ID and identical successor parameters.
+
 After the bind succeeds, read `binding.nativeId`, `binding.endpoint`, `binding.channelId`, and `binding.generation` from its JSON result. In the same Claude session, start the native `Monitor` tool with `persistent: true` and this command:
 
 ```sh
