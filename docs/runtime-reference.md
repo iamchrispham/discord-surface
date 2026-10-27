@@ -1,0 +1,943 @@
+# Runtime and CLI reference
+
+Use this reference for an installation that has been configured through
+[INSTALL.md](../INSTALL.md). Start with the [README](../README.md) for setup and session
+attachment.
+
+Commands use a built source checkout. For a package installation, substitute its absolute
+installed CLI path for `src/cli.js`. Keep the release and state directory consistent across
+callers. IDs and generations in examples must come from the active binding.
+
+## Issue and ticket threads
+
+Create a public Discord thread under an already bound text channel, then enroll its exact ID:
+
+```sh
+node src/cli.js thread-enroll --state-dir "$HOME/.config/discord-surface" \
+  --channel-id BOUND_PARENT_CHANNEL_ID --thread-id EXISTING_PUBLIC_THREAD_ID
+```
+
+Enrollment keeps the parent's native session and generation. Messages, receipt reactions, read
+acknowledgments and replies stay in the enrolled thread. Each thread has a separate history
+cursor. Repeating an active enrollment preserves that cursor. The command records each new
+enrollment as pending and requests recovery from a Gateway that supports threads. `status` shows
+the enrollment's readiness. A requested wake does not prove recovery or delivery.
+
+Unbinding the parent retires its thread enrollments. After rebinding the parent, explicitly
+enroll the same thread again to establish a fresh adoption boundary. Messages posted while the
+parent was unbound are excluded from the new enrollment.
+
+The first history read establishes the adoption boundary. Existing backlog is excluded, while
+messages already accepted during recovery retain custody. Restart recovery backfills newer
+messages from that thread's own cursor. An unlocked archived thread can be read without
+unarchiving it. A normal authorized reply can reactivate it through Discord's send operation.
+Locked, missing or inaccessible threads remain unavailable, with no reply fallback to the parent
+channel. Their failure does not demote a healthy parent binding. After fixing access, explicitly
+retry recovery with `recover --state-dir <directory> --intake-channel-id <thread-id>`. This
+retains the existing cursor and custody, marks the thread pending and requests a Gateway wake.
+It does not declare delivery successful or reset the adoption boundary.
+
+Enroll an existing public thread explicitly. Private threads, forum posts, direct posts, and
+slash interactions are outside this path. Ordinary text instructions in enrolled threads use the
+existing queue and native session.
+
+## Conductor channels and handoff
+
+`provision` creates or reuses one text channel for the stable conductor under its configured
+vendor category. Its topic is a fixed address marker. Local SQLite stores the provider,
+canonical repository key, native UUID, generation, readiness, history coverage, and custody. It
+never creates a native executor or resumes a session. The category comes from configuration, so
+a Codex command cannot choose the Claude category.
+
+```sh
+node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --conductor-id CONDUCTOR_ID \
+  --repo-key CANONICAL_REPOSITORY_KEY --task-name optional-presentation-name \
+  --native-id CODEX_SESSION_UUID --workspace /absolute/workspace
+```
+
+Repeated setup with the same conductor ID verifies the existing category, fixed marker, binding,
+URL, and generation before returning the same channel. It does not rewrite the topic. A fresh
+invocation that sees a remote marker must carry `--channel-id` before it can adopt that channel.
+An existing setup channel can be adopted explicitly after category and legacy native metadata
+validation:
+
+```sh
+node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --conductor-id CONDUCTOR_ID \
+  --repo-key CANONICAL_REPOSITORY_KEY --native-id CODEX_SESSION_UUID \
+  --workspace /absolute/workspace --channel-id EXISTING_CHANNEL_ID
+```
+
+Legacy v1 or v2 topics are read-only evidence. Ordinary setup and handoff reject them. A
+one-time migration requires the explicit channel ID and flag below. It validates the local
+conductor, repository, provider, native UUID, generation, guild, and category before one bounded
+topic update:
+
+```sh
+node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --conductor-id CONDUCTOR_ID \
+  --repo-key CANONICAL_REPOSITORY_KEY --native-id CODEX_SESSION_UUID \
+  --workspace /absolute/workspace --channel-id EXISTING_CHANNEL_ID \
+  --migrate-legacy-topic
+```
+
+A definite Discord response records migration success or rejection. A lost response stays
+unresolved and blocks migration, rebind, handoff, and readiness until the existing
+evidence-based reconciliation command proves its outcome. Migration never recreates a channel,
+retries a request, or restores execution readiness by itself.
+
+A successor native session keeps the same channel only through an explicit drained or reconciled
+handoff. Account rotation does not change the binding. The manual handoff path below retains
+caller-supplied channel, predecessor UUID, generation, and handoff ID values:
+
+```sh
+node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --conductor-id CONDUCTOR_ID \
+  --repo-key CANONICAL_REPOSITORY_KEY --channel-id CHANNEL_ID \
+  --from-native-id OLD_SESSION_UUID --from-generation 1 \
+  --native-id NEW_SESSION_UUID --workspace /absolute/workspace \
+  --handoff-id AUTHORITY_HANDOFF_ID
+```
+
+Canonical conductor pickup can derive those values from the active binding and lock history.
+Supply the authoritative remote, vendor, stable conductor ID, exact successor UUID, workspace,
+transcript, and worker manifest:
+
+```sh
+node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
+  --from-lock --repo FULL_AUTHORITATIVE_REMOTE --provider VENDOR \
+  --conductor-id STABLE_ID --repo-key CANONICAL_KEY \
+  --native-id SUCCESSOR_UUID --workspace FULL_WORKSPACE \
+  --session-file EXACT_TRANSCRIPT --worker-file EXACT_MANIFEST
+```
+
+For Claude, also pass `--endpoint FULL_ENDPOINT`. Normal pickup requires the canonical lock to
+show the predecessor release followed by the successor claim, with no intervening owner-changing
+verb. Forced takeover or missing history fails closed. The exact transcript and worker manifest
+must identify the full successor UUID and live process generation. Unresolved intake or
+publication custody still blocks the handoff and remains unchanged on refusal.
+
+Handoff changes the local native binding and generation after explicit authority and drained or
+reconciled custody. It does not edit the topic. Legacy topic publication custody, when present,
+must be explicitly reconciled before migration or handoff. A late legacy publication settles
+only its own audit record and cannot change local readiness or history coverage.
+
+An interrupted channel create leaves a durable intent. A later invocation may reconcile an exact
+topic marker or use explicit `--channel-id` adoption. If the create outcome is unknown and no
+channel evidence exists, the adapter stops rather than creating a possible duplicate. Discord
+permissions still need to allow channel creation under the selected category. `--task-name`
+changes presentation only. Ordinary workers and forks have no provisioning path.
+
+The bind and rebind commands reject a malformed UUID. Rebind and unbind wait until all accepted,
+dispatching, submitted, uncertain, and reply custody states have been reconciled. Unbind leaves
+an inactive tombstone so replied history remains readable. Each binding generation is persisted
+and stale native replies are rejected. Provider identity is checked with the UUID at every
+native reply boundary, so the same UUID under another provider cannot populate custody.
+
+## Gateway and courier routes
+
+Start and stop the one Gateway consumer with the local macOS `lockf` singleton.
+
+```sh
+node src/cli.js start --state-dir "$HOME/.config/discord-surface"
+node src/cli.js status --state-dir "$HOME/.config/discord-surface"
+node src/cli.js stop --state-dir "$HOME/.config/discord-surface"
+```
+
+To select one already registered courier route for a Gateway run, pass its exact route ID to
+`start`:
+
+```sh
+node src/cli.js start --state-dir "$HOME/.config/discord-surface" \
+  --courier-route-id ROUTE_ID
+```
+
+The CLI resolves the ID from existing state before starting the Gateway. A present option
+without a value or an unknown ID fails closed. Omitting the option keeps courier selection
+disabled. This exposes route selection only. It does not register a route, intercept a Desktop
+session, or prove live Discord and native qualification. Those checks remain required before
+operator activation.
+
+The courier's trusted native `PreToolUse` hook must run the installed guard before
+`mcp__codex_app__send_message_to_thread`:
+
+```sh
+/bin/sh /absolute/path/to/discord-surface/src/courier-guard.sh \
+  --disable-warning=ExperimentalWarning \
+  --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
+```
+
+The wrapper runs Node from a fixed absolute path rather than resolving `node` from the inherited
+`PATH`, so an earlier PATH entry cannot shim the guard. It tries `/usr/local/bin/node`,
+`/opt/homebrew/bin/node`, then `/usr/bin/node`. Set `DISCORD_SURFACE_NODE` to the absolute path
+of the intended `node` executable when none of those match, such as nvm-only installs.
+
+The guard reads the native hook event from stdin. It requires the registered courier session and
+workspace, the fixed recipient and exact prompt from one persisted attempt, current binding
+ownership and an unacknowledged message. It atomically records one forwarding claim before
+allowing the tool. Refusal writes the blocking reason to stderr and exits 2. Success leaves
+stdout empty. Startup failures also exit 2. The registered transcript root is checked before
+authorization. A refusal before any forwarding claim leaves the original message accepted and
+records definite non-forwarding, even if the courier queue already accepted it. A later queue
+result cannot override that refusal. The existing attempt stays held without automatic replay.
+Refusal after a forwarding claim cannot undo it. The database must already have the current
+schema. The guard never creates, migrates or repairs it. A claim survives restart or an unknown
+host-call outcome and cannot be retried. It neither acknowledges the message nor completes its
+reply obligation. Installing this command does not trust a project hook or activate a route.
+
+`status` includes a `gateway` process object. Its `state` is `running` only when the runtime PID
+file and the matching `ps` command identify this adapter and state directory. `stopped` means no
+PID file exists, `stale` means the recorded process is gone, and `unknown` means the PID file or
+owner identity cannot be verified. A `running` process reports `connection: unverified-live`. It
+does not claim a Discord connection.
+
+The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only
+the matching session JSONL file and does not select a task by name, newest activity, directory,
+or process ID. The runtime never adds approval bypass flags.
+
+Claude Channels require opt-in when the native Claude session launches. Start the channel server
+with the exact pre-bound UUID and short owner-only socket path, then pass that command in the
+MCP configuration used to launch the native session. The Claude process must be started with its
+Channels flag and the normal permission mode chosen by the operator. EOF or transport close
+stops the HTTP server, socket, MCP transport, and local state handle.
+
+```json
+{
+  "mcpServers": {
+    "discord-surface": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/discord-surface/src/cli.js",
+        "claude-channel",
+        "--state-dir",
+        "/Users/you/.config/discord-surface",
+        "--native-id",
+        "CLAUDE_SESSION_UUID",
+        "--socket",
+        "/tmp/discord-surface-claude-501/probe.sock"
+      ]
+    }
+  }
+}
+```
+
+The channel process forwards events only after checking its exact native UUID, binding endpoint,
+and generation. Its `reply` tool requires the inbound Discord message ID and generation. It
+persists reply custody before acknowledging the MCP tool call. A Claude session without
+launch-time channel opt-in is not attached or resumed by this adapter.
+
+A running Claude session may opt into the same transport through its native `Monitor` tool
+without a session restart. Start this blocking command from `Monitor` with the exact bound UUID
+and socket. The command writes no startup text. Each accepted event becomes one compact JSON
+line on stdout with the exact IDs and an owner-only `payloadPath`. Use `Read` on that path for
+the complete event, then follow its reply instructions. The payload is retained for recovery.
+The final answer goes to its suggested reply file and the command calls the same durable
+`recordNativeReply` path as the Claude channel tool.
+
+```text
+Monitor command:
+node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
+  --state-dir /Users/you/.config/discord-surface \
+  --native-id CLAUDE_SESSION_UUID \
+  --socket /tmp/discord-surface-claude-501/probe.sock
+```
+
+The Monitor process owns its listener lifetime. It ignores stdin EOF, stops on native
+cancellation or signal, and removes only its own socket. Reply files belong to the native owner
+and are never blanket-cleaned by the adapter. A second listener on the same socket is rejected.
+Monitor startup does not promote native execution readiness. Discord intake readiness and native
+execution status remain separate. A stopped or abruptly lost Monitor never causes submitted work
+to be sent again.
+
+### Ordinary Codex session binding
+
+Run these commands from the existing Codex session's own command context after configuring the
+adapter. Caller identity comes from the native session environment and is checked against its
+transcript. Do not copy another session's identity into that environment.
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-bind \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID
+```
+
+The channel must already exist in the configured server. A quoted `--channel '#channel-name'`
+can select an unambiguous name instead. The command preserves the current native session and
+reports its binding, generation, transcript-proof status and Gateway wake result. It does not
+create a session or a channel. If needed, supply `--workspace /absolute/workspace` and
+`--session-root /absolute/codex/sessions`. The workspace must match the transcript. Existing
+bindings retain their recorded session root when that option is omitted.
+
+A successful binding or requested wake is not delivery proof. Readiness can remain pending or
+unavailable until native identity and intake recovery succeed. A running Gateway must advertise
+ordinary-binding wake support. Coordinate an upgrade with its owner when it does not. Do not
+send signals to an incompatible shared Gateway. Only one ordinary bind runs at a time, exit 75
+means the lock was busy, and the command is safe to retry.
+
+For a milestone from that same bound session, use the returned native ID and generation:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --native-id CURRENT_CODEX_SESSION_UUID \
+  --generation BINDING_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key STABLE_MILESTONE_KEY
+```
+
+Keep the dedupe key unchanged when retrying the same milestone. The command checks the caller
+against the active Codex binding before posting. Its receipt distinguishes a completed Discord
+send from a pending or uncertain outcome.
+
+`/discord-bind` is maintained outside this package in the shared skills repository. Its
+ordinary-session integration is a separate delivery requirement. These CLI commands do not
+install or verify that skill integration. Live native delivery and operating-system
+qualification remain separate from local simulated tests.
+
+### Ordinary Claude session binding
+
+This path binds one existing Claude Code session to one existing message-capable channel. It
+does not create a channel, start or resume Claude, copy transcript history, change permission
+mode, or bypass native approval. Run the bind command from the existing Claude Code session's
+own command context:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-claude-bind \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --endpoint SHORT_OWNER_ONLY_SOCKET_PATH \
+  --transcript /absolute/path/to/the/exact/current/session.jsonl
+```
+
+The state directory must already be configured. `--channel-id` must name a message-capable
+channel in the configured guild. `--endpoint` is the exact short absolute Unix socket path that
+the Monitor will use. `--socket` is accepted as an alias when it names the same path.
+`--workspace` is optional and must equal the workspace recorded in the transcript when supplied.
+`--native-id` is optional and must equal the resolved Claude session ID, so omit it unless that
+value is already known exactly.
+
+The command imports the current local `~/.claude/hooks/session-chat-binding.mjs` hook and
+requires it to return exactly one active `claude-code` caller with a session ID. Run it in that
+caller context. Do not set or copy a guessed identity. If the hook cannot identify one active
+caller, or reports another harness, the command refuses.
+
+`--transcript` is an explicit evidence path, not an identity authority or a newest-file
+selector. The adapter checks the initial transcript metadata for the resolved session ID,
+`entrypoint: "cli"`, a version, and one absolute `cwd`. It derives the binding workspace from
+that `cwd`, and rejects an ambiguous or mismatching `--workspace`. Keep the transcript path tied
+to the same session that the caller hook returned.
+
+The bind result reports the binding, generation, transcript proof, and a Monitor-pending state.
+It does not prove that the native session is listening or that Discord intake is ready. If a
+running Gateway does not advertise ordinary-bind wake support, the bind must be retried after
+that Gateway is stopped or restarted with the supported build.
+
+After the bind succeeds, read `binding.nativeId`, `binding.endpoint`, `binding.channelId`, and
+`binding.generation` from its JSON result. In the same Claude session, start the native
+`Monitor` tool with `persistent: true` and this command:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id BINDING_NATIVE_ID \
+  --socket BINDING_ENDPOINT
+```
+
+Run this as the native Monitor tool, not as an unrelated background shell. The command must use
+the exact bound UUID and endpoint. It emits no startup line. Each accepted Discord instruction
+produces one JSON pointer containing `payloadPath`, message ID, native UUID, and generation.
+Read the complete payload file and run its acknowledgment command once when the message is
+picked up. Continue with the payload's instructions if acknowledgment returns `recorded=true`.
+On `duplicate=true`, follow the payload's duplicate-recovery instruction only for an agent
+request. All other duplicates stop. On a failed, missing, or ambiguous acknowledgment, stop
+without executing or replying to the request. For a human message that passes that check, write
+the final answer to its owner-only reply file and run its exact `reply.command`. Acknowledgment
+records receipt, not completion. The reply command records the final answer for the exact
+message and generation. Do not guess either identifier. A Monitor stop or transport loss leaves
+submitted custody for recovery and does not replay the instruction automatically.
+
+The Monitor marks ordinary binding readiness unavailable with `Claude Monitor unavailable` when
+it stops. On startup, if intake is unavailable because the Claude endpoint was unavailable
+before event write, it reconciles that intake and requests a Gateway wake.
+
+`claude-channel` is the other listener for the same binding. It serves the same socket and
+delivers each accepted instruction as an MCP notification, with `acknowledge` and `reply` as
+tools rather than as commands read from a payload file:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js claude-channel \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id BINDING_NATIVE_ID \
+  --socket BINDING_ENDPOINT
+```
+
+It carries the same ordinary-binding lifecycle as the Monitor, against the same identity checks
+on native UUID, workspace, endpoint, and generation: on startup it reconciles an intake left
+unavailable by a Claude endpoint failure and requests a Gateway wake, and when it stops it marks
+ordinary binding readiness unavailable, with the reason `Claude channel unavailable`. If the
+binding changed between construction and start, it refuses instead of writing. Neither listener
+revokes readiness for a binding that is no longer the one it attached to, so a successor
+generation keeps its own readiness.
+
+Run one listener at a time. Both own the same socket, and the second to start fails on the
+socket the first already holds. A conductor listener is excluded from ordinary readiness
+reconciliation and stop-time readiness revocation, but attaching either Claude listener still
+requests the Gateway recovery wake for the matching binding. Conductor attach and stop do not
+change readiness.
+
+For an explicit milestone from the same ordinary Claude session, write the text to an
+owner-controlled file and run:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-claude-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --db "$HOME/.config/discord-surface/surface.sqlite" \
+  --channel-id BOUND_CHANNEL_ID \
+  --native-id BINDING_NATIVE_ID \
+  --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key MILESTONE_KEY
+```
+
+This command resolves the current Claude caller again and requires the active ordinary Claude
+binding, exact native ID, channel, and generation. Repeat the same dedupe key with unchanged
+text to inspect or resume the same milestone. Add `--in-reply-to DISCORD_MESSAGE_ID` only when
+the milestone belongs to that source message. A successful result proves Discord accepted the
+returned message IDs. It does not prove that a human read the milestone or that Claude acted on
+it.
+
+Run the [live checks](../INSTALL.md#essential-live-check-and-return-receipt) on each installed
+host. Simulated tests and package imports do not verify native approval, socket recovery, or
+instruction and reply delivery.
+
+### Explicit live board refresh
+
+`board-refresh` updates one already bound status-board message from a compact rendered text
+file. It requires the exact active native UUID and generation, bound channel ID, target message
+ID, text file, and dedupe key. `--request-id` is accepted as the legacy alias for
+`--dedupe-key`. If both are supplied they must match.
+
+```sh
+node src/cli.js board-refresh \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id CURRENT_NATIVE_UUID \
+  --generation CURRENT_GENERATION \
+  --channel-id BOUND_CHANNEL_ID \
+  --message-id STATUS_BOARD_MESSAGE_ID \
+  --text-file /absolute/path/to/compact-board.txt \
+  --dedupe-key BOARD_REFRESH_KEY
+```
+
+The text file must contain non-empty text no longer than Discord's 2,000-character message
+limit. Before admission, the command reads the installation identity and target message,
+verifies the configured guild, bound channel, exact target ID, bot author, and sent-message
+provenance already recorded for that target. An already matching target is an honest no-op.
+Otherwise the command makes one PATCH with mentions suppressed. It does not POST, split, retry,
+delete, pin, or fall back to another target.
+
+Board custody has one unresolved edit fence per target message across dedupe keys and native
+generations. The command captures the target revision before its asynchronous reads and compares
+it atomically at admission. A stale prepared request refuses before PATCH. After admission, a
+timeout, abort, process stop, or malformed response remains unknown and blocks a newer edit for
+that target. A pre-aborted request refuses before admission and creates no attempt. Handoff,
+readiness, intake, topic publication, and ordinary-post custody remain separate. A settled
+duplicate returns historical receipt evidence without requiring a fresh target read.
+
+Reconcile a board attempt recorded as unknown only after direct evidence establishes that the
+desired content was applied:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --board-guild-id GUILD_ID \
+  --board-channel-id BOUND_CHANNEL_ID \
+  --board-message-id STATUS_BOARD_MESSAGE_ID \
+  --board-attempt-id BOARD_ATTEMPT_ID \
+  --board-resolution applied \
+  --board-evidence-scope EVIDENCE_DESCRIPTION \
+  --board-readback-at 2026-09-12T19:00:00.000Z \
+  --board-readback 'EXACT_DESIRED_BOARD_TEXT' \
+  --board-sole-writer true \
+  --board-single-attempt true \
+  --board-no-hidden-retry true
+```
+
+`--board-readback` is the exact desired board text, not a filename. Reconciliation requires a
+post-operation readback with the exact desired content, different from the pre-edit content, and
+explicit sole-writer, single-attempt, and no-hidden-retry evidence. An old response or a GET of
+prior content does not prove that the PATCH was unsent. The local suite uses disposable SQLite
+and controlled HTTP, so it does not prove that a real Discord target exists, that the configured
+token can access it, or that live Discord applies a disconnected PATCH. Those facts require
+separate direct verification.
+
+## Delivery and recovery
+
+Accepted input is durable before a Discord handler returns. After authorized intake commits, a
+ready binding gets one receipt reaction on the source message. A binding that is unavailable
+when the receipt is prepared gets one reply: `Receipt: saved. Delivery was paused when this
+receipt was prepared.` Ready bindings do not get a text receipt. Text receipts are replies with
+mentions disabled and a stable nonce. Neither receipt claims that the native agent has read,
+acted on, or answered the input. Receipt delivery is independent of native forwarding and never
+retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
+
+Ordinary Discord attachments are retained as validated URL metadata with the message, including
+filename, MIME type, and size. They are not downloaded or archived. The explicit
+`agent-message.tether` transport is the exception: with `--agent-presentation attachment-v1`,
+the adapter performs a bounded CDN fetch to recover the exact signed packet before durable
+intake and does not archive a separate copy of the bytes. CDN URLs can expire, so native
+sessions receive ordinary attachment references as untrusted user data and decide whether they
+need to read them.
+
+An operator may request one manual Spark preview from an existing durable receipt. The command
+reads one persisted source message and its transport receipt, keeps that raw evidence beside the
+result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result
+is labeled `liaison draft`. It is never posted to Discord and never changes forwarding or
+custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and
+cancellation return `draft: null`.
+
+```sh
+node src/cli.js liaison draft \
+  --state-dir "$HOME/.config/discord-surface" \
+  --receipt-id DURABLE_RECEIPT_ID
+```
+
+`--receipt-id` accepts the source Discord message ID or the numeric SQLite receipt row ID. Both
+forms must resolve to one persisted transport receipt.
+
+During login and reconnect, messages are durably held while a persisted Discord watermark is
+backfilled. Adoption starts at the newest observed message, so pre-adoption history is not
+executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds.
+A genuine coverage gap, including a page or message bound, remains held for explicit
+reconciliation. Deadline exhaustion records retryable unavailability instead of claiming missing
+history. A later startup, reconnect, attach, or explicit recovery rechecks the boundary within
+the existing deadline and resumes from confirmed coverage. HTTP 503 remains retryable. HTTP 403,
+unclassified failures, and explicit gaps do not gain automatic retry permission. The native
+output cursor is separate from this inbound Discord watermark.
+
+Startup connects in degraded mode when every non-ready binding has a persisted non-ready intake
+boundary. Healthy routes can serve while held routes retain their accepted custody and remain
+non-dispatchable. If every route is held, the transport connects without declaring the Gateway
+ready. The existing endpoint-unavailable exception remains. During reconnect, healthy bindings
+can resume while held bindings retain their custody. Neither policy declares an unresolved route
+ready. Selected-channel recovery keeps its original scope, concurrent follow-ups share the
+caller's deadline, and stop invalidates unfinished recovery. Uncertain native submissions and
+uncertain Discord sends are never automatically replayed.
+
+An empty Discord history response is accepted as coverage only when the bot's effective channel
+permissions include View Channel and Read Message History. A denied or unknown permission state
+remains visibly unavailable. `status` exposes both the observed message ID and the confirmed
+recovered-through ID.
+
+The topic is exactly `discord-surface:v3 conductor=<encoded-conductor-id> provider=<vendor>
+repo=<encoded-repo-key> [address only, not live status]`. It never carries native UUID,
+generation, readiness, connectivity, or timestamps. Recovery, reconnect, handoff, account
+rotation, and message handling perform no topic PATCH. Local status is authoritative for native
+availability and history coverage. `status` also exposes receipt attempts and outcomes. Legacy
+v1/v2 topics remain read-only evidence for explicit channel adoption or migration. Unresolved
+legacy publication custody blocks that migration until the existing evidence-based
+reconciliation is complete. The `recover --topic-channel-id` path is legacy-only and never
+changes local execution readiness.
+
+If the native owner is unavailable before submission, the message stays `accepted` with a
+`dispatch-not-submitted` receipt and no execution-success reply. A process stop during dispatch
+changes `dispatching` to `uncertain`. It is never retried automatically. A failed or ambiguous
+Discord send retains the native reply and records `reply_failed` or `reply_unknown` for explicit
+delivery reconciliation. Replies longer than Discord's 2000-character message limit are durably
+split into ordered parts, each with a stable nonce and nonce enforcement. The adapter never
+silently truncates a native reply.
+
+After a restart, the runtime makes one bounded transport recovery pass. It may drain definitely
+accepted work, resume observation from the saved byte cursor for submitted work, and deliver
+saved reply parts. Work that was uncertain at the dispatch boundary is never replayed
+automatically. Reconcile it explicitly after evidence is available:
+
+While the Gateway is running, each live submitted message keeps its one native observer beyond
+that bounded recovery window until a final response, explicit cancellation, shutdown, or binding
+fence. Reconnect recovery reuses that observer and does not start a second one.
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --message-id DISCORD_MESSAGE_ID --resolution submitted
+```
+
+`status` reports pending custody and labels live permission, native approval, quota, billing,
+and connection gates. Simulated tests do not prove those live gates. Completion evidence and
+live trials remain conductor-owned.
+
+To clear a recorded Discord intake gap after inspecting the attempted range, request explicit
+reconciliation:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --intake-channel-id CHANNEL_ID
+```
+
+For an enrolled thread, the command also requests a wake from a compatible running Gateway. For
+a parent channel, it records pending reconciliation without waking the Gateway. Its owner can
+use the exported `requestGatewayRecovery(paths, { expectedPid })` helper in `src/cli.js` after
+verifying the installed Gateway's PID and wake capability. A supported wake keeps the same
+process and does not require a restart. If that capability is absent or the Gateway is stopped,
+coordinate recovery with its owner. Do not send an unchecked signal. A requested wake is not
+delivery proof: verify intake readiness, retained custody and the actual native pickup
+afterward.
+
+Delivery-only reconciliation never calls a native provider. Use `--resolution reply_not_sent`
+after evidence that no Discord message was created, or `--resolution reply_sent --part-index N
+--reply-message-id MESSAGE_ID` after finding the message. The adapter does not infer either
+outcome from a timeout.
+
+Credential rotation does not change the provider, native UUID, generation, or saved messages.
+The adapter does not rotate credentials or report which provider account is active.
+
+## Milestone posts
+
+`post` publishes a milestone from an existing bound conductor without an inbound message or a
+running Gateway. `claude-post` is its Claude-only alias. A question that requires an answer
+remains pending until the canonical answer is recorded.
+
+```sh
+node src/cli.js claude-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --db "$HOME/.config/discord-surface/surface.sqlite" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key MILESTONE_KEY
+```
+
+The native ID must resolve to exactly one active conductor binding. Use `--channel-id` if it is
+ambiguous. The command refuses a stale generation and checks authority again before every split
+part. The same `splitReply` implementation and 10,000-character text limit apply to native
+replies and announcements. Mentions are suppressed.
+
+The CLI requires `--dedupe-key`. Existing callers may use `--request-id` as a legacy alias. If
+both are supplied they must match. Direct JavaScript callers may omit both and retain the
+derived fallback identity. Add `--in-reply-to DISCORD_MESSAGE_ID` to attach each part to an
+existing message in the bound channel. Discord validates that reference with
+`fail_if_not_exists`. The reference can predate the current conductor generation or be
+bot-authored. A different target with the same explicit key is rejected by durable custody.
+
+Repeat the same key, target and unchanged file to inspect or resume the same milestone, not
+create a duplicate. A new successful send returns `recorded: true, duplicate: false, state:
+"sent"`. A repeated confirmed send returns `recorded: false, duplicate: true, state: "sent"`.
+Partial, unknown, in-flight and stale results retain their existing `status`, `requestId`,
+`messageIds` and `parts` fields and expose the same value as `state`. Confirmed parts are
+skipped on retry. A request interrupted after its durable attempt stays uncertain and is never
+blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and
+delivery result are recorded in the existing receipts table.
+
+No native session, channel binding, automatic publication selection or phone configuration is
+changed. A successful receipt means Discord accepted the returned message IDs, not that the
+operator read them.
+
+### Direct-post local files
+
+The `post`, `ordinary-post`, `ordinary-claude-post` and `claude-post` commands can carry one
+regular local file beside one non-empty caption. Supply `--attachment-file FILE`, `--text-file
+CAPTION_FILE` and an explicit `--dedupe-key`. The file is copied into private state before the
+Discord request, hashed, and sent as the recorded snapshot. Files up to 20 MiB are accepted,
+including empty regular files. Eight file preparations can remain reserved at once. A repeated
+`--attachment-file` is refused before any file is copied, as is any other repeated flag. Send
+each additional file as its own post with its own dedupe key.
+
+```sh
+node src/cli.js post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/caption.txt \
+  --attachment-file /absolute/path/to/report.pdf \
+  --dedupe-key FILE_KEY
+```
+
+Resume is explicit and uses the same key. It reads the admitted snapshot, so the original
+caption and file can be absent. Omit `--in-reply-to` on resume so the recorded reference is
+restored. Replacement `--text-file`, `--attachment-file`, or `--in-reply-to` inputs are refused,
+as are binding or destination changes.
+
+The direct-post result includes `filePreparationId` for the named cleanup command.
+
+```sh
+node src/cli.js post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --resume --dedupe-key FILE_KEY
+```
+
+An unknown network outcome retains the snapshot and must be reconciled before cleanup. After the
+network outcome is resolved, release a named preparation using its recorded preparation ID:
+
+```sh
+node src/cli.js post-file-cleanup \
+  --state-dir "$HOME/.config/discord-surface" \
+  --preparation-id PREPARATION_ID
+```
+
+Cleanup deletes only the state-owned snapshot and releases its reservation. Native reply uploads
+and signed agent attachment delivery use separate contracts.
+
+### Native reply local files
+
+Native reply files use state schema 1.8. For an upgrade from 1.7, coordinate a drained
+migration, back up the drained database, and upgrade the adapter callers together. Opening the
+database performs the migration. Preserve the native sessions, bindings, and generations. Older
+clients cannot preserve the file metadata and refuse a 1.8 database. Do not relabel its schema
+version.
+
+`native-reply` records a reply for an existing submitted Discord message. An optional
+`--attachment-file` uploads one private staged snapshot beside the nonblank caption in
+`--text-file`. The file is limited to 20 MiB and uses the same eight-reservation pool as direct
+posts. A repeated `--attachment-file` is refused before the reply is recorded. `claude-reply`
+remains the Claude-only compatibility alias. `native-reply` requires an explicit `--provider` of
+`codex` or `claude`.
+
+```sh
+node src/cli.js native-reply \
+  --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --message-id DISCORD_MESSAGE_ID \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/caption.txt \
+  --attachment-file /absolute/path/to/report.pdf
+```
+
+The result includes `filePreparationId` when a file is admitted. The preparation ID is part of
+the durable reply manifest and must be supplied for cleanup. A sent file part may be released
+explicitly with:
+
+```sh
+node src/cli.js native-reply-file-cleanup \
+  --state-dir "$HOME/.config/discord-surface" \
+  --message-id DISCORD_MESSAGE_ID \
+  --preparation-id FILE_PREPARATION_ID
+```
+
+Cleanup compares the named preparation with the stored reply-part manifest before deleting
+bytes. It also accepts a dead-owner `PREPARING` reservation so a pre-stage crash can release its
+slot. Live preparations, pending or unknown reply delivery, and unresolved snapshots retain
+custody. Sending a reply never deletes the snapshot automatically.
+
+After a delivery failure, inspect the Discord outcome and use the existing explicit
+reconciliation command. `--resolution reply_not_sent` returns the reply to retryable custody and
+a later Gateway attempt reads the same staged snapshot. `reply_sent` records the observed
+Discord message so the exact preparation can then be cleaned up. A missing or corrupt staged
+snapshot cannot be repaired or abandoned through a supported command before a sent outcome is
+established. A `reply_not_sent` retry reports the known local snapshot failure and keeps custody
+for operator recovery. After exact sent-part and manifest proof, cleanup is idempotent even when
+a prior unlink completed before its `RELEASED` receipt was committed.
+
+
+## Decision presentations
+
+`decision-present` presents a question in an existing ordinary-session or conductor binding.
+Ordinary calls verify the native caller against the binding. Conductor calls resolve the
+requested active binding and generation, without the same native caller identity check. The
+canonical question CLI assigns the question identity and answer keys. The adapter stores the
+presentation and its canonical route in the existing receipts journal.
+
+The producer and local Gateway decision path are implemented. Gateway button consumption records
+callback custody and gates canonical settlement, original-question projection, and native
+continuation on Gateway readiness. Live Discord delivery and native-session return remain
+separate qualification boundaries. A sent presentation is not proof that a click reached the
+native session.
+
+Write a request file using the channel, native ID and generation returned by your binding. Use a
+stable namespace and request ID for each question:
+
+```json
+{
+  "namespace": "release",
+  "requestId": "release-choice-1",
+  "target": "lane:release",
+  "head": "-",
+  "question": "Release the verified build?",
+  "menu": [
+    { "key": "release", "consequence": "Publish the verified build." },
+    { "key": "hold", "consequence": "Keep the build unpublished." }
+  ],
+  "channelId": "BOUND_CHANNEL_ID",
+  "provider": "codex",
+  "nativeId": "BOUND_NATIVE_UUID",
+  "generation": 1
+}
+```
+
+```sh
+node src/cli.js decision-present \
+  --state-dir "$HOME/.config/discord-surface" \
+  --request-file /absolute/path/to/question.json \
+  --canonical-cli /absolute/path/to/tg-canonical.mjs \
+  --canonical-state-root /absolute/path/to/canonical-state
+```
+
+`provider` is `codex` or `claude`. Ordinary callers must run from the bound native session. The
+producer uses the canonical CLI's `register` operation and exported path resolver. The Gateway
+consumer uses exact `settle` and generation-bound `read` through that same owner. That CLI
+remains the answer authority. The adapter does not create a separate answer store. If
+`--canonical-cli` is omitted, it uses `~/.claude/skills/phone-notify/scripts/tg-canonical.mjs`.
+
+The request must be a regular JSON file of at most 64 KiB. The complete canonical menu,
+including any research option added by its owner, must fit one Discord message and no more than
+25 buttons. Answer keys and consequences are not truncated. Question identity and question
+generation are owner-assigned and are not accepted in the request file. The numeric binding
+generation is separate.
+
+Retry with the same namespace, request ID, binding, target, head, question and menu. Saved
+custody selects the original canonical route before registration, even if ambient state paths
+change. Explicit conflicting route overrides are refused. A previously sent, pending or unknown
+presentation never authorizes another POST. An unknown outcome must be reconciled before
+claiming delivery.
+
+Presentation delivery, callback visibility, canonical settlement, message update and native
+acknowledgment are distinct outcomes. Only a materialized canonical answer may return to the
+existing session. Silence or an uncertain callback never selects an answer or grants permission
+to continue blocked work.
+
+
+## Addressed agent messages
+
+`agent-send` sends bounded task/context to another existing session. It does not transfer a
+binding or create a session. Source and destination installations must belong to the same
+trusted operator fleet and use the same Discord bot credential. The signature proves possession
+of that credential, not independent native-session identity. Agent input is explicitly labeled
+and grants no operator authority.
+
+Version-2 result packets carry a signed `sourceParentChannelId`, derived from the sender's
+binding after child enrollment is validated. It must differ from the source child. This lets a
+separate receiving installation distinguish an exact legacy child reply from a parent-route
+fallback. Sent or unknown legacy result custody is returned without another send or a live child
+lookup. Activate this wire change only through the coordinated fleet release, after receivers
+support this field.
+
+On the receiving installation, export an authenticated address from its active binding. This
+uses the existing ordinary-session or conductor owner checks:
+
+```sh
+node src/cli.js agent-address --provider claude --channel-id TARGET_CHANNEL \
+  --agent-thread-id TARGET_CHILD_THREAD_ID \
+  --native-id TARGET_NATIVE_UUID --generation TARGET_GENERATION > destination.json
+```
+
+Transfer that file to the sender, then run:
+
+```sh
+node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \
+  --agent-thread-id SOURCE_CHILD_THREAD_ID \
+  --native-id SOURCE_NATIVE_UUID --generation SOURCE_GENERATION \
+  --target-file destination.json --text-file task.txt --dedupe-key task-123 \
+  --agent-presentation attachment-v1
+```
+
+The source uses existing ordinary-session or conductor post checks. Repeating the same key and
+content reuses custody. Changing the destination or content under that key is refused. A packet
+must fit in one Discord message, including its signed address envelope. Oversized input fails
+before posting. The optional `--agent-presentation` flag accepts `legacy` (the default) or
+`attachment-v1`. Use `--agent-presentation attachment-v1` only when the receiver has opted into
+the attachment transport. Discord then receives a short readable preview and the exact signed
+packet as one `agent-message.tether` attachment. The native Discord rendering of that attachment
+still needs verification with a real Discord client before enabling the mode for a receiver.
+Legacy JSON posting remains the release default and is used when the flag is omitted.
+
+`--agent-thread-id` selects one already enrolled public child under the supplied `--channel-id`
+parent. The parent remains the binding authority, while the selected child is the signed source
+or destination channel. Selection is explicit and has no parent fallback or thread discovery.
+Ordinary native replies remain in the receiving child. An explicit result follows the peer
+address carried by the accepted request, including that peer's selected child when present.
+
+Only authenticated addressed packets enter agent delivery. Ordinary bot replies and milestone
+posts remain excluded. A result may be explicitly sent with `--agent-reply-to task-123` and a
+new dedupe key, using the accepted request receipt to recover the original source as its
+destination. The result command may omit `--target-file`. A supplied target file is still
+checked when present. Receiving a packet does not automatically send another packet. Legacy
+accepted requests remain answerable from an explicitly selected child, including requests
+recorded after child enrollment. New intake receipts record the routing version, so new
+parent-targeted requests cannot use that compatibility path. A known-unsent legacy retry means a
+matching persisted `direct-post-outcome` receipt whose `outcome` is `not_sent`. A
+`direct-post-attempt` without that outcome, a missing outcome, or an `unknown` outcome is not
+known-unsent and is never safe to retry. A known-unsent retry keeps its original custody and
+records the selected child as the new wire source. Sent and unknown outcomes remain non-sending
+on retry. Existing native acknowledgment and reply delivery remain separate from intake.
+
+The current requester can withdraw an acknowledged request that has no reply or result custody
+with `agent-withdraw --provider PROVIDER --message-id DISCORD_ID --packet-id PACKET_ID
+--native-id NATIVE_UUID --generation GENERATION`. This records a distinct withdrawal receipt and
+releases the recipient's handoff fence. It does not claim the request was completed. A late
+result is refused. Withdrawal requires the shared state database that holds the accepted request
+and both bindings. It does not transmit cancellation between installations. An unknown request
+in another installation is refused without changing custody.
+
+Receiving installations pin the exact destination generation and deduplicate the packet
+identity. Reconnecting the same native owner preserves accepted custody. Changing owners still
+requires the existing explicit binding handoff. Drain unaccepted packets before rotating the
+shared bot credential, because an old signature cannot be verified with a replacement
+credential.
+
+Verify a signed request and correlated result through the intended native sessions before
+enabling a receiver. These examples do not establish live delivery or support on another OS.
+
+Legacy known-unsent request retries require a freshly exported v2 child destination proof
+matching the recorded target. A v1 destination does not establish that it is a child and is
+refused before sending. Terminal sent/unknown recovery still accepts its original recorded
+identity without resending. Legacy result compatibility uses the latest outcome per attempt,
+excludes preflight receipts, and matches the exact original child or its signed parent.
+
+### Authenticated peer MCP
+
+`discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]` serves tools over
+stdio using the same binding database and outbound receipts as CLI sends. Register it only
+through a native harness integration that passes the current session identity to the MCP process
+and loads the tools into that same session. A generic `codex mcp add` saves configuration but
+proves neither step. Use the installed Node and CLI paths for that release. Do not supply a bot
+token in tool arguments, a static session UUID, or a copied destination address file.
+
+The server derives the caller from the native Codex invocation identifiers or the existing
+Claude caller resolver on every call. The caller must have exactly one active binding in the
+configured guild. A generic process without that identity cannot send by supplying someone
+else's UUID. This command does not bind, enroll, repair, resume or replace a session.
+
+- `peer_list()` returns every active binding in the configured guild, including
+the caller. Each row reports binding readiness, child route and a reachability reason. Inactive
+and other-guild bindings are excluded. Listing does not send network requests or change custody.
+A ready binding without one ready child is not reachable for a new request. A correlated result
+uses the recorded return route.
+- `peer_send({peer, text|text_file, dedupe_key})` resolves an exact
+`{repoKey, provider}`, `{conductorId}`, `{channelId}` or `{channelName}` at call time. Channel
+names come from the configured guild. Unknown or ambiguous peers and multiple active children
+refuse rather than select an arbitrary destination. Requests use signed agent packets and the
+existing `attachment-v1` delivery.
+- For a result, call `peer_send({reply_to, text|text_file, dedupe_key})` without
+`peer`. The existing immutable request determines the return address. The recommended `reply_to`
+is the request packet ID.
+- `peer_result({correlation_id})` inspects this caller's outbound correlation.
+Transport outcome, native delivery, acknowledgment and terminal completion are separate fields.
+Received result text does not imply native consumption. Reading this tool never acknowledges or
+completes custody.
+- `post({role, text_file, dedupe_key, ...})` selects an existing operation.
+`announce` posts to the caller's bound parent. `board` additionally requires `message_id` and
+uses the existing board-update provenance checks, including a conductor binding. `child`
+additionally requires `peer` or `reply_to` and uses the same authenticated agent path as
+`peer_send`. Raw human text is never a fallback for a child packet.
+
+`text_file` on `peer_send` file input and on `post` file input exports local UTF-8 file contents
+to Discord. Relative paths resolve from the MCP process working directory. Native host tool
+approval governs invocation. For a child agent send, the published message carries the validated
+text snapshot even if the source file later changes.
+
+Keep the same dedupe key and content after an uncertain outcome. A changed owner or generation
+is not permission to replay. These tools do not establish CLI active-turn steering or repair
+native pickup. Installation, current-source tests, and an actual native correlated round trip
+remain separate qualification steps.
+
+### Peer result inspection from a native shell
+
+```sh
+discord-surface peer-result --provider codex --correlation-id request-key --state-dir /path/to/state
+```
+
+Use `--provider claude` from an existing Claude session. The command derives the current native
+caller and uses the same correlation and generation checks as `peer_result`. It needs neither a
+loaded peer MCP catalog nor a bot token file. Identity comes from the harness environment and
+its Claude session resolver. Caller scoping does not protect against a same-user process that
+sets those identity variables. The command accepts no `--native-id` flag. It reads local
+receipts without network requests, delivery retries, acknowledgment or completion. Missing state
+and older schemas are refused without creation or migration. Result text remains peer-provided
+data. A successful inspection does not prove native pickup, active-turn steering or MCP
+adoption.
