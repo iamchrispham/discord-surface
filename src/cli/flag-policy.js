@@ -92,6 +92,7 @@ const COMMAND_FLAGS = Object.freeze({
   'native-reply-file-cleanup': ['message-id', 'preparation-id', 'part-index'],
   liaison: ['receipt-id'],
   'courier-guard': ['courier-route-id'],
+  'claude-stop-guard': [],
   'courier-input': ['courier-route-id', 'message-id', 'attempt-id', 'native-id']
 });
 

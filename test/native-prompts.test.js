@@ -129,12 +129,12 @@ const expectedDigests = {
   codexPromptAgentResult: 'f88215d73e2a267afba9c33a5cf2a32c814e35d31afcec3c20111245518accec',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
-  claudeEventHuman: '911abc7b2fa1a150eaa9aca8ac98095cd53f4f73ea81c18ee5c6b67a5ac75f4c',
-  claudeEventAttachment: '22eb3473721966977f21e52d12f95b3119d69be2dda0df03496129f25fafc5bf',
-  claudeEventAgentRequest: 'e957e4d0b76c8923ea691f99db9736b6e279f387b2fcf4bb7e790dc960e81f09',
-  claudeEventAgentResult: '06200d8e2398583fa24d6457dd9ffa9b3e289ccbd4d97068b2552f529a366be6',
-  claudeEventDecision: '013e49f8486367da8108864033bfa960ede92a9881183986d0721e0f841b8ff4',
-  claudeEventWatcher: '450bba4f711e01e1c173517032984718d5d9d03edbfe74aa40f9d1b796b4ea5c'
+  claudeEventHuman: '54fe0648301ae48b095fbb059d96d0f67893004af5daa1a626437c9bfb0d81e5',
+  claudeEventAttachment: '1f12429ce61160294eac1dc8f5ac86df9c985f70f01f55018328a39410802a0d',
+  claudeEventAgentRequest: '0e9d1200d58404227e51952995efb9461da2945c0e79dcfcdb1a575918f19a0b',
+  claudeEventAgentResult: 'e8ba8e52e9773580fe6ac830b1d9a5977b0bef7b125c11224d0ee9e035c6c862',
+  claudeEventDecision: '359c9ca9b5086a06fc64d73c37f7d79ccf21cab0758be9a7362fb2b067c3d144',
+  claudeEventWatcher: 'f2c757aa2f08c60759d06519a9b006b07cbb3a1f95e003fe193a70b75490c064'
 };
 
 function digest(value) {

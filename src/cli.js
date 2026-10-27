@@ -16,6 +16,10 @@ if (require.main === module && startup.command === 'courier-guard' && startup.ar
   }
   return;
 }
+if (require.main === module && startup.command === 'claude-stop-guard' && startup.args.help !== true) {
+  try { require('./claude-stop-guard').claudeStopGuard(startup.args, pathsFor, startup.error); } catch {}
+  return;
+}
 
 const { createGatewayProcessInspection } = require('./cli/gateway-process');
 const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
@@ -173,7 +177,7 @@ claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-ad
 agent-send, agent-complete, agent-withdraw, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
 post-file-cleanup,
 native-reply-file-cleanup,
-decision-present, courier-guard, liaison draft
+decision-present, courier-guard, claude-stop-guard, liaison draft
 
 Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
 

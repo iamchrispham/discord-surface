@@ -197,6 +197,10 @@ function assertDirectEventAcknowledgment(content, messageId, generation, workMar
   assert.ok(ackStep.includes(`messageId "${messageId}"`), `ACK tool step must carry the exact messageId: ${ackStep}`);
   assert.ok(ackStep.includes(`generation ${generation}`), `ACK tool step must carry the exact generation: ${ackStep}`);
   assert.ok(ackStep.includes(CLAUDE_PICKUP_ACKNOWLEDGMENT), `ACK tool step must carry the exact shared condition: ${ackStep}`);
+  const lines = content.split('\n');
+  const loadStep = lines[lines.indexOf(ackStep) + 1];
+  assert.match(loadStep, /load acknowledge and reply with one ToolSearch call, then call acknowledge in the same turn/, `deferred-tool load step must follow the ACK step: ${loadStep}`);
+  assert.doesNotMatch(loadStep, /mcp__/, 'load step must not hardcode the configured server prefix');
   const ackIndex = content.indexOf('At pickup, call acknowledge with messageId');
   const conditionIndex = content.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT);
   const workIndex = content.indexOf(workMarker);

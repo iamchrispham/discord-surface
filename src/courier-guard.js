@@ -100,4 +100,4 @@ function courierGuard(args, pathsFor, argumentError = null) {
   }
 }
 
-module.exports = { courierGuard, MAX_HOOK_BYTES, persistGuardRefusal };
+module.exports = { courierGuard, MAX_HOOK_BYTES, persistGuardRefusal, readHookEvent };
