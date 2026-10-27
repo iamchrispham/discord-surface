@@ -104,6 +104,24 @@ test('ignores messages handed to another session and messages not yet handed', (
   } finally { dispose(f); }
 });
 
+test('ignores a handed message from a binding generation that moved on', () => {
+  const f = fixture();
+  try {
+    hand(f, '2007');
+    f.state.db.prepare('UPDATE bindings SET generation = generation + 1 WHERE channel_id = ?').run('101');
+    assert.equal(runGuard(f.db, { session_id: CLAUDE_ID, stop_hook_active: false }), '');
+  } finally { dispose(f); }
+});
+
+test('ignores a handed message whose binding is inactive', () => {
+  const f = fixture();
+  try {
+    hand(f, '2008');
+    f.state.db.prepare('UPDATE bindings SET active = 0 WHERE channel_id = ?').run('101');
+    assert.equal(runGuard(f.db, { session_id: CLAUDE_ID, stop_hook_active: false }), '');
+  } finally { dispose(f); }
+});
+
 test('fails open without a database or a session id', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-stop-guard-missing-'));
   try {

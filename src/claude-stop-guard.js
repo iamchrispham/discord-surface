@@ -4,7 +4,7 @@ const { readHookEvent } = require('./courier-guard');
 const STOP_GUARD_VOCABULARY = Object.freeze({ SUBMITTED: 'submitted', CLAUDE: 'claude', NATIVE_ACK: 'native-ack' });
 const BUSY_TIMEOUT_MS = 200;
 
-// Submitted is set only after dispatch confirmed the event reached the session; the same set claude-submitted-reoffer treats as owed.
+// Submitted means the listener's notification write succeeded (Claude Code may still queue it), the set claude-submitted-reoffer treats as owed.
 const UNACKNOWLEDGED_HANDED_MESSAGES = `SELECT m.discord_id AS messageId, m.generation FROM messages m
   JOIN bindings b ON b.channel_id = m.channel_id
   WHERE m.native_id = ? AND m.provider = ? AND m.state = ?
