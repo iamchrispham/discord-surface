@@ -241,9 +241,13 @@ export function createOrdinaryBindingHandlers(
       });
     },
 
-    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, enrollmentProof = null, beforeMutation = undefined }) {
+    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, endpoint, handoffId, identity, nativeProof, intakeCutoff = null, enrollmentProof = null, beforeMutation = undefined }) {
       if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
-      if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
+      const isClaude = provider === PROVIDERS.CLAUDE;
+      if (!isClaude && provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff provider is unsupported');
+      if (isClaude && (sessionRoot !== undefined || intakeCutoff !== null || enrollmentProof !== null)) {
+        throw new BindingError('ordinary Claude handoff preserves the existing intake and session-root boundaries');
+      }
       assertUuid(fromNativeId, 'fromNativeId');
       assertUuid(nativeId, 'nativeId');
       if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
@@ -251,46 +255,84 @@ export function createOrdinaryBindingHandlers(
       if (!identity || identity.sessionId !== nativeId || identity.threadId !== nativeId) {
         throw new BindingError('ordinary handoff identity does not match the successor native session');
       }
+      if (isClaude && identity.harness !== 'claude-code') {
+        throw new BindingError('ordinary Claude handoff requires the claude-code harness');
+      }
       assertUuid(identity.sessionId, 'sessionId');
       assertUuid(identity.threadId, 'threadId');
       assertText(workspace, 'workspace', 4096);
       if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
       const existing = state.getBinding(channelId);
       if (!existing || !state.isOrdinaryBindingRecord(existing)) throw new BindingError('ordinary handoff source is unavailable');
-      const requestedSessionRoot = sessionRoot === undefined ? existing.sessionRoot : sessionRoot;
+      const requestedSessionRoot = isClaude ? existing.sessionRoot : sessionRoot === undefined ? existing.sessionRoot : sessionRoot;
       if (requestedSessionRoot !== null && requestedSessionRoot !== undefined) {
         assertText(requestedSessionRoot, 'sessionRoot', 4096);
         if (!path.isAbsolute(requestedSessionRoot)) throw new BindingError('sessionRoot must be absolute');
       }
       const input = state.bindingInput({
-        channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId, workspace,
-        sessionRoot: requestedSessionRoot, conductorId: null, repoKey: null, readiness: READINESS.PENDING
+        channelId, guildId: existing.guildId, provider, nativeId, workspace,
+        sessionRoot: requestedSessionRoot, endpoint: isClaude ? endpoint : undefined,
+        conductorId: null, repoKey: null, readiness: READINESS.PENDING
       }, existing);
       if (!nativeProof || typeof nativeProof.file !== 'string' || !path.isAbsolute(nativeProof.file) ||
         nativeProof.sessionId !== nativeId || nativeProof.threadId !== nativeId || nativeProof.workspace !== workspace ||
-        (nativeProof.sessionRoot || null) !== (input.sessionRoot || null)) {
-        throw new BindingError('ordinary handoff requires a matching Codex transcript proof');
+        (isClaude
+          ? nativeProof.harness !== 'claude-code' || nativeProof.endpoint !== input.endpoint
+          : (nativeProof.sessionRoot || null) !== (input.sessionRoot || null))) {
+        throw new BindingError(`ordinary handoff requires a matching ${isClaude ? 'Claude' : 'Codex'} transcript proof`);
       }
+      const matchesHandoffBinding = (
+        candidate: OrdinaryBindingRecord | null,
+        expected: OrdinaryBindingRecord | null
+      ): boolean => bindingMatchesExpected(candidate, expected) &&
+        candidate?.workspace === expected?.workspace && (!isClaude || candidate?.endpoint === expected?.endpoint);
+      const matchesHandoffHistory = (
+        candidate: Record<string, unknown> | null,
+        expected: Record<string, unknown> | null
+      ): boolean => Boolean(candidate && expected &&
+        candidate.channelId === expected.channelId && candidate.provider === expected.provider &&
+        candidate.fromNativeId === expected.fromNativeId && candidate.fromGeneration === expected.fromGeneration &&
+        candidate.nativeId === expected.nativeId && candidate.generation === expected.generation &&
+        candidate.workspace === expected.workspace && (candidate.sessionRoot || null) === (expected.sessionRoot || null) &&
+        (!isClaude || candidate.endpoint === expected.endpoint));
+      const recordHandoffRetry = (
+        expectedBinding: OrdinaryBindingRecord,
+        expectedHistory: Record<string, unknown>
+      ): OrdinaryBindingRecord & { handoffReconciled: true } => state.transaction(() => {
+        let current = state.getBinding(channelId);
+        let latest = state._findOrdinaryHandoff(handoffId);
+        if (!current?.active || !matchesHandoffBinding(current, expectedBinding) ||
+          !matchesHandoffHistory(latest, expectedHistory)) {
+          throw new StaleGenerationError('ordinary handoff retry source identity is stale');
+        }
+        if (typeof beforeMutation === 'function') beforeMutation();
+        current = state.getBinding(channelId);
+        latest = state._findOrdinaryHandoff(handoffId);
+        if (!current?.active || !matchesHandoffBinding(current, expectedBinding) ||
+          !matchesHandoffHistory(latest, expectedHistory)) {
+          throw new StaleGenerationError('ordinary handoff retry source identity changed before receipt');
+        }
+        state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
+          channelId, provider, handoffId, nativeId, generation: current.generation,
+          ...(isClaude ? { endpoint: input.endpoint } : {})
+        });
+        return { ...current, handoffReconciled: true };
+      });
       const previous = state._findOrdinaryHandoff(handoffId);
       if (previous) {
-        const sameRequest = previous.channelId === channelId && previous.provider === PROVIDERS.CODEX &&
+        const sameRequest = previous.channelId === channelId && previous.provider === provider &&
           previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
-          previous.nativeId === nativeId &&
-          previous.generation === existing.generation && existing.active && existing.nativeId === nativeId &&
-          existing.generation === fromGeneration + 1 && existing.workspace === input.workspace &&
-          (existing.sessionRoot || null) === (input.sessionRoot || null);
+          previous.nativeId === nativeId && previous.generation === existing.generation && existing.active &&
+          existing.provider === provider && existing.nativeId === nativeId && existing.generation === fromGeneration + 1 &&
+          existing.workspace === input.workspace && (existing.sessionRoot || null) === (input.sessionRoot || null) &&
+          (!isClaude || (previous.endpoint === input.endpoint && existing.endpoint === input.endpoint));
         if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
-        const retryResult = state.transaction(() => {
-          state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
-            channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
-          });
-          return { ...existing, handoffReconciled: true };
-        });
+        const retryResult = recordHandoffRetry(existing, previous);
         state.ordinaryHandoffPauses.delete(channelId);
         state.ordinaryHandoffPauseSnapshots?.delete(channelId);
         return retryResult;
       }
-      if (existing.provider !== PROVIDERS.CODEX || existing.conductorId || existing.repoKey ||
+      if (existing.provider !== provider || existing.conductorId || existing.repoKey ||
         existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
         throw new StaleGenerationError('ordinary handoff source identity is stale');
       }
@@ -301,18 +343,21 @@ export function createOrdinaryBindingHandlers(
       if (state.hasUnresolved(channelId) || state.hasUnresolvedBindingPost(channelId)) {
         throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       }
-      state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+      state.assertNativeOwnerFree(provider, nativeId, channelId);
       const hasActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
-      if (hasActiveEnrollments && intakeCutoff === null) {
+      if (!isClaude && hasActiveEnrollments && intakeCutoff === null) {
         throw new BindingError('active thread enrollments require an observed intake cutoff');
       }
       try {
         const handoffResult = state.transaction(() => {
           const current = state.getBinding(channelId);
           if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
-          if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+          if (!current || current.provider !== provider || current.conductorId || current.repoKey ||
             current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
             throw new StaleGenerationError('ordinary handoff source identity is stale');
+          }
+          if (isClaude && current.endpoint !== existing.endpoint) {
+            throw new StaleGenerationError('ordinary handoff source endpoint is stale');
           }
           if (!current.active && !state.hasUnboundReceipt(channelId, fromGeneration)) {
             throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
@@ -320,15 +365,15 @@ export function createOrdinaryBindingHandlers(
           if (state.hasUnresolved(channelId) || state.hasUnresolvedBindingPost(channelId)) {
             throw new UnresolvedWorkError('cannot handoff while work is unresolved');
           }
-          state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+          state.assertNativeOwnerFree(provider, nativeId, channelId);
           const hasCurrentActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
-          if (hasCurrentActiveEnrollments && intakeCutoff === null) {
+          if (!isClaude && hasCurrentActiveEnrollments && intakeCutoff === null) {
             throw new BindingError('active thread enrollments require an observed intake cutoff');
           }
           state.assertLegacyMigrationSafe(channelId);
           if (typeof beforeMutation === 'function') beforeMutation();
           const updatedAt = now();
-          if (intakeCutoff !== null) {
+          if (!isClaude && intakeCutoff !== null) {
             if (enrollmentProof) {
               if (typeof state.assertThreadEnrollmentCoverage !== 'function') {
                 throw new BindingError('handoff enrollment proof cannot be validated');
@@ -339,22 +384,31 @@ export function createOrdinaryBindingHandlers(
             advanceEnrolledThreadCutoffs(compareDiscordIds, state, channelId, intakeCutoff, updatedAt);
           }
           const generation = existing.generation + 1;
-          state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
-            WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
-            .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
-              PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
-          state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
-            .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
+          if (isClaude) {
+            state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, active=1, updated_at=?
+              WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+              .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, updatedAt, channelId,
+                provider, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+          } else {
+            state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
+              WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+              .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
+                PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+            state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+              .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
+          }
           state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
-            channelId, provider: PROVIDERS.CODEX, handoffId,
+            channelId, provider, handoffId,
             fromNativeId, fromGeneration, fromActive: existing.active,
             nativeId: input.nativeId, generation, intakeCutoff, workspace: input.workspace, sessionRoot: input.sessionRoot,
-            sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+            sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file,
+            ...(isClaude ? { endpoint: input.endpoint, harness: 'claude-code' } : {})
           });
           state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
-            channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
+            channelId, guildId: existing.guildId, provider, nativeId: input.nativeId,
             workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
-            sessionId: identity.sessionId, threadId: identity.threadId
+            sessionId: identity.sessionId, threadId: identity.threadId,
+            ...(isClaude ? { endpoint: input.endpoint, harness: 'claude-code' } : {})
           });
           return state.getBinding(channelId);
         });
@@ -365,25 +419,18 @@ export function createOrdinaryBindingHandlers(
         if (!(error instanceof StaleGenerationError)) throw error;
         const committed = state._findOrdinaryHandoff(handoffId);
         const successor = state.getBinding(channelId);
-        const reconciled = committed && successor && successor.active && successor.provider === PROVIDERS.CODEX &&
+        const reconciled = committed && successor && successor.active && successor.provider === provider &&
           !successor.conductorId && !successor.repoKey && successor.nativeId === nativeId &&
           successor.generation === fromGeneration + 1 && successor.workspace === input.workspace &&
           (successor.sessionRoot || null) === (input.sessionRoot || null) &&
-          committed.channelId === channelId && committed.provider === PROVIDERS.CODEX &&
+          (!isClaude || successor.endpoint === input.endpoint) &&
+          committed.channelId === channelId && committed.provider === provider &&
           committed.fromNativeId === fromNativeId && committed.fromGeneration === fromGeneration &&
           committed.nativeId === nativeId && committed.generation === successor.generation &&
-          committed.workspace === input.workspace && (committed.sessionRoot || null) === (input.sessionRoot || null);
+          committed.workspace === input.workspace && (committed.sessionRoot || null) === (input.sessionRoot || null) &&
+          (!isClaude || committed.endpoint === input.endpoint);
         if (!reconciled) throw error;
-        const retryResult = state.transaction(() => {
-          const current = state.getBinding(channelId);
-          const latest = state._findOrdinaryHandoff(handoffId);
-          if (!latest || !bindingMatchesExpected(current, successor) || latest.nativeId !== nativeId ||
-            latest.generation !== current?.generation) throw error;
-          state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
-            channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current!.generation
-          });
-          return { ...current!, handoffReconciled: true };
-        });
+        const retryResult = recordHandoffRetry(successor, committed);
         state.ordinaryHandoffPauses.delete(channelId);
         state.ordinaryHandoffPauseSnapshots?.delete(channelId);
         return retryResult;

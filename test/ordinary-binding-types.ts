@@ -18,7 +18,7 @@ const messageStates = {
   UNCERTAIN: 'uncertain',
   SUBMITTED: 'submitted'
 } satisfies OrdinaryBindingDependencies['MESSAGE_STATES'];
-const providers = { CODEX: 'codex' } satisfies OrdinaryBindingDependencies['PROVIDERS'];
+const providers = { CODEX: 'codex', CLAUDE: 'claude' } satisfies OrdinaryBindingDependencies['PROVIDERS'];
 const readinessValues = { PENDING: 'pending' } satisfies OrdinaryBindingDependencies['READINESS'];
 
 const validMessageState: MessageState = messageStates.DISPATCHING;
@@ -34,8 +34,8 @@ const swappedMessageStates = {
 } as const;
 // @ts-expect-error message-state keys retain their exact values
 const invalidMessageStates: OrdinaryBindingDependencies['MESSAGE_STATES'] = swappedMessageStates;
-const invalidProviderMap = { CODEX: 'claude' } as const;
-// @ts-expect-error ordinary provider map only accepts the Codex value
+const invalidProviderMap = { CODEX: 'claude', CLAUDE: 'codex' } as const;
+// @ts-expect-error provider map values remain tied to their provider keys
 const invalidProviderMapValue: OrdinaryBindingDependencies['PROVIDERS'] = invalidProviderMap;
 const invalidReadinessMap = { PENDING: 'ready' } as const;
 // @ts-expect-error ordinary readiness map only accepts the pending value
@@ -118,8 +118,32 @@ const handoff: OrdinaryHandoffInput = {
   intakeCutoff: null
 };
 
-// @ts-expect-error ordinary handoffs accept the Codex provider only
-const invalidHandoffProvider: OrdinaryHandoffInput = { ...handoff, provider: 'claude' };
+// @ts-expect-error ordinary handoffs reject unsupported providers
+const invalidHandoffProvider: OrdinaryHandoffInput = { ...handoff, provider: 'other' };
+
+const claudeHandoff: OrdinaryHandoffInput = {
+  channelId: binding.channelId,
+  provider: 'claude',
+  fromNativeId: binding.nativeId,
+  fromGeneration: binding.generation,
+  nativeId,
+  workspace: binding.workspace,
+  endpoint: '/tmp/claude.sock',
+  handoffId: 'claude-handoff',
+  identity: { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' },
+  nativeProof: {
+    file: '/tmp/claude-session.jsonl',
+    sessionId: nativeId,
+    threadId: nativeId,
+    workspace: binding.workspace,
+    endpoint: '/tmp/claude.sock',
+    harness: 'claude-code'
+  }
+};
+// @ts-expect-error Claude handoff requires the validated Claude harness
+const invalidClaudeHandoffIdentity: OrdinaryHandoffInput = { ...claudeHandoff, identity: { sessionId: nativeId, threadId: nativeId, harness: 'codex' } };
+// @ts-expect-error Claude handoff cannot install a new intake cutoff
+const invalidClaudeHandoffCutoff: OrdinaryHandoffInput = { ...claudeHandoff, intakeCutoff: '100' };
 
 const bound = handlers.bindOrdinary(state, { ...binding, provider: 'codex' }, identity);
 const rebound = handlers.rebindOrdinary(state, { ...binding, provider: 'codex' }, identity);
@@ -139,6 +163,7 @@ handlers.recordOrdinaryPreflight(state, binding, {});
 // @ts-expect-error rebind handler options expose only the mutation hook
 handlers.rebindOrdinary(state, { ...binding }, identity, null, null, { intakeCutoff: 'cutoff' });
 const transferred = handlers.handoffOrdinary(state, { ...handoff, nativeId: 'b8f0d4f6-b26a-4f96-8d37-6d7df4f1d4a0' });
+const transferredClaude = handlers.handoffOrdinary(state, claudeHandoff);
 const preflightViaHandler: boolean = handlers.hasOrdinaryPreflight(state, binding);
 const bindingReceipt: boolean = hasOrdinaryBindingReceipt(state, binding);
 const preflightReceipt: boolean = hasOrdinaryPreflightReceipt(state, binding);
@@ -164,6 +189,7 @@ rebound?.provider satisfies AgentProvider | undefined;
 preflight?.active satisfies boolean | undefined;
 transferred?.workspace satisfies string | undefined;
 transferred?.handoffReconciled satisfies boolean | undefined;
+transferredClaude?.endpoint satisfies unknown;
 validMessageState satisfies MessageState;
 validProvider satisfies AgentProvider;
 validReadiness satisfies Readiness;
