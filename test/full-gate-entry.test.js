@@ -1322,7 +1322,7 @@ test('watchdog cleans a TERM-resistant body after its supervisor is killed', { t
   assert.equal(result.signal, 'SIGKILL');
   const drained = identity => roleFixture.identityGone(identity, roleFixture.captureIdentity(identity.pid));
   const bound = Date.now() + 30000;
-  while ((!drained(body.identity) || !drained(roles.worker)) && Date.now() < bound) {
+  while ((!drained(body.identity) || !drained(roles.worker) || fs.existsSync(body.scratch)) && Date.now() < bound) {
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   assert.equal(drained(body.identity), true, 'body remained after watchdog cleanup');
