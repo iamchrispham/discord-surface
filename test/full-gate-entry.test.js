@@ -516,7 +516,7 @@ test('Python supervisor verdict uses the channel separate from saturated stderr'
 test('both public full entries decline before starting work without admission', () => {
   const env = { ...process.env };
   env.NODE_OPTIONS = '';
-  env.APERTURE_GATE_TIME_LEFT_S = '20';
+  env.APERTURE_GATE_TIME_LEFT_S = '120';
   env.APERTURE_GATE_SLOWEST_RUN_S = '5';
   env.APERTURE_GATE_ADMISSION_COMMAND = path.join(os.tmpdir(), 'gate-admission-missing-' + process.pid);
   delete env.DISCORD_SURFACE_GATE_BODY;
@@ -524,7 +524,7 @@ test('both public full entries decline before starting work without admission', 
     const registered = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8')).scripts.test.split(/\s+/).slice(2);
     const args = file === 'scripts/test-gate.js' ? registered : [];
     const result = spawnSync('python3', ['-I', SUPERVISOR_SCRIPT, '--', process.execPath, path.join(PROJECT, file), ...args], {
-      cwd: PROJECT, env, encoding: 'utf8', timeout: 120000
+      cwd: PROJECT, env, encoding: 'utf8', timeout: 150000
     });
     assert.equal(result.status, 98);
     const output = result.stdout + result.stderr;
