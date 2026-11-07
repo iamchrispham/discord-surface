@@ -2,12 +2,39 @@ const ts = require('typescript');
 
 const { bindingIdentifiers, propertyName } = require('./handler-discovery-bindings');
 const { statementCanFallThrough } = require('./handler-discovery-flow');
+const { isCommonJsRequireCall } = require('./handler-discovery-require');
+
+function staticFactoryArgument(node) {
+  while (ts.isParenthesizedExpression(node)) node = node.expression;
+  if (ts.isStringLiteral(node) || ts.isNumericLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isBigIntLiteral(node) || node.kind === ts.SyntaxKind.TrueKeyword ||
+      node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return true;
+  if (ts.isPrefixUnaryExpression(node) &&
+      [ts.SyntaxKind.PlusToken, ts.SyntaxKind.MinusToken].includes(node.operator) &&
+      ts.isNumericLiteral(node.operand)) return true;
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.every(element => !ts.isSpreadElement(element) && staticFactoryArgument(element));
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.every(property => {
+      if (!ts.isPropertyAssignment(property)) return false;
+      const name = property.name;
+      const staticName = ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name) ||
+        (ts.isComputedPropertyName(name) &&
+          (ts.isStringLiteral(name.expression) || ts.isNumericLiteral(name.expression) ||
+            ts.isNoSubstitutionTemplateLiteral(name.expression)));
+      return staticName && staticFactoryArgument(property.initializer);
+    });
+  }
+  return false;
+}
 
 function calledFactory(expression, requireCall = false) {
   let candidate = expression;
   while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
   const actualCall = ts.isCallExpression(candidate);
   if (requireCall && !actualCall) return null;
+  if (actualCall && candidate.arguments.some(argument => !staticFactoryArgument(argument))) return null;
   let target = actualCall ? candidate.expression : candidate;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) target = target.right;
@@ -18,8 +45,7 @@ function calledFactory(expression, requireCall = false) {
 }
 
 function directRequire(receiver) {
-  if (!receiver || !ts.isCallExpression(receiver) || !ts.isIdentifier(receiver.expression) || receiver.expression.text !== 'require' ||
-      receiver.arguments.length !== 1 || !ts.isStringLiteral(receiver.arguments[0])) return null;
+  if (!receiver || !isCommonJsRequireCall(receiver.getSourceFile(), receiver)) return null;
   return receiver.arguments[0].text;
 }
 

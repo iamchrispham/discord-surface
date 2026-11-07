@@ -211,10 +211,12 @@ function declarationForIdentifier(declarations, identifier, source) {
   }
   const useStart = identifier.getStart(source);
   for (const scope of scopes) {
-    const candidates = declarations.filter(item => item.scope === scope && item.name === identifier.text &&
+    const scopedDeclarations = declarations.filter(item => item.scope === scope && item.name === identifier.text);
+    const candidates = scopedDeclarations.filter(item =>
       (ts.isFunctionDeclaration(item.declaration) || isVarDeclaration(item.declaration) ||
         item.declaration.getStart(source) <= useStart));
     if (candidates.length) return candidates[candidates.length - 1].declaration;
+    if (scopedDeclarations.length) return null;
   }
   return null;
 }

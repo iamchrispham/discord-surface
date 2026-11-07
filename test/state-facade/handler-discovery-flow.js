@@ -32,11 +32,38 @@ function statementFlow(statement) {
     return { normal: false, breaks: new Set([statement.label?.text || null]) };
   }
   if (ts.isIfStatement(statement)) {
+    const condition = statement.expression;
+    const constantCondition = ts.isParenthesizedExpression(condition) ? condition.expression : condition;
+    if (constantCondition.kind === ts.SyntaxKind.FalseKeyword) {
+      return statement.elseStatement
+        ? statementFlow(statement.elseStatement)
+        : { normal: true, breaks: new Set() };
+    }
     const thenFlow = statementFlow(statement.thenStatement);
     const elseFlow = statement.elseStatement ? statementFlow(statement.elseStatement) : { normal: true, breaks: new Set() };
+    if (constantCondition.kind === ts.SyntaxKind.TrueKeyword) return thenFlow;
     const breaks = new Set([...thenFlow.breaks, ...elseFlow.breaks]);
     return {
       normal: thenFlow.normal || elseFlow.normal,
+      breaks
+    };
+  }
+  if (ts.isWhileStatement(statement) || ts.isDoStatement(statement) || ts.isForStatement(statement)) {
+    const condition = ts.isForStatement(statement) ? statement.condition : statement.expression;
+    const constantCondition = condition && ts.isParenthesizedExpression(condition) ? condition.expression : condition;
+    const alwaysTrue = !condition || constantCondition.kind === ts.SyntaxKind.TrueKeyword;
+    const alwaysFalse = !!condition && constantCondition.kind === ts.SyntaxKind.FalseKeyword;
+    const bodyFlow = statementFlow(statement.statement);
+    const breaks = new Set([...bodyFlow.breaks].filter(target => target !== null));
+    if (ts.isDoStatement(statement)) {
+      return {
+        normal: bodyFlow.breaks.has(null) || (!alwaysTrue && bodyFlow.normal),
+        breaks
+      };
+    }
+    if (alwaysFalse) return { normal: true, breaks: new Set() };
+    return {
+      normal: !alwaysTrue || bodyFlow.breaks.has(null),
       breaks
     };
   }

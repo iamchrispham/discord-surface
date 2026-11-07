@@ -58,6 +58,10 @@ test('existing forwarding delegate removal refused', () => {
   assert.equal(!matches(removeMethod('acceptInteraction')), true);
 });
 
+test('candidate baseline cannot remove a required public delegate', () => {
+  assert.equal(matchesWithCandidateBaseline(removeMethod('getConfig')), false);
+});
+
 test('swapped arguments refused', () => {
   assert.equal(!matches(insert('newForward(a, b) { return configurationHandlers.setConfig.call(this, b, a); }')), true);
 });
@@ -211,6 +215,42 @@ test('rejects exported owner prototype mutations through aliases', () => {
   const text = `${source}
 const proto = SurfaceState.prototype;
 delete proto.getConfig;`;
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('rejects an exported constructor passed to a mutating helper with a candidate baseline', () => {
+  const text = `${source}
+function remove(C) { delete C.prototype.getConfig; }
+remove(SurfaceState);`;
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('requires the recorded defaults on protected forwarding signatures', () => {
+  for (const name of ['_bindOrdinary', '_bindOrdinaryClaude']) {
+    const original = `${name}(binding, identity, adoptionCutoff = null, options = {})`;
+    const replacement = `${name}(binding, identity, adoptionCutoff, options)`;
+    const text = source.replace(original, replacement);
+    assert.notEqual(text, source, `fixture signature for ${name}`);
+    assert.equal(matchesWithCandidateBaseline(text), false, name);
+  }
+});
+
+test('resolves owner exports in property order and rejects ambiguous later writes', () => {
+  const exportStart = source.lastIndexOf('module.exports = {');
+  const ownerEntry = source.indexOf('SurfaceState', exportStart);
+  const ownerEntryEnd = source.indexOf(',', ownerEntry) + 1;
+  assert.ok(exportStart >= 0 && ownerEntry > exportStart && ownerEntryEnd > ownerEntry);
+  const withSpread = value => source.slice(0, ownerEntryEnd) +
+    `\n  ...{ ${value} },` + source.slice(ownerEntryEnd);
+
+  assert.equal(matchesWithCandidateBaseline(withSpread('OtherSurface: null')), true);
+  assert.equal(matchesWithCandidateBaseline(withSpread('SurfaceState: null')), false);
+});
+
+test('rejects unresolved computed writes to the exported owner with a candidate baseline', () => {
+  const text = `${source}
+const key = 'SurfaceState';
+module.exports[key] = class {};`;
   assert.equal(matchesWithCandidateBaseline(text), false);
 });
 

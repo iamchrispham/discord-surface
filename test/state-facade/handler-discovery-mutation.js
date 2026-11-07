@@ -85,6 +85,28 @@ function mutatedDeclarations(factory, declarations, source, includeFunctionBodie
     aliases.get(rightDeclaration).add(leftDeclaration);
   };
   const linkDestructured = (pattern, initializer) => {
+    const value = unwrapExpression(initializer);
+    if (value && ts.isCallExpression(value)) {
+      const helper = declarationForIdentifier(resolvedDeclarations, rootIdentifier(value.expression), source);
+      const helperFunction = localHelper(helper);
+      const body = helperFunction?.body;
+      const returned = body && ts.isBlock(body)
+        ? body.statements.length === 1 && ts.isReturnStatement(body.statements[0])
+          ? body.statements[0].expression
+          : null
+        : body;
+      if (returned && ts.isIdentifier(unwrapExpression(returned))) {
+        const parameterIndex = (helperFunction.parameters || []).findIndex(parameter =>
+          ts.isIdentifier(parameter.name) && parameter.name.text === unwrapExpression(returned).text);
+        const argument = parameterIndex >= 0 ? value.arguments[parameterIndex] : null;
+        if (argument) {
+          link(pattern, argument);
+          return;
+        }
+      }
+      for (const argument of value.arguments) mark(argument);
+      return;
+    }
     const pairs = destructuredBindings(pattern, initializer);
     if (pairs.length) {
       for (const [left, right] of pairs) link(left, right);
@@ -126,6 +148,12 @@ function mutatedDeclarations(factory, declarations, source, includeFunctionBodie
         mutatedParameter = true;
         return;
       }
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Reflect' &&
+          node.expression.name.text === 'set' && rootIdentifier(node.arguments[0])?.text === parameterName) {
+        mutatedParameter = true;
+        return;
+      }
       if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
           rootIdentifier(node.initializer)?.text === parameterName) {
         mutatedParameter = true;
@@ -163,6 +191,11 @@ function mutatedDeclarations(factory, declarations, source, includeFunctionBodie
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
         ['assign', 'defineProperty', 'defineProperties'].includes(node.expression.name.text) &&
         node.arguments.length) {
+      mark(node.arguments[0]);
+    }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+        ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Reflect' &&
+        node.expression.name.text === 'set' && node.arguments.length) {
       mark(node.arguments[0]);
     }
     if (ts.isCallExpression(node)) {

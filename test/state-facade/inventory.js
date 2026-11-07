@@ -4,7 +4,13 @@ const assert = require('node:assert/strict');
 
 const ts = require('typescript');
 
+const committedBaseline = require('./baseline.json');
 const { INVOCATION_STYLES, discoverFactory, mutatedBindingNames } = require('./handler-discovery');
+
+const REQUIRED_SURFACE_METHOD_NAMES = new Set([
+  ...Object.keys(committedBaseline.bodies),
+  ...committedBaseline.forwarding
+]);
 
 function tokens(text) {
   const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, text);
@@ -306,6 +312,10 @@ function exportedClassDeclaration(source, exportName) {
         (ts.isStringLiteral(node.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression))) {
       return node.argumentExpression.text;
     }
+    if (ts.isComputedPropertyName(node) &&
+        (ts.isStringLiteral(node.expression) || ts.isNoSubstitutionTemplateLiteral(node.expression))) {
+      return node.expression.text;
+    }
     return null;
   };
   const isComputedModuleExports = node => ts.isElementAccessExpression(node) &&
@@ -355,6 +365,8 @@ function exportedClassDeclaration(source, exportName) {
     findExportObjectAliases(source);
   }
   const isExportName = node => propertyName(node) === exportName && isExportObject(node.expression);
+  const isUnresolvedComputedExportName = node => ts.isElementAccessExpression(node) &&
+    propertyName(node) === null && isExportObject(node.expression);
   const exportObjectEscapes = node => {
     if (isExportObject(node)) return true;
     if (ts.isParenthesizedExpression(node) || ts.isSpreadElement(node) || ts.isSpreadAssignment(node)) {
@@ -371,14 +383,17 @@ function exportedClassDeclaration(source, exportName) {
     return false;
   };
   const isExportMutation = node => {
-    if (ts.isDeleteExpression(node)) return isExportName(node.expression);
+    if (ts.isDeleteExpression(node)) {
+      return isExportName(node.expression) || isUnresolvedComputedExportName(node.expression);
+    }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
         node.operatorToken.kind <= assignmentEnd &&
-        (isExportName(node.left) || isModuleExports(node.left) || isComputedModuleExports(node.left))) {
+        (isExportName(node.left) || isUnresolvedComputedExportName(node.left) ||
+          isModuleExports(node.left) || isComputedModuleExports(node.left))) {
       return !topLevelExportAssignments.has(node);
     }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
-        isExportName(node.operand)) {
+        (isExportName(node.operand) || isUnresolvedComputedExportName(node.operand))) {
       return true;
     }
     return ts.isCallExpression(node) && node.arguments.some(exportObjectEscapes);
@@ -399,11 +414,32 @@ function exportedClassDeclaration(source, exportName) {
         exported = null;
         continue;
       }
-      const property = right.properties.find(candidate =>
-        (ts.isShorthandPropertyAssignment(candidate) && candidate.name.text === exportName) ||
-        (ts.isPropertyAssignment(candidate) && candidate.name &&
-          ts.isIdentifier(candidate.name) && candidate.name.text === exportName));
-      exported = property ? expressionForProperty(property) : null;
+      let property = null;
+      let ambiguousOwner = false;
+      const applyExportProperties = properties => {
+        for (const candidate of properties) {
+          if (ts.isSpreadAssignment(candidate)) {
+            if (ts.isObjectLiteralExpression(candidate.expression)) {
+              applyExportProperties(candidate.expression.properties);
+            }
+            else if (property) {
+              ambiguousOwner = true;
+            }
+            continue;
+          }
+          if (candidate.name && ts.isComputedPropertyName(candidate.name) &&
+              propertyName(candidate.name) === null) {
+            if (property) ambiguousOwner = true;
+            continue;
+          }
+          if (propertyName(candidate.name) === exportName) {
+            property = candidate;
+            ambiguousOwner = false;
+          }
+        }
+      };
+      applyExportProperties(right.properties);
+      exported = ambiguousOwner ? null : property ? expressionForProperty(property) : null;
     }
   }
   const findExportMutations = node => {
@@ -469,6 +505,11 @@ function exportedPrototypeMutated(source, owner, ownerName) {
         mutated = true;
         return;
       }
+      if (ts.isCallExpression(node) && node.arguments.some(argument =>
+        ts.isIdentifier(argument) && argument.text === ownerName)) {
+        mutated = true;
+        return;
+      }
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
           ['assign', 'defineProperty', 'defineProperties', 'setPrototypeOf'].includes(node.expression.name.text) &&
           node.arguments.length > 0 && isPrototypeObject(node.arguments[0])) {
@@ -488,7 +529,7 @@ function matches(text, baseline, fileName = 'state.js') {
     if (raw.unapprovedHandlers.length || !raw.ownerMatchesExport || raw.ownerPrototypeMutated) return false;
     const candidate = compact(raw);
     const candidateMethodNames = new Set([...Object.keys(candidate.bodies), ...candidate.forwarding]);
-    const requiredSurfaceMethodNames = new Set([...PRIOR_SURFACE_METHOD_NAMES, ...baseline.forwarding]);
+    const requiredSurfaceMethodNames = new Set([...REQUIRED_SURFACE_METHOD_NAMES, ...baseline.forwarding]);
     for (const name of requiredSurfaceMethodNames) {
       if (!candidateMethodNames.has(name)) return false;
     }
@@ -518,6 +559,9 @@ function matches(text, baseline, fileName = 'state.js') {
         parameter.initializer || !ts.isIdentifier(parameter.name));
       const exactLegacyParameterShape = JSON.stringify(parameterShape(method, parsed)) ===
         JSON.stringify((PRIOR_UNSUPPORTED_FORWARDING_SHAPES.get(name) || []).map(text => tokens(text)));
+      if (priorUnsupportedForwarding.has(name) && baseline.forwarding.includes(name) && !exactLegacyParameterShape) {
+        return false;
+      }
       const grandfatheredParameterShape = hasUnsupportedParameters &&
         baseline.forwarding.includes(name) &&
         priorUnsupportedForwarding.has(name) &&

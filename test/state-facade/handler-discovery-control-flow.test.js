@@ -17,6 +17,7 @@ const {
   source,
   inventory
 } = require('./owner-test-helpers');
+const { matches: matchesInventory } = require('./inventory');
 
 test('rejects imported companion factories with reassigned callable identifiers', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
@@ -65,6 +66,46 @@ test('rejects imported companion factories with aliased object mutations', () =>
 }
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
+});
+
+test('rejects a replaced property on a required factory module with a candidate baseline', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-inventory-'));
+  try {
+    const modulePath = path.join(root, 'factories.js');
+    fs.writeFileSync(modulePath, `function createInner() { return { hidden(state, value) {} }; }
+module.exports = { createInner };`);
+    const importPath = JSON.stringify(modulePath);
+    const positive = source.replace('class SurfaceState {', `const factories = require(${importPath});
+function createFakeHandlers() { return factories.createInner(); }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(positive), true);
+    const text = positive.replace('function createFakeHandlers()',
+      'factories.createInner = () => ({});\nfunction createFakeHandlers()');
+    assert.equal(matchesWithCandidateBaseline(text), false);
+  }
+  finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rejects calls through a reassigned CommonJS loader with a candidate baseline', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-inventory-'));
+  try {
+    const modulePath = path.join(root, 'factories.js');
+    fs.writeFileSync(modulePath, `function createInner() { return { hidden(state, value) {} }; }
+module.exports = { createInner };`);
+    const importPath = JSON.stringify(modulePath);
+    const text = source.replace('class SurfaceState {', `require = () => ({ createInner() { return {}; } });
+const factories = require(${importPath});
+function createFakeHandlers() { return factories.createInner(); }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(text), false);
+  }
+  finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('rejects descriptor mutations of returned handlers', () => {
@@ -129,6 +170,32 @@ function createFakeHandlers() {
 }
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
+});
+
+test('propagates returned aliases from simple local helpers before mutation checks', () => {
+  const positive = source.replace('class SurfaceState {', `function identity(value) { return value; }
+function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  const alias = identity(handlers);
+  return handlers;
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+  assert.equal(matchesWithCandidateBaseline(positive), true);
+  const text = positive.replace('  return handlers;', '  alias.hidden = 0;\n  return handlers;');
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('rejects Reflect.set mutations of returned handlers with a candidate baseline', () => {
+  const positive = source.replace('class SurfaceState {', `function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  return handlers;
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+  assert.equal(matchesWithCandidateBaseline(positive), true);
+  const text = positive.replace('  return handlers;', "  Reflect.set(handlers, 'hidden', 0);\n  return handlers;");
+  assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
 test('rejects generator companion factories', () => {
@@ -210,22 +277,28 @@ module.exports = { createFakeHandlers };`);
 test('rejects facade forwarding to an unbound later-state handler', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-inventory-'));
   try {
-    fs.writeFileSync(path.join(root, 'companion.js'), `function createFakeHandlers() {
-  return { hidden(deps, state, value) {} };
-}
-module.exports = { createFakeHandlers };`);
-    const ownerPath = path.join(root, 'owner.js');
+    const companionPath = path.join(root, 'companion.js');
+    const ownerPath = path.join(__dirname, '../../src/state.js');
     const text = source.replace(
       'class SurfaceState {',
-      `const { createFakeHandlers } = require('./companion');
-function createWrapper() { return createFakeHandlers({}); }
-const fakeHandlers = createWrapper();
+      `const { createFakeHandlers } = require(${JSON.stringify(companionPath)});
+const fakeHandlers = createFakeHandlers();
 class SurfaceState {
-newForward(value) { return fakeHandlers.hidden(this, value); }
+newForward(deps, value) { return fakeHandlers.hidden(this, deps, value); }
 `
     );
-    const candidate = compact(inventory(text, ownerPath));
-    assert.equal(require('./inventory').matches(text, candidate, ownerPath), false);
+    const writeFactory = parameters => fs.writeFileSync(companionPath, `function createFakeHandlers() {
+  return { hidden(${parameters}) {} };
+}
+module.exports = { createFakeHandlers };`);
+
+    writeFactory('state, deps, value');
+    const positiveCandidate = compact(inventory(text, ownerPath));
+    assert.equal(matchesInventory(text, positiveCandidate, ownerPath), true);
+
+    writeFactory('deps, state, value');
+    const laterStateCandidate = compact(inventory(text, ownerPath));
+    assert.equal(matchesInventory(text, laterStateCandidate, ownerPath), false);
   }
   finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -449,6 +522,47 @@ test('rejects a factory parameter that shadows an outer callable', () => {
 function createFakeHandlers(hidden) { return { hidden }; }
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
+});
+
+test('rejects factory calls with unresolved arguments while retaining static arguments', () => {
+  const positive = source.replace('class SurfaceState {', `function createInner() {
+  return { hidden(state, value) {} };
+}
+function createFakeHandlers() { return createInner({}); }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+  assert.equal(matchesWithCandidateBaseline(positive), true);
+  const text = positive.replace('createInner({})', 'createInner(missingDependency)');
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('treats statically nonterminating factory loops as abrupt flow', () => {
+  for (const loop of ['while (true) {}', 'for (;;) {}']) {
+    const text = source.replace('class SurfaceState {', `function createFakeHandlers() {
+  ${loop}
+  return { hidden(state, value) {} };
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(text), false, loop);
+  }
+  const positive = source.replace('class SurfaceState {', `function createFakeHandlers() {
+  while (true) { break; }
+  return { hidden(state, value) {} };
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+  assert.equal(matchesWithCandidateBaseline(positive), true);
+});
+
+test('keeps later lexical declarations shadowing outer handler functions', () => {
+  const positive = source.replace('class SurfaceState {', `function hidden(state, value) {}
+function createFakeHandlers() { return { hidden }; }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+  assert.equal(matchesWithCandidateBaseline(positive), true);
+  const text = positive.replace('return { hidden };', 'return { hidden }; const hidden = 0;');
+  assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
 test('ignores unreachable factory returns', () => {

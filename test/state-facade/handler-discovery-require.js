@@ -1,6 +1,71 @@
 const ts = require('typescript');
 
-const { declarationScope, isScopeNode, propertyName, scopeNode } = require('./handler-discovery-lexical');
+const { bindingIdentifiers, declarationScope, isScopeNode, propertyName, scopeNode } = require('./handler-discovery-lexical');
+
+function isCommonJsRequireCall(source, call) {
+  if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) || call.expression.text !== 'require' ||
+      call.arguments.length !== 1 || !ts.isStringLiteral(call.arguments[0])) return false;
+  const declarations = [];
+  const add = (identifier, declaration, scope = declarationScope(declaration)) => {
+    if (ts.isIdentifier(identifier) && identifier.text === 'require') declarations.push({ scope });
+  };
+  const collect = node => {
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      for (const identifier of bindingIdentifiers(node.name)) add(identifier, node);
+    }
+    else if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
+      add(node.name, node);
+    }
+    else if (ts.isFunctionExpression(node) && node.name) {
+      add(node.name, node, node);
+    }
+    else if (ts.isImportClause(node) || ts.isImportSpecifier(node) || ts.isNamespaceImport(node) ||
+        ts.isImportEqualsDeclaration(node)) {
+      add(node.name, node);
+    }
+    ts.forEachChild(node, collect);
+  };
+  collect(source);
+  const scopeChain = identifier => {
+    const scopes = [];
+    let current = scopeNode(identifier);
+    while (current) {
+      scopes.push(current);
+      current = current.parent;
+      while (current && !isScopeNode(current)) current = current.parent;
+    }
+    return scopes;
+  };
+  const hasShadow = identifier => {
+    const scopes = scopeChain(identifier);
+    return declarations.some(binding => scopes.includes(binding.scope));
+  };
+  if (hasShadow(call.expression)) return false;
+  let loaderReassigned = false;
+  const markLoaderTarget = target => {
+    for (const identifier of bindingIdentifiers(target)) {
+      if (identifier.text === 'require' && !hasShadow(identifier)) loaderReassigned = true;
+    }
+  };
+  const isAssignmentOperator = kind => kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment;
+  const findLoaderWrites = node => {
+    if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
+      markLoaderTarget(node.left);
+    }
+    if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+        !ts.isVariableDeclarationList(node.initializer)) {
+      markLoaderTarget(node.initializer);
+    }
+    if (ts.isDeleteExpression(node)) markLoaderTarget(node.expression);
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+      markLoaderTarget(node.operand);
+    }
+    ts.forEachChild(node, findLoaderWrites);
+  };
+  findLoaderWrites(source);
+  return !loaderReassigned;
+}
 
 function requireBindings(source) {
   const bindings = [];
@@ -13,7 +78,7 @@ function requireBindings(source) {
       for (const declaration of node.declarationList.declarations) {
         if (!declaration.initializer || !ts.isCallExpression(declaration.initializer) ||
             !ts.isIdentifier(declaration.initializer.expression) || declaration.initializer.expression.text !== 'require' ||
-            declaration.initializer.arguments.length !== 1 || !ts.isStringLiteral(declaration.initializer.arguments[0])) continue;
+            !isCommonJsRequireCall(source, declaration.initializer)) continue;
         const modulePath = declaration.initializer.arguments[0].text;
         if (ts.isIdentifier(declaration.name)) {
           addBinding(declaration.name.text, declaration, modulePath, null);
@@ -62,6 +127,10 @@ function requireBindings(source) {
       if (binding) binding.reassigned = true;
       return;
     }
+    if (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+      markBindingTarget(target.expression);
+      return;
+    }
     if (ts.isArrayLiteralExpression(target) || ts.isArrayBindingPattern(target)) {
       for (const element of target.elements) {
         if (ts.isOmittedExpression(element)) continue;
@@ -107,4 +176,4 @@ function requireBindings(source) {
   };
 }
 
-module.exports = { requireBindings };
+module.exports = { isCommonJsRequireCall, requireBindings };
