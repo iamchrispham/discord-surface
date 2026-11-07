@@ -6,7 +6,9 @@ const {
   callableDeclarations,
   declarationForIdentifier,
   declarationScope,
+  isScopeNode,
   propertyName,
+  scopeNode,
   scopedDeclarations
 } = require('./handler-discovery-lexical');
 

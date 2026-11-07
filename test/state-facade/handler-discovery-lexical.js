@@ -181,11 +181,16 @@ function destructuredBindings(pattern, initializer) {
 }
 
 function bindingInitializer(identifier) {
-  let current = identifier;
+  let binding = identifier;
+  if (ts.isVariableDeclaration(binding)) {
+    if (!ts.isIdentifier(binding.name)) return null;
+    binding = binding.name;
+  }
+  let current = binding;
   while (current && !ts.isVariableDeclaration(current)) current = current.parent;
   if (!current?.initializer) return null;
   return destructuredBindings(current.name, current.initializer)
-    .find(([binding]) => binding === identifier)?.[1] || null;
+    .find(([declaration]) => declaration === binding)?.[1] || null;
 }
 
 function callableDeclarations(source, factory) {
