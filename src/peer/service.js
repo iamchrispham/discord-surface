@@ -5,9 +5,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
+const { READINESS } = require('../../dist/topic');
 const {
   canonicalNativeId, currentPeerDestination, resolvePeerBinding, samePeerBinding,
-  validatePeerSelector, requireReadyPeer, READINESS
+  validatePeerSelector, requireReadyPeer
 } = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');

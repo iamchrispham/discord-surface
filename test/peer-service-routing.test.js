@@ -43,6 +43,52 @@ test('peer result preserves current and rejects stale legacy parent destinations
   assert.equal(stale.status, 'stale');
 });
 
+test('peer-qualified reply uses a ready parent when no child is enrolled', async t => {
+  const f = fixture(t); const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'parent-only-peer-reply-request', kind: 'request',
+    source: { guildId: target.guildId, channelId: '201', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: { guildId: caller.guildId, channelId: caller.channelId, provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, text: 'parent-only request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+    content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation,
+    state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'parent-only-peer-reply-discord', '100', caller.channelId, caller.channelId, '901',
+    encodeAgentMessage(request, 'fixture'), '[]', caller.provider, caller.nativeId, caller.workspace,
+    caller.endpoint, caller.conductorId, caller.repoKey, caller.generation, MESSAGE_STATES.ACCEPTED,
+    timestamp, timestamp);
+  f.state.receipt('parent-only-peer-reply-discord', 'agent-message', { packet: request, authorId: '901' });
+  f.state.receipt('parent-only-peer-reply-discord', 'accepted', {
+    channelId: caller.channelId, generation: caller.generation, readiness: 'ready'
+  });
+  assert.equal(f.state.claimDispatch('parent-only-peer-reply-discord').claimed, true);
+
+  let posts = 0;
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    posts += 1;
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: 'parent-only-peer-reply-result' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: request.id,
+    text: 'result', dedupe_key: 'parent-only-peer-reply-result' });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
+  assert.ok(postUrl.endsWith('/channels/201/messages'));
+  const attempts = f.state.directPostRows('parent-only-peer-reply-result')
+    .filter(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].detail.agentPacket.kind, 'result');
+  assert.equal(attempts[0].detail.agentPacket.replyTo, request.id);
+});
+
 test('peer result resolves a frozen local child before sibling selection', async t => {
   const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
   const binding = f.state.getBinding('101');
