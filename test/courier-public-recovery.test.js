@@ -98,7 +98,8 @@ test('eligible recovery retires the attempt and leaves every unrelated row byte-
     attemptId: claim.attempt.attemptId,
     route: { routeId: f.route.routeId, routeGeneration: 1 },
     generation: f.binding.generation,
-    source: 'courier-recovery'
+    source: 'courier-recovery',
+    trigger: 'explicit'
   });
 
   assert.deepEqual(f.state.getCourierDeliveryStatus(f.messageId), [{

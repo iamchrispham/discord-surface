@@ -6,6 +6,7 @@ import type {
   COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
   COURIER_RECOVERY_REASONS,
+  COURIER_RECOVERY_TRIGGERS,
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS,
@@ -94,6 +95,7 @@ export interface CourierDispatchInput {
 
 export interface CourierEnvelope {
   type: typeof ENVELOPE_TYPE;
+  predecessorAttemptId?: string;
   attemptId: string;
   messageId: string;
   route: { routeId: string; routeGeneration: number };
@@ -118,6 +120,8 @@ export interface CourierEnvelope {
 
 export interface CourierAttempt {
   attemptId: string;
+  predecessorAttemptId?: string;
+  inputPrompt?: string;
   attemptKey: string;
   state: typeof COURIER_ATTEMPT_STATES[keyof typeof COURIER_ATTEMPT_STATES];
   messageId: string;
@@ -143,6 +147,7 @@ export type CourierResultStatus = typeof COURIER_RESULT_STATUSES[keyof typeof CO
 export type CourierRouteState = typeof COURIER_ROUTE_STATES[keyof typeof COURIER_ROUTE_STATES];
 export type CourierDeliveryStatus = typeof COURIER_DELIVERY_STATUSES[keyof typeof COURIER_DELIVERY_STATUSES];
 export type CourierRecoveryReason = typeof COURIER_RECOVERY_REASONS[keyof typeof COURIER_RECOVERY_REASONS];
+export type CourierRecoveryTrigger = typeof COURIER_RECOVERY_TRIGGERS[keyof typeof COURIER_RECOVERY_TRIGGERS];
 
 // Issue128 public projection result. `retired` means only "this attempt can no
 // longer gain forwarding permission"; it is never a native-completion claim.
@@ -192,6 +197,7 @@ export interface CourierState {
   getBinding(channelId: string): any;
   getThreadEnrollment(threadId: string): any;
   getMessage(messageId: string): CourierMessage | null;
+  hasNativeAcknowledgment(message: CourierMessage): boolean;
   getMessageRoute(deliveryChannelId: string): any;
   currentMessageBinding(message: CourierMessage): any;
   getWatcherNoticeArm?(armKey: string): any;

@@ -3,7 +3,8 @@ import {
   COURIER_OUTCOMES,
   COURIER_RECEIPT_KINDS,
   COURIER_RECOVERY_REASONS,
-  COURIER_RECOVERY_SOURCES
+  COURIER_RECOVERY_SOURCES,
+  COURIER_RECOVERY_TRIGGERS
 } from './constants';
 import { hasCourierForwardClaim, hasRetiredCourierAttempt } from './forward';
 import { isConfirmedCourierGuardRefusal } from './guard-refusal';
@@ -15,6 +16,7 @@ import type {
   CourierMessage,
   CourierRecoveryReason,
   CourierRecoveryResult,
+  CourierRecoveryTrigger,
   CourierState,
   SqlRow
 } from './types';
@@ -59,7 +61,7 @@ function attemptIds(state: RecoveryState, messageId: string): string[] {
 // `uncertain-reconciled-not_submitted` receipt (no source/attemptId) still fences
 // late forwarding through hasRetiredCourierAttempt, but it is not an idempotent
 // public recovery result.
-function retiredByRecovery(state: RecoveryState, messageId: string, attemptReceiptId: number, attemptId: string): boolean {
+function retiredByRecovery(state: RecoveryState, messageId: string, attemptReceiptId: number, attemptId: string, trigger: CourierRecoveryTrigger | null = null): boolean {
   if (!Number.isSafeInteger(attemptReceiptId) || !hasRetiredCourierAttempt(state, messageId, attemptReceiptId)) return false;
   const rows = state.db.prepare('SELECT detail FROM receipts WHERE kind=? AND discord_id=? AND id>? ORDER BY id')
     .all(COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, messageId, attemptReceiptId);
@@ -67,8 +69,21 @@ function retiredByRecovery(state: RecoveryState, messageId: string, attemptRecei
     const detail = receiptDetail(row);
     return Boolean(detail &&
       detail.source === COURIER_RECOVERY_SOURCES.COURIER_RECOVERY &&
-      detail.attemptId === attemptId);
+      detail.attemptId === attemptId && (trigger === null || detail.trigger === trigger));
   });
+}
+
+function needsRetryConfirmation(state: RecoveryState, message: CourierMessage, attempt: CourierAttemptRecord): boolean {
+  return Boolean(message.watcherNotice &&
+    !retiredByRecovery(state, message.id, Number(attempt.attempt.receiptId), attempt.attempt.attemptId, COURIER_RECOVERY_TRIGGERS.EXPLICIT));
+}
+
+const PRE_SUBMISSION_ABORT_REASON = 'courier dispatch stopped before queue submission';
+
+function interruptedSignedSuccessor(message: CourierMessage, attempt: CourierAttemptRecord): boolean {
+  return Boolean(message.watcherNotice && attempt.attempt.predecessorAttemptId &&
+    attempt.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED &&
+    attempt.outcome.reason === PRE_SUBMISSION_ABORT_REASON);
 }
 
 function parentIdentityMatches(message: CourierMessage, attempt: CourierAttemptRecord): boolean {
@@ -111,7 +126,9 @@ function recoveryReason(
     message.state === deps.MESSAGE_STATES.SUBMITTED;
   const guardRefusedCustody = message.state === deps.MESSAGE_STATES.ACCEPTED &&
     isConfirmedCourierGuardRefusal(attempt.outcome);
-  if (!submittedCustody && !guardRefusedCustody) return COURIER_RECOVERY_REASONS.NOT_SUBMITTED;
+  const interruptedSuccessorCustody = message.state === deps.MESSAGE_STATES.ACCEPTED &&
+    interruptedSignedSuccessor(message, attempt);
+  if (!submittedCustody && !guardRefusedCustody && !interruptedSuccessorCustody) return COURIER_RECOVERY_REASONS.NOT_SUBMITTED;
   return COURIER_RECOVERY_REASONS.ELIGIBLE;
 }
 
@@ -149,10 +166,12 @@ export function recoverCourierAttempt(
   deps: CourierDependencies,
   state: RecoveryState,
   messageId: string,
-  attemptId: string
+  attemptId: string,
+  trigger: CourierRecoveryTrigger = COURIER_RECOVERY_TRIGGERS.EXPLICIT
 ): CourierRecoveryResult {
   deps.assertText(messageId, 'messageId', 128);
   deps.assertText(attemptId, 'attemptId', 128);
+  if (!Object.values(COURIER_RECOVERY_TRIGGERS).includes(trigger)) throw new deps.BindingError('invalid courier recovery trigger');
   return state.transaction(() => {
     const message = state.getMessage(messageId);
     if (!message) throw new deps.BindingError(refusal(COURIER_RECOVERY_REASONS.UNKNOWN_MESSAGE));
@@ -165,6 +184,17 @@ export function recoverCourierAttempt(
     // repeat of the same retirement stays retired even after later native
     // acknowledgment. It never retires a newer attempt.
     if (reason === COURIER_RECOVERY_REASONS.RETIRED) {
+      const confirmRetry = trigger === COURIER_RECOVERY_TRIGGERS.EXPLICIT && latest && needsRetryConfirmation(state, message, latest);
+      if (confirmRetry) {
+        if (state.hasNativeAcknowledgment(message)) throw new deps.BindingError(refusal(COURIER_RECOVERY_REASONS.NATIVE_ACKNOWLEDGED));
+        if (hasCourierForwardClaim(state, messageId)) throw new deps.BindingError(refusal(COURIER_RECOVERY_REASONS.FORWARD_CLAIMED));
+        if (message.state !== deps.MESSAGE_STATES.ACCEPTED) throw new deps.BindingError(refusal(COURIER_RECOVERY_REASONS.NOT_SUBMITTED));
+        state.receipt(messageId, COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {
+          attemptId, source: COURIER_RECOVERY_SOURCES.COURIER_RECOVERY, trigger,
+          route: latest.attempt.route, generation: message.generation
+        });
+        return { message: state.getMessage(messageId), attemptId, retired: true, duplicate: false };
+      }
       return { message: state.getMessage(messageId), attemptId, retired: true, duplicate: true };
     }
     if (reason !== COURIER_RECOVERY_REASONS.ELIGIBLE || !latest) {
@@ -179,7 +209,8 @@ export function recoverCourierAttempt(
         routeGeneration: latest.attempt.route.routeGeneration
       },
       generation: message.generation,
-      source: COURIER_RECOVERY_SOURCES.COURIER_RECOVERY
+      source: COURIER_RECOVERY_SOURCES.COURIER_RECOVERY,
+      trigger
     });
     return { message: state.getMessage(messageId), attemptId, retired: true, duplicate: false };
   });
@@ -199,12 +230,14 @@ export function getCourierDeliveryStatus(
     const attempt = state.getCourierAttempt(messageId, id);
     if (!attempt || attempt.attempt.attemptId !== id) continue;
     const reason = recoveryReason(deps, state, message, attempt, latest?.attempt.attemptId ?? null);
+    const confirmation = reason === COURIER_RECOVERY_REASONS.RETIRED && needsRetryConfirmation(state, message, attempt) &&
+      message.state === deps.MESSAGE_STATES.ACCEPTED && !state.hasNativeAcknowledgment(message) && !hasCourierForwardClaim(state, messageId);
     rows.push({
       messageId,
       attemptId: id,
       status: projectedStatus(deps, state, message, attempt, latest?.attempt.attemptId ?? null),
-      recoveryEligible: reason === COURIER_RECOVERY_REASONS.ELIGIBLE,
-      recoveryReason: reason
+      recoveryEligible: reason === COURIER_RECOVERY_REASONS.ELIGIBLE || confirmation,
+      recoveryReason: confirmation ? COURIER_RECOVERY_REASONS.RETRY_CONFIRMATION_REQUIRED : reason
     });
   }
   return rows;

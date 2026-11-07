@@ -1,4 +1,5 @@
 'use strict';
+const { PUBLICATION_OWNER_FILES, PUBLICATION_OWNER_FILE_LIST, PUBLICATION_DEFINITION_OWNERS, PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST, APPEND_EVENT_CALL_COUNT } = require('../town-hall-publication-scenarios-source-inventory.cjs');
 
 function register({ test, assert, fs, os, path, SurfaceState, BindingError, StateCorruptError, discordNonce, TOWN_HALL_PUBLICATION_RECEIPTS, createTownHallPublicationHandlers, planTownHallRoomParts, INSTRUCTION_PREFIX, PUBLICATION_PREFIX, INSTRUCTION_PART_PREFIX, PUBLICATION_PART_PREFIX, CORRUPT, INVALID_KEY, MISSING_JOURNAL, INVALID_PART, PROJECT_ROOT, SOURCE_ID, CODEX_ID, SECOND_ID, OWNER, address, input, longInput, fixture, publicationKeyFor, partPublicationKey, partReceiptKind, receiptIds, rowsOf, sortedKeys, assertBindingError, assertCorrupt, publicationHandlers, overrideOwnerAlive, insertRawReceipt, dropExpressionIndexes, restoreExpressionIndexes, insertMessagesRow, partIds, journalPlan, eventDetail, seedSentPart }) {
 function listProductionSourceFiles() {
@@ -81,22 +82,19 @@ test('publication part transitions keep one writer and decoder', () => {
   const ts = require('typescript');
   const records = parseSources(listProductionSourceFiles());
   const { definitions, calls, receiptWrites, constantConsumers } = collectDefinitions(ts, records);
-  const repositoryFile = 'src/state/town-hall-publication/repository.ts';
+  const repositoryFile = PUBLICATION_OWNER_FILES.repository;
+  const journalFile = PUBLICATION_DEFINITION_OWNERS.appendEvent;
   const contextFile = 'src/state/town-hall-publication/context.ts';
-  const projectionFile = 'src/state/town-hall-publication/projection.ts';
-  const ownerFiles = [
-    'src/state/town-hall-publication/index.ts',
-    projectionFile,
-    repositoryFile,
-    'src/state/town-hall-publication/types.ts'
-  ];
+  const projectionFile = PUBLICATION_OWNER_FILES.projection;
+  const ownerFiles = PUBLICATION_OWNER_FILE_LIST;
 
   const ownerDirectory = 'src/state/town-hall-publication/';
   const inOwner = entry => entry.file.startsWith(ownerDirectory);
-  for (const name of ['appendEvent', 'canonicalEvent', 'decodePublication', 'readRows', 'classifyLiveness']) {
+  const definitionOwners = PUBLICATION_DEFINITION_OWNERS;
+  for (const [name, ownerFile] of Object.entries(definitionOwners)) {
     const found = definitions.filter(entry => entry.name === name && inOwner(entry));
     assert.equal(found.length, 1, `expected one ${name} definition under the publication owner, found ${found.map(entry => entry.file).join(', ')}`);
-    assert.equal(found[0].file, repositoryFile, `${name} belongs to repository.ts`);
+    assert.equal(found[0].file, ownerFile, `${name} belongs to ${ownerFile}`);
   }
   const groupEvents = definitions.filter(entry => entry.name === 'groupEvents' && inOwner(entry));
   assert.equal(groupEvents.length, 1, 'expected one groupEvents definition');
@@ -106,13 +104,13 @@ test('publication part transitions keep one writer and decoder', () => {
   }
 
   const appendCalls = calls.filter(entry => entry.name === 'appendEvent');
-  assert.equal(appendCalls.length, 5, `expected five appendEvent calls, found ${appendCalls.length}`);
+  assert.equal(appendCalls.length, APPEND_EVENT_CALL_COUNT, `expected five appendEvent calls, found ${appendCalls.length}`);
   assert.ok(appendCalls.every(entry => entry.file === repositoryFile), 'appendEvent is only called in repository.ts');
 
   const partWrites = receiptWrites.filter(entry => entry.referencesPartKind);
   assert.equal(partWrites.length, 1, 'exactly one publication receipt writer call site');
-  assert.equal(partWrites[0].file, repositoryFile, 'no receipt writes outside repository.ts');
-  assert.equal(receiptWrites.filter(entry => entry.referencesPartKind && entry.file !== repositoryFile).length, 0);
+  assert.equal(partWrites[0].file, journalFile, 'no receipt writes outside journal.ts');
+  assert.equal(receiptWrites.filter(entry => entry.referencesPartKind && entry.file !== journalFile).length, 0);
 
   for (const consumer of constantConsumers) {
     const file = consumer.slice(0, consumer.lastIndexOf(':'));
@@ -121,7 +119,7 @@ test('publication part transitions keep one writer and decoder', () => {
 
   const repositoryRecord = records.find(record => record.file === repositoryFile);
   assert.ok(repositoryRecord);
-  assertReceiptConsumerFiles(constantConsumers, ownerFiles);
+  assertReceiptConsumerFiles(constantConsumers, PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST);
   const unusedImportText = repositoryRecord.text.replace(
     "TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PART_PREFIX + key + ':'",
     "'town-hall-publication-part/v1:' + key + ':'"
@@ -134,7 +132,7 @@ test('publication part transitions keep one writer and decoder', () => {
   };
   const mutantConsumers = collectDefinitions(ts, records.map(record =>
     record.file === repositoryFile ? unusedImportRecord : record)).constantConsumers;
-  assert.throws(() => assertReceiptConsumerFiles(mutantConsumers, ownerFiles), /four real owner consumers/);
+  assert.throws(() => assertReceiptConsumerFiles(mutantConsumers, PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST), /four real owner consumers/);
 
   const entrypoints = ['getTownHallPublication', 'reserveTownHallPublication', 'markTownHallPublicationInFlight',
     'recordTownHallPublicationOutcome', 'recoverTownHallPublication', 'confirmTownHallPublication'];

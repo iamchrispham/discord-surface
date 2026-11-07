@@ -1,4 +1,4 @@
-const { COURIER_OUTCOMES } = require('../state/courier-route');
+const { COURIER_OUTCOMES, COURIER_RECOVERY_TRIGGERS } = require('../state/courier-route');
 const { MESSAGE_STATES } = require('../state');
 
 function createCourierPickupDeadline(state, messageId, signal, timeoutMs = 120000) {
@@ -26,7 +26,7 @@ function createCourierPickupDeadline(state, messageId, signal, timeoutMs = 12000
       timer = null;
       if (!signal?.aborted) {
         try {
-          const recovered = state.recoverCourierAttempt(messageId, record.attempt.attemptId);
+          const recovered = state.recoverCourierAttempt(messageId, record.attempt.attemptId, COURIER_RECOVERY_TRIGGERS.PICKUP_DEADLINE);
           retired = recovered.retired && !recovered.duplicate;
           if (retired) observer.abort();
         } catch {

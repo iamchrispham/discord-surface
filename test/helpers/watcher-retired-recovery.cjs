@@ -103,11 +103,12 @@ function retireByPublicRecovery(f, message, claim) {
 
 // Direct provider mock. Courier dispatch records the envelope; direct dispatch
 // records the message id. Observation honors the signal and settles immediately.
-function scenarioConsumer(f, { courier = [], direct = [] } = {}) {
+function scenarioConsumer(f, { courier = [], direct = [], observeOptions = {} } = {}) {
   return createSurfaceConsumer({
     state: f.state,
     stateDir: f.dir,
     courierRoute: { routeId: f.route.routeId },
+    observeOptions,
     providers: {
       codex: {
         async dispatchCourier(envelope) {

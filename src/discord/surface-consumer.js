@@ -122,6 +122,9 @@ function createSurfaceConsumer(options, { recoveryError, recoveryKind, compareDi
     const input = { routeId: selected.routeId, prompt, observerCursor };
     const claimed = state.beginCourierAttempt(message.id, input);
     if (!claimed.accepted) {
+      if (claimed.attempt && state.hasRetiredCourierAttempt(message.id, claimed.attempt.receiptId)) {
+        return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: courierDispatchError(claimed.status) };
+      }
       const previousOutcome = claimed.outcome?.outcome;
       if (previousOutcome) {
         const current = state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
@@ -200,7 +203,7 @@ function createSurfaceConsumer(options, { recoveryError, recoveryKind, compareDi
     const courierAttempt = state.getCourierAttempt?.(durable.id);
     const retiredCourierAttempt = Boolean(courierAttempt &&
       state.hasRetiredCourierAttempt?.(durable.id, courierAttempt.attempt.receiptId));
-    const selected = !retiredCourierAttempt && selectedCourierRoute(durable)
+    const selected = (!retiredCourierAttempt || isCodexWatcherNotice(durable)) && selectedCourierRoute(durable)
       ? { routeId: courierRoute.routeId }
       : null;
     let dispatchOverride = null;

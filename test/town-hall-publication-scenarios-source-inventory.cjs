@@ -10,18 +10,26 @@ const PUBLICATION_OWNER_FILES = Object.freeze({
   index: `${PUBLICATION_OWNER_PREFIX}index.ts`,
   projection: `${PUBLICATION_OWNER_PREFIX}projection.ts`,
   repository: `${PUBLICATION_OWNER_PREFIX}repository.ts`,
+  journal: `${PUBLICATION_OWNER_PREFIX}journal.ts`,
   types: `${PUBLICATION_OWNER_PREFIX}types.ts`
 });
+const PUBLICATION_DEFINITION_OWNERS = Object.freeze({ appendEvent: PUBLICATION_OWNER_FILES.journal, canonicalEvent: PUBLICATION_OWNER_FILES.journal, decodePublication: PUBLICATION_OWNER_FILES.journal, readRows: PUBLICATION_OWNER_FILES.journal, classifyLiveness: PUBLICATION_OWNER_FILES.repository, groupEvents: PUBLICATION_OWNER_FILES.projection });
 const PUBLICATION_OWNER_FILE_LIST = Object.freeze([
   PUBLICATION_OWNER_FILES.repository,
+  PUBLICATION_OWNER_FILES.journal,
   PUBLICATION_OWNER_FILES.projection,
   PUBLICATION_OWNER_FILES.types,
   PUBLICATION_OWNER_FILES.index
 ]);
 // Derivation of these two allowlists is the census in F-001: the publication
 // receipt prefix/constants and the event vocabulary are consumed only by the
-// four owner files. Any new consumer (for example an alternate writer) fails.
-const PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST = PUBLICATION_OWNER_FILE_LIST;
+// five owner files. Any new consumer (for example an alternate writer) fails.
+const PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST = Object.freeze([
+  PUBLICATION_OWNER_FILES.repository,
+  PUBLICATION_OWNER_FILES.projection,
+  PUBLICATION_OWNER_FILES.types,
+  PUBLICATION_OWNER_FILES.index
+]);
 const PUBLICATION_EVENT_CONSUMER_ALLOWLIST = PUBLICATION_OWNER_FILE_LIST;
 const FINITE_PUBLICATION_VALUES = Object.freeze([
   'planned', 'claimed', 'in_flight', 'sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale'
@@ -229,8 +237,8 @@ function analyzePublicationOwnership(records) {
   const appendDefinitions = definitionsNamed('appendEvent');
   if (appendDefinitions.length !== 1) {
     failures.push(`expected exactly one appendEvent definition, found ${appendDefinitions.length}: ${appendDefinitions.map(d => d.file).join(', ') || 'none'}`);
-  } else if (appendDefinitions[0].file !== PUBLICATION_OWNER_FILES.repository) {
-    failures.push(`appendEvent must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${appendDefinitions[0].file}`);
+  } else if (appendDefinitions[0].file !== PUBLICATION_DEFINITION_OWNERS.appendEvent) {
+    failures.push(`appendEvent must be defined in ${PUBLICATION_DEFINITION_OWNERS.appendEvent}, found ${appendDefinitions[0].file}`);
   }
   const appendCalls = callsNamed('appendEvent');
   if (appendCalls.length !== APPEND_EVENT_CALL_COUNT) {
@@ -246,8 +254,8 @@ function analyzePublicationOwnership(records) {
   const decodeDefinitions = definitionsNamed('decodePublication');
   if (decodeDefinitions.length !== 1) {
     failures.push(`expected exactly one decodePublication definition, found ${decodeDefinitions.length}: ${decodeDefinitions.map(d => d.file).join(', ') || 'none'}`);
-  } else if (decodeDefinitions[0].file !== PUBLICATION_OWNER_FILES.repository) {
-    failures.push(`decodePublication must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${decodeDefinitions[0].file}`);
+  } else if (decodeDefinitions[0].file !== PUBLICATION_DEFINITION_OWNERS.decodePublication) {
+    failures.push(`decodePublication must be defined in ${PUBLICATION_DEFINITION_OWNERS.decodePublication}, found ${decodeDefinitions[0].file}`);
   }
 
   // 3. the publication read path readRows -> canonicalEvent lives only with the
@@ -260,8 +268,8 @@ function analyzePublicationOwnership(records) {
       failures.push(`expected exactly one ${name} definition under the publication owner, found ${named.length}: ${named.map(d => d.file).join(', ') || 'none'}`);
       continue;
     }
-    if (named[0].file !== PUBLICATION_OWNER_FILES.repository) {
-      failures.push(`${name} must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${named[0].file}`);
+    if (named[0].file !== PUBLICATION_DEFINITION_OWNERS[name]) {
+      failures.push(`${name} must be defined in ${PUBLICATION_DEFINITION_OWNERS[name]}, found ${named[0].file}`);
     }
   }
   const canonicalOutsideOwner = definitions
@@ -278,7 +286,7 @@ function analyzePublicationOwnership(records) {
       failures.push(`duplicated publication read path readRows -> canonicalEvent outside the owner at ${entry.file}`);
     }
   }
-  if (!calls.some(call => call.file === PUBLICATION_OWNER_FILES.repository && call.name === 'canonicalEvent')) {
+  if (!calls.some(call => call.file === PUBLICATION_DEFINITION_OWNERS.canonicalEvent && call.name === 'canonicalEvent')) {
     failures.push('canonicalEvent must be reached from the publication read path');
   }
 
@@ -308,7 +316,7 @@ function analyzePublicationOwnership(records) {
     failures.push(`publication receipt constants may only be consumed by the four owner files: ${failure}`);
   }
   for (const failure of eventConsumerFailures) {
-    failures.push(`publication event vocabulary may only be consumed by the four owner files: ${failure}`);
+    failures.push(`publication event vocabulary may only be consumed by the five owner files: ${failure}`);
   }
   const receiptConsumers = records
     .filter(record => {
@@ -331,7 +339,7 @@ function analyzePublicationOwnership(records) {
     .sort();
   try {
     assert.deepEqual(eventConsumers, [...PUBLICATION_EVENT_CONSUMER_ALLOWLIST].sort(),
-      'publication event vocabulary may only be consumed by the four owner files');
+      'publication event vocabulary may only be consumed by the five owner files');
   } catch (error) {
     failures.push(error.message);
   }
@@ -399,4 +407,4 @@ function analyzePublicationOwnership(records) {
   return failures;
 }
 
-module.exports = { publicationSourceRoot, listProductionSourceFiles, parseProductionSources, walkAst, foldStringExpression, collectConsumerEvidence, analyzePublicationOwnership, PUBLICATION_OWNER_PREFIX, PUBLICATION_OWNER_FILES, PUBLICATION_OWNER_FILE_LIST, PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST, PUBLICATION_EVENT_CONSUMER_ALLOWLIST, FINITE_PUBLICATION_VALUES, PUBLICATION_EVENT_VOCABULARY, PUBLICATION_PREFIX_LITERALS, APPEND_EVENT_CALL_COUNT, RETRYABLE_OUTCOME_REFS, BLOCKED_RESERVE_STATUS_REFS };
+module.exports = { PUBLICATION_DEFINITION_OWNERS, publicationSourceRoot, listProductionSourceFiles, parseProductionSources, walkAst, foldStringExpression, collectConsumerEvidence, analyzePublicationOwnership, PUBLICATION_OWNER_PREFIX, PUBLICATION_OWNER_FILES, PUBLICATION_OWNER_FILE_LIST, PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST, PUBLICATION_EVENT_CONSUMER_ALLOWLIST, FINITE_PUBLICATION_VALUES, PUBLICATION_EVENT_VOCABULARY, PUBLICATION_PREFIX_LITERALS, APPEND_EVENT_CALL_COUNT, RETRYABLE_OUTCOME_REFS, BLOCKED_RESERVE_STATUS_REFS };

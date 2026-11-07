@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_ROUTE_STATES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
+import { courierPredecessorRouteMatches, retiredCourierPredecessor } from './retirement';
 import { findMatchingRoute, getRoute } from './route';
 import type {
   CourierAttemptRecord,
@@ -108,11 +109,23 @@ export function validatePersistedForwardEligibility(
     throw new deps.BindingError('courier queue submission was refused');
   }
 
-  const dispatch = { routeId, prompt, observerCursor: current.attempt.observerCursor };
+  const predecessorAttemptId = current.attempt.predecessorAttemptId || null;
+  if (predecessorAttemptId && (!message.watcherNotice ||
+      retiredCourierPredecessor(deps, state, messageId, attemptReceiptId) !== predecessorAttemptId ||
+      !courierPredecessorRouteMatches(deps, state, messageId, predecessorAttemptId, route, attemptReceiptId) ||
+      hasCourierForwardClaim(state, messageId))) {
+    throw new deps.BindingError('courier successor is not eligible for forwarding');
+  }
+  const dispatch = {
+    routeId,
+    prompt: predecessorAttemptId ? current.attempt.inputPrompt as string : prompt,
+    observerCursor: current.attempt.observerCursor
+  };
   const hash = payloadHash(message, dispatch);
-  const key = attemptKey(message, route, hash);
-  const envelope = createEnvelope(message, route, id, hash, dispatch);
+  const key = attemptKey(message, route, hash, predecessorAttemptId);
+  const envelope = createEnvelope(message, route, id, hash, dispatch, predecessorAttemptId);
   if (id !== attemptId(key) || key !== current.attempt.attemptKey || hash !== current.attempt.payloadHash ||
+      prompt !== envelope.prompt ||
       JSON.stringify(envelope) !== JSON.stringify(current.attempt.envelope)) {
     throw new deps.BindingError('courier attempt changed after admission');
   }

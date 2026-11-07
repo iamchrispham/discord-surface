@@ -58,6 +58,7 @@ const COMMAND_FLAGS = Object.freeze({
   unbind: ['channel-id'],
   status: [],
   mcp: ['provider'],
+  'peer-result': ['provider', 'correlation-id'],
   recover: RECOVER_FLAGS.restart,
   'board-refresh': ['channel-id', 'dedupe-key', 'generation', 'message-id', 'native-id', 'request-id', 'text-file'],
   provision: ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],

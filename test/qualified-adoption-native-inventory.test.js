@@ -124,8 +124,9 @@ const EXPECTED_CREATORS = [
   'src/state.js|bindOrdinary|this|_bindOrdinary',
   'src/state.js|bindOrdinaryClaude|this|_bindOrdinaryClaude',
   'src/state.js|_bindOrdinary|ordinaryBindingHandlers|bindOrdinary',
-  'src/state.js|_bindOrdinaryClaude|this|bind',
+  'src/state.js|_bindOrdinaryClaude|ordinaryClaudeBindingHandlers|bindOrdinaryClaude',
   'src/state.js|enrollThread|threadEnrollmentHandlers|enrollThread',
+  'src/state/ordinary-binding-claude.ts|bindOrdinaryClaude|state|bind',
   'src/state/ordinary-binding.ts|bindOrdinary|state|bind'
 ];
 
@@ -278,7 +279,7 @@ test('adoption owner inventory rejects an added private creator or history reade
   const real = scanInventory(entries);
   assert.deepEqual(real.unclassifiedBinds, [], 'an unrecognized bind() receiver is a failure');
   assert.deepEqual(real.creators, EXPECTED_CREATORS.slice().sort(),
-    'creator multiset must match exactly the thirteen production tuples');
+    'creator multiset must match exactly the fourteen production tuples');
   assert.deepEqual(real.messagesFetch, EXPECTED_MESSAGES_FETCH.slice().sort(),
     'direct messages.fetch multiset must match exactly the seven accepted entries');
   assert.deepEqual(real.fetchHistory, EXPECTED_FETCH_HISTORY.slice().sort(),

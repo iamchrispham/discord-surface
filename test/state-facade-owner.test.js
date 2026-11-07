@@ -27,6 +27,18 @@ test('accepts the unchanged persistence facade baseline', () => {
   assert.equal(matches(source), true);
 });
 
+for (const [name, parameters] of [
+  ['_bindOrdinaryClaude', 'binding, identity, adoptionCutoff = null, options = {}'],
+  ['_rebindOrdinaryClaude', 'binding, identity, intakeCutoff = null, options = {}']
+]) {
+  test(`rejects changed defaults on retained ${name} forwarding`, () => {
+    const original = `${name}(${parameters})`;
+    const changed = source.replace(original, `${name}(${parameters.replace('options = {}', 'options = null')})`);
+    assert.notEqual(changed, source);
+    assert.equal(matchesWithCandidateBaseline(changed), false);
+  });
+}
+
 test('rejects a static modifier on a retained non-forwarding facade method', () => {
   const parsed = parseJavaScript(source);
   const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
