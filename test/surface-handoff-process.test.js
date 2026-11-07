@@ -239,7 +239,7 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
   }
 });
 
-test('simulated: handoff gate survives parent termination until its child exits', async () => {
+for (const contenderDelayMs of [0, 300]) test(`simulated: handoff gate survives parent termination until its child exits (${contenderDelayMs} ms contender startup)`, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-pickup-gate-'));
   const lockDir = path.join(dir, 'lock');
   const sessionRoot = path.join(dir, 'sessions');
@@ -309,10 +309,23 @@ while (!fs.existsSync(process.env.DISCORD_SURFACE_GATE_CHILD_RELEASE)) {
 fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_DONE, 'done');
 `, { mode: 0o700 });
   const contenderScript = `
-import fcntl, os, signal, sys
+import errno, fcntl, os, signal, sys, time
 signal.alarm(5)
+time.sleep(int(sys.argv[4]) / 1000)
 fd = os.open(sys.argv[1], os.O_RDONLY)
-fcntl.flock(fd, fcntl.LOCK_EX)
+blocked = False
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    if error.errno != errno.EWOULDBLOCK:
+        raise
+    blocked = True
+temporary = sys.argv[3] + '.tmp'
+with open(temporary, 'x', encoding='utf-8') as output:
+    output.write('blocked' if blocked else 'acquired')
+os.replace(temporary, sys.argv[3])
+if blocked:
+    fcntl.flock(fd, fcntl.LOCK_EX)
 with open(sys.argv[2], 'w', encoding='utf-8') as output:
     output.write('acquired')
 `;
@@ -365,9 +378,10 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     assert.equal(gateExit.signal, 'SIGTERM');
 
     const acquired = path.join(dir, 'writer-acquired');
-    contender = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-c', contenderScript, lockDir, acquired], { stdio: 'ignore' });
-    await new Promise(resolve => setTimeout(resolve, 150));
-    assert.equal(fs.existsSync(acquired), false);
+    const attempted = path.join(dir, 'writer-attempted');
+    contender = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-c', contenderScript, lockDir, acquired, attempted, String(contenderDelayMs)], { stdio: 'ignore' });
+    await waitForFile(attempted, 2000);
+    assert.equal(fs.readFileSync(attempted, 'utf8'), 'blocked', 'contender must observe the inherited gate lock before child release');
     fs.writeFileSync(childRelease, 'release');
     await waitForFile(childDone, 2000);
     await waitForProcessGone(childPid, 2000);

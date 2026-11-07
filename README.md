@@ -4,7 +4,7 @@ For a new host or OS, start with [the installation handoff](INSTALL.md).
 
 This local adapter keeps Discord transport custody in SQLite and sends accepted messages to an already-owned native Codex task or an explicitly channel-enabled Claude session. It does not start a model executor, resume a history file, change native approval settings, or switch providers.
 
-The runtime needs Node 22.13.0 through Node 22.x for unflagged `node:sqlite`. Run `npm ci` from a clean checkout to install the pinned runtime dependencies locally, then run `npm run build` before starting. The package resolves `discord.js` and the MCP SDK from its local `node_modules`. The running adapter uses emitted JavaScript and does not need the compiler installed. Run `npm run package-smoke` to build, pack, install, and import the artifact in an isolated temporary prefix without starting the adapter.
+The runtime needs Node 22.13.0 through Node 22.x for unflagged `node:sqlite`. Run `npm ci` from a clean checkout to install the pinned runtime dependencies locally, then run `npm run build` before starting. The package resolves `discord.js` and the MCP SDK from its local `node_modules`. The running adapter uses emitted JavaScript and does not need the compiler installed. Run `python3 -I scripts/full-gate/supervisor.py -- npm run package-smoke` to build, pack, install, and import the artifact in an isolated temporary prefix without starting the adapter. Linux full gates require subreaper and pidfd support. macOS full gates require an isolated user-session launchd job, resource-coalition task counters, and process-identity-safe signaling. Both require `NODE_OPTIONS` to be unset. Unsupported hosts return no verdict before test or package work starts.
 
 Use a private state directory and an owner-only dotenv file. The secret file must contain a `DISCORD_TOKEN=` assignment and have mode `0600`.
 
@@ -404,8 +404,35 @@ Cswap owns Claude account rotation. The adapter keeps provider plus native UUID 
 Run the simulated consumer and persistence scenarios with:
 
 ```sh
-npm test
+python3 -I scripts/full-gate/supervisor.py -- npm test
 ```
+
+Full test and package-smoke entries require `APERTURE_GATE_ADMISSION_COMMAND`. `NODE_OPTIONS` must be unset. Linux requires subreaper and pidfd support. macOS requires an isolated user-session launchd job, resource-coalition task counters, and process-identity-safe signaling. Unsupported hosts return no verdict.
+to name the host's supported admission executable with `--full-gate`, `--holder`,
+`--max-wait` and `--ticket`. The gate starts no build, tests or package work
+without admission. Set `APERTURE_GATE_TIME_LEFT_S` to the caller's remaining
+whole-second budget and `APERTURE_GATE_SLOWEST_RUN_S` to its measured execution
+allowance. The defaults are 7200 and 3600 seconds. A shorter outer timeout needs
+shorter values that still cover admission and the full run.
+
+Exit 98 with one `APERTURE-GATE-INDETERMINATE` line means no verdict. The
+`setup` and `queue-missing` reasons require admission setup repair before retry.
+The `cleanup` reason requires the gate's owned process group or scratch directory
+to be inspected and cleaned before retry. `capacity` means reschedule later with
+the same ticket so admission retains the queue arrival. `interrupted`, `stale`
+and `timeout` never establish a pass or a test failure. A raw body exit 98
+without the marker is the command result, not a no-verdict result. Raw build,
+typecheck and test failures retain their command exit. The entry does not retry.
+Detached checkouts, private uncommitted Git copies and source archives are
+supported. Archive source fencing excludes `.git`, `node_modules` and `dist`,
+which contain metadata, dependencies and generated output.
+
+The full test entry requires the complete registered list and rejects test
+selection options in arguments or `NODE_OPTIONS`. Use a separately admitted
+`node --test` command for selected drills. Other Node options remain unchanged.
+The gate records its captured head, target and source digest before work.
+Changes during admission invalidate that premise. After execution, source
+changes invalidate proof, while a fetch that only moves `origin/main` does not.
 
 The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex, Claude, or Spark, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.
 
@@ -744,3 +771,8 @@ It reads local receipts without network requests, delivery retries, acknowledgme
 or completion. Missing state and older schemas are refused without creation or
 migration. Result text remains peer-provided data. A successful inspection
 does not prove native pickup, active-turn steering or MCP adoption.
+
+
+Full test and package gates use the machine's admission command before starting work. Set `APERTURE_GATE_ADMISSION_COMMAND` to that executable. It must support `LABEL --full-gate --holder PID --max-wait SECONDS --ticket KEY`, returning 0 when admitted, 3 without admission and 4 for invalid input. No command is bundled or configured globally.
+
+`APERTURE_GATE_TIME_LEFT_S` bounds preflight, admission, execution, and cleanup together. `APERTURE_GATE_SLOWEST_RUN_S` reserves the measured execution time before calculating the wait. Their defaults are 7200 and 3600 seconds. Configure both to fit a shorter calling timeout. The explicit test list stays in `scripts.test`, and files run serially after build and typecheck. A refused, handled interruption or stale gate starts no further work and exits 98 with a no-verdict line. Unexpected supervisor death keeps the signal exit and the watchdog supplies the no-verdict line. Retry and rescheduling belong to the caller. A raw test failure stays a failure. Linux uses a subreaper and pidfds to drain owned descendants. macOS uses a temporary launchd job and its resource coalition to prove that no job tasks remain. Windows execution needs a supported process supervisor before these full gates can run.

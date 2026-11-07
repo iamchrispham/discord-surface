@@ -57,7 +57,7 @@ def process_start_time(pid):
 def spawn_bounded_child(seconds=CHILD_SECONDS):
     """A self-expiring process whose pid/start can back a live manifest."""
     code = 'import time,sys; time.sleep(float(sys.argv[1]))'
-    return subprocess.Popen([sys.executable, '-c', code, str(seconds)],
+    return subprocess.Popen([sys.executable, '-I', '-c', code, str(seconds)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -548,7 +548,7 @@ def run_gate(cfg):
                WRAPPER_SRC_ENV: SRC}
         if cfg.get('preCarryEnv') is not None:
             env[CARRY_ENV] = cfg['preCarryEnv']
-        result = subprocess.run([sys.executable, wrapper], capture_output=True, text=True,
+        result = subprocess.run([sys.executable, '-I', wrapper], capture_output=True, text=True,
                                 timeout=30, env=env, cwd=root)
         marker_data = None
         if os.path.exists(marker):

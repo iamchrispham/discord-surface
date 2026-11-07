@@ -269,7 +269,8 @@ test('simulated: installed lockf creates, excludes, releases, and retains the lo
   try {
     await waitForFile(heldMarker);
     const contender = lockfRun(lockPath, write(contenderMarker));
-    assert.notEqual(contender.status, 0);
+    assert.equal(contender.error, undefined, contender.error?.message);
+    assert.equal(contender.status, 75, contender.stderr);
     assert.equal(fs.existsSync(contenderMarker), false);
     const holderResult = await waitForChild(holder);
     assert.equal(holderResult.code, 0);
