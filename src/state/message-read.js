@@ -1,3 +1,6 @@
+const { AGENT_PRESENTATIONS } = require('../../dist/agent-presentation');
+const { AGENT_ROUTING_VERSION } = require('./agent-routing');
+
 function createMessageReadHandlers({
   parseJson,
   deserializeReplyContext,
@@ -97,6 +100,10 @@ getMessage(messageId) {
       if (agent) {
         message.agentMessage = agent.packet;
         message.agentRoute = legacyAgentRequestRoute.frozenRoute(this, message);
+        if (agent.packet?.kind === 'request' && agent.routingVersion === AGENT_ROUTING_VERSION &&
+            agent.agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT) {
+          message.agentPresentation = agent.agentPresentation;
+        }
       }
       const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;
       if (notice) {
