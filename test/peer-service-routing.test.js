@@ -46,6 +46,9 @@ test('peer result preserves current and rejects stale legacy parent destinations
 test('peer-qualified reply uses a ready parent when no child is enrolled', async t => {
   const f = fixture(t); const target = addRecipient(f);
   const caller = f.state.getBinding('101');
+  f.enroll('102');
+  f.state.deactivateThreadEnrollments(target.channelId, target);
+  assert.equal(f.state.listThreadEnrollments(target.channelId).filter(enrollment => enrollment.active).length, 0);
   const request = {
     id: 'parent-only-peer-reply-request', kind: 'request',
     source: { guildId: target.guildId, channelId: '201', provider: target.provider,
@@ -87,6 +90,7 @@ test('peer-qualified reply uses a ready parent when no child is enrolled', async
   assert.equal(attempts.length, 1);
   assert.equal(attempts[0].detail.agentPacket.kind, 'result');
   assert.equal(attempts[0].detail.agentPacket.replyTo, request.id);
+  assert.deepEqual(attempts[0].detail.agentPacket.target, request.source);
 });
 
 test('peer result resolves a frozen local child before sibling selection', async t => {
