@@ -30,6 +30,7 @@ import {
   decisionCompatibilityHeld,
   journal,
   findPresentation,
+  isInvalidCompatibilityClick,
   mutableClickOutput,
   mutablePresentationOutput,
   nativeOutcome,
@@ -118,7 +119,11 @@ function admitClickInTransaction(
   input: NormalizedClickInput,
   beginCallback: boolean
 ): DecisionClickAdmission {
-  const existing = clickFor(state, input.interactionId);
+  const replay = snapshot(state);
+  const existing = replay.clicks.get(input.interactionId);
+  if (existing && isInvalidCompatibilityClick(existing)) {
+    return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+  }
   if (existing) {
     if (!sameClickInput(existing, input, input.binding)) {
       return { accepted: false, duplicate: true, reason: DECISION_REASONS.DUPLICATE_INTERACTION_CONFLICT, click: mutableClickOutput(existing) };
@@ -374,7 +379,8 @@ export function createDecisionHandlers(): DecisionHandlers {
     },
 
     recoverCallbackAttemptsAfterRestart(state) {
-      const interrupted = [...snapshot(state).clicks.values()].filter(click => click.callbackAttempted && !click.callbackOutcome);
+      const interrupted = [...snapshot(state).clicks.values()].filter(click =>
+        !isInvalidCompatibilityClick(click) && click.callbackAttempted && !click.callbackOutcome);
       for (const click of interrupted) {
         append(state, DECISION_RECEIPT_KINDS.CALLBACK_OUTCOME, {
           interactionId: click.interactionId,
@@ -488,7 +494,9 @@ export function createDecisionHandlers(): DecisionHandlers {
 
     pendingWork(state) {
       const current = snapshot(state);
-      return [...current.clicks.values()].filter(pending).map(mutableClickOutput);
+      return [...current.clicks.values()]
+        .filter(click => !isInvalidCompatibilityClick(click) && pending(click))
+        .map(mutableClickOutput);
     }
   };
 }

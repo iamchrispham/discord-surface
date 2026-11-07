@@ -12,7 +12,7 @@ const { DiscordGateway } = require('../src/discord');
 const { encodeDecisionCustomId } = require('../src/discord-interaction');
 const { createDecisionConsumer, parseDecisionComponent, renderDecisionProjection } = require('../src/discord/decision');
 const { CANONICAL_OPERATIONS } = require('../src/decision-canonical');
-const { READINESS, SurfaceState } = require('../src/state');
+const { DECISION_REASONS, READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
@@ -726,6 +726,281 @@ test('pre-cut rejection outcomes and interrupted attempts retain their exact reo
   assert.deepEqual(rawJournalSnapshot(f.state), before);
   assertDecisionHistoryReadOnly(f.state, 'h4-sent');
   assertDecisionHistoryReadOnly(f.state, 'h4-rejected');
+});
+
+test('malformed legacy applicationId quarantines only its interaction during replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const affectedId = 'h5-invalid-application-id';
+  const siblingId = 'h5-valid-sibling-application-id';
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, siblingId)).accepted, true);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, affectedId), applicationId: 17, authorizationPending: true
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.ok(!f.state.listDecisionPendingWork().some(click => click.interactionId === affectedId));
+  assertDecisionHistoryReadOnly(f.state, affectedId);
+  const admissionRefusal = { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+  assert.deepEqual(f.state.admitDecisionClick(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('malformed legacy token quarantines only its interaction during replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const affectedId = 'h5-invalid-token';
+  const siblingId = 'h5-valid-sibling-token';
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, siblingId)).accepted, true);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, affectedId), token: 17, authorizationPending: true
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.ok(!f.state.listDecisionPendingWork().some(click => click.interactionId === affectedId));
+  assertDecisionHistoryReadOnly(f.state, affectedId);
+  const admissionRefusal = { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+  assert.deepEqual(f.state.admitDecisionClick(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('malformed legacy authorization outcome quarantines only its interaction during replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const affectedId = 'h5-invalid-authorization';
+  const siblingId = 'h5-valid-sibling-authorization';
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, siblingId)).accepted, true);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, affectedId), authorizationPending: true
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: affectedId, outcome: 'invalid-synthetic'
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.ok(!f.state.listDecisionPendingWork().some(click => click.interactionId === affectedId));
+  assertDecisionHistoryReadOnly(f.state, affectedId);
+  const admissionRefusal = { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+  assert.deepEqual(f.state.admitDecisionClick(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('malformed legacy rejection outcome quarantines only its interaction during replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const affectedId = 'h5-invalid-rejection';
+  const siblingId = 'h5-valid-sibling-rejection';
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, siblingId)).accepted, true);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, affectedId), authorizationPending: true
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: affectedId, outcome: 'denied'
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.REJECTION_ATTEMPT, { interactionId: affectedId });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.REJECTION_OUTCOME, {
+    interactionId: affectedId, outcome: 'invalid-synthetic'
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.equal(f.state.getDecisionClick(siblingId).interactionId, siblingId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === siblingId));
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.ok(!f.state.listDecisionPendingWork().some(click => click.interactionId === affectedId));
+  assertDecisionHistoryReadOnly(f.state, affectedId);
+  const admissionRefusal = { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+  assert.deepEqual(f.state.admitDecisionClick(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, affectedId)), admissionRefusal);
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('malformed current-format callback outcome remains strict during replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const interactionId = 'h5-current-invalid-callback';
+  assert.equal(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, interactionId)).accepted, true);
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CALLBACK_OUTCOME, {
+    interactionId, outcome: 'invalid-synthetic'
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.throws(() => f.state.getDecisionClick(interactionId), error =>
+    error?.constructor?.name === 'DecisionError' && error.message === 'invalid decision transport outcome');
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('valid marked legacy click remains duplicate-safe during admission', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const writers = createHistoricalDecisionWriters();
+  const interactionId = 'h6-valid-legacy-duplicate';
+  assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, interactionId)).accepted, true);
+  const beforeDuplicate = rawJournalSnapshot(f.state);
+  const duplicate = f.state.admitDecisionClickAndBeginCallback(historicalInput(f, interactionId));
+  assert.equal(duplicate.accepted, false);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.continuing, true);
+  assert.equal(duplicate.click.interactionId, interactionId);
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeDuplicate);
+});
+
+test('orphan outcomes and duplicate click rows stay ignored in ordered replay', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const orphanId = 'h6-orphan-authorization-outcome';
+  const duplicateId = 'h6-duplicate-click';
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: orphanId, outcome: 'invalid-synthetic'
+  });
+  assert.equal(f.state.getDecisionClick(orphanId), null);
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, orphanId), authorizationPending: true
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, duplicateId), authorizationPending: true
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, duplicateId), applicationId: 17, authorizationPending: true
+  });
+  const beforeReads = rawJournalSnapshot(f.state);
+  assert.equal(f.state.getDecisionClick(orphanId).interactionId, orphanId);
+  assert.equal(f.state.getDecisionClick(duplicateId).interactionId, duplicateId);
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === orphanId));
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === duplicateId));
+  assert.deepEqual(rawJournalSnapshot(f.state), beforeReads);
+});
+
+test('quarantined legacy history still reserves canonical and native conflicts', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const affectedId = 'h6-quarantined-proof';
+  const conflictingId = 'h6-conflicting-winner';
+  const nativeDuplicateId = 'h6-native-duplicate';
+  const presentation = f.presentation;
+  const winner = answer => ({
+    qid: presentation.qid,
+    questionGeneration: presentation.questionGeneration,
+    target: presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: `legacy-proof:${answer}`,
+    answer
+  });
+  const rowsFor = interactionId => f.state.db.prepare(
+    'SELECT id, kind, detail FROM receipts ORDER BY id'
+  ).all().filter(row => JSON.parse(row.detail)?.interactionId === interactionId);
+
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CLICK, {
+    ...historicalInput(f, affectedId), authorizationPending: true
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: affectedId, outcome: 'authorized'
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: affectedId, outcome: 'invalid-synthetic'
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CALLBACK_OUTCOME, {
+    interactionId: affectedId, outcome: 'sent'
+  });
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.CANONICAL_IMPORT, {
+    interactionId: affectedId,
+    qid: presentation.qid,
+    questionGeneration: presentation.questionGeneration,
+    target: presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'legacy-proof:approve',
+    answer: 'approve'
+  });
+  const binding = f.state.getBinding('channel');
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.NATIVE_RETURN, {
+    interactionId: affectedId,
+    presentationId: presentation.presentationId,
+    selectedKey: 'approve',
+    questionMessageId: presentation.messageId,
+    qid: presentation.qid,
+    questionGeneration: presentation.questionGeneration,
+    target: presentation.target,
+    canonicalSource: 'current',
+    answer: 'approve',
+    provider: binding.provider,
+    nativeId: binding.nativeId,
+    generation: binding.generation,
+    channelId: binding.channelId,
+    guildId: binding.guildId,
+    workspace: binding.workspace,
+    canonicalReference: 'legacy-proof:approve'
+  });
+  const affectedRows = rowsFor(affectedId);
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.equal(f.state.getDecisionPresentation(presentation.presentationId).clickCount, 1);
+
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, conflictingId)).accepted, true);
+  const conflicting = f.state.importDecisionWinner(conflictingId, winner('different'));
+  assert.equal(conflicting.accepted, false);
+  assert.equal(conflicting.reason, DECISION_REASONS.CANONICAL_RESULT_CONFLICT);
+
+  assert.equal(f.state.admitDecisionClick(historicalInput(f, nativeDuplicateId)).accepted, true);
+  assert.equal(f.state.importDecisionWinner(nativeDuplicateId, winner('approve')).accepted, true);
+  assert.equal(f.state.getDecisionPresentation(presentation.presentationId).clickCount, 3);
+  const queued = f.state.queueDecisionNativeReturn(nativeDuplicateId);
+  assert.equal(queued.accepted, false);
+  assert.equal(queued.duplicate, true);
+  assert.equal(queued.reason, DECISION_REASONS.NATIVE_RETURN_ALREADY_QUEUED);
+  assert.equal(queued.existingInteractionId, affectedId);
+  assert.equal(rowsFor(nativeDuplicateId).some(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_RETURN), false);
+  assert.deepEqual(rowsFor(affectedId), affectedRows);
+});
+
+test('quarantined legacy callback attempts stay unchanged during restart recovery', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const writers = createHistoricalDecisionWriters();
+  const affectedId = 'h7-quarantined-restart';
+  const siblingId = 'h7-healthy-restart';
+  assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, affectedId)).accepted, true);
+  assert.equal(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, siblingId)).accepted, true);
+  historicalAppend(f.state, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
+    interactionId: affectedId, outcome: 'invalid-synthetic'
+  });
+  const rowsFor = interactionId => f.state.db.prepare(
+    'SELECT id, kind, detail FROM receipts ORDER BY id'
+  ).all().filter(row => JSON.parse(row.detail)?.interactionId === interactionId);
+  const affectedRows = rowsFor(affectedId);
+
+  f.state.recoverAfterRestart();
+  assert.equal(f.state.getDecisionClick(affectedId), null);
+  assert.equal(f.state.getDecisionClick(siblingId).callbackOutcome, 'unknown');
+  assert.equal(rowsFor(affectedId).some(row => row.kind === HISTORICAL_DECISION_KINDS.CALLBACK_OUTCOME), false);
+  assert.deepEqual(rowsFor(affectedId), affectedRows);
+  const recoveredSiblingRows = rowsFor(siblingId);
+  assert.equal(recoveredSiblingRows.filter(row => row.kind === HISTORICAL_DECISION_KINDS.CALLBACK_OUTCOME).length, 1);
+
+  f.state.recoverAfterRestart();
+  assert.deepEqual(rowsFor(affectedId), affectedRows);
+  assert.deepEqual(rowsFor(siblingId), recoveredSiblingRows);
 });
 
 test('historical markers hold both real decision replay entrypoints and exact generic interactions', { timeout: 30000 }, async t => {

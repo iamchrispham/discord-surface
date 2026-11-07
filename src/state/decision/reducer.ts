@@ -57,6 +57,11 @@ const READ_COMPATIBILITY_KINDS: ReadonlySet<string> = new Set([
   DECISION_RECEIPT_KINDS.TOKEN_RELEASE
 ]);
 const readCompatibilityClicks = new WeakSet<MutableClick>();
+const invalidCompatibilityClicks = new WeakSet<MutableClick>();
+
+export function isInvalidCompatibilityClick(click: MutableClick): boolean {
+  return invalidCompatibilityClicks.has(click);
+}
 
 function readCompatibilityInteractions(rows: readonly Pick<JournalRow, 'kind' | 'detail'>[]): Set<string> {
   const interactions = new Set<string>();
@@ -368,8 +373,8 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         guildId: text(detail.guildId, 'guildId', 128),
         channelId: text(detail.channelId, 'channelId', 128),
         messageId: text(detail.messageId, 'messageId', 256),
-        applicationId: readCompatibility ? optionalText(detail.applicationId, 'applicationId', 256) : null,
-        token: readCompatibility ? optionalText(detail.token, 'token', 512) : null,
+        applicationId: null,
+        token: null,
         binding: normalizeBinding(detail.binding),
         state: detail.authorizationPending === true ? DECISION_STATES.AUTHORIZATION_PENDING : DECISION_STATES.CLICK_ADMITTED,
         authorizationOutcome: null,
@@ -383,7 +388,21 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         createdAt: row.created_at,
         updatedAt: row.created_at
       };
-      if (readCompatibility) readCompatibilityClicks.add(click);
+      if (readCompatibility) {
+        readCompatibilityClicks.add(click);
+        try {
+          click.applicationId = optionalText(detail.applicationId, 'applicationId', 256);
+        } catch (error) {
+          if (!(error instanceof DecisionError)) throw error;
+          invalidCompatibilityClicks.add(click);
+        }
+        try {
+          click.token = optionalText(detail.token, 'token', 512);
+        } catch (error) {
+          if (!(error instanceof DecisionError)) throw error;
+          invalidCompatibilityClicks.add(click);
+        }
+      }
       clicks.set(interactionId, click);
       presentation.clickIds.push(interactionId);
       if (presentation.state === DECISION_STATES.PRESENTED_UNANSWERED) presentation.state = DECISION_STATES.CLICK_ADMITTED;
@@ -393,7 +412,14 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     const click = interactionId ? clicks.get(interactionId) : undefined;
     if (!click) continue;
     if (row.kind === DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME) {
-      const nextOutcome = authorizationOutcome(detail.outcome);
+      let nextOutcome: DecisionAuthorizationOutcome;
+      try {
+        nextOutcome = authorizationOutcome(detail.outcome);
+      } catch (error) {
+        if (!readCompatibilityClicks.has(click) || !(error instanceof DecisionError)) throw error;
+        invalidCompatibilityClicks.add(click);
+        continue;
+      }
       click.authorizationOutcome = nextOutcome;
       if (nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) click.token = null;
       click.state = nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED
@@ -428,7 +454,15 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.rejectionOutcome = null;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
-      click.rejectionOutcome = outcome(detail.outcome);
+      let nextOutcome: DecisionTransportOutcome;
+      try {
+        nextOutcome = outcome(detail.outcome);
+      } catch (error) {
+        if (!readCompatibilityClicks.has(click) || !(error instanceof DecisionError)) throw error;
+        invalidCompatibilityClicks.add(click);
+        continue;
+      }
+      click.rejectionOutcome = nextOutcome;
       const retryable = REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome) ||
         (click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.SENT);
       if (!retryable) click.token = null;
@@ -521,7 +555,8 @@ export function findPresentation(
 }
 
 export function clickFor(state: DecisionStateStore, interactionId: string): MutableClick | null {
-  return snapshot(state).clicks.get(text(interactionId, 'interactionId', 256)) || null;
+  const click = snapshot(state).clicks.get(text(interactionId, 'interactionId', 256)) || null;
+  return click && !isInvalidCompatibilityClick(click) ? click : null;
 }
 
 export function sameCanonical(left: DecisionCanonicalResult, right: DecisionCanonicalResult): boolean {
