@@ -1,6 +1,6 @@
 'use strict';
 
-const { decisionCompatibilityHeld } = require('../state/decision/reducer');
+const { decisionCompatibilityHeld } = require('../../dist/state/decision/reducer');
 
 function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES }) {
   return {
