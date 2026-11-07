@@ -140,16 +140,19 @@ class SurfaceState {`);
   });
 });
 
-test('preserves registered handler objects passed as factory dependencies', () => {
-  withTempCompanion(`function createBoardRefreshHandlers() { return { refresh(state, value) {} }; }
-function createMessageRecoveryHandlers(dependencies) { return { hidden(state, value) {} }; }
-module.exports = { createBoardRefreshHandlers, createMessageRecoveryHandlers };`, ({ requirePath }) => {
-    const positive = source.replace('class SurfaceState {', `const { createBoardRefreshHandlers, createMessageRecoveryHandlers } = require(${JSON.stringify(requirePath)});
-const boardRefreshHandlers = createBoardRefreshHandlers();
-const messageRecoveryHandlers = createMessageRecoveryHandlers({ boardRefreshHandlers });
-class SurfaceState {`);
-    assert.equal(matchesWithCandidateBaseline(positive), true);
-  });
+test('preserves production handler dependencies by shorthand and explicit reference', () => {
+  assert.equal(matchesWithCandidateBaseline(source), true);
+  const explicit = source.replace(
+    'createMessageRecoveryHandlers({ boardRefreshHandlers,',
+    'createMessageRecoveryHandlers({ boardRefreshHandlers: boardRefreshHandlers,');
+  assert.notEqual(explicit, source);
+  assert.equal(matchesWithCandidateBaseline(explicit), true);
+
+  const reassigned = source.replace(
+    'const boardRefreshHandlers = createBoardRefreshHandlers();',
+    'let boardRefreshHandlers = createBoardRefreshHandlers();\nboardRefreshHandlers = {};');
+  assert.notEqual(reassigned, source);
+  assert.equal(matchesWithCandidateBaseline(reassigned), false);
 });
 
 test('rejects comma expressions in returned factory callees', () => {
@@ -678,16 +681,20 @@ class SurfaceState {`);
 
 test('does not resolve a factory getter through a dead branch return', () => {
   withTempCompanion(`function createInner() { return { hidden(state, value) {} }; }
-module.exports = { get createFakeHandlers() { return createInner; } };`, ({ requirePath, writeCompanion }) => {
+Object.defineProperty(exports, 'createFakeHandlers', {
+  get: function () { return createInner; }
+});`, ({ requirePath, writeCompanion }) => {
     const positive = source.replace('class SurfaceState {', `const { createFakeHandlers } = require(${JSON.stringify(requirePath)});
 const fakeHandlers = createFakeHandlers();
 class SurfaceState {`);
     assert.equal(matchesWithCandidateBaseline(positive), true);
     writeCompanion(`function createInner() { return { hidden(state, value) {} }; }
-module.exports = { get createFakeHandlers() {
+Object.defineProperty(exports, 'createFakeHandlers', {
+  get: function () {
   if (false) return createInner;
   while (true) {}
-} };`);
+  }
+});`);
     assert.equal(matchesWithCandidateBaseline(positive), false);
   });
 });
@@ -704,6 +711,64 @@ class SurfaceState {`);
 function createFakeHandlers() { return { hidden }; const hidden = 0; }
 module.exports = { createFakeHandlers };`);
     assert.equal(matchesWithCandidateBaseline(positive), false);
+  });
+});
+
+test('resolves bare factory calls through their lexical bindings', () => {
+  const companion = `function inner() { return { hidden(state, value) {} }; }
+function createFakeHandlers() { return inner(); }
+module.exports = { createFakeHandlers };`;
+  withTempCompanion(companion, ({ requirePath, writeCompanion }) => {
+    const positive = source.replace('class SurfaceState {', `const { createFakeHandlers } = require(${JSON.stringify(requirePath)});
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(positive), true);
+    writeCompanion(companion.replace(
+      'function createFakeHandlers() { return inner(); }',
+      'function createFakeHandlers() { const inner = () => ({}); return inner(); }'));
+    assert.equal(matchesWithCandidateBaseline(positive), false);
+  });
+});
+
+test('resolves destructured handlers after later object overwrites', () => {
+  const companion = `function createFakeHandlers() {
+  const { hidden } = { hidden: (state, value) => value };
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`;
+  withTempCompanion(companion, ({ requirePath, writeCompanion }) => {
+    const positive = source.replace('class SurfaceState {', `const { createFakeHandlers } = require(${JSON.stringify(requirePath)});
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(positive), true);
+    writeCompanion(companion.replace(
+      '{ hidden: (state, value) => value }',
+      '{ hidden: (state, value) => value, ...{ hidden: 0 } }'));
+    assert.equal(matchesWithCandidateBaseline(positive), false);
+  });
+});
+
+test('rejects writes, deletes, and escapes through required receiver aliases', () => {
+  withTempCompanion(`function createInner() { return { hidden(state, value) {} }; }
+module.exports = { createInner };`, ({ requirePath }) => {
+    const prefix = `const fixtureFactories = require(${JSON.stringify(requirePath)});
+const fixtureFactoryAlias = fixtureFactories;
+const createFakeHandlers = (...args) => fixtureFactoryAlias.createInner(...args);
+const fakeHandlers = createFakeHandlers();
+`;
+    const positive = source.replace('class SurfaceState {', `${prefix}class SurfaceState {`);
+    assert.equal(matchesWithCandidateBaseline(positive), true);
+    for (const mutation of [
+      'fixtureFactoryAlias.createInner = 0;',
+      'delete fixtureFactoryAlias.createInner;',
+      'consume(fixtureFactoryAlias);'
+    ]) {
+      const negative = positive.replace(
+        'const createFakeHandlers =',
+        `function consume(value) {}\n${mutation}\nconst createFakeHandlers =`);
+      assert.notEqual(negative, positive);
+      assert.equal(matchesWithCandidateBaseline(negative), false, mutation);
+    }
   });
 });
 

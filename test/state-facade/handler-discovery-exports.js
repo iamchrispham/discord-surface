@@ -1,58 +1,47 @@
 const ts = require('typescript');
 
 const { bindingIdentifiers, propertyName } = require('./handler-discovery-bindings');
+const { callableDeclarations, declarationForIdentifier, scopedDeclarations } = require('./handler-discovery-lexical');
+const { mutatedDeclarations, stableDeclarationForIdentifier } = require('./handler-discovery-mutation');
 const { reachableReturnExpressions, statementCanFallThrough } = require('./handler-discovery-flow');
 const { isCommonJsRequireCall } = require('./handler-discovery-require');
 
-function factoryParameterReference(factory, identifier, requireRest = false) {
-  if (!factory || !ts.isIdentifier(identifier)) return false;
-  const parameter = (factory.parameters || []).find(candidate =>
-    ts.isIdentifier(candidate.name) && candidate.name.text === identifier.text &&
-    (!requireRest || !!candidate.dotDotDotToken));
-  if (!parameter) return false;
-  let shadowed = false;
-  const visit = node => {
-    if (!node || shadowed) return;
-    if (node !== factory && ts.isFunctionLike(node)) {
-      if (ts.isFunctionDeclaration(node) && node.name?.text === identifier.text) shadowed = true;
-      return;
-    }
-    if (ts.isVariableDeclaration(node) && bindingIdentifiers(node.name).some(binding => binding.text === identifier.text)) {
-      shadowed = true;
-      return;
-    }
-    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
-        node !== factory && node.name?.text === identifier.text) {
-      shadowed = true;
-      return;
-    }
-    if (ts.isCatchClause(node) && node.variableDeclaration &&
-        bindingIdentifiers(node.variableDeclaration.name).some(binding => binding.text === identifier.text)) {
-      shadowed = true;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(factory.body);
-  return !shadowed;
+function factoryArgumentContext(node, context) {
+  const source = node.getSourceFile();
+  const declarations = scopedDeclarations(source, callableDeclarations(source, context.factory || null));
+  const mutated = mutatedDeclarations(source, declarations, source, true);
+  return { ...context, source, declarations, mutated };
 }
 
-function staticFactoryArgument(node, context = {}) {
+function factoryParameterReference(context, identifier) {
+  const { factory, source, declarations, mutated } = context;
+  if (!factory || !ts.isIdentifier(identifier)) return false;
+  const declaration = declarationForIdentifier(declarations, identifier, source);
+  if (!declaration || mutated.has(declaration)) return false;
+  return (factory.parameters || []).some(parameter =>
+    !!parameter.dotDotDotToken && bindingIdentifiers(parameter.name).includes(declaration));
+}
+
+function staticFactoryArgument(node, context) {
   while (ts.isParenthesizedExpression(node)) node = node.expression;
   if (ts.isStringLiteral(node) || ts.isNumericLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
       ts.isBigIntLiteral(node) || node.kind === ts.SyntaxKind.TrueKeyword ||
       node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return true;
-  if (ts.isIdentifier(node)) {
-    return context.allowedIdentifiers?.has(node.text) || factoryParameterReference(context.factory, node);
-  }
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) return true;
+  if (ts.isIdentifier(node)) return !!stableDeclarationForIdentifier(
+    context.source, node, context.factory, context.declarations, context.mutated);
   if (ts.isPrefixUnaryExpression(node) &&
       [ts.SyntaxKind.PlusToken, ts.SyntaxKind.MinusToken].includes(node.operator) &&
       ts.isNumericLiteral(node.operand)) return true;
   if (ts.isArrayLiteralExpression(node)) {
-    return node.elements.every(element => !ts.isSpreadElement(element) && staticFactoryArgument(element, context));
+    return node.elements.every(element => ts.isSpreadElement(element)
+      ? staticFactoryArgument(element.expression, context)
+      : staticFactoryArgument(element, context));
   }
   if (ts.isObjectLiteralExpression(node)) {
     return node.properties.every(property => {
+      if (ts.isSpreadAssignment(property)) return staticFactoryArgument(property.expression, context);
+      if (ts.isShorthandPropertyAssignment(property)) return staticFactoryArgument(property.name, context);
       if (!ts.isPropertyAssignment(property)) return false;
       const name = property.name;
       const staticName = ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name) ||
@@ -67,7 +56,7 @@ function staticFactoryArgument(node, context = {}) {
 
 function staticFactoryCallArgument(node, context) {
   return ts.isSpreadElement(node)
-    ? factoryParameterReference(context.factory, node.expression, true)
+    ? factoryParameterReference(context, node.expression)
     : staticFactoryArgument(node, context);
 }
 
@@ -76,7 +65,10 @@ function calledFactory(expression, requireCall = false, context = {}) {
   while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
   const actualCall = ts.isCallExpression(candidate);
   if (requireCall && !actualCall) return null;
-  if (actualCall && candidate.arguments.some(argument => !staticFactoryCallArgument(argument, context))) return null;
+  if (actualCall) {
+    context = factoryArgumentContext(candidate, context);
+    if (candidate.arguments.some(argument => !staticFactoryCallArgument(argument, context))) return null;
+  }
   let target = actualCall ? candidate.expression : candidate;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) return null;

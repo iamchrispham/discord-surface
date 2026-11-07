@@ -6,6 +6,13 @@ const ts = require('typescript');
 
 const committedBaseline = require('./baseline.json');
 const { INVOCATION_STYLES, discoverFactory, mutatedBindingNames } = require('./handler-discovery');
+const {
+  bindingInitializer,
+  callableDeclarations,
+  declarationForIdentifier,
+  scopedDeclarations
+} = require('./handler-discovery-lexical');
+const { mutatedDeclarations, stableDeclarationForIdentifier } = require('./handler-discovery-mutation');
 
 const REQUIRED_SURFACE_METHOD_NAMES = new Set([
   ...Object.keys(committedBaseline.bodies),
@@ -493,6 +500,41 @@ function exportedPrototypeMutated(source, owner, ownerName) {
   };
   const assignmentStart = ts.SyntaxKind.FirstAssignment;
   const assignmentEnd = ts.SyntaxKind.LastAssignment;
+  const declarations = scopedDeclarations(source, callableDeclarations(source, null));
+  const ownerMutations = mutatedDeclarations(source, declarations, source, true);
+  const carriesOwner = (expression, seen = new Set()) => {
+    if (!expression) return false;
+    while (ts.isParenthesizedExpression(expression)) expression = expression.expression;
+    if (ts.isFunctionLike(expression)) return false;
+    if (ts.isIdentifier(expression)) {
+      const resolved = declarationForIdentifier(declarations, expression, source);
+      if (resolved === owner) return true;
+      if (!resolved || seen.has(resolved)) return false;
+      seen.add(resolved);
+      const stable = stableDeclarationForIdentifier(source, expression, null, declarations, ownerMutations);
+      const initializer = bindingInitializer(stable || resolved);
+      return !!initializer && carriesOwner(initializer, seen);
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      return carriesOwner(expression.expression, seen) ||
+        (ts.isElementAccessExpression(expression) && carriesOwner(expression.argumentExpression, seen));
+    }
+    if (ts.isArrayLiteralExpression(expression)) {
+      return expression.elements.some(element => carriesOwner(
+        ts.isSpreadElement(element) ? element.expression : element, seen));
+    }
+    if (ts.isObjectLiteralExpression(expression)) {
+      return expression.properties.some(property => {
+        if (ts.isShorthandPropertyAssignment(property)) return carriesOwner(property.name, seen);
+        if (ts.isPropertyAssignment(property)) return carriesOwner(property.initializer, seen);
+        return ts.isSpreadAssignment(property) && carriesOwner(property.expression, seen);
+      });
+    }
+    if (ts.isCallExpression(expression)) {
+      return expression.arguments.some(argument => carriesOwner(argument, seen));
+    }
+    return false;
+  };
   let mutated = false;
   const visit = node => {
     if (mutated) return;
@@ -512,8 +554,7 @@ function exportedPrototypeMutated(source, owner, ownerName) {
         return;
       }
       if (ts.isCallExpression(node) && node.arguments.some(argument => {
-        while (ts.isParenthesizedExpression(argument)) argument = argument.expression;
-        return ts.isIdentifier(argument) && argument.text === ownerName;
+        return carriesOwner(argument);
       })) {
         mutated = true;
         return;

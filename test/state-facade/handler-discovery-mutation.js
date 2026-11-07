@@ -2,49 +2,17 @@ const ts = require('typescript');
 
 const {
   bindingIdentifiers,
+  bindingInitializer,
   callableDeclarations,
   declarationScope,
   declarationForIdentifier,
   destructuredBindings,
   isVarDeclaration,
   rootIdentifier,
+  scopedDeclarations,
   targetExpressions,
   unwrapExpression
 } = require('./handler-discovery-lexical');
-
-function scopedDeclarations(source, declarations) {
-  const result = [...declarations];
-  const bindingDeclaration = declaration => {
-    if (!ts.isIdentifier(declaration)) return declaration;
-    let current = declaration.parent;
-    while (current) {
-      if (ts.isVariableDeclaration(current) && bindingIdentifiers(current.name).includes(declaration)) return current;
-      current = current.parent;
-    }
-    return declaration;
-  };
-  const known = new Set(result.map(item => bindingDeclaration(item.declaration)));
-  const add = (name, declaration) => {
-    const binding = bindingDeclaration(declaration);
-    if (!name || known.has(binding)) return;
-    known.add(binding);
-    result.push({ name, declaration, scope: declarationScope(declaration) });
-  };
-  const visit = node => {
-    if (ts.isFunctionLike(node)) {
-      for (const parameter of node.parameters || []) {
-        for (const identifier of bindingIdentifiers(parameter.name)) add(identifier.text, identifier);
-      }
-    }
-    if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
-    if (ts.isVariableDeclaration(node)) {
-      for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
-  return result;
-}
 
 function mutatedDeclarations(factory, declarations, source, includeFunctionBodies = false) {
   const resolvedDeclarations = includeFunctionBodies ? scopedDeclarations(source, declarations) : declarations;
@@ -222,6 +190,25 @@ function mutatedDeclarations(factory, declarations, source, includeFunctionBodie
   return mutated;
 }
 
+function stableDeclarationForIdentifier(source, identifier, factory = null, knownDeclarations = null, knownMutations = null) {
+  const declarations = scopedDeclarations(source, knownDeclarations || callableDeclarations(source, factory));
+  const declaration = declarationForIdentifier(declarations, identifier, source);
+  if (!declaration) return null;
+
+  let variable = declaration;
+  while (variable && !ts.isVariableDeclaration(variable)) variable = variable.parent;
+  if (variable) {
+    const list = variable.parent;
+    if (!ts.isVariableDeclarationList(list) || !(list.flags & ts.NodeFlags.Const) ||
+        !bindingInitializer(declaration)) return null;
+  } else if (!ts.isFunctionDeclaration(declaration) && !ts.isClassDeclaration(declaration)) {
+    return null;
+  }
+
+  const mutated = knownMutations || mutatedDeclarations(source, declarations, source, true);
+  return mutated.has(declaration) ? null : declaration;
+}
+
 function mutatedBindingNames(source, names) {
   const declarations = callableDeclarations(source, null);
   const mutated = mutatedDeclarations(source, declarations, source);
@@ -254,4 +241,4 @@ function factoryDeclaration(source, factoryName) {
   return mutated.has(binding) ? null : candidate;
 }
 
-module.exports = { factoryDeclaration, mutatedBindingNames, mutatedDeclarations };
+module.exports = { factoryDeclaration, mutatedBindingNames, mutatedDeclarations, stableDeclarationForIdentifier };

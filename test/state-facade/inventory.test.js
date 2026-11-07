@@ -160,6 +160,20 @@ test('rejects bare and parenthesized exported constructor escapes', () => {
   }
 });
 
+test('rejects constructor escapes through literal aggregates and aliases', () => {
+  const unrelated = `${source}\nfunction ignore(value) {}\nignore({ target: {} });\nignore([{}]);`;
+  assert.equal(matchesWithCandidateBaseline(unrelated), true);
+  for (const escape of [
+    'remove({ target: SurfaceState });',
+    'remove([SurfaceState]);',
+    'const captured = { target: SurfaceState };\nremove(captured);',
+    'const captured = [SurfaceState];\nremove(captured);'
+  ]) {
+    const text = `${source}\nfunction remove(value) {}\n${escape}`;
+    assert.equal(matchesWithCandidateBaseline(text), false, escape);
+  }
+});
+
 test('keeps protected parameter defaults fixed after body reclassification', () => {
   const text = source.replace(/(_bindOrdinaryClaude\([^)]*\)\s*\{)/, signature =>
     `${signature.replace(/\s*=\s*[^,)]+/g, '')}\n  const retained = true;`);

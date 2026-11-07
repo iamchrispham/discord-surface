@@ -100,13 +100,41 @@ function objectPropertyKey(property) {
 function objectPropertyValue(expression, key) {
   const value = unwrapExpression(expression);
   if (!value || !ts.isObjectLiteralExpression(value)) return value;
+  let selected = null;
+  let unresolved = false;
   for (const property of value.properties) {
-    if (objectPropertyKey(property) !== key) continue;
-    if (ts.isBindingElement(property)) return property.initializer || property.name;
-    if (ts.isShorthandPropertyAssignment(property)) return property.name;
-    if (ts.isPropertyAssignment(property)) return property.initializer;
+    if (ts.isSpreadAssignment(property)) {
+      const spread = unwrapExpression(property.expression);
+      if (!spread || !ts.isObjectLiteralExpression(spread)) {
+        selected = null;
+        unresolved = true;
+        continue;
+      }
+      const spreadValue = objectPropertyValue(spread, key);
+      if (spreadValue === undefined) {
+        selected = null;
+        unresolved = true;
+      } else if (spreadValue !== null) {
+        selected = spreadValue;
+        unresolved = false;
+      }
+      continue;
+    }
+    const propertyKey = objectPropertyKey(property);
+    if (propertyKey === null) {
+      if (property.name && ts.isComputedPropertyName(property.name)) {
+        selected = null;
+        unresolved = true;
+      }
+      continue;
+    }
+    if (propertyKey !== key) continue;
+    if (ts.isBindingElement(property)) selected = property.initializer || property.name;
+    else if (ts.isShorthandPropertyAssignment(property)) selected = property.name;
+    else if (ts.isPropertyAssignment(property)) selected = property.initializer;
+    unresolved = false;
   }
-  return null;
+  return unresolved ? undefined : selected;
 }
 
 function destructuredBindings(pattern, initializer) {
@@ -120,7 +148,7 @@ function destructuredBindings(pattern, initializer) {
       return;
     }
     if (ts.isBindingElement(current)) {
-      const selected = value || current.initializer;
+      const selected = value === undefined ? undefined : value || current.initializer;
       walk(current.name, selected);
       return;
     }
@@ -170,6 +198,10 @@ function callableDeclarations(source, factory) {
       add(node.name?.text, node);
       return;
     }
+    if (ts.isClassDeclaration(node)) {
+      add(node.name?.text, node);
+      return;
+    }
     if (ts.isFunctionLike(node)) return;
     if (ts.isVariableDeclaration(node)) {
       if (ts.isIdentifier(node.name)) add(node.name.text, node);
@@ -190,6 +222,7 @@ function callableDeclarations(source, factory) {
       return;
     }
     if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
+    if (ts.isClassDeclaration(node)) add(node.name?.text, node);
     if (ts.isVariableDeclaration(node)) {
       if (ts.isIdentifier(node.name)) add(node.name.text, node);
       else for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
@@ -198,6 +231,41 @@ function callableDeclarations(source, factory) {
   };
   visitFactory(factory);
   return declarations;
+}
+
+function scopedDeclarations(source, declarations) {
+  const result = [...declarations];
+  const bindingDeclaration = declaration => {
+    if (!ts.isIdentifier(declaration)) return declaration;
+    let current = declaration.parent;
+    while (current) {
+      if (ts.isVariableDeclaration(current) && bindingIdentifiers(current.name).includes(declaration)) return current;
+      current = current.parent;
+    }
+    return declaration;
+  };
+  const known = new Set(result.map(item => bindingDeclaration(item.declaration)));
+  const add = (name, declaration) => {
+    const binding = bindingDeclaration(declaration);
+    if (!name || known.has(binding)) return;
+    known.add(binding);
+    result.push({ name, declaration, scope: declarationScope(declaration) });
+  };
+  const visit = node => {
+    if (ts.isFunctionLike(node)) {
+      for (const parameter of node.parameters || []) {
+        for (const identifier of bindingIdentifiers(parameter.name)) add(identifier.text, identifier);
+      }
+    }
+    if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
+    if (ts.isClassDeclaration(node)) add(node.name?.text, node);
+    if (ts.isVariableDeclaration(node)) {
+      for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return result;
 }
 
 function declarationForIdentifier(declarations, identifier, source) {
@@ -243,6 +311,7 @@ module.exports = {
   objectPropertyKey,
   objectPropertyValue,
   propertyName,
+  scopedDeclarations,
   rootIdentifier,
   isScopeNode,
   scopeNode,

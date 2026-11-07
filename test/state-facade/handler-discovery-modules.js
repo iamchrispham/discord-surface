@@ -12,6 +12,7 @@ const {
   factoryDeclaration,
   requireBindings
 } = require('./handler-discovery-bindings');
+const { mutatedDeclarations, stableDeclarationForIdentifier } = require('./handler-discovery-mutation');
 const {
   calledFactory,
   directRequire,
@@ -60,6 +61,22 @@ function hasFactoryLocalBinding(factory, name) {
   return found;
 }
 
+function localFactoryForTarget(source, factory, target) {
+  const declaration = stableDeclarationForIdentifier(source, target, factory);
+  if (!declaration) return null;
+  if (ts.isFunctionDeclaration(declaration)) return declaration;
+  const initializer = bindingInitializer(declaration);
+  let value = initializer;
+  while (value && ts.isParenthesizedExpression(value)) value = value.expression;
+  return value && ts.isFunctionLike(value) ? value : null;
+}
+
+function requiredBindings(source) {
+  const declarations = callableDeclarations(source, null);
+  const mutated = mutatedDeclarations(source, declarations, source, true);
+  return requireBindings(source, mutated);
+}
+
 function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
   const key = `${filePath}:${methodName}`;
   if (seen.has(key)) return null;
@@ -72,7 +89,7 @@ function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
     const local = exportedName ? factoryDeclaration(source, exportedName) : null;
     if (local) return callableDescriptor(local);
     if (!exported) return null;
-    const bindings = requireBindings(source);
+    const bindings = requiredBindings(source);
     const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
       ? bindings.get(exported.expression.text, exported.expression)
       : null;
@@ -127,7 +144,7 @@ function moduleFactoryAllowed(filePath, factoryName, seen = new Set(), allowDefa
     const text = fs.readFileSync(filePath, 'utf8');
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const exported = exportedFactoryExpression(source, factoryName, allowDefault);
-    const bindings = requireBindings(source);
+    const bindings = requiredBindings(source);
     if (!exported) {
       for (const modulePath of reexportedModulePaths(source)) {
         const importedPath = resolveModulePath(modulePath, filePath);
@@ -164,21 +181,21 @@ function moduleFactoryAllowed(filePath, factoryName, seen = new Set(), allowDefa
   }
 }
 
-function factoryMethodsFromSource(source, sourcePath, factoryName, seen, allowedIdentifiers = new Set()) {
-  const key = `${sourcePath}:${factoryName}`;
+function factoryMethodsFromSource(source, sourcePath, factoryName, seen, allowedIdentifiers = new Set(), factoryOverride = null) {
+  const key = `${sourcePath}:${factoryName}:${factoryOverride ? factoryOverride.getStart(source) : 'exported'}`;
   if (seen.has(key)) return new Map();
   seen.add(key);
-  const factory = factoryDeclaration(source, factoryName);
+  const factory = factoryOverride || factoryDeclaration(source, factoryName);
   if (!factory) return null;
   if (isAsyncFactory(factory)) return null;
   if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return null;
-  const bindings = requireBindings(source);
+  const bindings = requiredBindings(source);
   const resolveExpression = expression => {
     const called = calledFactory(expression, true, { factory, allowedIdentifiers });
     if (!called) return new Map();
-    const localFactory = called.receiver ? null : factoryDeclaration(source, called.name);
+    const localFactory = called.receiver ? null : localFactoryForTarget(source, factory, called.target);
     const local = localFactory
-      ? factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen), allowedIdentifiers)
+      ? factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen), allowedIdentifiers, localFactory)
       : null;
     if (localFactory) return local || new Map();
     if (called.receiver && ts.isIdentifier(called.receiver) && hasFactoryLocalBinding(factory, called.receiver.text)) {
@@ -212,7 +229,7 @@ function moduleFactoryMethods(filePath, factoryName, seen, allowDefault = false)
     if (filePath !== stateSourcePath && !moduleFactoryAllowed(filePath, factoryName, new Set(), allowDefault)) return new Map();
     const importedText = fs.readFileSync(filePath, 'utf8');
     const importedSource = ts.createSourceFile(filePath, importedText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const bindings = requireBindings(importedSource);
+    const bindings = requiredBindings(importedSource);
     const exported = exportedFactoryExpression(importedSource, factoryName, allowDefault);
     const exportedName = exported && ts.isIdentifier(exported) ? exported.text : null;
     const inventoryName = exportedName || (!exported ? factoryName : null);
@@ -250,12 +267,12 @@ function moduleFactoryMethods(filePath, factoryName, seen, allowDefault = false)
   }
 }
 
-function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set(), allowedIdentifiers = new Set()) {
-  const key = `${sourcePath}:${factoryName}`;
+function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set(), allowedIdentifiers = new Set(), factoryOverride = null) {
+  const key = `${sourcePath}:${factoryName}:${factoryOverride ? factoryOverride.getStart(source) : 'exported'}`;
   if (seen.has(key)) return false;
   seen.add(key);
-  const bindings = requireBindings(source);
-  const factory = factoryDeclaration(source, factoryName);
+  const bindings = requiredBindings(source);
+  const factory = factoryOverride || factoryDeclaration(source, factoryName);
   if (!factory) {
     const binding = bindings.get(factoryName);
     if (binding?.modulePath) {
@@ -301,8 +318,9 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
       const allowDefault = !called.receiver && !binding?.exportName;
       if (importedPath && moduleFactoryAllowed(importedPath, importedName, new Set(), allowDefault)) return true;
     }
-    return factoryDeclaration(source, called.name) &&
-      factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen), allowedIdentifiers);
+    const localFactory = called.receiver ? null : localFactoryForTarget(source, factory, called.target);
+    return !!localFactory &&
+      factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen), allowedIdentifiers, localFactory);
   });
 }
 
