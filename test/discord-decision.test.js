@@ -11,6 +11,7 @@ const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
 const { encodeDecisionCustomId } = require('../src/discord-interaction');
 const { createDecisionConsumer, parseDecisionComponent, renderDecisionProjection } = require('../src/discord/decision');
+const { CANONICAL_OPERATIONS } = require('../src/decision-canonical');
 const { READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -478,6 +479,26 @@ function createCompatibilityTestConsumer(f, counters, processAccepted = async ()
     runCanonical: async (_route, operation, input) => {
       counters.canonical += 1;
       const questionGeneration = input.generation || input.questionGeneration;
+      if (operation === CANONICAL_OPERATIONS.READ) {
+        const presentation = f.state.getDecisionPresentation(f.presentation.presentationId);
+        return {
+          status: 'complete',
+          payload: {
+            ok: true,
+            operation,
+            qid: input.qid,
+            question_generation: questionGeneration,
+            source: 'current',
+            evidence_name: 'fixture-evidence',
+            answer: {
+              qid: input.qid,
+              question_generation: questionGeneration,
+              target: presentation.target,
+              answer: 'approve'
+            }
+          }
+        };
+      }
       return {
         status: 'complete',
         payload: {
@@ -577,35 +598,56 @@ test('baseline old-kind histories reopen with baseline click and effect state', 
   assert.deepEqual(rawJournalSnapshot(paired.state), pairedBefore);
 
   for (const nativeOutcome of ['in_flight', 'unknown', 'not_submitted', 'submitted', 'rejected']) {
-    const f = await fixture(t);
-    const id = `h1-${nativeOutcome}`;
-    const presentation = f.state.getDecisionPresentation(f.presentation.presentationId);
-    assert.equal(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, id)).accepted, true);
-    f.state.recordDecisionCallbackOutcome(id, 'unknown');
-    assert.equal(f.state.importDecisionWinner(id, {
-      qid: presentation.qid,
-      questionGeneration: presentation.questionGeneration,
-      target: presentation.target,
-      source: 'current',
-      materialized: true,
-      reference: `fixture:${id}`,
-      answer: 'approve'
-    }).accepted, true);
     for (const projectionOutcome of ['unknown', 'not_sent', 'rate_limited']) {
+      const f = await fixture(t);
+      const presentation = f.state.getDecisionPresentation(f.presentation.presentationId);
+      const id = `h1-${nativeOutcome}-${projectionOutcome}`;
+      assert.equal(f.state.admitDecisionClickAndBeginCallback(historicalInput(f, id)).accepted, true);
+      f.state.recordDecisionCallbackOutcome(id, 'unknown');
+      assert.equal(f.state.importDecisionWinner(id, {
+        qid: presentation.qid,
+        questionGeneration: presentation.questionGeneration,
+        target: presentation.target,
+        source: 'current',
+        materialized: true,
+        reference: `fixture:${id}`,
+        answer: 'approve'
+      }).accepted, true);
       f.state.recordDecisionProjectionOutcome(id, projectionOutcome);
-      assert.equal(f.state.getDecisionClick(id).projectionOutcome, projectionOutcome);
+
+      const queued = f.state.getDecisionClick(id);
+      assert.equal(queued.canonical.answer, 'approve');
+      assert.equal(queued.projectionOutcome, projectionOutcome);
+      assert.ok(queued.nativeReturn);
+      assert.equal(queued.nativeReturn.outcome, null);
+      const interactionRows = () => f.state.listReceipts().map(row => ({ kind: row.kind, detail: JSON.parse(row.detail) }))
+        .filter(row => row.detail.interactionId === id);
+      const queuedRows = interactionRows();
+      assert.equal(queuedRows.filter(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_RETURN).length, 1);
+      assert.equal(queuedRows.filter(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_OUTCOME).length, 0);
+
+      const recorded = f.state.recordDecisionNativeReturnOutcome(id, nativeOutcome);
+      assert.equal(recorded.accepted, true);
+      assert.equal(recorded.click.nativeReturn.outcome, nativeOutcome);
+      const nativeRows = interactionRows().filter(row =>
+        row.kind === HISTORICAL_DECISION_KINDS.NATIVE_RETURN || row.kind === HISTORICAL_DECISION_KINDS.NATIVE_OUTCOME);
+      assert.equal(nativeRows.filter(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_RETURN).length, 1);
+      assert.equal(nativeRows.filter(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_OUTCOME).length, 1);
+      assert.equal(nativeRows.find(row => row.kind === HISTORICAL_DECISION_KINDS.NATIVE_OUTCOME).detail.outcome, nativeOutcome);
+      assert.equal(compatibilityMarkerFor(f.state, id), false);
+
+      const before = rawJournalSnapshot(f.state);
+      await f.reopen();
+      const click = f.state.getDecisionClick(id);
+      assert.equal(click.callbackOutcome, 'unknown');
+      assert.equal(click.canonical.answer, 'approve');
+      assert.equal(click.projectionOutcome, projectionOutcome);
+      assert.equal(click.nativeReturn.outcome, nativeOutcome);
+      assert.deepEqual(interactionRows().filter(row =>
+        row.kind === HISTORICAL_DECISION_KINDS.NATIVE_RETURN || row.kind === HISTORICAL_DECISION_KINDS.NATIVE_OUTCOME), nativeRows);
+      assert.equal(compatibilityMarkerFor(f.state, id), false);
+      assert.deepEqual(rawJournalSnapshot(f.state), before);
     }
-    f.state.recordDecisionNativeReturnOutcome(id, nativeOutcome);
-    const before = rawJournalSnapshot(f.state);
-    assert.equal(compatibilityMarkerFor(f.state, id), false);
-    await f.reopen();
-    const click = f.state.getDecisionClick(id);
-    assert.equal(click.callbackOutcome, 'unknown');
-    assert.equal(click.canonical.answer, 'approve');
-    assert.equal(click.projectionOutcome, 'rate_limited');
-    assert.equal(click.nativeReturn.outcome, nativeOutcome);
-    assert.equal(compatibilityMarkerFor(f.state, id), false);
-    assert.deepEqual(rawJournalSnapshot(f.state), before);
   }
 });
 
@@ -626,6 +668,7 @@ test('pre-cut authorization histories preserve pending custody and both callback
   f.state.recordDecisionCallbackOutcome(deniedId, 'unknown');
   assert.equal(writers.recordAuthorizationOutcome(f.state, deniedFirstId, 'denied').accepted, true);
   f.state.recordDecisionCallbackOutcome(deniedFirstId, 'unknown');
+  const before = rawJournalSnapshot(f.state);
   await f.reopen();
 
   const pending = f.state.getDecisionClick(pendingId);
@@ -688,14 +731,15 @@ test('pre-cut rejection outcomes and interrupted attempts retain their exact reo
 test('historical markers hold both real decision replay entrypoints and exact generic interactions', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const writers = createHistoricalDecisionWriters();
-  const pendingId = 'h10-pending';
-  const completedId = 'h10-completed-denial';
+  const pendingId = '100000000000000010';
+  const completedId = '100000000000000020';
+  const siblingId = '100000000000000005';
   assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, pendingId)).accepted, true);
   assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, completedId)).accepted, true);
   assert.equal(writers.recordAuthorizationOutcome(f.state, completedId, 'denied').accepted, true);
   assert.equal(writers.beginRejectionFollowup(f.state, completedId).accepted, true);
   assert.equal(writers.recordRejectionOutcome(f.state, completedId, 'sent').accepted, true);
-  for (const id of [pendingId, completedId, 'h10-unrelated-sibling']) {
+  for (const id of [pendingId, completedId, siblingId]) {
     const accepted = f.state.acceptDiscordMessage({
       id,
       guildId: 'guild',
@@ -731,7 +775,7 @@ test('historical markers hold both real decision replay entrypoints and exact ge
   f.gateway.transportReady = true;
   f.gateway.ready = true;
   await f.gateway.reconcilePending();
-  assert.deepEqual(f.dispatches.map(message => message.id), ['h10-unrelated-sibling']);
+  assert.deepEqual(f.dispatches.map(message => message.id), [siblingId]);
   assert.equal(f.state.getMessage(pendingId).state, 'accepted');
   assert.equal(f.state.getMessage(completedId).state, 'accepted');
   const markedNativeRows = f.state.listReceipts().map(row => ({ kind: row.kind, detail: JSON.parse(row.detail) }))
@@ -743,14 +787,15 @@ test('historical markers hold both real decision replay entrypoints and exact ge
 test('CLICK_STALE holds only its exact interaction while unrelated work keeps baseline admission', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const writers = createHistoricalDecisionWriters();
-  const staleId = 'h5-stale-click';
+  const staleId = '100000000000000040';
+  const siblingId = '100000000000000035';
   assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, staleId)).accepted, true);
   assert.equal(writers.recordAuthorizationOutcome(f.state, staleId, 'authorized').accepted, true);
   f.state.setBindingReadiness('channel', READINESS.PENDING);
   writers.reconcileClickBinding(f.state, staleId);
   assert.ok(f.state.listReceipts().some(row => row.kind === HISTORICAL_DECISION_KINDS.CLICK_STALE));
   f.state.setBindingReadiness('channel', READINESS.READY);
-  for (const id of [staleId, 'h5-unrelated-native-work']) {
+  for (const id of [staleId, siblingId]) {
     assert.equal(f.state.acceptDiscordMessage({
       id,
       guildId: 'guild',
@@ -763,19 +808,19 @@ test('CLICK_STALE holds only its exact interaction while unrelated work keeps ba
   }
   await f.reopen();
   assert.equal(compatibilityMarkerFor(f.state, staleId), true);
-  assert.equal(compatibilityMarkerFor(f.state, 'h5-unrelated-native-work'), false);
+  assert.equal(compatibilityMarkerFor(f.state, siblingId), false);
   f.gateway.started = true;
   f.gateway.transportReady = true;
   f.gateway.ready = true;
   await f.gateway.reconcilePending();
-  assert.deepEqual(f.dispatches.map(message => message.id), ['h5-unrelated-native-work']);
+  assert.deepEqual(f.dispatches.map(message => message.id), [siblingId]);
 });
 
 test('a later valid click on the same presentation passes its own baseline checks', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const writers = createHistoricalDecisionWriters();
-  const heldId = 'h7-held-click';
-  const laterId = 'h7-later-valid-click';
+  const heldId = '100000000000000060';
+  const laterId = '100000000000000070';
   assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, heldId)).accepted, true);
   const counters = { callbacks: 0, canonical: 0, native: 0, project: 0 };
   const consumer = createCompatibilityTestConsumer(
@@ -800,18 +845,41 @@ test('applicationId alone does not classify an old-kind-only click as historical
   const f = await fixture(t);
   const writers = createHistoricalDecisionWriters();
   const id = 'h11-application-id-only';
+  const receiptRows = () => f.state.db.prepare(
+    'SELECT id, discord_id, kind, detail, created_at FROM receipts ORDER BY id'
+  ).all();
   assert.equal(writers.admitClick(f.state, historicalInput(f, id, 'approve', {
     applicationId: 'token-shaped-application-id'
   })).accepted, true);
+  const originalRows = receiptRows();
+  const originalRowIds = new Set(originalRows.map(row => row.id));
+  const rawClickBeforeReopen = rawClickDetail(f.state, id);
+  assert.equal(rawClickBeforeReopen.applicationId, 'token-shaped-application-id');
+  assert.equal(Object.hasOwn(rawClickBeforeReopen, 'token'), false);
   await f.reopen();
+  assert.deepEqual(receiptRows(), originalRows);
   assert.equal(compatibilityMarkerFor(f.state, id), false);
-  assert.equal(f.state.getDecisionClick(id).applicationId, 'token-shaped-application-id');
+  const clickBeforeRecovery = f.state.getDecisionClick(id);
+  assert.equal(Object.hasOwn(clickBeforeRecovery, 'applicationId'), false);
+  assert.equal(Object.hasOwn(clickBeforeRecovery, 'token'), false);
+  const publicClickRow = f.state.listReceipts().find(row => row.kind === HISTORICAL_DECISION_KINDS.CLICK &&
+    JSON.parse(row.detail).interactionId === id);
+  const publicClickDetail = JSON.parse(publicClickRow.detail);
+  assert.equal(publicClickDetail.applicationId, 'token-shaped-application-id');
+  assert.equal(Object.hasOwn(publicClickDetail, 'token'), false);
+  assert.deepEqual(rawClickDetail(f.state, id), rawClickBeforeReopen);
   const counters = { callbacks: 0, canonical: 0, native: 0, project: 0 };
   const consumer = createCompatibilityTestConsumer(f, counters);
   await consumer.recover(new AbortController().signal);
   assert.equal(counters.canonical > 0, true);
   assert.equal(counters.callbacks, 0);
-  assert.equal(f.state.getDecisionClick(id).canonical.answer, 'approve');
+  const recoveredClick = f.state.getDecisionClick(id);
+  assert.equal(recoveredClick.canonical.answer, 'approve');
+  assert.equal(Object.hasOwn(recoveredClick, 'applicationId'), false);
+  assert.equal(Object.hasOwn(recoveredClick, 'token'), false);
+  assert.equal(compatibilityMarkerFor(f.state, id), false);
+  assert.deepEqual(rawClickDetail(f.state, id), rawClickBeforeReopen);
+  assert.deepEqual(receiptRows().filter(row => originalRowIds.has(row.id)), originalRows);
 });
 
 test('qualified token history stays readable while every returned view remains redacted', { timeout: 30000 }, async t => {
@@ -913,8 +981,9 @@ test('marked native outcomes remain observable without a second submission', { t
 test('later malformed receipts cannot erase a valid marker or widen it to sibling work', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const writers = createHistoricalDecisionWriters();
-  const markedId = 'h13-marked-interaction';
-  const siblingId = 'h13-unmarked-sibling';
+  const markedId = '100000000000000100';
+  const genericSiblingId = '100000000000000090';
+  const decisionSiblingId = '100000000000000110';
   assert.equal(writers.admitClickAndBeginAuthorization(f.state, historicalInput(f, markedId)).accepted, true);
   f.state.receipt(null, HISTORICAL_DECISION_KINDS.CLICK, {
     journal: 'decision-v1', interactionId: markedId, authorizationPending: 'true'
@@ -923,12 +992,11 @@ test('later malformed receipts cannot erase a valid marker or widen it to siblin
   f.state.receipt(null, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
     journal: 'decision-v1', interactionId: 17, outcome: 'denied'
   });
-  assert.equal(writers.admitClick(f.state, historicalInput(f, siblingId)).accepted, true);
   const before = rawJournalSnapshot(f.state);
   await f.reopen();
 
   assert.equal(compatibilityMarkerFor(f.state, markedId), true);
-  assert.equal(compatibilityMarkerFor(f.state, siblingId), false);
+  assert.equal(compatibilityMarkerFor(f.state, decisionSiblingId), false);
   assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === markedId));
   assertDecisionHistoryReadOnly(f.state, markedId);
   const decisionCounters = { callbacks: 0, canonical: 0, native: 0, project: 0 };
@@ -941,7 +1009,7 @@ test('later malformed receipts cannot erase a valid marker or widen it to siblin
   assert.equal(decisionCounters.callbacks + decisionCounters.canonical + decisionCounters.native + decisionCounters.project, 0);
   assert.deepEqual(rawJournalSnapshot(f.state), before);
 
-  for (const id of [markedId, siblingId]) {
+  for (const id of [genericSiblingId, markedId]) {
     assert.equal(f.state.acceptDiscordMessage({
       id,
       guildId: 'guild',
@@ -952,14 +1020,47 @@ test('later malformed receipts cannot erase a valid marker or widen it to siblin
       content: `accepted ${id}`
     }).accepted, true);
   }
+  const markedReceiptRows = f.state.db.prepare(
+    'SELECT id, discord_id, kind, detail, created_at FROM receipts ORDER BY id'
+  ).all().filter(row => JSON.parse(row.detail).interactionId === markedId);
+  assert.equal(writers.admitClick(f.state, historicalInput(f, decisionSiblingId)).accepted, true);
+  const siblingRemaining = await decisionConsumer.recover(new AbortController().signal);
+  assert.ok(siblingRemaining.some(click => click.interactionId === markedId));
+  assert.equal(f.state.getDecisionClick(decisionSiblingId).canonical.answer, 'approve');
+  assert.ok(decisionCounters.canonical > 0);
+  assert.ok(decisionCounters.native > 0);
+  assert.ok(decisionCounters.project > 0);
+  assert.deepEqual(f.state.db.prepare(
+    'SELECT id, discord_id, kind, detail, created_at FROM receipts ORDER BY id'
+  ).all().filter(row => JSON.parse(row.detail).interactionId === markedId), markedReceiptRows);
+
   f.gateway.started = true;
   f.gateway.transportReady = true;
   f.gateway.ready = true;
   await f.gateway.reconcilePending();
-  assert.deepEqual(f.dispatches.map(message => message.id), [siblingId]);
+  const genericMessage = f.state.getMessage(genericSiblingId);
+  const markedMessage = f.state.getMessage(markedId);
+  const decisionMessage = f.state.getMessage(decisionSiblingId);
+  assert.ok(genericMessage);
+  assert.ok(markedMessage);
+  assert.ok(decisionMessage);
+  assert.equal(genericMessage.state, 'submitted');
+  assert.equal(f.state.hasNativeAcknowledgment(genericMessage), false);
+  assert.equal(markedMessage.state, 'accepted');
+  assert.equal(f.state.isInteractionMessage(markedId), false);
+  assert.equal(decisionMessage.state, 'accepted');
+  assert.equal(f.state.isInteractionMessage(decisionSiblingId), true);
+  assert.equal(compatibilityMarkerFor(f.state, decisionSiblingId), false);
+  assert.equal(f.state.getDecisionClick(decisionSiblingId).canonical.answer, 'approve');
+  assert.ok(f.state.listDecisionPendingWork().some(click => click.interactionId === decisionSiblingId));
+  assert.equal(f.state.hasNativeAcknowledgment(decisionMessage), false);
+  assert.deepEqual(f.dispatches.map(message => message.id), [genericSiblingId]);
+  assert.deepEqual(f.state.db.prepare(
+    'SELECT id, discord_id, kind, detail, created_at FROM receipts ORDER BY id'
+  ).all().filter(row => JSON.parse(row.detail).interactionId === markedId), markedReceiptRows);
 
   const control = await fixture(t);
-  const controlId = 'h13-unassignable-control';
+  const controlId = '100000000000000120';
   control.state.receipt(null, HISTORICAL_DECISION_KINDS.AUTHORIZATION_OUTCOME, {
     journal: 'decision-v1', interactionId: 17, outcome: 'denied'
   });
@@ -1036,10 +1137,11 @@ test('compatibility source inventory covers all marker kinds and effect consumer
   assert.deepEqual(inline.allowedMentions, { parse: [] });
   assert.equal(inline.files, undefined);
 
-  const longAnswer = '界'.repeat(1366);
-  assert.equal(Buffer.byteLength(longAnswer, 'utf8'), 4098);
+  const longAnswer = '界'.repeat(4097);
+  assert.equal(longAnswer.length, 4097);
+  assert.equal(Buffer.byteLength(longAnswer, 'utf8'), 12291);
   const attached = renderDecisionProjection(presentation, longAnswer);
-  assert.equal(attached.content, presentation.content);
+  assert.equal(attached.content, `${presentation.content}\n\nSelected action is attached in selected-action.txt.`);
   assert.equal(attached.embeds[0].title, 'Selected action');
   assert.equal(attached.embeds[0].description, 'Full answer attached in selected-action.txt.');
   assert.equal(attached.files[0].name, 'selected-action.txt');
