@@ -28,6 +28,7 @@ function inventory(text, fileName = 'state.js') {
   const ownerPrototypeMutated = !!exportedOwner && exportedPrototypeMutated(source, exportedOwner, 'SurfaceState');
   const handlers = new Set();
   const handlerFactories = new Map();
+  const handlerInitializers = new Map();
   for (const statement of source.statements) {
     if (!ts.isVariableStatement(statement)) continue;
     for (const declaration of statement.declarationList.declarations) {
@@ -36,10 +37,13 @@ function inventory(text, fileName = 'state.js') {
           ts.isIdentifier(declaration.initializer.expression) && declaration.initializer.expression.text.startsWith('create')) {
         handlers.add(declaration.name.text);
         handlerFactories.set(declaration.name.text, declaration.initializer.expression.text);
+        handlerInitializers.set(declaration.name.text, declaration.initializer);
       }
     }
   }
-  const handlerDiscoveries = [...handlerFactories].map(([name, factory]) => [name, discoverFactory(source, factory)]);
+  const registeredHandlerNames = new Set(handlerFactories.keys());
+  const handlerDiscoveries = [...handlerFactories].map(([name, factory]) => [name,
+    discoverFactory(source, factory, handlerInitializers.get(name), registeredHandlerNames)]);
   const handlerMethodDescriptors = Object.fromEntries(handlerDiscoveries.map(([name, discovery]) => [name, discovery.methods]));
   const mutatedHandlers = mutatedBindingNames(source, new Set(handlerFactories.keys()));
   const unapprovedHandlers = handlerDiscoveries
@@ -307,6 +311,8 @@ function exportedClassDeclaration(source, exportName) {
   const topLevelExportAssignments = new Set();
   let exportMutated = false;
   const propertyName = node => {
+    if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node) ||
+        ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
     if (ts.isPropertyAccessExpression(node)) return node.name.text;
     if (ts.isElementAccessExpression(node) &&
         (ts.isStringLiteral(node.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression))) {
@@ -505,8 +511,10 @@ function exportedPrototypeMutated(source, owner, ownerName) {
         mutated = true;
         return;
       }
-      if (ts.isCallExpression(node) && node.arguments.some(argument =>
-        ts.isIdentifier(argument) && argument.text === ownerName)) {
+      if (ts.isCallExpression(node) && node.arguments.some(argument => {
+        while (ts.isParenthesizedExpression(argument)) argument = argument.expression;
+        return ts.isIdentifier(argument) && argument.text === ownerName;
+      })) {
         mutated = true;
         return;
       }
@@ -550,6 +558,9 @@ function matches(text, baseline, fileName = 'state.js') {
     for (const method of owner.members) {
       const name = ts.isConstructorDeclaration(method) ? 'constructor' : method.name?.text;
       const hasUnsupportedModifiers = !!method.modifiers?.length;
+      const exactLegacyParameterShape = JSON.stringify(parameterShape(method, parsed)) ===
+        JSON.stringify((PRIOR_UNSUPPORTED_FORWARDING_SHAPES.get(name) || []).map(text => tokens(text)));
+      if (PRIOR_UNSUPPORTED_FORWARDING_NAMES.has(name) && !exactLegacyParameterShape) return false;
       if (!candidate.forwarding.includes(name)) {
         if (hasUnsupportedModifiers) return false;
         continue;
@@ -557,11 +568,6 @@ function matches(text, baseline, fileName = 'state.js') {
       if (ts.isConstructorDeclaration(method)) return false;
       const hasUnsupportedParameters = method.parameters.some(parameter =>
         parameter.initializer || !ts.isIdentifier(parameter.name));
-      const exactLegacyParameterShape = JSON.stringify(parameterShape(method, parsed)) ===
-        JSON.stringify((PRIOR_UNSUPPORTED_FORWARDING_SHAPES.get(name) || []).map(text => tokens(text)));
-      if (priorUnsupportedForwarding.has(name) && baseline.forwarding.includes(name) && !exactLegacyParameterShape) {
-        return false;
-      }
       const grandfatheredParameterShape = hasUnsupportedParameters &&
         baseline.forwarding.includes(name) &&
         priorUnsupportedForwarding.has(name) &&

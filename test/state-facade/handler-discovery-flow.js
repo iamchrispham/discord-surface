@@ -33,7 +33,8 @@ function statementFlow(statement) {
   }
   if (ts.isIfStatement(statement)) {
     const condition = statement.expression;
-    const constantCondition = ts.isParenthesizedExpression(condition) ? condition.expression : condition;
+    let constantCondition = condition;
+    while (constantCondition && ts.isParenthesizedExpression(constantCondition)) constantCondition = constantCondition.expression;
     if (constantCondition.kind === ts.SyntaxKind.FalseKeyword) {
       return statement.elseStatement
         ? statementFlow(statement.elseStatement)
@@ -50,7 +51,8 @@ function statementFlow(statement) {
   }
   if (ts.isWhileStatement(statement) || ts.isDoStatement(statement) || ts.isForStatement(statement)) {
     const condition = ts.isForStatement(statement) ? statement.condition : statement.expression;
-    const constantCondition = condition && ts.isParenthesizedExpression(condition) ? condition.expression : condition;
+    let constantCondition = condition;
+    while (constantCondition && ts.isParenthesizedExpression(constantCondition)) constantCondition = constantCondition.expression;
     const alwaysTrue = !condition || constantCondition.kind === ts.SyntaxKind.TrueKeyword;
     const alwaysFalse = !!condition && constantCondition.kind === ts.SyntaxKind.FalseKeyword;
     const bodyFlow = statementFlow(statement.statement);
@@ -106,4 +108,69 @@ function statementCanFallThrough(statement) {
   return statementFlow(statement).normal;
 }
 
-module.exports = { statementCanFallThrough };
+function reachableReturnExpressions(factory) {
+  const returns = [];
+  const seenReturns = new Set();
+  let supported = true;
+  const collectStatements = statements => {
+    let reachable = true;
+    for (const statement of statements) {
+      if (!reachable || !supported) break;
+      collect(statement);
+      reachable = statementCanFallThrough(statement);
+    }
+  };
+  const collect = node => {
+    if (!node || !supported) return;
+    if (node !== factory && ts.isFunctionLike(node)) return;
+    if (ts.isBlock(node) || ts.isSourceFile(node)) {
+      collectStatements(node.statements);
+      return;
+    }
+    if (ts.isReturnStatement(node)) {
+      if (!seenReturns.has(node)) {
+        seenReturns.add(node);
+        returns.push(node.expression || null);
+      }
+      return;
+    }
+    if (ts.isIfStatement(node)) {
+      let condition = node.expression;
+      while (ts.isParenthesizedExpression(condition)) condition = condition.expression;
+      if (condition.kind === ts.SyntaxKind.FalseKeyword) {
+        collect(node.elseStatement);
+      }
+      else if (condition.kind === ts.SyntaxKind.TrueKeyword) {
+        collect(node.thenStatement);
+      }
+      else {
+        collect(node.thenStatement);
+        collect(node.elseStatement);
+      }
+      return;
+    }
+    if (ts.isSwitchStatement(node)) {
+      for (const clause of node.caseBlock.clauses) collectStatements(clause.statements);
+      return;
+    }
+    if (ts.isWhileStatement(node) || ts.isDoStatement(node) || ts.isForStatement(node)) {
+      const condition = ts.isForStatement(node) ? node.condition : node.expression;
+      let constantCondition = condition;
+      while (constantCondition && ts.isParenthesizedExpression(constantCondition)) constantCondition = constantCondition.expression;
+      if (condition && constantCondition.kind !== ts.SyntaxKind.TrueKeyword &&
+          constantCondition.kind !== ts.SyntaxKind.FalseKeyword) {
+        supported = false;
+        return;
+      }
+      const alwaysFalse = !!condition && constantCondition.kind === ts.SyntaxKind.FalseKeyword;
+      if (ts.isDoStatement(node) || !alwaysFalse) collect(node.statement);
+      return;
+    }
+    ts.forEachChild(node, collect);
+  };
+  if (factory.body && ts.isBlock(factory.body)) collect(factory.body);
+  else if (factory.body) returns.push(factory.body);
+  return supported ? returns : null;
+}
+
+module.exports = { reachableReturnExpressions, statementCanFallThrough };

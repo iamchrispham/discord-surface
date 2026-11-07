@@ -152,6 +152,7 @@ function requireBindings(source) {
     if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
       markBindingTarget(node.left);
     }
+    if (ts.isDeleteExpression(node)) markBindingTarget(node.expression);
     if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
         !ts.isVariableDeclarationList(node.initializer)) {
       markBindingTarget(node.initializer);

@@ -4,7 +4,7 @@ const path = require('node:path');
 
 const ts = require('typescript');
 
-const { statementCanFallThrough } = require('./handler-discovery-flow');
+const { reachableReturnExpressions, statementCanFallThrough } = require('./handler-discovery-flow');
 const {
   bindingInitializer,
   callableDeclarations,
@@ -164,7 +164,7 @@ function moduleFactoryAllowed(filePath, factoryName, seen = new Set(), allowDefa
   }
 }
 
-function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
+function factoryMethodsFromSource(source, sourcePath, factoryName, seen, allowedIdentifiers = new Set()) {
   const key = `${sourcePath}:${factoryName}`;
   if (seen.has(key)) return new Map();
   seen.add(key);
@@ -174,11 +174,11 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return null;
   const bindings = requireBindings(source);
   const resolveExpression = expression => {
-    const called = calledFactory(expression);
+    const called = calledFactory(expression, true, { factory, allowedIdentifiers });
     if (!called) return new Map();
     const localFactory = called.receiver ? null : factoryDeclaration(source, called.name);
     const local = localFactory
-      ? factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen))
+      ? factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen), allowedIdentifiers)
       : null;
     if (localFactory) return local || new Map();
     if (called.receiver && ts.isIdentifier(called.receiver) && hasFactoryLocalBinding(factory, called.receiver.text)) {
@@ -250,23 +250,7 @@ function moduleFactoryMethods(filePath, factoryName, seen, allowDefault = false)
   }
 }
 
-function returnedExpressions(factory) {
-  const body = factory.body;
-  if (!body || !ts.isBlock(body)) return body ? [body] : [];
-  const expressions = [];
-  const visit = node => {
-    if (node !== body && ts.isFunctionLike(node)) return;
-    if (ts.isReturnStatement(node)) {
-      expressions.push(node.expression || null);
-      return;
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(body);
-  return expressions;
-}
-
-function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set()) {
+function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set(), allowedIdentifiers = new Set()) {
   const key = `${sourcePath}:${factoryName}`;
   if (seen.has(key)) return false;
   seen.add(key);
@@ -298,10 +282,11 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
   }
   if (isAsyncFactory(factory)) return false;
   if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return false;
-  const expressions = returnedExpressions(factory);
+  const expressions = reachableReturnExpressions(factory);
+  if (!expressions) return false;
   if (!expressions.length || expressions.some(expression => !expression)) return false;
   return expressions.every(expression => {
-    const called = calledFactory(expression, true);
+    const called = calledFactory(expression, true, { factory, allowedIdentifiers });
     if (!called) return false;
     if (called.receiver && ts.isIdentifier(called.receiver) && hasFactoryLocalBinding(factory, called.receiver.text)) return false;
     const binding = called.receiver && ts.isIdentifier(called.receiver)
@@ -317,27 +302,31 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
       if (importedPath && moduleFactoryAllowed(importedPath, importedName, new Set(), allowDefault)) return true;
     }
     return factoryDeclaration(source, called.name) &&
-      factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen));
+      factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen), allowedIdentifiers);
   });
 }
 
-function factoryMethods(source, factoryName) {
+function factoryMethods(source, factoryName, allowedIdentifiers = new Set()) {
   const sourcePath = path.isAbsolute(source.fileName) ? source.fileName : stateSourcePath;
-  const methods = factoryMethodsFromSource(source, sourcePath, factoryName, new Set());
+  const methods = factoryMethodsFromSource(source, sourcePath, factoryName, new Set(), allowedIdentifiers);
   return methods?.size ? methods : null;
 }
 
-function importedFactoryMethods(source, factoryName) {
+function importedFactoryMethods(source, factoryName, allowedIdentifiers = new Set()) {
   const sourcePath = path.isAbsolute(source.fileName) ? source.fileName : stateSourcePath;
-  if (!factoryResolvesToCompanion(source, sourcePath, factoryName)) return null;
-  const local = factoryMethods(source, factoryName);
+  if (!factoryResolvesToCompanion(source, sourcePath, factoryName, new Set(), allowedIdentifiers)) return null;
+  const local = factoryMethods(source, factoryName, allowedIdentifiers);
   if (local) return local;
   const imported = moduleFactoryMethods(sourcePath, factoryName, new Set());
   return imported.size ? imported : null;
 }
 
-function discoverFactory(source, factoryName) {
-  const methods = importedFactoryMethods(source, factoryName);
+function discoverFactory(source, factoryName, initializer = null, registeredHandlerNames = new Set()) {
+  if (initializer) {
+    const registeredCall = calledFactory(initializer, true, { allowedIdentifiers: registeredHandlerNames });
+    if (!registeredCall || registeredCall.name !== factoryName) return { methods: new Map(), approved: false };
+  }
+  const methods = importedFactoryMethods(source, factoryName, registeredHandlerNames);
   return { methods: methods || new Map(), approved: methods !== null };
 }
 

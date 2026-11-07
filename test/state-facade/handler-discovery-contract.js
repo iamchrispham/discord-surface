@@ -9,7 +9,7 @@ const {
   mutatedDeclarations,
   propertyName
 } = require('./handler-discovery-bindings');
-const { statementCanFallThrough } = require('./handler-discovery-flow');
+const { reachableReturnExpressions } = require('./handler-discovery-flow');
 
 const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state', PURE: 'pure' });
 
@@ -193,28 +193,8 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     }
     return resolveExpression(current);
   };
-  const body = factory.body;
-  const returns = [];
-  const collectReturns = node => {
-    if (!node) return;
-    if (node !== factory && ts.isFunctionLike(node)) return;
-    if (ts.isBlock(node) || ts.isSourceFile(node)) {
-      let reachable = true;
-      for (const statement of node.statements) {
-        if (!reachable) break;
-        collectReturns(statement);
-        reachable = statementCanFallThrough(statement);
-      }
-      return;
-    }
-    if (ts.isReturnStatement(node)) {
-      returns.push(node.expression || null);
-      return;
-    }
-    ts.forEachChild(node, collectReturns);
-  };
-  if (body && ts.isBlock(body)) collectReturns(body);
-  else if (body) returns.push(body);
+  const returns = reachableReturnExpressions(factory);
+  if (!returns) return methods;
   const branchMethods = returns.map(expression => resolveReturnedExpression(expression));
   if (!branchMethods.length) return methods;
   const [first, ...rest] = branchMethods;

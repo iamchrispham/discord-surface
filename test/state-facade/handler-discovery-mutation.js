@@ -104,7 +104,6 @@ function mutatedDeclarations(factory, declarations, source, includeFunctionBodie
           return;
         }
       }
-      for (const argument of value.arguments) mark(argument);
       return;
     }
     const pairs = destructuredBindings(pattern, initializer);

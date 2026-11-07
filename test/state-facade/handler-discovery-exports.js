@@ -1,19 +1,55 @@
 const ts = require('typescript');
 
 const { bindingIdentifiers, propertyName } = require('./handler-discovery-bindings');
-const { statementCanFallThrough } = require('./handler-discovery-flow');
+const { reachableReturnExpressions, statementCanFallThrough } = require('./handler-discovery-flow');
 const { isCommonJsRequireCall } = require('./handler-discovery-require');
 
-function staticFactoryArgument(node) {
+function factoryParameterReference(factory, identifier, requireRest = false) {
+  if (!factory || !ts.isIdentifier(identifier)) return false;
+  const parameter = (factory.parameters || []).find(candidate =>
+    ts.isIdentifier(candidate.name) && candidate.name.text === identifier.text &&
+    (!requireRest || !!candidate.dotDotDotToken));
+  if (!parameter) return false;
+  let shadowed = false;
+  const visit = node => {
+    if (!node || shadowed) return;
+    if (node !== factory && ts.isFunctionLike(node)) {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === identifier.text) shadowed = true;
+      return;
+    }
+    if (ts.isVariableDeclaration(node) && bindingIdentifiers(node.name).some(binding => binding.text === identifier.text)) {
+      shadowed = true;
+      return;
+    }
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+        node !== factory && node.name?.text === identifier.text) {
+      shadowed = true;
+      return;
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration &&
+        bindingIdentifiers(node.variableDeclaration.name).some(binding => binding.text === identifier.text)) {
+      shadowed = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(factory.body);
+  return !shadowed;
+}
+
+function staticFactoryArgument(node, context = {}) {
   while (ts.isParenthesizedExpression(node)) node = node.expression;
   if (ts.isStringLiteral(node) || ts.isNumericLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
       ts.isBigIntLiteral(node) || node.kind === ts.SyntaxKind.TrueKeyword ||
       node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return true;
+  if (ts.isIdentifier(node)) {
+    return context.allowedIdentifiers?.has(node.text) || factoryParameterReference(context.factory, node);
+  }
   if (ts.isPrefixUnaryExpression(node) &&
       [ts.SyntaxKind.PlusToken, ts.SyntaxKind.MinusToken].includes(node.operator) &&
       ts.isNumericLiteral(node.operand)) return true;
   if (ts.isArrayLiteralExpression(node)) {
-    return node.elements.every(element => !ts.isSpreadElement(element) && staticFactoryArgument(element));
+    return node.elements.every(element => !ts.isSpreadElement(element) && staticFactoryArgument(element, context));
   }
   if (ts.isObjectLiteralExpression(node)) {
     return node.properties.every(property => {
@@ -23,21 +59,27 @@ function staticFactoryArgument(node) {
         (ts.isComputedPropertyName(name) &&
           (ts.isStringLiteral(name.expression) || ts.isNumericLiteral(name.expression) ||
             ts.isNoSubstitutionTemplateLiteral(name.expression)));
-      return staticName && staticFactoryArgument(property.initializer);
+      return staticName && staticFactoryArgument(property.initializer, context);
     });
   }
   return false;
 }
 
-function calledFactory(expression, requireCall = false) {
+function staticFactoryCallArgument(node, context) {
+  return ts.isSpreadElement(node)
+    ? factoryParameterReference(context.factory, node.expression, true)
+    : staticFactoryArgument(node, context);
+}
+
+function calledFactory(expression, requireCall = false, context = {}) {
   let candidate = expression;
   while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
   const actualCall = ts.isCallExpression(candidate);
   if (requireCall && !actualCall) return null;
-  if (actualCall && candidate.arguments.some(argument => !staticFactoryArgument(argument))) return null;
+  if (actualCall && candidate.arguments.some(argument => !staticFactoryCallArgument(argument, context))) return null;
   let target = actualCall ? candidate.expression : candidate;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
-  if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) target = target.right;
+  if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) return null;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isIdentifier(target)) return { name: target.text, receiver: null, target };
   if (ts.isPropertyAccessExpression(target)) return { name: target.name.text, receiver: target.expression, target };
@@ -166,27 +208,8 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
       const body = getter.body;
       if (!body || !ts.isBlock(body)) continue;
       if (statementCanFallThrough(body)) return { rejected: true };
-      const returns = [];
-      const collectReturns = node => {
-        if (!node) return;
-        if (node !== body && ts.isFunctionLike(node)) return;
-        if (ts.isBlock(node) || ts.isSourceFile(node)) {
-          let reachable = true;
-          for (const statement of node.statements) {
-            if (!reachable) break;
-            collectReturns(statement);
-            reachable = statementCanFallThrough(statement);
-          }
-          return;
-        }
-        if (ts.isReturnStatement(node)) {
-          returns.push(node.expression || null);
-          return;
-        }
-        ts.forEachChild(node, collectReturns);
-      };
-      collectReturns(body);
-      if (!returns.length || returns.some(expression => !expression)) return { rejected: true };
+      const returns = reachableReturnExpressions(getter);
+      if (!returns || !returns.length || returns.some(expression => !expression)) return { rejected: true };
       const firstText = returns[0].getText(source);
       if (returns.some(expression => expression.getText(source) !== firstText)) return { rejected: true };
       return { expression: returns[0] };

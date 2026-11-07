@@ -131,8 +131,38 @@ test('baseline accepted', () => {
   assert.equal(matches(source), true);
 });
 
-test('rejects an exported constructor that differs from the inventoried owner', () => {
+test('recognizes string and numeric keys while preserving the exported owner', () => {
+  const stringKey = source.replace(
+    /(module\.exports\s*=\s*\{[\s\S]*?)\bSurfaceState(?=\s*[,}])/, '$1"SurfaceState": SurfaceState');
+  assert.equal(matchesWithCandidateBaseline(stringKey), true);
+  const numericKey = source.replace('module.exports = {', 'module.exports = { 1: null,');
+  assert.equal(matchesWithCandidateBaseline(numericKey), true);
+});
+
+test('keeps the actual owner when an earlier export key names another constructor', () => {
   const text = source.replace('module.exports = {', 'class ActualState { constructor() {} }\nmodule.exports = { SurfaceState: ActualState,');
+  assert.equal(matchesWithCandidateBaseline(text), true);
+});
+
+test('rejects the constructor at the effective final export key', () => {
+  const candidate = source.replace('module.exports = {', 'class ActualState { constructor() {} }\nmodule.exports = {');
+  const text = candidate.replace(/(module\.exports\s*=\s*\{[\s\S]*?)(\n\s*};)/, (match, properties, close) =>
+    `${properties}${properties.trimEnd().endsWith(',') ? '' : ','}\n  SurfaceState: ActualState${close}`);
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('rejects bare and parenthesized exported constructor escapes', () => {
+  for (const argument of ['SurfaceState', '(SurfaceState)']) {
+    const text = source.replace('class SurfaceState {',
+      `function remove(value) {}\nclass SurfaceState {`).replace(
+      'module.exports = {', `remove(${argument});\nmodule.exports = {`);
+    assert.equal(matchesWithCandidateBaseline(text), false, argument);
+  }
+});
+
+test('keeps protected parameter defaults fixed after body reclassification', () => {
+  const text = source.replace(/(_bindOrdinaryClaude\([^)]*\)\s*\{)/, signature =>
+    `${signature.replace(/\s*=\s*[^,)]+/g, '')}\n  const retained = true;`);
   assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
