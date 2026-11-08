@@ -1827,3 +1827,113 @@ test('decision projection keeps complete answers at the embed and file boundary'
   assert.deepEqual(attached.allowedMentions, { parse: [] });
   assert.deepEqual(attached.attachments, []);
 });
+
+
+for (const scenario of [
+  {
+    title: 'Gateway stop releases a held decision channel fetch before its late result',
+    stage: 'channel',
+    outcome: 'not_sent'
+  },
+  {
+    title: 'Gateway stop releases a held decision message fetch before its late result',
+    stage: 'message',
+    outcome: 'not_sent'
+  },
+  {
+    title: 'Gateway stop classifies a held decision edit as unknown before its late result',
+    stage: 'edit',
+    outcome: 'unknown'
+  }
+]) {
+  test(scenario.title, { timeout: 30000 }, async t => {
+    let releaseHeld;
+    let enterHeld;
+    const held = new Promise(resolve => { releaseHeld = resolve; });
+    const entered = new Promise(resolve => { enterHeld = resolve; });
+    const release = () => {
+      releaseHeld();
+      enterHeld();
+    };
+    t.signal.addEventListener('abort', release, { once: true });
+    t.after(release);
+    let f;
+    let stopping;
+    try {
+      f = await fixture(t);
+      const calls = { channel: 0, message: 0, edit: 0 };
+      const waitForHeld = value => {
+        enterHeld();
+        return held.then(() => value);
+      };
+      const question = {
+        id: f.presentation.messageId,
+        edit(payload) {
+          calls.edit += 1;
+          f.edits.push(payload);
+          const edited = { id: f.presentation.messageId, ...payload };
+          return scenario.stage === 'edit' ? waitForHeld(edited) : Promise.resolve(edited);
+        }
+      };
+      const channel = {
+        id: 'channel',
+        messages: {
+          fetch(messageId) {
+            assert.equal(messageId, f.presentation.messageId);
+            calls.message += 1;
+            return scenario.stage === 'message' ? waitForHeld(question) : Promise.resolve(question);
+          }
+        }
+      };
+      f.gateway.client.channels.fetch = channelId => {
+        assert.equal(channelId, 'channel');
+        calls.channel += 1;
+        return scenario.stage === 'channel' ? waitForHeld(channel) : Promise.resolve(channel);
+      };
+      f.gateway.started = true;
+      f.gateway.transportReady = true;
+      f.gateway.ready = true;
+      const listener = f.listeners.get('interactionCreate');
+      assert.equal(typeof listener, 'function');
+      const interactionId = `stop-held-projection-${scenario.stage}`;
+      listener(component(f.presentation, interactionId, 0));
+      await entered;
+      assert.equal(t.signal.aborted, false, 'the controlled projection wait was reached');
+      const tracked = [...f.gateway.inFlight];
+      assert.equal(tracked.length, 1, 'the real interaction listener owns the projection work');
+      let workSettled = false;
+      Promise.allSettled(tracked).then(() => { workSettled = true; });
+      let stopSettled = false;
+      let stopError;
+      stopping = f.gateway.stop().then(
+        () => { stopSettled = true; },
+        error => { stopError = error; stopSettled = true; }
+      );
+      // Only abort continuations may run before this turn. The SDK wait stays held.
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(workSettled, true, 'stop must settle tracked work without the held SDK result');
+      assert.equal(stopSettled, true, 'stop must not join the unresolved SDK promise');
+      assert.ifError(stopError);
+      await stopping;
+      assert.equal(f.gateway.inFlight.size, 0);
+      assert.equal(f.gateway.controllers.size, 0);
+      const click = f.state.getDecisionClick(interactionId);
+      assert.equal(click.projectionOutcome, scenario.outcome,
+        'an uninvoked edit is not_sent and an invoked ambiguous edit is unknown');
+      const beforeLateResult = { ...calls };
+      assert.equal(calls.edit, scenario.stage === 'edit' ? 1 : 0);
+      release();
+      await held;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(calls, beforeLateResult, 'a late SDK result starts no further lookup or edit');
+      assert.equal(f.dispatches.length, 0, 'stop and late fulfillment start no native dispatch');
+      assert.equal(f.state.getDecisionClick(interactionId).projectionOutcome, scenario.outcome,
+        'late success cannot replace the cancellation outcome');
+    } finally {
+      release();
+      if (stopping) await stopping;
+      if (f) await Promise.allSettled([...f.gateway.inFlight]);
+      t.signal.removeEventListener('abort', release);
+    }
+  });
+}
