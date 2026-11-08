@@ -2134,3 +2134,52 @@ for (const [title, locked, archived, manager, expectedEdit] of [
     }
   });
 }
+
+
+test('a final SDK rejection leaves a possibly applied decision edit unknown across recovery', { timeout: 30000 }, async t => {
+  const { DiscordAPIError } = require('discord.js');
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const channel = await f.gateway.client.channels.fetch('channel');
+  const question = await channel.messages.fetch(f.presentation.messageId);
+  const url = `https://discord.com/api/v10/channels/${channel.id}/messages/${question.id}`;
+  const rejection = new DiscordAPIError(
+    { code: 50013, message: 'Missing Permissions' }, 50013, 403, 'PATCH', url, { body: {}, files: [] }
+  );
+  assert.ok(rejection instanceof DiscordAPIError);
+  assert.equal(rejection.status, 403);
+  assert.equal(rejection.method, 'PATCH');
+  assert.equal(rejection.url, url);
+  assert.equal(rejection.outcome, undefined);
+
+  let appliedPayload;
+  let editCalls = 0;
+  question.edit = async payload => {
+    editCalls++;
+    appliedPayload = payload;
+    throw rejection;
+  };
+
+  const id = 'final-edit-rejection';
+  const signal = new AbortController().signal;
+  await f.gateway.handleInteraction(component(f.presentation, id, 0), signal);
+  assertDecisionProjection(appliedPayload, f.presentation, 'approve');
+  const click = f.state.getDecisionClick(id);
+  assert.equal(click.projectionOutcome, 'unknown');
+  assert.equal(click.canonical.answer, 'approve');
+  assert.equal(click.nativeReturn.outcome, 'submitted');
+  assert.equal(editCalls, 1);
+  assert.deepEqual(f.callbacks.map(callback => callback.body), [{ type: 6 }]);
+  assert.equal(f.dispatches.length, 1);
+
+  const recoveryErrors = [];
+  f.gateway.logger = message => recoveryErrors.push(message);
+  assert.deepEqual(await f.gateway.startDecisionRecovery(signal), []);
+  assert.deepEqual(recoveryErrors, []);
+  assert.equal(f.state.getDecisionClick(id).projectionOutcome, 'unknown');
+  assert.equal(editCalls, 1);
+  assert.equal(f.callbacks.length, 1);
+  assert.equal(f.dispatches.length, 1);
+});
