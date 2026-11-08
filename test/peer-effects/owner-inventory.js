@@ -62,24 +62,59 @@ function enclosingOwner(node) {
   return null;
 }
 
-function callSites(sourceFile) {
+function callSites(sourceFile, violations, reportedUnsupported, sources) {
   const sites = [];
-  const sourcePath = path.resolve(sourceFile.fileName);
+  const logicalFile = sourceFile.fileName;
+  const sourcePath = path.resolve(logicalFile);
   const compilerOptions = {
     allowJs: true,
     noLib: true,
     noResolve: true,
+    types: [],
     target: ts.ScriptTarget.Latest
   };
-  const host = ts.createCompilerHost(compilerOptions);
-  const defaultGetSourceFile = host.getSourceFile.bind(host);
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-    path.resolve(fileName) === sourcePath
-      ? sourceFile
-      : defaultGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
-  host.fileExists = fileName => path.resolve(fileName) === sourcePath;
-  host.readFile = fileName => path.resolve(fileName) === sourcePath ? sourceFile.text : undefined;
-  const program = ts.createProgram([sourcePath], compilerOptions, host);
+  const roots = [sourcePath];
+  const files = new Map([[sourcePath, sourceFile]]);
+  const companion = 'src/direct-post/contracts.ts';
+  if (logicalFile === 'src/direct-post.ts' && typeof sources[companion] === 'string') {
+    const contractPath = path.resolve(companion);
+    files.set(contractPath, parse(contractPath, sources[companion]));
+    roots.push(contractPath);
+  }
+  const currentDirectory = path.resolve('.');
+  const directories = new Set([currentDirectory]);
+  for (const file of files.keys()) {
+    let dir = path.dirname(file);
+    while (!directories.has(dir)) {
+      directories.add(dir);
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  const host = {
+    getSourceFile: name => files.get(path.resolve(name)),
+    fileExists: name => files.has(path.resolve(name)),
+    readFile: name => files.get(path.resolve(name))?.text,
+    directoryExists: name => directories.has(path.resolve(name)),
+    getDirectories: () => [],
+    readDirectory: () => [],
+    realpath: name => path.resolve(name),
+    getCurrentDirectory: () => currentDirectory,
+    getDefaultLibFileName: () => 'lib.d.ts',
+    useCaseSensitiveFileNames: () => true,
+    getCanonicalFileName: name => name,
+    getNewLine: () => '\n',
+    getEnvironmentVariable: () => '',
+    writeFile: () => { throw new Error('inventory compiler host is read-only'); },
+    resolveModuleNames: (names, importingFile) => names.map(name => {
+      if (path.resolve(importingFile) !== sourcePath || name !== './direct-post/contracts' || roots.length !== 2) {
+        return undefined;
+      }
+      return { resolvedFileName: roots[1], extension: ts.Extension.Ts };
+    })
+  };
+  const program = ts.createProgram(roots, compilerOptions, host);
   const checker = program.getTypeChecker();
   const symbolAt = node => {
     if (!node) return null;
@@ -88,12 +123,14 @@ function callSites(sourceFile) {
     }
     return checker.getSymbolAtLocation(node);
   };
+  const unsupportedDefault = Symbol('unsupported stored callable');
+  const incompleteReceiver = Symbol('unsupported receiver history');
   const bindingHistoryBySymbol = new Map();
-  const recordBinding = (identifier, position, expression = null, canonical = null) => {
+  const recordBinding = (identifier, position, expression = null, canonical = null, expressionPosition = position, defaultedCapture = false) => {
     const symbol = symbolAt(identifier);
     if (!symbol) return;
     const entries = bindingHistoryBySymbol.get(symbol) || [];
-    entries.push({ position, expression, canonical, tracked: Boolean(expression || canonical) });
+    entries.push({ position, expression, expressionPosition, canonical, defaultedCapture, tracked: Boolean(expression || canonical) });
     entries.sort((left, right) => left.position - right.position);
     bindingHistoryBySymbol.set(symbol, entries);
   };
@@ -104,6 +141,42 @@ function callSites(sourceFile) {
     }
     return binding;
   };
+  const isExternalCallbackOption = (declaration, element) => {
+    if (!ts.isIdentifier(element.name) || element.dotDotDotToken || element.initializer.kind !== ts.SyntaxKind.NullKeyword) return false;
+    const property = element.propertyName || element.name;
+    if (!ts.isIdentifier(property) && !ts.isStringLiteral(property)) return false;
+    const inventoried = name => name === 'fetch' || name === 'loadChannels' ||
+      Object.values(EXPECTED_TRANSPORT).some(expected => Object.hasOwn(expected, name));
+    if (inventoried(property.text) || inventoried(element.name.text)) return false;
+    let input = declaration.initializer;
+    while (input && (ts.isAsExpression(input) || ts.isParenthesizedExpression(input) || ts.isTypeAssertionExpression(input))) {
+      input = input.expression;
+    }
+    if (!input || !ts.isIdentifier(input)) return false;
+    const symbol = symbolAt(input);
+    const parameter = symbol?.declarations?.length === 1 ? symbol.declarations[0] : null;
+    if (!parameter || !ts.isParameter(parameter) || !ts.isIdentifier(parameter.name) ||
+        !parameter.type || parameter.initializer || parameter.dotDotDotToken) return false;
+    const receiverType = checker.getTypeFromTypeNode(parameter.type);
+    const variants = receiverType.isUnion() ? receiverType.types : [receiverType];
+    const callableProperty = variant => {
+      if (!(variant.flags & ts.TypeFlags.Object)) return false;
+      const field = checker.getPropertyOfType(variant, property.text);
+      if (!field || !field.declarations?.length) return false;
+      const value = checker.getTypeOfSymbolAtLocation(field, parameter.name);
+      const alternatives = (value.isUnion() ? value.types : [value]).filter(type =>
+        !(type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)));
+      return alternatives.length > 0 && alternatives.every(type =>
+        !(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter)) &&
+        checker.getSignaturesOfType(type, ts.SignatureKind.Call).length > 0);
+    };
+    if (!variants.every(callableProperty)) return false;
+    const otherUse = node => {
+      if (ts.isIdentifier(node) && node !== parameter.name && node !== input && symbolAt(node) === symbol) return true;
+      return ts.forEachChild(node, otherUse);
+    };
+    return !otherUse(parameter.parent);
+  };
   const collectBindings = node => {
     if (ts.isImportSpecifier(node)) {
       recordBinding(node.name, -Infinity, null, (node.propertyName || node.name).text);
@@ -111,8 +184,48 @@ function callSites(sourceFile) {
       recordBinding(node.name, node.getStart(sourceFile), node.initializer || null);
     } else if (ts.isBindingElement(node) && ts.isIdentifier(node.name)) {
       const property = node.propertyName || node.name;
-      recordBinding(node.name, node.getStart(sourceFile), node.initializer || null,
-        ts.isIdentifier(property) ? property.text : null);
+      const declaration = node.parent.parent;
+      if (ts.isBindingElement(declaration)) {
+        let outer = declaration;
+        let defaulted = Boolean(node.initializer);
+        while (ts.isBindingElement(outer)) {
+          defaulted ||= Boolean(outer.initializer);
+          outer = outer.parent.parent;
+        }
+        if (defaulted && ts.isVariableDeclaration(outer)) {
+          recordBinding(node.name, node.getStart(sourceFile), null, incompleteReceiver);
+          ts.forEachChild(node, collectBindings);
+          return;
+        }
+      }
+      const receiver = ts.isObjectBindingPattern(node.parent) && ts.isVariableDeclaration(declaration) &&
+        declaration.initializer && ts.isIdentifier(declaration.initializer) && !node.dotDotDotToken
+        ? declaration.initializer
+        : null;
+      const position = node.getStart(sourceFile);
+      if (node.initializer && ts.isObjectBindingPattern(node.parent) && ts.isVariableDeclaration(declaration) &&
+          !isExternalCallbackOption(declaration, node)) {
+        const history = receiver && objectHistoryAt(symbolAt(receiver), position);
+        const properties = objectPropertiesAt(history, position);
+        const staticKey = ts.isIdentifier(property) || ts.isStringLiteral(property);
+        const complete = history && history.unsupportedFrom > position && properties && staticKey;
+        const stored = complete ? properties.get(property.text) : null;
+        if (!complete) {
+          recordBinding(node.name, position, null, incompleteReceiver);
+        } else if (!stored || ts.isVoidExpression(stored)) {
+          recordBinding(node.name, position, node.initializer, null, position, true);
+        } else {
+          recordBinding(node.name, position, stored, null, stored.getStart(sourceFile), true);
+        }
+        ts.forEachChild(node, collectBindings);
+        return;
+      }
+      const captured = receiver && (ts.isIdentifier(property) || ts.isStringLiteral(property))
+        ? objectPropertyAt(receiver, property.text, node.getStart(sourceFile))
+        : null;
+      const canonical = !captured && ts.isIdentifier(property) ? property.text : null;
+      recordBinding(node.name, node.getStart(sourceFile), captured || node.initializer || null, canonical,
+        captured ? captured.getStart(sourceFile) : node.getStart(sourceFile));
     } else if (ts.isFunctionDeclaration(node) && node.name) {
       recordBinding(node.name, -Infinity);
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
@@ -121,26 +234,54 @@ function callSites(sourceFile) {
     }
     ts.forEachChild(node, collectBindings);
   };
-  collectBindings(sourceFile);
 
-  const canonicalForExpression = (expression, position = expression?.getStart(sourceFile), resolving = new Set()) => {
-    if (!expression) return null;
+  const protectedImport = (identifier, name) => {
+    if (!Object.values(EXPECTED_TRANSPORT).some(expected => Object.hasOwn(expected, name))) return false;
+    const declarations = symbolAt(identifier)?.declarations || [];
+    return declarations.some(declaration => {
+      if (ts.isImportSpecifier(declaration)) return !declaration.isTypeOnly && !declaration.parent.parent.isTypeOnly;
+      if (!ts.isBindingElement(declaration) || declaration.initializer) return false;
+      const variable = declaration.parent.parent;
+      if (!ts.isVariableDeclaration(variable)) return false;
+      let initializer = variable.initializer;
+      if (initializer && ts.isAsExpression(initializer)) initializer = initializer.expression;
+      return !!initializer && ts.isCallExpression(initializer) && ts.isIdentifier(initializer.expression) &&
+        initializer.expression.text === 'require' && !symbolAt(initializer.expression)?.declarations?.length &&
+        initializer.arguments.length === 1 && ts.isStringLiteral(initializer.arguments[0]) &&
+        checker.getTypeAtLocation(identifier).getCallSignatures().length > 0;
+    });
+  };
+  const canonicalForExpression = (expression, position = expression?.getStart(sourceFile), resolving = new Set(),
+                                  representedOnly = false) => {
+    if (!expression) return representedOnly ? unsupportedDefault : null;
     if (ts.isIdentifier(expression)) {
       const symbol = symbolAt(expression);
-      if (!symbol || !symbol.declarations?.length) return expression.text;
+      if (!symbol || !symbol.declarations?.length) return representedOnly ? unsupportedDefault : expression.text;
       const binding = bindingAt(expression, position);
-      if (!binding || resolving.has(binding)) return null;
-      if (!binding.expression) return binding.canonical;
+      if (!binding || resolving.has(binding)) return representedOnly ? unsupportedDefault : null;
+      if (!binding.expression) {
+        if (!representedOnly || binding.canonical === unsupportedDefault || binding.canonical === incompleteReceiver) return binding.canonical;
+        if (binding.canonical && protectedImport(expression, binding.canonical)) return binding.canonical;
+        if (binding.position === -Infinity && symbol.declarations.some(ts.isFunctionDeclaration)) return null;
+        return unsupportedDefault;
+      }
       const next = new Set(resolving);
       next.add(binding);
-      return canonicalForExpression(binding.expression, binding.position, next);
+      return canonicalForExpression(binding.expression, binding.expressionPosition, next,
+        representedOnly || binding.defaultedCapture);
+    }
+    if (representedOnly) {
+      if (ts.isFunctionExpression(expression) || ts.isArrowFunction(expression)) return null;
+      return unsupportedDefault;
     }
     if (ts.isPropertyAccessExpression(expression)) {
       const object = canonicalForExpression(expression.expression, position, resolving);
+      if (object === unsupportedDefault || object === incompleteReceiver) return object;
       return object ? `${object}.${expression.name.text}` : null;
     }
     if (ts.isElementAccessExpression(expression)) {
       const object = canonicalForExpression(expression.expression, position, resolving);
+      if (object === unsupportedDefault || object === incompleteReceiver) return object;
       const argument = expression.argumentExpression;
       if (object === 'globalThis' && argument && ts.isStringLiteral(argument)) return argument.text;
       return null;
@@ -182,17 +323,21 @@ function callSites(sourceFile) {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
         node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
       const properties = new Map();
+      let complete = true;
       for (const property of node.initializer.properties) {
         if (ts.isPropertyAssignment(property)) {
           const propertyName = property.name && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name))
             ? property.name.text
             : null;
+          if (!propertyName || propertyName === '__proto__') complete = false;
           if (propertyName) properties.set(propertyName, property.initializer);
         } else if (ts.isShorthandPropertyAssignment(property)) {
           properties.set(property.name.text, property.name);
+        } else {
+          complete = false;
         }
       }
-      const history = { entries: [] };
+      const history = { entries: [], unsupportedFrom: complete ? Infinity : node.getStart(sourceFile) };
       recordObjectProperties(history, node.getStart(sourceFile), properties);
       associateObjectHistory(symbolAt(node.name), node.getStart(sourceFile), history);
     }
@@ -207,6 +352,25 @@ function callSites(sourceFile) {
     ts.forEachChild(node, collectObjectAliases);
   };
   const collectObjectPropertyWrites = node => {
+    if (ts.isIdentifier(node)) {
+      const position = node.getStart(sourceFile);
+      const history = objectHistoryAt(symbolAt(node), position);
+      if (history) {
+        const parent = node.parent;
+        const aliasOrExtraction = ts.isVariableDeclaration(parent) && parent.initializer === node &&
+          (ts.isIdentifier(parent.name) || ts.isObjectBindingPattern(parent.name));
+        const ownDeclaration = ts.isVariableDeclaration(parent) && parent.name === node;
+        const member = (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === node;
+        const assignment = member && parent.parent;
+        const plainWrite = assignment && ts.isBinaryExpression(assignment) && assignment.left === parent &&
+          assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          (ts.isPropertyAccessExpression(parent) || ts.isStringLiteral(parent.argumentExpression)) &&
+          ts.isExpressionStatement(assignment.parent) && ts.isSourceFile(assignment.parent.parent);
+        if (!aliasOrExtraction && !ownDeclaration && !plainWrite) {
+          history.unsupportedFrom = Math.min(history.unsupportedFrom, position);
+        }
+      }
+    }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
         (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
       const receiver = node.left.expression;
@@ -229,6 +393,7 @@ function callSites(sourceFile) {
   collectObjectLiterals(sourceFile);
   collectObjectAliases(sourceFile);
   collectObjectPropertyWrites(sourceFile);
+  collectBindings(sourceFile);
   const visit = node => {
     if (ts.isCallExpression(node)) {
       const expression = node.expression;
@@ -275,13 +440,25 @@ function callSites(sourceFile) {
         }
       }
       if (name) {
-        sites.push({
-          node,
-          name,
-          canonical,
-          indirect,
-          owner: enclosingOwner(node)
-        });
+        const reason = canonical === incompleteReceiver ? 'receiver history is incomplete' :
+          canonical === unsupportedDefault ? 'callable identity is not represented' : null;
+        let unsupportedDefaultDiagnostic = null;
+        if (reason) {
+          const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+          const callee = ts.isPropertyAccessExpression(expression) && (name === 'call' || name === 'apply')
+            ? expression.expression : expression;
+          const calledName = ts.isIdentifier(callee) ? callee.text :
+            ts.isPropertyAccessExpression(callee) ? callee.name.text : '<computed>';
+          unsupportedDefaultDiagnostic = `${logicalFile}:${line + 1}:${character + 1}: unsupported defaulted capture '${calledName}': ${reason}`;
+        }
+        if (unsupportedDefaultDiagnostic) {
+          if (!reportedUnsupported.has(unsupportedDefaultDiagnostic)) {
+            reportedUnsupported.add(unsupportedDefaultDiagnostic);
+            violations.push(unsupportedDefaultDiagnostic);
+          }
+        } else {
+          sites.push({ node, name, canonical, indirect, owner: enclosingOwner(node) });
+        }
       }
     }
     ts.forEachChild(node, visit);
@@ -308,8 +485,8 @@ function assertionFactoryNames(sourceFile) {
   return names;
 }
 
-function hasFactoryCall(sourceFile) {
-  return callSites(sourceFile).some(site => site.canonical === 'createCallerAssertion');
+function hasFactoryCall(sites) {
+  return sites.some(site => site.canonical === 'createCallerAssertion');
 }
 
 // Resolve an object literal's named properties, following identifier spreads of
@@ -360,7 +537,7 @@ function suppliesValue(initializer) {
 // ---------------------------------------------------------------------------
 // Inventory checkers. Each returns an array of human-readable violations.
 
-function transportViolations(sources) {
+function transportViolations(sources, reportedUnsupported) {
   const violations = [];
   for (const [file, expected] of Object.entries(EXPECTED_TRANSPORT)) {
     const text = sources[file];
@@ -370,7 +547,7 @@ function transportViolations(sources) {
     }
     const sourceFile = parse(file, text);
     const counts = new Map();
-    for (const site of callSites(sourceFile)) {
+    for (const site of callSites(sourceFile, violations, reportedUnsupported, sources)) {
       if (site.canonical === 'fetch' || site.name === 'fetch' ||
           (ts.isPropertyAccessExpression(site.node.expression) && site.name === 'fetch')) {
         violations.push(`${file}: direct fetch call at ${site.owner || '<top>'}`);
@@ -412,19 +589,20 @@ function transportViolations(sources) {
       violations.push(`${file}: source is missing`);
       continue;
     }
-    for (const site of callSites(parse(file, text))) {
+    for (const site of callSites(parse(file, text), violations, reportedUnsupported, sources)) {
       if (site.name === 'fetch') violations.push(`${file}: direct fetch call at ${site.owner || '<top>'}`);
     }
   }
   return violations;
 }
 
-function serverFetchViolations(sources) {
+function serverFetchViolations(sources, reportedUnsupported) {
   const file = 'src/peer/server.js';
   const text = sources[file];
   if (typeof text !== 'string') return [`${file}: source is missing`];
-  const sites = callSites(parse(file, text)).filter(site => site.canonical === 'fetch' || site.name === 'fetch');
   const violations = [];
+  const sites = callSites(parse(file, text), violations, reportedUnsupported, sources)
+    .filter(site => site.canonical === 'fetch' || site.name === 'fetch');
   if (sites.length !== 1) violations.push(`${file}: fetch expected 1, found ${sites.length}`);
   for (const site of sites) {
     if (site.owner !== 'loadChannels') violations.push(`${file}: fetch outside loadChannels at ${site.owner || '<top>'}`);
@@ -432,7 +610,7 @@ function serverFetchViolations(sources) {
   return violations;
 }
 
-function channelLookupViolations(sources) {
+function channelLookupViolations(sources, reportedUnsupported) {
   const violations = [];
   const text = sources['src/peer/service.js'];
   if (typeof text !== 'string') {
@@ -440,13 +618,13 @@ function channelLookupViolations(sources) {
     return violations;
   }
   const sourceFile = parse('src/peer/service.js', text);
-  const sites = callSites(sourceFile);
+  const sites = callSites(sourceFile, violations, reportedUnsupported, sources);
   const lookups = sites.filter(site => site.canonical === 'loadChannels');
   if (lookups.length !== 1) violations.push(`src/peer/service.js: loadChannels expected 1, found ${lookups.length}`);
   const factoryNames = new Set(assertionFactoryNames(sourceFile));
   factoryNames.add('assertCallerCurrent');
   const assertions = sites.filter(site => factoryNames.has(site.name) || factoryNames.has(site.canonical));
-  if (!hasFactoryCall(sourceFile)) violations.push('src/peer/service.js: no createCallerAssertion call found');
+  if (!hasFactoryCall(sites)) violations.push('src/peer/service.js: no createCallerAssertion call found');
   if (lookups.length === 1) {
     const lookup = lookups[0].node;
     const before = assertions.some(site => site.node.pos < lookup.pos && site.owner === lookups[0].owner);
@@ -458,7 +636,7 @@ function channelLookupViolations(sources) {
 }
 
 // Public peer roles must forward the assertion produced by the peer caller owner.
-function wiringViolations(sources) {
+function wiringViolations(sources, reportedUnsupported = new Set()) {
   const violations = [];
   for (const file of ['src/peer/service.js', 'src/peer/post.js']) {
     const text = sources[file];
@@ -469,8 +647,9 @@ function wiringViolations(sources) {
     const sourceFile = parse(file, text);
     const initializers = variableInitializers(sourceFile);
     const factoryNames = new Set(assertionFactoryNames(sourceFile));
-    if (!hasFactoryCall(sourceFile)) violations.push(`${file}: no createCallerAssertion call found`);
-    const runCalls = callSites(sourceFile).filter(site =>
+    const sites = callSites(sourceFile, violations, reportedUnsupported, sources);
+    if (!hasFactoryCall(sites)) violations.push(`${file}: no createCallerAssertion call found`);
+    const runCalls = sites.filter(site =>
       site.canonical === 'runDirectPost' || site.canonical === 'runBoardRefresh');
     if (file.endsWith('service.js')) {
       const sendRun = runCalls.filter(site => site.owner === 'send');
@@ -531,7 +710,7 @@ function wiringViolations(sources) {
 
 function realSources() {
   const files = [
-    'src/direct-post.ts', 'src/direct-post/delivery-identity.ts', 'src/board-refresh.ts',
+    'src/direct-post.ts', 'src/direct-post/contracts.ts', 'src/direct-post/delivery-identity.ts', 'src/board-refresh.ts',
     'src/peer/service.js', 'src/peer/server.js', 'src/peer/post.js', 'test/peer-effect-revalidation.test.js'
   ];
   return Object.fromEntries(files.map(file => [file, fs.readFileSync(path.join(ROOT, file), 'utf8')]));
@@ -594,7 +773,14 @@ function rejectionViolations(sources) {
 }
 
 function ownerViolations(sources) {
-  return [...transportViolations(sources), ...serverFetchViolations(sources), ...channelLookupViolations(sources), ...wiringViolations(sources), ...rejectionViolations(sources)];
+  const reportedUnsupported = new Set();
+  return [
+    ...transportViolations(sources, reportedUnsupported),
+    ...serverFetchViolations(sources, reportedUnsupported),
+    ...channelLookupViolations(sources, reportedUnsupported),
+    ...wiringViolations(sources, reportedUnsupported),
+    ...rejectionViolations(sources)
+  ];
 }
 
 

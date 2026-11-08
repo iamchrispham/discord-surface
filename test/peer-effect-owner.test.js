@@ -626,3 +626,222 @@ test('transport inventory visits function, arrow and binding parameter defaults'
 
 // Board run helper local to this suite, so mutant checks never touch the
 // worktree and runtime fixtures stay disposable.
+
+test('transport inventory resolves destructured object values at capture time', () => {
+  const sources = realSources();
+  assert.deepEqual(ownerViolations(sources), [], 'the real sources pass the combined inventory');
+  const countViolation = 'src/direct-post.ts: sendDiscordMessage expected 1, found 2';
+  const cases = [
+    ['undefined property keeps the protected default', 'const transport = { send: void 0 }; const { send = sendDiscordMessage } = transport; send({});', true],
+    ['shorthand extraction', 'const transport = { send: sendDiscordMessage }; const { send } = transport; send({});', true],
+    ['renamed extraction', 'const transport = { send: sendDiscordMessage }; const { send: publish } = transport; publish({});', true],
+    ['tracked receiver alias', 'const transport = { send: sendDiscordMessage }; const alias = transport; const { send } = alias; send({});', true],
+    ['protected property captured before overwrite', 'const transport = { send: sendDiscordMessage }; const { send } = transport; transport.send = JSON.stringify; send({});', true],
+    ['ordinary property captured before protected overwrite', 'const transport = { send: JSON.stringify }; const { send } = transport; transport.send = sendDiscordMessage; send({});', false],
+    ['stored initializer keeps its outer lexical binding', 'const transport = { send: sendDiscordMessage }; { const sendDiscordMessage = JSON.stringify; const { send } = transport; send({}); }', true],
+    ['protected initializer captured before alias reassignment', 'let helper = sendDiscordMessage; const transport = { send: helper }; helper = JSON.stringify; const { send } = transport; send({});', true],
+    ['ordinary initializer captured before alias reassignment', 'let helper = JSON.stringify; const transport = { send: helper }; helper = sendDiscordMessage; const { send } = transport; send({});', false],
+    ['ordinary value under a protected property spelling', 'const transport = { sendDiscordMessage: JSON.stringify }; const { sendDiscordMessage: send } = transport; send({});', false],
+    ['ordinary receiver shadows a protected receiver', 'const transport = { send: sendDiscordMessage }; { const transport = { send: JSON.stringify }; const { send } = transport; send({}); }', false]
+  ];
+  for (const [name, snippet, refused] of cases) {
+    const violations = ownerViolations({
+      ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\n${snippet}\n`
+    });
+    if (refused) {
+      assert.ok(violations.includes(countViolation),
+        `${name}: missing ${countViolation}. Actual: ${JSON.stringify(violations)}`);
+    } else {
+      assert.deepEqual(violations, [], name);
+    }
+  }
+});
+
+
+test('supported default capture counts a represented protected value and selects a known missing or void fallback', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const expected = [file + ': sendDiscordMessage expected 1, found 2'];
+  for (const [slot, fallback] of [
+    ['send: sendDiscordMessage', 'JSON.stringify'],
+    ['send: void 0', 'sendDiscordMessage'],
+    ['', 'sendDiscordMessage']
+  ]) {
+    const snippet = `const transport = { ${slot} }; const { send = ${fallback} } = transport; send({});`;
+    assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + '\n' + snippet }), expected);
+  }
+});
+
+test('a default capture with an unrepresented free-global callable reports an unsupported use', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const text = sources[file] + '\nconst transport = { send: JSON.stringify };\n' +
+    'const { send = sendDiscordMessage } = transport;\n  send({});';
+  const line = text.split(/\r\n|[\r\n]/).length;
+  assert.deepEqual(ownerViolations({ ...sources, [file]: text }), [
+    `${file}:${line}:3: unsupported defaulted capture 'send': callable identity is not represented`
+  ]);
+});
+
+test('incomplete defaulted receiver history reports the called alias but permits an ordinary read', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const prefix = sources[file] + '\nconst transport = { ...supplied };\n' +
+    'const { send = JSON.stringify } = transport;\nconst alias = send;\n';
+  const line = prefix.split(/\r\n|[\r\n]/).length;
+  assert.deepEqual(ownerViolations({ ...sources, [file]: prefix + ' alias({});' }), [
+    `${file}:${line}:2: unsupported defaulted capture 'alias': receiver history is incomplete`
+  ]);
+  assert.deepEqual(ownerViolations({ ...sources, [file]: prefix + ' void alias;' }), []);
+});
+
+test('represented local callables win over a protected destructuring default', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  for (const ordinary of ['function localSend() {}', 'const localSend = () => {};']) {
+    const snippet = `${ordinary}
+const transport = { send: localSend };
+const { send = sendDiscordMessage } = transport;
+send({});`;
+    assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + '\n' + snippet }), []);
+  }
+});
+
+
+test('server fetch inventory distinguishes unsupported callees from confirmed fetches', () => {
+  const sources = realSources();
+  const file = 'src/peer/server.js';
+  for (const name of ['publish', 'fetch']) {
+    const prefix = sources[file] + '\n{\n  const transport = { ...supplied };\n' +
+      `  const { send: ${name} = JSON.stringify } = transport;\n`;
+    const line = prefix.split(/\r\n|[\r\n]/).length;
+    const check = statement => ownerViolations({ ...sources, [file]: prefix + statement + '\n}' });
+    assert.deepEqual(check(`  ${name}({});`), [
+      `${file}:${line}:3: unsupported defaulted capture '${name}': receiver history is incomplete`
+    ]);
+    assert.deepEqual(check(`  void ${name};`), []);
+  }
+  const ordinary = '\n{ const publish = () => {}; const transport = { send: publish }; ' +
+    'const { send = fetch } = transport; send({}); }';
+  assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + ordinary }), []);
+});
+
+test('overlapping service inventory checks report an unresolved call only once', () => {
+  const sources = realSources();
+  const file = 'src/peer/service.js';
+  const prefix = sources[file] + '\n{ const transport = { ...supplied }; ' +
+    'const { publish = fetch } = transport;\n';
+  const line = prefix.split(/\r\n|[\r\n]/).length;
+  const changed = { ...sources, [file]: prefix + ' publish({});\n}' };
+  const expected = [`${file}:${line}:2: unsupported defaulted capture 'publish': receiver history is incomplete`];
+  assert.deepEqual(ownerViolations(changed), expected);
+  assert.deepEqual(wiringViolations(changed), expected);
+});
+
+
+test('a typed external input with a null callback default uses ordinary callsite analysis', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const snippet = `
+function runOptions(input: { ready?: (() => boolean) | null }) {
+  const { ready = null } = input as { ready?: (() => boolean) | null };
+  if (typeof ready === 'function') ready();
+}`;
+  assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + snippet }), []);
+});
+
+test('a null fallback cannot conceal locally stored or uncertain transport values', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const known = '\nconst box = { run: sendDiscordMessage }; const { run: invoke = null } = box; invoke({});';
+  assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + known }), [
+    file + ': sendDiscordMessage expected 1, found 2'
+  ]);
+
+  for (const source of [
+    'const box = { ...supplied }; const { run: invoke = null } = box;',
+    'function changed(input: any) { input.run = sendDiscordMessage; const { run: invoke = null } = input;'
+  ]) {
+    const prefix = sources[file] + '\n' + source + '\n';
+    const line = prefix.split(/\r\n|[\r\n]/).length;
+    const close = source.startsWith('function') ? '\n}' : '';
+    const check = action => ownerViolations({ ...sources, [file]: prefix + action + close });
+    assert.deepEqual(check('  invoke({});'), [
+      `${file}:${line}:3: unsupported defaulted capture 'invoke': receiver history is incomplete`
+    ]);
+    assert.deepEqual(check('  void invoke;'), []);
+  }
+});
+
+
+test('only a resolved flat callback property can use the external input exception', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  for (const [label, annotation, pattern] of [
+    ['untyped input', '', '{ ready: invoke = null }'],
+    ['any input', ': any', '{ ready: invoke = null }'],
+    ['unknown input', ': unknown', '{ ready: invoke = null }'],
+    ['unresolved input', ': MissingInput', '{ ready: invoke = null }'],
+    ['any property', ': { ready?: any }', '{ ready: invoke = null }'],
+    ['unknown property', ': { ready?: unknown }', '{ ready: invoke = null }'],
+    ['missing property', ': { other?: () => boolean }', '{ ready: invoke = null }'],
+    ['noncallable property', ': { ready?: number }', '{ ready: invoke = null }'],
+    ['mixed property', ': { ready?: number | (() => boolean) }', '{ ready: invoke = null }'],
+    ['nested leaf default', ': { inner: { ready?: () => boolean } }', '{ inner: { ready: invoke = null } }'],
+    ['nested container default', ': { inner: { ready: () => boolean } }', '{ inner: { ready: invoke } = {} }']
+  ]) {
+    const prefix = sources[file] + `\nfunction probe(input${annotation}) {\n  const ${pattern} = input;\n`;
+    const line = prefix.split(/\r\n|[\r\n]/).length;
+    const check = action => ownerViolations({ ...sources, [file]: prefix + action + '\n}' });
+    assert.deepEqual(check('  invoke();'), [
+      `${file}:${line}:3: unsupported defaulted capture 'invoke': receiver history is incomplete`
+    ], label);
+    assert.deepEqual(check('  void invoke;'), [], label);
+  }
+});
+
+test('real injected callback options depend on the imported DirectPostInput declaration', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const contract = 'src/direct-post/contracts.ts';
+  assert.deepEqual(ownerViolations(sources), []);
+  const before = 'bindingCurrent?: (() => boolean) | null;';
+  assert.ok(sources[contract].includes(before));
+  const changed = sources[contract].replace(before, 'bindingCurrent?: string | null;');
+  const lines = sources[file].split(/\r\n|[\r\n]/);
+  const line = lines.findIndex(value => value.includes('return bindingCurrent();'));
+  assert.notEqual(line, -1);
+  const column = lines[line].indexOf('bindingCurrent()') + 1;
+  const absent = { ...sources };
+  delete absent[contract];
+  const missing = ['assertCallerCurrent(signal)', 'bindingCurrent()', 'agentDestinationCurrent(target)'].map(call => {
+    const row = lines.findIndex(value => value.includes(call));
+    assert.notEqual(row, -1);
+    const name = call.slice(0, call.indexOf('('));
+    return `${file}:${row + 1}:${lines[row].indexOf(call) + 1}: unsupported defaulted capture '${name}': receiver history is incomplete`;
+  });
+  assert.deepEqual(ownerViolations(absent), missing);
+  assert.deepEqual(ownerViolations({ ...sources, [contract]: '' }), missing);
+  assert.deepEqual(ownerViolations({ ...sources, [contract]: changed }), [
+    `${file}:${line + 1}:${column}: unsupported defaulted capture 'bindingCurrent': receiver history is incomplete`
+  ]);
+});
+
+
+test('checking callback contracts does not consult the TypeScript system filesystem', t => {
+  const ts = require('typescript');
+  const sources = realSources();
+  const consulted = [];
+  for (const method of ['fileExists', 'readFile', 'directoryExists', 'getDirectories', 'readDirectory', 'realpath']) {
+    t.mock.method(ts.sys, method, () => {
+      consulted.push(method);
+      throw new Error('unexpected TypeScript system access: ' + method);
+    });
+  }
+  try {
+    assert.deepEqual(ownerViolations(sources), []);
+    assert.deepEqual(consulted, []);
+  } finally {
+    t.mock.restoreAll();
+  }
+});
