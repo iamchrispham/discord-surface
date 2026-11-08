@@ -739,17 +739,25 @@ test('overlapping service inventory checks report an unresolved call only once',
 });
 
 
-test('a typed external input with a null callback default uses ordinary callsite analysis', () => {
+test('a local helper cannot hide a stored transport behind a typed callback input', () => {
   const sources = realSources();
   const file = 'src/direct-post.ts';
   const snippet = `
-function runOptions(input: { ready?: (() => boolean) | null }) {
-  const { ready = null } = input as { ready?: (() => boolean) | null };
-  if (typeof ready === 'function') ready();
-}`;
-  assert.deepEqual(ownerViolations({ ...sources, [file]: sources[file] + snippet }), []);
+const localTransportOptions = { ready: sendDiscordMessage };
+function invokeLocalOption(input: { ready?: typeof sendDiscordMessage | null }) {
+  const { ready: invoke = null } = input;
+  if (invoke) invoke({ token: '', channelId: '0', content: 'fixture', nonce: '0' });
+}
+invokeLocalOption(localTransportOptions);`;
+  const changed = { ...sources, [file]: sources[file] + snippet };
+  const lines = changed[file].split(/\r\n|[\r\n]/);
+  const callLine = lines.findIndex(value => value.includes('if (invoke) invoke('));
+  assert.notEqual(callLine, -1);
+  const callColumn = lines[callLine].lastIndexOf('invoke(') + 1;
+  const violations = ownerViolations(changed);
+  const unsupported = `${file}:${callLine + 1}:${callColumn}: unsupported defaulted capture 'invoke': receiver history is incomplete`;
+  assert.deepEqual(violations, [unsupported], 'a stored transport in a local helper must not receive the external callback exception');
 });
-
 test('a null fallback cannot conceal locally stored or uncertain transport values', () => {
   const sources = realSources();
   const file = 'src/direct-post.ts';
@@ -827,6 +835,80 @@ test('real injected callback options depend on the imported DirectPostInput decl
   ]);
 });
 
+
+
+test('external callback exception accepts optional or nullable callable properties', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const contract = 'src/direct-post/contracts.ts';
+  const original = 'bindingCurrent?: (() => boolean) | null;';
+  const lines = sources[file].split(/\r\n|[\r\n]/);
+  const line = lines.findIndex(value => value.includes('return bindingCurrent();'));
+  assert.notEqual(line, -1);
+  const column = lines[line].indexOf('bindingCurrent()') + 1;
+  const expected = [`${file}:${line + 1}:${column}: unsupported defaulted capture 'bindingCurrent': receiver history is incomplete`];
+  const check = (label, changedDeclaration, expectedViolations) => {
+    const changedContract = sources[contract].replace(original, changedDeclaration);
+    assert.notEqual(changedContract, sources[contract], `${label} mutation target exists`);
+    assert.deepEqual(ownerViolations({ ...sources, [contract]: changedContract }), expectedViolations, label);
+  };
+  check('required nonnullable callback', 'bindingCurrent: () => boolean;', expected);
+  check('required nullable callback', 'bindingCurrent: (() => boolean) | null;', []);
+  check('optional nonnullable callback', 'bindingCurrent?: () => boolean;', []);
+});
+
+
+test('callback exception requires runtime publication and canonical contract identity', () => {
+  const sources = realSources();
+  const file = 'src/direct-post.ts';
+  const lines = sources[file].split(/\r\n|[\r\n]/);
+  const exportLine = lines.find(line =>
+    /^\s*export\s+\{[^}]*\brunDirectPost\b[^}]*\}\s*;?\s*$/.test(line));
+  assert.notEqual(exportLine, undefined);
+  const specifierList = exportLine.match(/\{([^}]*)\}/);
+  assert.notEqual(specifierList, null);
+  const namedSpecifiers = specifierList[1].split(',').map(value => value.trim()).filter(Boolean);
+  assert.equal(namedSpecifiers.filter(value => value === 'runDirectPost').length, 1);
+  const otherRuntimeExport = `export { ${namedSpecifiers.filter(value => value !== 'runDirectPost').join(', ')} };`;
+
+  const replaceOnce = (source, before, after, label) => {
+    assert.equal(source.split(before).length - 1, 1, label);
+    return source.replace(before, after);
+  };
+  const missing = ['assertCallerCurrent(signal)', 'bindingCurrent()', 'agentDestinationCurrent(target)'].map(call => {
+    const row = lines.findIndex(value => value.includes(call));
+    assert.notEqual(row, -1, call);
+    const name = call.slice(0, call.indexOf('('));
+    return file + ':' + (row + 1) + ':' + (lines[row].indexOf(call) + 1) +
+      ": unsupported defaulted capture '" + name + "': receiver history is incomplete";
+  });
+
+  const typeOnlyDeclaration = `${otherRuntimeExport}\nexport type { runDirectPost };`;
+  const typeOnlySpecifier = exportLine.replace(/\brunDirectPost\b/, 'type runDirectPost');
+  for (const [label, replacement] of [
+    ['type-only export declaration', typeOnlyDeclaration],
+    ['type-only export specifier', typeOnlySpecifier]
+  ]) {
+    assert.notEqual(replacement, exportLine, label);
+    const changed = replaceOnce(sources[file], exportLine, replacement, label);
+    assert.deepEqual(ownerViolations({ ...sources, [file]: changed }), missing, label);
+  }
+
+  const aliasSource = replaceOnce(
+    "import type { DirectPostInput as Input } from './direct-post/contracts';\n" + sources[file],
+    'input: DirectPostInput',
+    'input: Input',
+    'parameter type alias');
+  assert.deepEqual(ownerViolations({ ...sources, [file]: aliasSource }), []);
+
+  const functionLine = lines.find(line => /^\s*(?:async\s+)?function\s+runDirectPost\s*\(/.test(line));
+  assert.notEqual(functionLine, undefined);
+  const inlineFunctionLine = functionLine.replace(/^(\s*)/, '$1export ');
+  const withoutNamedExport = replaceOnce(sources[file], exportLine, otherRuntimeExport, 'remove runDirectPost named export');
+  const inlineSource = replaceOnce(withoutNamedExport, functionLine, inlineFunctionLine, 'inline runtime export');
+  assert.deepEqual(ownerViolations({ ...sources, [file]: inlineSource }), []);
+  assert.deepEqual(ownerViolations(sources), []);
+});
 
 test('checking callback contracts does not consult the TypeScript system filesystem', t => {
   const ts = require('typescript');

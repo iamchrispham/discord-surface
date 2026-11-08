@@ -141,8 +141,18 @@ function callSites(sourceFile, violations, reportedUnsupported, sources) {
     }
     return binding;
   };
+  const namedRuntimeExport = sourceFile.statements.some(statement =>
+    ts.isExportDeclaration(statement) && !statement.isTypeOnly && !statement.moduleSpecifier &&
+    statement.exportClause && ts.isNamedExports(statement.exportClause) &&
+    statement.exportClause.elements.some(specifier => !specifier.isTypeOnly &&
+      (specifier.propertyName || specifier.name).text === 'runDirectPost'));
+  const inlineRuntimeExport = sourceFile.statements.some(statement =>
+    ts.isFunctionDeclaration(statement) && statement.name?.text === 'runDirectPost' &&
+    statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword));
+  const exportedRunDirectPost = namedRuntimeExport || inlineRuntimeExport;
   const isExternalCallbackOption = (declaration, element) => {
-    if (!ts.isIdentifier(element.name) || element.dotDotDotToken || element.initializer.kind !== ts.SyntaxKind.NullKeyword) return false;
+    if (!ts.isIdentifier(element.name) || element.dotDotDotToken ||
+        element.initializer.kind !== ts.SyntaxKind.NullKeyword) return false;
     const property = element.propertyName || element.name;
     if (!ts.isIdentifier(property) && !ts.isStringLiteral(property)) return false;
     const inventoried = name => name === 'fetch' || name === 'loadChannels' ||
@@ -155,14 +165,35 @@ function callSites(sourceFile, violations, reportedUnsupported, sources) {
     if (!input || !ts.isIdentifier(input)) return false;
     const symbol = symbolAt(input);
     const parameter = symbol?.declarations?.length === 1 ? symbol.declarations[0] : null;
+    const owner = parameter?.parent;
     if (!parameter || !ts.isParameter(parameter) || !ts.isIdentifier(parameter.name) ||
-        !parameter.type || parameter.initializer || parameter.dotDotDotToken) return false;
-    const receiverType = checker.getTypeFromTypeNode(parameter.type);
+        !parameter.type || parameter.initializer || parameter.dotDotDotToken ||
+        logicalFile !== 'src/direct-post.ts' || !ts.isFunctionDeclaration(owner) ||
+        owner.name?.text !== 'runDirectPost' || owner.parent !== sourceFile ||
+        owner.parameters.length !== 1 || owner.parameters[0] !== parameter || !exportedRunDirectPost) return false;
+    const typeReference = parameter.type;
+    if (!ts.isTypeReferenceNode(typeReference) || !ts.isIdentifier(typeReference.typeName)) return false;
+    const importedType = checker.getSymbolAtLocation(typeReference.typeName);
+    const directPostInput = importedType && (importedType.flags & ts.SymbolFlags.Alias)
+      ? checker.getAliasedSymbol(importedType)
+      : importedType;
+    if (!directPostInput || directPostInput.name !== 'DirectPostInput' ||
+        !directPostInput.declarations?.some(typeDeclaration =>
+          path.resolve(typeDeclaration.getSourceFile().fileName) === path.resolve(companion))) return false;
+    const receiverType = checker.getTypeFromTypeNode(typeReference);
     const variants = receiverType.isUnion() ? receiverType.types : [receiverType];
     const callableProperty = variant => {
       if (!(variant.flags & ts.TypeFlags.Object)) return false;
       const field = checker.getPropertyOfType(variant, property.text);
       if (!field || !field.declarations?.length) return false;
+      const optionalOrNullableContract = field.declarations.every(fieldDeclaration => {
+        if (!ts.isPropertySignature(fieldDeclaration) || !fieldDeclaration.type) return false;
+        if (fieldDeclaration.questionToken) return true;
+        return ts.isUnionTypeNode(fieldDeclaration.type) && fieldDeclaration.type.types.some(type =>
+          type.kind === ts.SyntaxKind.UndefinedKeyword ||
+          (ts.isLiteralTypeNode(type) && type.literal.kind === ts.SyntaxKind.NullKeyword));
+      });
+      if (!optionalOrNullableContract) return false;
       const value = checker.getTypeOfSymbolAtLocation(field, parameter.name);
       const alternatives = (value.isUnion() ? value.types : [value]).filter(type =>
         !(type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)));
