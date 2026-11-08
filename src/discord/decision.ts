@@ -1,3 +1,4 @@
+import type { ProjectionPermissions } from './history-access';
 import { decisionCompatibilityHeld } from '../state/decision/reducer';
 import { PROVIDERS, type AgentProvider } from '../agent-message';
 import {
@@ -48,21 +49,29 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
 const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
 const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
 
-export function renderDecisionProjection(presentation: Pick<DecisionPresentation, 'content'>, answer: string) {
-  const inline = answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT;
+export function renderDecisionProjection(
+  presentation: Pick<DecisionPresentation, 'content'>,
+  answer: string,
+  permissions: ProjectionPermissions | null = null
+) {
+  if (permissions?.allowed !== true) return null;
   const prompt = presentation.content || '';
   const separator = prompt.length > 0 ? '\n\n' : '';
+  const base = { components: [], attachments: [], allowedMentions: { parse: [] } };
+
+  if (permissions.embedLinks === true && answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT) {
+    return { ...base, content: prompt, embeds: [{ title: 'Selected action', description: answer }] };
+  }
+  const plain = `${prompt}${separator}Selected action:\n${answer}`;
+  if (plain.length <= DISCORD_MESSAGE_CONTENT_LIMIT) return { ...base, content: plain, embeds: [] };
+  if (permissions.attachFiles !== true) return null;
+
   const attachmentNotice = `${prompt}${separator}Selected action is attached in selected-action.txt.`;
   return {
-    content: inline ? prompt : attachmentNotice.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? attachmentNotice : prompt,
-    embeds: [{
-      title: 'Selected action',
-      description: inline ? answer : 'Full answer attached in selected-action.txt.'
-    }],
-    components: [],
-    attachments: [],
-    allowedMentions: { parse: [] },
-    ...(inline ? {} : { files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }] })
+    ...base,
+    content: attachmentNotice.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? attachmentNotice : prompt,
+    embeds: permissions.embedLinks === true ? [{ title: 'Selected action', description: 'Full answer attached in selected-action.txt.' }] : [],
+    files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }]
   };
 }
 

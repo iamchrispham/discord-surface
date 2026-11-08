@@ -16,6 +16,16 @@ const { DECISION_REASONS, READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
+const fullProjectionPermissions = { allowed: true, embedLinks: true, attachFiles: true };
+
+function fixturePermissions({ embedLinks = true, attachFiles = true } = {}) {
+  const { PermissionFlagsBits: flags } = require('discord.js');
+  const allowed = new Set([flags.ViewChannel, flags.ReadMessageHistory, flags.SendMessages]);
+  if (embedLinks) allowed.add(flags.EmbedLinks);
+  if (attachFiles) allowed.add(flags.AttachFiles);
+  return { has: permission => allowed.has(permission) };
+}
+
 async function fixture(t, { callback = null, question: prompt = 'Choose the canonical answer' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-decision-gateway-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -72,11 +82,14 @@ async function fixture(t, { callback = null, question: prompt = 'Choose the cano
   };
   const channel = {
     id: 'channel',
+    isThread: () => false,
+    permissionsFor: () => fixturePermissions(),
     messages: { async fetch(messageId) { assert.equal(messageId, presentation.messageId); return question; } },
     async send(payload) { return { id: `reply-${payload.nonce || edits.length}` }; }
   };
   const listeners = new Map();
   const client = {
+    user: { id: 'fixture-bot' },
     application: { id: 'application', commands: null },
     channels: { async fetch(channelId) { assert.equal(channelId, 'channel'); return channel; } },
     on(name, listener) { listeners.set(name, listener); },
@@ -1403,7 +1416,7 @@ test('compatibility source inventory covers all marker kinds and effect consumer
   const presentation = { content: 'saved prompt' };
   const inlineAnswer = 'é'.repeat(2048);
   assert.equal(Buffer.byteLength(inlineAnswer, 'utf8'), 4096);
-  const inline = renderDecisionProjection(presentation, inlineAnswer);
+  const inline = renderDecisionProjection(presentation, inlineAnswer, fullProjectionPermissions);
   assert.equal(inline.content, presentation.content);
   assert.equal(inline.embeds[0].title, 'Selected action');
   assert.equal(inline.embeds[0].description, inlineAnswer);
@@ -1415,7 +1428,7 @@ test('compatibility source inventory covers all marker kinds and effect consumer
   const longAnswer = '界'.repeat(4097);
   assert.equal(longAnswer.length, 4097);
   assert.equal(Buffer.byteLength(longAnswer, 'utf8'), 12291);
-  const attached = renderDecisionProjection(presentation, longAnswer);
+  const attached = renderDecisionProjection(presentation, longAnswer, fullProjectionPermissions);
   assert.equal(attached.content, `${presentation.content}\n\nSelected action is attached in selected-action.txt.`);
   assert.equal(attached.embeds[0].title, 'Selected action');
   assert.equal(attached.embeds[0].description, 'Full answer attached in selected-action.txt.');
@@ -1808,7 +1821,7 @@ test('decision projection preserves a 2,000-character saved prompt', { timeout: 
 test('decision projection keeps complete answers at the embed and file boundary', () => {
   const presentation = { content: 'Q'.repeat(2000) };
   const inlineAnswer = 'A'.repeat(4096);
-  const inline = renderDecisionProjection(presentation, inlineAnswer);
+  const inline = renderDecisionProjection(presentation, inlineAnswer, fullProjectionPermissions);
   assert.equal(inline.content, presentation.content);
   assert.equal(inline.embeds[0].description, inlineAnswer);
   assert.deepEqual(inline.components, []);
@@ -1817,7 +1830,7 @@ test('decision projection keeps complete answers at the embed and file boundary'
   assert.equal(inline.files, undefined);
 
   const longAnswer = 'B'.repeat(4097);
-  const attached = renderDecisionProjection(presentation, longAnswer);
+  const attached = renderDecisionProjection(presentation, longAnswer, fullProjectionPermissions);
   assert.equal(attached.content, presentation.content);
   assert.equal(attached.embeds[0].title, 'Selected action');
   assert.equal(attached.embeds[0].description, 'Full answer attached in selected-action.txt.');
@@ -1877,6 +1890,8 @@ for (const scenario of [
       };
       const channel = {
         id: 'channel',
+        isThread: () => false,
+        permissionsFor: () => fixturePermissions(),
         messages: {
           fetch(messageId) {
             assert.equal(messageId, f.presentation.messageId);
@@ -1937,3 +1952,151 @@ for (const scenario of [
     }
   });
 }
+
+test('Gateway projects an answer using channel permissions without changing native delivery', { timeout: 30000 }, async t => {
+  for (const embedLinks of [true, false]) {
+    for (const attachFiles of [true, false]) {
+      const f = await fixture(t);
+      const channel = await f.gateway.client.channels.fetch('channel');
+      channel.permissionsFor = user => {
+        assert.equal(user, f.gateway.client.user);
+        return fixturePermissions({ embedLinks, attachFiles });
+      };
+      f.gateway.started = true;
+      f.gateway.transportReady = true;
+      f.gateway.ready = true;
+      const id = 'capability-' + Number(embedLinks) + Number(attachFiles);
+      await f.gateway.handleInteraction(component(f.presentation, id, 0), new AbortController().signal);
+      assert.equal(f.callbacks.length, 1);
+      assert.equal(f.dispatches.length, 1);
+      assert.equal(f.state.getDecisionClick(id).projectionOutcome, 'sent');
+      assert.equal(f.edits.length, 1);
+      const edit = f.edits[0];
+      if (embedLinks) assertDecisionProjection(edit, f.presentation, 'approve');
+      else {
+        assert.equal(edit.content, `${f.presentation.content}\n\nSelected action:\napprove`);
+        assert.deepEqual(edit.embeds, []);
+        assert.deepEqual(edit.components, []);
+        assert.deepEqual(edit.allowedMentions, { parse: [] });
+        assert.equal(edit.files, undefined);
+      }
+    }
+  }
+});
+
+test('unknown or denied projection permissions leave the message intact while native delivery proceeds', { timeout: 30000 }, async t => {
+  for (const lookup of [undefined, () => null, () => { throw new Error('unavailable'); }, () => ({ has: () => false })]) {
+    const f = await fixture(t);
+    const channel = await f.gateway.client.channels.fetch('channel');
+    channel.permissionsFor = lookup;
+    f.gateway.started = true;
+    f.gateway.transportReady = true;
+    f.gateway.ready = true;
+    await f.gateway.handleInteraction(component(f.presentation, 'unknown-projection', 0), new AbortController().signal);
+    assert.equal(f.callbacks.length, 1);
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(f.edits.length, 0);
+    assert.equal(f.state.getDecisionClick('unknown-projection').projectionOutcome, 'not_sent');
+  }
+});
+
+test('a bound question can attempt a complete plain edit without send or history permission', async t => {
+  const { PermissionFlagsBits: flags } = require('discord.js');
+  const f = await fixture(t);
+  const channel = await f.gateway.client.channels.fetch('channel');
+  const bits = new Set([flags.ViewChannel, flags.EmbedLinks, flags.AttachFiles]);
+  channel.permissionsFor = () => ({ has: permission => bits.has(permission) });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  await f.gateway.handleInteraction(component(f.presentation, 'own-plain', 0), new AbortController().signal);
+  assert.equal(f.edits.length, 1);
+  assert.equal(f.edits[0].content, `${f.presentation.content}\n\nSelected action:\napprove`);
+  assert.deepEqual(f.edits[0].embeds, []);
+  assert.deepEqual(f.edits[0].allowedMentions, { parse: [] });
+  assert.equal(f.edits[0].files, undefined);
+  assert.equal(f.callbacks.length, 1);
+  assert.equal(f.dispatches.length, 1);
+});
+
+test('unknown channel type permits only complete plain projection for a known viewer', { timeout: 30000 }, async t => {
+  for (const classify of [undefined, () => 'unknown']) {
+    const f = await fixture(t);
+    const channel = await f.gateway.client.channels.fetch('channel');
+    channel.isThread = classify;
+    channel.permissionsFor = () => fixturePermissions();
+    f.gateway.started = true;
+    f.gateway.transportReady = true;
+    f.gateway.ready = true;
+    await f.gateway.handleInteraction(component(f.presentation, 'unknown-type', 0), new AbortController().signal);
+    assert.equal(f.edits.length, 1);
+    assert.equal(f.edits[0].content, `${f.presentation.content}\n\nSelected action:\napprove`);
+    assert.deepEqual(f.edits[0].embeds, []);
+    assert.equal(f.edits[0].files, undefined);
+    assert.deepEqual(f.edits[0].components, []);
+    assert.deepEqual(f.edits[0].allowedMentions, { parse: [] });
+    assert.equal(f.callbacks.length, 1);
+    assert.equal(f.dispatches.length, 1);
+  }
+});
+
+test('effective rich projection permissions follow the applicable send bit and thread lock', () => {
+  const { PermissionFlagsBits: flags } = require('discord.js');
+  const { decisionProjectionPermissions } = require('../src/discord/history-access');
+  const user = { id: 'fixture-bot' };
+  const cases = [
+    [false, false, [flags.SendMessagesInThreads], false],
+    [false, false, [flags.SendMessages], true],
+    [true, false, [flags.SendMessages], false],
+    [true, false, [flags.SendMessagesInThreads], true],
+    [true, true, [flags.SendMessagesInThreads], false],
+    [true, true, [flags.SendMessagesInThreads, flags.ManageThreads], true],
+    [true, true, [flags.SendMessagesInThreads, flags.Administrator], true]
+  ];
+  for (const [thread, locked, sendBits, rich] of cases) {
+    const bits = new Set([flags.ViewChannel, flags.EmbedLinks, flags.AttachFiles, ...sendBits]);
+    const channel = { isThread: () => thread, locked, permissionsFor: () => ({ has: p => bits.has(p) }) };
+    assert.deepEqual(decisionProjectionPermissions(channel, user), { allowed: true, embedLinks: rich, attachFiles: rich });
+    bits.delete(flags.ViewChannel);
+    assert.deepEqual(decisionProjectionPermissions(channel, user), { allowed: false, embedLinks: false, attachFiles: false });
+  }
+});
+
+test('lossless projection measures the complete plain content and requires permission for files', () => {
+  const prompt = ' Q  ';
+  const prefix = `${prompt}\n\nSelected action:\n`;
+  const answer = 'x'.repeat(2000 - prefix.length - 2) + '😀';
+  const neither = { allowed: true, embedLinks: false, attachFiles: false };
+  const plain = renderDecisionProjection({ content: prompt }, answer, neither);
+  assert.equal(plain.content.length, 2000);
+  assert.equal(plain.content, prefix + answer);
+  assert.deepEqual(plain.allowedMentions, { parse: [] });
+  assert.equal(renderDecisionProjection({ content: prompt }, answer + ' ', neither), null);
+
+  const large = '界'.repeat(4097);
+  const fileOnly = renderDecisionProjection({ content: 'Q'.repeat(2000) }, large, { ...neither, attachFiles: true });
+  assert.equal(fileOnly.content, 'Q'.repeat(2000));
+  assert.deepEqual(fileOnly.embeds, []);
+  assert.deepEqual(fileOnly.components, []);
+  assert.deepEqual(fileOnly.allowedMentions, { parse: [] });
+  assert.equal(fileOnly.files[0].name, 'selected-action.txt');
+  assert.deepEqual(fileOnly.files[0].attachment, Buffer.from(large, 'utf8'));
+  assert.equal(renderDecisionProjection({ content: prompt }, large, { ...neither, embedLinks: true }), null);
+});
+
+test('a full prompt and unavailable rich formats leave the question intact and preserve native delivery', { timeout: 30000 }, async t => {
+  const probe = await fixture(t, { question: 'Q' });
+  const renderedSuffix = probe.presentation.content.slice(1);
+  const f = await fixture(t, { question: 'Q'.repeat(2000 - renderedSuffix.length) });
+  const channel = await f.gateway.client.channels.fetch('channel');
+  channel.permissionsFor = () => fixturePermissions({ embedLinks: false, attachFiles: false });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  await f.gateway.handleInteraction(component(f.presentation, 'full-plain', 0), new AbortController().signal);
+  assert.equal(f.presentation.content.length, 2000);
+  assert.equal(f.edits.length, 0);
+  assert.equal(f.callbacks.length, 1);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.getDecisionClick('full-plain').projectionOutcome, 'not_sent');
+});

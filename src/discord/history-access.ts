@@ -21,6 +21,32 @@ export function historyPermission(channel: HistoryPermissionChannel, user: unkno
   } catch { return { known: false, allowed: false }; }
 }
 
+export interface ProjectionPermissions {
+  allowed: boolean;
+  embedLinks: boolean;
+  attachFiles: boolean;
+}
+
+export function decisionProjectionPermissions(channel: HistoryPermissionChannel, user: unknown): ProjectionPermissions | null {
+  try {
+    if (!user || typeof channel?.permissionsFor !== 'function') return null;
+    const permissions = channel.permissionsFor(user);
+    if (!permissions || typeof permissions.has !== 'function') return null;
+    const { PermissionFlagsBits: flags } = discord();
+    if (permissions.has(flags.ViewChannel) !== true) return { allowed: false, embedLinks: false, attachFiles: false };
+    const thread = channel.isThread?.();
+    if (typeof thread !== 'boolean') return { allowed: true, embedLinks: false, attachFiles: false };
+    const send = permissions.has(thread ? flags.SendMessagesInThreads : flags.SendMessages) === true;
+    const canSendRich = send && (!thread || channel.locked === false ||
+      permissions.has(flags.ManageThreads) === true || permissions.has(flags.Administrator) === true);
+    return {
+      allowed: true,
+      embedLinks: canSendRich && permissions.has(flags.EmbedLinks) === true,
+      attachFiles: canSendRich && permissions.has(flags.AttachFiles) === true
+    };
+  } catch { return null; }
+}
+
 export const ADOPTION_REFUSAL_DETAILS = Object.freeze({
   STOPPED: 'Adoption history acquisition stopped',
   CHANNEL: 'Adoption history channel does not match the requested channel',

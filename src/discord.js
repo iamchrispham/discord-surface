@@ -17,6 +17,7 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
+const { decisionProjectionPermissions } = require('./discord/history-access');
 const {
   classifyRecoveryFailure,
   isInterruptedRetryBoundary,
@@ -538,8 +539,6 @@ class DiscordGateway {
         if (!message || typeof message.edit !== 'function') {
           throw new Error('decision question message cannot be edited');
         }
-        const savedPresentation = presentation || this.state.getDecisionPresentation(click.presentationId);
-        const payload = renderDecisionProjection(savedPresentation, answer);
         const stored = this.state.getMessage(click.interactionId);
         if (stored) {
           this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
@@ -557,6 +556,10 @@ class DiscordGateway {
             throw new Error('decision projection authorization is no longer valid');
           }
         }
+        const permissions = decisionProjectionPermissions(channel, this.client.user);
+        const savedPresentation = presentation || this.state.getDecisionPresentation(click.presentationId);
+        const payload = renderDecisionProjection(savedPresentation, answer, permissions);
+        if (!payload) throw new Error('decision answer cannot be projected with the current channel permissions');
         assertProjectionActive();
         editInvoked = true;
         return message.edit(payload);
