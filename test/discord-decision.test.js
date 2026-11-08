@@ -2045,18 +2045,18 @@ test('effective rich projection permissions follow the applicable send bit and t
   const { decisionProjectionPermissions } = require('../src/discord/history-access');
   const user = { id: 'fixture-bot' };
   const cases = [
-    [false, false, [flags.SendMessagesInThreads], false],
-    [false, false, [flags.SendMessages], true],
-    [true, false, [flags.SendMessages], false],
-    [true, false, [flags.SendMessagesInThreads], true],
-    [true, true, [flags.SendMessagesInThreads], false],
-    [true, true, [flags.SendMessagesInThreads, flags.ManageThreads], true],
-    [true, true, [flags.SendMessagesInThreads, flags.Administrator], true]
+    [false, false, [flags.SendMessagesInThreads], true, false],
+    [false, false, [flags.SendMessages], true, true],
+    [true, false, [flags.SendMessages], true, false],
+    [true, false, [flags.SendMessagesInThreads], true, true],
+    [true, true, [flags.SendMessagesInThreads], false, false],
+    [true, true, [flags.SendMessagesInThreads, flags.ManageThreads], true, true],
+    [true, true, [flags.SendMessagesInThreads, flags.Administrator], true, true]
   ];
-  for (const [thread, locked, sendBits, rich] of cases) {
+  for (const [thread, locked, sendBits, allowed, rich] of cases) {
     const bits = new Set([flags.ViewChannel, flags.EmbedLinks, flags.AttachFiles, ...sendBits]);
-    const channel = { isThread: () => thread, locked, permissionsFor: () => ({ has: p => bits.has(p) }) };
-    assert.deepEqual(decisionProjectionPermissions(channel, user), { allowed: true, embedLinks: rich, attachFiles: rich });
+    const channel = { isThread: () => thread, locked, archived: false, permissionsFor: () => ({ has: p => bits.has(p) }) };
+    assert.deepEqual(decisionProjectionPermissions(channel, user), { allowed, embedLinks: rich, attachFiles: rich });
     bits.delete(flags.ViewChannel);
     assert.deepEqual(decisionProjectionPermissions(channel, user), { allowed: false, embedLinks: false, attachFiles: false });
   }
@@ -2100,3 +2100,37 @@ test('a full prompt and unavailable rich formats leave the question intact and p
   assert.equal(f.dispatches.length, 1);
   assert.equal(f.state.getDecisionClick('full-plain').projectionOutcome, 'not_sent');
 });
+
+
+for (const [title, locked, archived, manager, expectedEdit] of [
+  ['a locked decision thread declines an edit without thread management', true, false, false, false],
+  ['an archived decision thread declines an edit even with thread management', false, true, true, false],
+  ['an active unlocked decision thread permits a complete plain edit', false, false, false, true],
+  ['an active locked decision thread permits a complete plain edit with thread management', true, false, true, true]
+]) {
+  test(title, { timeout: 30000 }, async t => {
+    const { PermissionFlagsBits: flags } = require('discord.js');
+    const f = await fixture(t);
+    const channel = await f.gateway.client.channels.fetch('channel');
+    channel.isThread = () => true;
+    channel.locked = locked;
+    channel.archived = archived;
+    const bits = new Set([flags.ViewChannel]);
+    if (manager) bits.add(flags.ManageThreads);
+    channel.permissionsFor = () => ({ has: bit => bits.has(bit) });
+    f.gateway.started = true;
+    f.gateway.transportReady = true;
+    f.gateway.ready = true;
+    await f.gateway.handleInteraction(component(f.presentation, 'thread-projection', 0), new AbortController().signal);
+    assert.equal(f.callbacks.length, 1);
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(f.edits.length, expectedEdit ? 1 : 0);
+    assert.equal(f.state.getDecisionClick('thread-projection').projectionOutcome, expectedEdit ? 'sent' : 'not_sent');
+    if (expectedEdit) {
+      assert.equal(f.edits[0].content, `${f.presentation.content}\n\nSelected action:\napprove`);
+      assert.deepEqual(f.edits[0].embeds, []);
+      assert.equal(f.edits[0].files, undefined);
+      assert.deepEqual(f.edits[0].allowedMentions, { parse: [] });
+    }
+  });
+}

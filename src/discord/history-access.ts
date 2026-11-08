@@ -4,6 +4,7 @@ export interface HistoryPermissionChannel {
   permissionsFor?: (user: unknown) => { has: (permission: bigint) => boolean } | null;
   isThread?: () => boolean;
   locked?: boolean;
+  archived?: boolean | null;
 }
 
 export function historyPermission(channel: HistoryPermissionChannel, user: unknown, requireSend = false) {
@@ -36,9 +37,15 @@ export function decisionProjectionPermissions(channel: HistoryPermissionChannel,
     if (permissions.has(flags.ViewChannel) !== true) return { allowed: false, embedLinks: false, attachFiles: false };
     const thread = channel.isThread?.();
     if (typeof thread !== 'boolean') return { allowed: true, embedLinks: false, attachFiles: false };
+    if (thread && channel.archived === true) return { allowed: false, embedLinks: false, attachFiles: false };
     const send = permissions.has(thread ? flags.SendMessagesInThreads : flags.SendMessages) === true;
-    const canSendRich = send && (!thread || channel.locked === false ||
-      permissions.has(flags.ManageThreads) === true || permissions.has(flags.Administrator) === true);
+    const canBypassLock = !thread || channel.locked === false ||
+      ((channel.locked === true || send) &&
+        (permissions.has(flags.ManageThreads) === true || permissions.has(flags.Administrator) === true));
+    if (thread && channel.locked === true && !canBypassLock) {
+      return { allowed: false, embedLinks: false, attachFiles: false };
+    }
+    const canSendRich = send && canBypassLock;
     return {
       allowed: true,
       embedLinks: canSendRich && permissions.has(flags.EmbedLinks) === true,
