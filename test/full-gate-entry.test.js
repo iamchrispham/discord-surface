@@ -1112,12 +1112,40 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
 });
 
 
-test('caller disconnect during final source verification is a no-verdict', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
+for (const scenario of [
+  { name: 'caller disconnect during final source verification is a no-verdict', disconnect: true, expected: 98 },
+  { name: 'caller disconnect during failed final source verification is a no-verdict', disconnect: true, brokenSource: true, expected: 98 },
+  { name: 'closed IPC during final source verification does not need its disconnect event', disconnect: true, suppressEvent: true, expected: 98 },
+  { name: 'healthy IPC during final source verification preserves the body result', expected: 0 },
+  { name: 'closed IPC control exposes a missing final connectivity check', disconnect: true, suppressEvent: true, control: true, expected: 0 }
+]) test(scenario.name, { skip: process.platform === 'win32', timeout: 180000 }, async t => {
   const f = fixture(t);
   const bin = path.join(f.scratch, 'git-wrapper');
   fs.mkdirSync(bin);
   const counter = path.join(f.scratch, 'revision-count');
   const signalMarker = path.join(f.scratch, 'final-snapshot-signal');
+  const disconnectMarker = path.join(f.scratch, 'disconnect-observed');
+  const entry = path.join(f.scratch, 'entry.js');
+  let entrySource = fs.readFileSync(entry, 'utf8');
+  if (scenario.suppressEvent) {
+    entrySource = 'if(require.main===module){const emit=process.emit;process.emit=function(event,...args){'
+      + 'if(event==="disconnect"){require("node:fs").writeFileSync(' + JSON.stringify(disconnectMarker)
+      + ',"observed");return true;}return emit.call(this,event,...args);};}\n' + entrySource;
+  }
+  if (scenario.control) {
+    const source = fs.readFileSync(GATE, 'utf8');
+    const check = '    if (process.connected === false) onDisconnect();';
+    assert.equal(source.split(check).length, 2, 'one final connectivity owner');
+    const control = source.replace(check, '');
+    const load = '(()=>{const Module=require("node:module");const owner=new Module(' + JSON.stringify(GATE)
+      + ',module);owner.filename=' + JSON.stringify(GATE)
+      + ';owner.paths=Module._nodeModulePaths(require("node:path").dirname(owner.filename));owner._compile('
+      + JSON.stringify(control) + ',owner.filename);return owner.exports;})()';
+    const ownerImport = 'require(' + JSON.stringify(GATE) + ')';
+    assert.equal(entrySource.split(ownerImport).length, 2);
+    entrySource = entrySource.replace(ownerImport, load);
+  }
+  fs.writeFileSync(entry, entrySource);
   const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
   const wrapper = path.join(bin, 'git');
   fs.writeFileSync(wrapper, '#!' + process.execPath + '\n' + [
@@ -1140,14 +1168,25 @@ test('caller disconnect during final source verification is a no-verdict', { ski
   const signal = JSON.parse(fs.readFileSync(signalMarker, 'utf8'));
   assert.equal(signal.manager, run.child.pid);
   assert.equal(run.child.connected, true);
-  run.child.disconnect();
+  if (scenario.disconnect) {
+    const disconnected = new Promise(resolve => run.child.once('disconnect', resolve));
+    run.child.disconnect();
+    await disconnected;
+  }
   run.child.ref();
+  if (scenario.brokenSource) {
+    fs.unlinkSync(path.join(f.root, 'input'));
+    fs.symlinkSync('missing-final-source', path.join(f.root, 'input'));
+  }
   fs.writeFileSync(f.emergencyRelease, 'release');
   const result = await run.done;
   assert.equal(fs.readFileSync(counter, 'utf8'), '3');
-  assert.equal(result.code, 98, result.output);
-  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
-  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  assert.equal(result.code, scenario.expected, result.output);
+  if (scenario.suppressEvent) assert.equal(fs.readFileSync(disconnectMarker, 'utf8'), 'observed');
+  if (scenario.expected === 98) {
+    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
+    assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  }
 });
 
 for (const layout of ['detached', 'uncommitted', 'archive']) {
