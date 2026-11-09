@@ -186,12 +186,15 @@ function callSites(sourceFile, violations, reportedUnsupported, sources) {
       if (!(variant.flags & ts.TypeFlags.Object)) return false;
       const field = checker.getPropertyOfType(variant, property.text);
       if (!field || !field.declarations?.length) return false;
+      const nullableContractType = type => {
+        if (ts.isParenthesizedTypeNode(type)) return nullableContractType(type.type);
+        if (ts.isUnionTypeNode(type)) return type.types.some(nullableContractType);
+        return type.kind === ts.SyntaxKind.UndefinedKeyword ||
+          (ts.isLiteralTypeNode(type) && type.literal.kind === ts.SyntaxKind.NullKeyword);
+      };
       const optionalOrNullableContract = field.declarations.every(fieldDeclaration => {
         if (!ts.isPropertySignature(fieldDeclaration) || !fieldDeclaration.type) return false;
-        if (fieldDeclaration.questionToken) return true;
-        return ts.isUnionTypeNode(fieldDeclaration.type) && fieldDeclaration.type.types.some(type =>
-          type.kind === ts.SyntaxKind.UndefinedKeyword ||
-          (ts.isLiteralTypeNode(type) && type.literal.kind === ts.SyntaxKind.NullKeyword));
+        return Boolean(fieldDeclaration.questionToken) || nullableContractType(fieldDeclaration.type);
       });
       if (!optionalOrNullableContract) return false;
       const value = checker.getTypeOfSymbolAtLocation(field, parameter.name);

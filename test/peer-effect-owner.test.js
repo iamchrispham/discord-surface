@@ -854,6 +854,12 @@ test('external callback exception accepts optional or nullable callable properti
   };
   check('required nonnullable callback', 'bindingCurrent: () => boolean;', expected);
   check('required nullable callback', 'bindingCurrent: (() => boolean) | null;', []);
+  check('parenthesized nullable union', 'bindingCurrent: ((() => boolean) | null);', []);
+  check('parenthesized null member', 'bindingCurrent: (() => boolean) | (null);', []);
+  check('parenthesized undefined member', 'bindingCurrent: (() => boolean) | (undefined);', []);
+  check('nested nullable union', 'bindingCurrent: (() => boolean) | ((null | undefined));', []);
+  check('parenthesized nonnullable callback', 'bindingCurrent: (() => boolean);', expected);
+  check('nullable return is not a nullable callback', 'bindingCurrent: () => (boolean | null);', expected);
   check('optional nonnullable callback', 'bindingCurrent?: () => boolean;', []);
 });
 
