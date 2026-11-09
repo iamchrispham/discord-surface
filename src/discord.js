@@ -12,11 +12,12 @@ const {
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DECISION_TRANSPORT_OUTCOMES, DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
+const { decisionProjectionPermissions } = require('./discord/history-access');
 const {
   classifyRecoveryFailure,
   isInterruptedRetryBoundary,
@@ -39,7 +40,7 @@ const {
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
-const { createDecisionConsumer } = require('./discord/decision');
+const { createDecisionConsumer, renderDecisionProjection } = require('./discord/decision');
 const { sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
 const { sendGatewayTransportReceipt } = require('./discord/transport-receipts');
 const { createSurfaceConsumer: createSurfaceConsumerImpl } = require('./discord/surface-consumer');
@@ -384,7 +385,12 @@ class DiscordGateway {
       interactionFetch: this.interactionFetch,
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
-      processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
+      processAccepted: (message, signal, options) => {
+        if (signal?.aborted || this.stopping) {
+          throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'decision native return stopped');
+        }
+        return this.consumer.processAccepted(message, signal, options);
+      },
       project: (input, signal) => this.projectDecisionMessage(input, signal)
     });
     this.boundMessage = message => {
@@ -510,32 +516,64 @@ class DiscordGateway {
     return this.consumer.processAccepted(message, signal);
   }
 
-  async projectDecisionMessage({ click, answer }, signal) {
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
-    const channel = await this.client.channels?.fetch?.(click.channelId);
-    const message = await channel?.messages?.fetch?.(click.messageId);
-    if (!message || typeof message.edit !== 'function') {
-      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent' });
-    }
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
-    const stored = this.state.getMessage(click.interactionId);
-    if (stored) {
-      this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
-    } else {
-      const config = this.state.requireConfig();
-      const current = this.state.getBinding(click.channelId);
-      const sameBinding = Boolean(current?.active) && current.channelId === click.binding.channelId &&
-        current.guildId === click.binding.guildId && current.provider === click.binding.provider &&
-        current.nativeId === click.binding.nativeId && current.workspace === click.binding.workspace &&
-        (current.sessionRoot || null) === (click.binding.sessionRoot || null) &&
-        (current.endpoint || null) === (click.binding.endpoint || null) &&
-        (current.conductorId || null) === (click.binding.conductorId || null) &&
-        (current.repoKey || null) === (click.binding.repoKey || null) && current.generation === click.binding.generation;
-      if (!sameBinding || config.guildId !== click.guildId || config.operatorId !== click.actorId) {
-        throw new Error('decision projection authorization is no longer valid');
+  async projectDecisionMessage({ click, presentation, answer }, signal) {
+    const deadline = Date.now() + this.recoveryTimeoutMs;
+    const lifecycleEpoch = this.lifecycleEpoch;
+    let editInvoked = false;
+    const assertProjectionActive = () => {
+      if (signal?.aborted || this.stopping || lifecycleEpoch !== this.lifecycleEpoch) {
+        throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'decision projection stopped');
       }
+      if (Date.now() >= deadline) {
+        throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'decision projection deadline exceeded');
+      }
+    };
+    const waitForProjection = operation => waitForRecoveryOperation(() => {
+      assertProjectionActive();
+      return operation();
+    }, signal, deadline);
+    try {
+      const channel = await waitForProjection(() => this.client.channels?.fetch?.(click.channelId));
+      const message = await waitForProjection(() => channel?.messages?.fetch?.(click.messageId));
+      return await waitForProjection(() => {
+        if (!message || typeof message.edit !== 'function') {
+          throw new Error('decision question message cannot be edited');
+        }
+        const stored = this.state.getMessage(click.interactionId);
+        if (stored) {
+          this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
+        } else {
+          const config = this.state.requireConfig();
+          const current = this.state.getBinding(click.channelId);
+          const sameBinding = Boolean(current?.active) && current.channelId === click.binding.channelId &&
+            current.guildId === click.binding.guildId && current.provider === click.binding.provider &&
+            current.nativeId === click.binding.nativeId && current.workspace === click.binding.workspace &&
+            (current.sessionRoot || null) === (click.binding.sessionRoot || null) &&
+            (current.endpoint || null) === (click.binding.endpoint || null) &&
+            (current.conductorId || null) === (click.binding.conductorId || null) &&
+            (current.repoKey || null) === (click.binding.repoKey || null) && current.generation === click.binding.generation;
+          if (!sameBinding || config.guildId !== click.guildId || config.operatorId !== click.actorId) {
+            throw new Error('decision projection authorization is no longer valid');
+          }
+        }
+        const permissions = decisionProjectionPermissions(channel, this.client.user);
+        const savedPresentation = presentation || this.state.getDecisionPresentation(click.presentationId);
+        const payload = renderDecisionProjection(savedPresentation, answer, permissions);
+        if (!payload) throw new Error('decision answer cannot be projected with the current channel permissions');
+        assertProjectionActive();
+        editInvoked = true;
+        return message.edit(payload);
+      });
+    } catch (error) {
+      let outcome = DECISION_TRANSPORT_OUTCOMES.NOT_SENT;
+      if (editInvoked) {
+        outcome = DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+        if (Object.values(DECISION_TRANSPORT_OUTCOMES).includes(error?.outcome)) {
+          outcome = error.outcome;
+        }
+      }
+      throw Object.assign(new Error(error?.message || String(error)), { cause: error, outcome });
     }
-    return message.edit({ content: answer, components: [] });
   }
 
   async sendInteractionRejection(interaction, reason, signal) {

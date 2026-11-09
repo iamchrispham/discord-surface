@@ -402,6 +402,11 @@ async function runFullGate(root, label, entry, args) {
   });
   const onDisconnect = () => stop(REASONS.INTERRUPTED);
   process.on('disconnect', onDisconnect);
+  const observePendingInterrupts = async () => {
+    // Cross a poll turn before classifying a synchronous source read.
+    await new Promise(resolve => setImmediate(() => setImmediate(resolve)));
+    if (process.connected === false) onDisconnect();
+  };
   const removeInterruptHandlers = () => {
     process.removeListener('disconnect', onDisconnect);
     for (const [signal, handler] of handlers) process.removeListener(signal, handler);
@@ -583,13 +588,13 @@ async function runFullGate(root, label, entry, args) {
   if (finalSnapshotRequired) {
     try {
       const finalRevision = revision(root, deadline);
-      await new Promise(resolve => setTimeout(resolve, 1));
+      await observePendingInterrupts();
       const sourceChanged = !sameSource(premise, finalRevision);
       if (stopped === REASONS.TIMEOUT || Date.now() >= deadline) return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
       if (stopped) return decline(REASONS.INTERRUPTED, 'source verification was interrupted');
       if (sourceChanged) return decline(REASONS.STALE, 'source changed during execution');
     } catch (error) {
-      await new Promise(resolve => setTimeout(resolve, 1));
+      await observePendingInterrupts();
       if (error.code === 'ETIMEDOUT' || stopped === REASONS.TIMEOUT || Date.now() >= deadline) {
         return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
       }
