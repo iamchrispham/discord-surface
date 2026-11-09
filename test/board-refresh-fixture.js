@@ -112,7 +112,9 @@ async function refresh(f, content, requestId, fetchImpl, options = {}) {
     fetchImpl,
     timeoutMs: options.timeoutMs || 1000,
     signal: options.signal,
-    resolveBinding: resolver
+    resolveBinding: resolver,
+    bindingCurrent: options.bindingCurrent,
+    assertCallerCurrent: options.assertCallerCurrent
   });
 }
 

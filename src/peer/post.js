@@ -1,6 +1,6 @@
 'use strict';
 
-const { resolvePeerCaller } = require('./caller');
+const { resolvePeerCaller, createCallerAssertion } = require('./caller');
 const { requireReadyBinding } = require('../../dist/peer/resolution');
 const { runDirectPost, resolveDirectBinding } = require('../direct-post');
 const { runBoardRefresh } = require('../board-refresh');
@@ -37,8 +37,10 @@ async function postByRole(context, input, signal, send) {
   const binding = await resolvePeerCaller(state, provider, callerDependencies, signal);
   requireReadyBinding(state, binding);
   const ordinary = state.isOrdinaryBindingRecord(binding);
+  const assertCallerCurrent = createCallerAssertion(state, provider, callerDependencies, binding);
   const common = { state, token, nativeId: binding.nativeId, generation: binding.generation,
-    channelId: binding.channelId, textFile: args.text_file, dedupeKey: args.dedupe_key, signal, fetchImpl };
+    channelId: binding.channelId, textFile: args.text_file, dedupeKey: args.dedupe_key, signal, fetchImpl,
+    assertCallerCurrent };
   const bindingCurrent = () => readyBindingCurrent(state, binding);
   if (role === POST_ROLES.ANNOUNCE) return runDirectPost({ ...common, provider, ordinary, stateDir, bindingCurrent });
   if (ordinary) throw new Error('board updates require a conductor binding');

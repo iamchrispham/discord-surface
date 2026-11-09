@@ -12,7 +12,7 @@ const {
   validWatcherAddress,
   watcherNoticeId
 } = require('../src/watcher-notice');
-const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
+const { SurfaceState, BindingError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { runWatcherNoticePost } = require('../src/direct-post');
 const { ClaudeProvider, watcherNoticeCompletionCommand } = require('../src/native');
@@ -544,4 +544,38 @@ test('watcher packet rejects required field accessors before reads', () => {
     }
   }
   assert.deepEqual(failures, []);
+});
+
+
+test('watcher post refuses revoked arm disclosure while retaining sent or unknown custody', async () => {
+  for (const outcome of ['sent', 'unknown']) {
+    const f = fixture();
+    const textFile = path.join(f.dir, 'revoked-notice.txt');
+    fs.writeFileSync(textFile, 'Watcher completion.');
+    let posts = 0;
+    try {
+      armFixture(f.state, f.armKey);
+      await assert.rejects(runWatcherNoticePost({ state: f.state, token, armKey: f.armKey,
+        triggerKey: `revoked-${outcome}`, textFile, fetchImpl: async (url, options) => {
+          if (options.method === 'GET') return response(200, { id: child.channelId, guild_id: child.guildId });
+          posts += 1;
+          f.state.setConfig({ operatorId: 'another-operator' });
+          if (outcome === 'unknown') throw new Error('simulated post failure');
+          return response(200, { id: 'revoked-first-part' });
+        }
+      }), BindingError);
+      assert.equal(posts, 1);
+      const rows = f.state.directPostRows(watcherNoticeId(f.armKey, `revoked-${outcome}`));
+      const attempts = rows.filter(row => row.kind === 'direct-post-attempt');
+      const outcomes = rows.filter(row => row.kind === 'direct-post-outcome');
+      assert.equal(attempts.length, 1);
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0].detail.outcome, outcome);
+      assert.equal(outcomes[0].detail.nonce, attempts[0].detail.nonce);
+      if (outcome === 'sent') assert.equal(outcomes[0].detail.messageId, 'revoked-first-part');
+    } finally {
+      f.state.close();
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  }
 });

@@ -225,6 +225,54 @@ test('derived JavaScript fallback identity separates reply targets', async t => 
   assert.equal(recorder.calls.length, 2);
 });
 
+test('non-claimed direct post checks readiness after a successful caller assertion', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'cached direct post');
+  const requestId = 'post-admission-readiness-race';
+  const recorder = fetchRecorder();
+  const beginDirectPostPart = f.state.beginDirectPostPart.bind(f.state);
+  let initialLookupMissed = false;
+  let competingClaim = null;
+  let admissionClaim = null;
+  let ready = true;
+  let assertedAfterAdmission = false;
+  f.state.beginDirectPostPart = meta => {
+    initialLookupMissed = f.state.directPostRows(meta.requestId).length === 0;
+    competingClaim = beginDirectPostPart(meta);
+    assert.equal(competingClaim.claimed, true);
+    f.state.recordDirectPostOutcome(meta.requestId, competingClaim.attemptId, 'sent', { messageId: 'cached-message' });
+    admissionClaim = beginDirectPostPart(meta);
+    return admissionClaim;
+  };
+
+  const result = await runDirectPost({
+    state: f.state,
+    token: 'fixture',
+    nativeId: f.nativeId,
+    generation: 1,
+    textFile: f.textFile,
+    dedupeKey: requestId,
+    fetchImpl: recorder.fetchImpl,
+    bindingCurrent: () => ready,
+    assertCallerCurrent: async () => {
+      if (admissionClaim && !admissionClaim.claimed) {
+        assertedAfterAdmission = true;
+        ready = false;
+      }
+    }
+  });
+
+  assert.equal(initialLookupMissed, true);
+  assert.equal(admissionClaim.claimed, false);
+  assert.equal(assertedAfterAdmission, true);
+  assert.equal(result.parts[0].status, 'stale');
+  assert.equal(recorder.calls.length, 0);
+  const outcomes = f.state.directPostRows(requestId).filter(row => row.kind === 'direct-post-outcome');
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].detail.outcome, 'sent');
+  assert.equal(outcomes[0].detail.messageId, 'cached-message');
+});
+
 test('claude-post selection rejects codex and generic post rejects ambiguous native owners', async t => {
   const f = fixture(t, 'claude');
   f.state.bind({ channelId: 'codex-channel', guildId: 'guild', provider: 'codex', nativeId: CLAUDE, workspace: f.dir, conductorId: 'other', repoKey: 'repo:other' }, { intakeCutoff: '100' });
