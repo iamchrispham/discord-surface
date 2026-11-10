@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
 import { planTownHallBroadcast, type TownHallPlan } from '../../peer/town-hall-plan';
+import { deriveTownHallJournalKey } from './key';
 import {
   TOWN_HALL_JOURNAL_RECEIPTS,
   TOWN_HALL_JOURNAL_STATES,
@@ -11,7 +11,6 @@ import {
   type TownHallJournalStateStore
 } from './types';
 
-const JOURNAL_DOMAIN = 'discord-surface/town-hall-journal/v1';
 const CORRUPT_MESSAGE = 'town-hall broadcast journal is corrupt';
 const INVALID_KEY_MESSAGE = 'invalid town-hall journal key';
 const CONFLICT_MESSAGE = 'town-hall broadcast identity conflict';
@@ -35,10 +34,6 @@ interface ReceiptProjection {
   plan: TownHallPlan;
 }
 
-function sha256Hex(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
 function reject(deps: TownHallJournalDependencies): never {
   throw new deps.StateCorruptError(CORRUPT_MESSAGE);
 }
@@ -51,18 +46,6 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   if (Object.getOwnPropertySymbols(value).length !== 0) return false;
   const names = Object.getOwnPropertyNames(value);
   return names.length === keys.length && names.every(name => keys.includes(name));
-}
-
-function journalKeyForPlan(plan: TownHallPlan): string {
-  return sha256Hex(JSON.stringify([
-    JOURNAL_DOMAIN,
-    plan.source.guildId,
-    plan.source.channelId,
-    plan.source.provider,
-    plan.source.nativeId,
-    plan.source.generation,
-    plan.broadcastId
-  ]));
 }
 
 function assertJournalKey(deps: TownHallJournalDependencies, journalKey: string): string {
@@ -135,7 +118,7 @@ function canonicalPlan(deps: TownHallJournalDependencies, key: string, detail: s
   }
   if (replanned.version !== 1 || replanned.broadcastId !== plan.broadcastId || replanned.text !== plan.text) reject(deps);
   if (replanned.fingerprint !== plan.fingerprint) reject(deps);
-  if (journalKeyForPlan(replanned) !== key) reject(deps);
+  if (deriveTownHallJournalKey(replanned.source, replanned.broadcastId) !== key) reject(deps);
   if (replanned.townHall.guildId !== plan.townHall.guildId || replanned.townHall.channelId !== plan.townHall.channelId) reject(deps);
   const source = replanned.source;
   if (source.guildId !== plan.source.guildId || source.channelId !== plan.source.channelId ||
@@ -207,7 +190,7 @@ export function createTownHallBroadcast(
   input: unknown
 ): TownHallBroadcastCreateResult {
   const plan = planTownHallBroadcast(input);
-  const key = journalKeyForPlan(plan);
+  const key = deriveTownHallJournalKey(plan.source, plan.broadcastId);
   return state.transaction(() => {
     const manifestRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX + key);
     const recipientRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX + key);

@@ -151,6 +151,7 @@
     "src/state/decision/types.ts",
     "src/state/town-hall-journal/index.ts",
     "src/state/town-hall-journal/types.ts",
+    "src/state/town-hall-journal/key.ts",
     "src/state/town-hall-journal/repository.ts",
     "test/types/town-hall-journal-types.ts",
     "src/state/town-hall-publication/index.ts",
@@ -160,6 +161,8 @@
     "src/state/town-hall-publication/context.ts",
     "test/types/town-hall-publication-types.ts",
     "test/types/town-hall-publication-parts-types.ts",
+    "src/town-hall-child.ts",
+    "test/types/town-hall-child-types.ts",
     "src/state/thread-enrollment/contracts.ts",
     "src/state/thread-enrollment/handlers.ts",
     "src/state/town-hall-publication/journal.ts"
