@@ -102,7 +102,17 @@ function fixture(t) {
     "async function runBody() {",
     "  const watchdogEnvironment = process.platform === 'linux' ? fs.readFileSync('/proc/' + process.ppid + '/environ') : Buffer.alloc(0);",
     "  const bodyIdentity=roles.captureIdentity(process.pid);if(bodyIdentity.kind!=='present')throw new Error('body identity could not be established');fs.writeFileSync(process.env.FIXTURE_MARKER, JSON.stringify({ pid: process.pid, identity: bodyIdentity, scratch: process.env.DISCORD_SURFACE_GATE_SCRATCH, gitDir: process.env.GIT_DIR, gitWorkTree: process.env.GIT_WORK_TREE, locale: process.env.LC_ALL, optionalLocks: process.env.GIT_OPTIONAL_LOCKS, secretPresent: Object.prototype.hasOwnProperty.call(process.env, 'DISCORD_SURFACE_GATE_NO_VERDICT_SECRET'), parentSecretPresent: watchdogEnvironment.includes(Buffer.from('DISCORD_SURFACE_GATE_NO_VERDICT_SECRET=')) }));",
-    "  if (process.env.FIXTURE_KILL_GUARD) { const actors=JSON.parse(fs.readFileSync(process.env.FIXTURE_ROLE_FILE,'utf8'));const body=roles.captureIdentity(process.pid);if(body.kind!=='present')throw new Error('body identity could not be established');const custody={state:'prepared',guardian:actors.guardian,body};fs.writeFileSync(process.env.FIXTURE_MARKER+'.guard-custody',JSON.stringify(custody));if(!roles.signalOwned(actors.guardian,'SIGKILL'))throw new Error('guardian identity changed before termination');custody.state='signaled';fs.writeFileSync(process.env.FIXTURE_MARKER+'.guard-custody',JSON.stringify(custody)); }",
+    "  const startEscapePipe = () => {",
+    "    const cp=require('node:child_process');const marker=process.env.FIXTURE_MARKER+'.escape-signalled';",
+    "    const legacyProgram=\"const fs=require('node:fs');const path=require('node:path');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_MARKER+'.escape-signalled','terminated');if(process.env.FIXTURE_RECREATE_SCRATCH){const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(path.join(scratch,'writer'),'active');},5);}else process.exit(0);});setTimeout(()=>process.exit(0),90000);\";",
+    "    const boundedProgram=\"const fs=require('node:fs');const path=require('node:path');const armed=process.env.FIXTURE_ESCAPE_ARMED;const release=process.env.FIXTURE_ESCAPE_RELEASE;const started=process.env.FIXTURE_ESCAPE_STARTED;const done=process.env.FIXTURE_ESCAPE_DONE;const removed=process.env.FIXTURE_SCRATCH_REMOVED;const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;const absoluteEnd=Date.now()+12000;let observer;let ready;let finished=false;const stop=(reason,code)=>{if(finished)return;finished=true;clearInterval(observer);clearInterval(ready);fs.writeFileSync(done,reason);process.exit(code);};const observe=()=>{if(!fs.existsSync(scratch)){try{fs.writeFileSync(removed,'removed',{flag:'wx'});}catch(error){if(error.code!=='EEXIST')throw error;}}fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(path.join(scratch,'writer'),'active');};const start=()=>{if(observer||finished)return;fs.writeFileSync(started,'started');observe();observer=setInterval(observe,5);};fs.writeFileSync(armed,'armed');ready=setInterval(()=>{if(fs.existsSync(release)){clearInterval(ready);start();}else if(Date.now()>=absoluteEnd)stop('reason=hard-timeout',9);},5);process.on('SIGTERM',()=>{if(finished)return;observe();stop('reason=supervisor-stop',0);});setTimeout(()=>stop('reason=hard-timeout',9),12000);\";",
+    "    const program=process.env.FIXTURE_ESCAPE_READY ? boundedProgram : legacyProgram;",
+    "    const escape=cp.spawn(process.execPath,['-e',program],{detached:true,stdio:'inherit'});escape.unref();",
+    "    if (process.env.FIXTURE_ESCAPE_READY) { const until=Date.now()+10000;while(!fs.existsSync(process.env.FIXTURE_ESCAPE_ARMED)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_ESCAPE_ARMED))throw new Error('escaped child did not arm'); }",
+    "    const info=JSON.parse(fs.readFileSync(process.env.FIXTURE_MARKER,'utf8'));const escapeIdentity=roles.captureIdentity(escape.pid);if(escapeIdentity.kind!=='present')throw new Error('escaped child identity could not be established');info.escapePid=escape.pid;info.escapeIdentity=escapeIdentity;fs.writeFileSync(process.env.FIXTURE_MARKER+'.part',JSON.stringify(info));fs.renameSync(process.env.FIXTURE_MARKER+'.part',process.env.FIXTURE_MARKER);",
+    "  };",
+    "  if (process.env.FIXTURE_ESCAPE_PIPE && process.env.FIXTURE_ESCAPE_READY) startEscapePipe();",
+    "  if (process.env.FIXTURE_KILL_GUARD) { const actors=JSON.parse(fs.readFileSync(process.env.FIXTURE_ROLE_FILE,'utf8'));const body=roles.captureIdentity(process.pid);if(body.kind!=='present')throw new Error('body identity could not be established');const custody={state:'prepared',guardian:actors.guardian,body};fs.writeFileSync(process.env.FIXTURE_MARKER+'.guard-custody',JSON.stringify(custody));if(!process.env.FIXTURE_ESCAPE_READY){if(!roles.signalOwned(actors.guardian,'SIGKILL'))throw new Error('guardian identity changed before termination');custody.state='signaled';fs.writeFileSync(process.env.FIXTURE_MARKER+'.guard-custody',JSON.stringify(custody));if(process.env.FIXTURE_ESCAPE_KILLED)fs.writeFileSync(process.env.FIXTURE_ESCAPE_KILLED,'guardian-signalled');if(process.env.FIXTURE_MONITOR_BARRIER)fs.writeFileSync(process.env.FIXTURE_MONITOR_BARRIER,'guardian-signalled');} }",
     "  if (process.env.FIXTURE_KILL_WORKER) { process.on('SIGTERM',()=>{});const actors=JSON.parse(fs.readFileSync(process.env.FIXTURE_ROLE_FILE,'utf8'));const body=roles.captureIdentity(process.pid);if(body.kind!=='present')throw new Error('body identity could not be established');const supervisors=actors.extraHolders.length?actors.extraHolders:[actors.manager];const custody={state:'prepared',manager:actors.manager,worker:actors.worker,guardian:actors.guardian,extraHolders:supervisors,body,completed:[]};const custodyPath=process.env.FIXTURE_WORKER_KILLED;fs.writeFileSync(custodyPath,JSON.stringify(custody));const send=(identity,name,sig)=>{if(!roles.signalOwned(identity,sig)){custody.failed=name;fs.writeFileSync(custodyPath,JSON.stringify(custody));throw new Error(name+' identity changed before signal');}custody.completed.push(name);fs.writeFileSync(custodyPath,JSON.stringify(custody));};for(const holder of supervisors)send(holder,'supervisor-'+holder.pid,'SIGSTOP');send(actors.guardian,'guardian','SIGSTOP');send(actors.worker,'worker','SIGKILL');custody.state='signaled';fs.writeFileSync(custodyPath,JSON.stringify(custody)); }",
     "  if (process.env.FIXTURE_SIGNAL) process.kill(process.pid, 'SIGTERM');",
     "  if (process.env.FIXTURE_FORGE_MARKER) {",
@@ -138,15 +148,10 @@ function fixture(t) {
     "    const code=await new Promise(resolve=>helper.once('exit',(status,signal)=>resolve(signal?128:status)));if(code!==0)throw new Error('bounded helper exited ' + code);",
     "    fs.writeFileSync(process.env.FIXTURE_REPARENTED_ORPHANED, 'helper-exited');",
     "  }",
-    "  if (process.env.FIXTURE_ESCAPE_PIPE) {",
-    "    const cp=require('node:child_process');const marker=process.env.FIXTURE_MARKER+'.escape-signalled';",
-    "    const program=\"const fs=require('node:fs');const path=require('node:path');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_MARKER+'.escape-signalled','terminated');if(process.env.FIXTURE_RECREATE_SCRATCH){const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(path.join(scratch,'writer'),'active');},5);}else process.exit(0);});setTimeout(()=>process.exit(0),90000);\";",
-    "    const escape=cp.spawn(process.execPath,['-e',program],{detached:true,stdio:'inherit'});escape.unref();",
-    "    const info=JSON.parse(fs.readFileSync(process.env.FIXTURE_MARKER,'utf8'));const escapeIdentity=roles.captureIdentity(escape.pid);if(escapeIdentity.kind!=='present')throw new Error('escaped child identity could not be established');info.escapePid=escape.pid;info.escapeIdentity=escapeIdentity;fs.writeFileSync(process.env.FIXTURE_MARKER+'.part',JSON.stringify(info));fs.renameSync(process.env.FIXTURE_MARKER+'.part',process.env.FIXTURE_MARKER);",
-    "  }",
+    "  if (process.env.FIXTURE_ESCAPE_PIPE && !process.env.FIXTURE_ESCAPE_READY) startEscapePipe();",
     "  if (process.env.FIXTURE_READ_ONLY_SCRATCH) { const ro=require('node:path').join(process.env.DISCORD_SURFACE_GATE_SCRATCH,'ro');fs.mkdirSync(ro);fs.writeFileSync(require('node:path').join(ro,'f'),'x');fs.chmodSync(ro,0o500); }",
     "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
-    "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
+    "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH && !process.env.FIXTURE_ESCAPE_READY) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
     "}",
     "setTimeout(() => process.exit(98), 120000).unref();",
@@ -156,9 +161,49 @@ function fixture(t) {
     "}"
   ].join('\n'));
   const processes = [];
+  const boundedCustodies = [];
   t.after(async () => {
     const unresolved = [];
     const identities = new Map();
+    const retainedGateScratch = new Set();
+    const writerIdentities = [];
+    const recordBoundedCustody = value => {
+      if (!boundedCustodies.length) return;
+      if (!value || typeof value !== 'object') {
+        unresolved.push('bounded-custody-missing');
+        return;
+      }
+      const gateScratch = value.scratch;
+      const normalizedScratch = typeof gateScratch === 'string' ? path.normalize(gateScratch) : '';
+      const resolvedScratch = typeof gateScratch === 'string' ? path.resolve(gateScratch) : '';
+      const validScratch = typeof gateScratch === 'string'
+        && gateScratch.length > 0
+        && path.isAbsolute(gateScratch)
+        && normalizedScratch === gateScratch
+        && path.dirname(resolvedScratch) === path.resolve(os.tmpdir())
+        && /^discord-gate-/.test(path.basename(resolvedScratch))
+        && resolvedScratch !== path.resolve(scratch);
+      if (!validScratch) unresolved.push('bounded-custody-scratch');
+      else retainedGateScratch.add(resolvedScratch);
+      const writer = value.escapeIdentity;
+      if (!writer || writer.kind !== 'present' || !Number.isSafeInteger(writer.pid)
+          || !Number.isSafeInteger(value.escapePid) || writer.pid !== value.escapePid) {
+        unresolved.push('bounded-custody-unknown-writer');
+      } else writerIdentities.push(writer);
+      for (const selected of boundedCustodies) {
+        for (const [name, file] of [
+          ['armed', selected.armed], ['release', selected.release], ['killed', selected.killed],
+          ['barrier', selected.barrier], ['started', selected.started], ['done', selected.done]
+        ]) {
+          if (typeof file !== 'string' || !fs.existsSync(file)) unresolved.push('bounded-custody-' + name);
+        }
+        if (typeof selected.done === 'string' && fs.existsSync(selected.done)) {
+          try {
+            if (fs.readFileSync(selected.done, 'utf8') !== 'reason=supervisor-stop') unresolved.push('bounded-custody-expired');
+          } catch { unresolved.push('bounded-custody-done-read'); }
+        }
+      }
+    };
     const remember = value => {
       if (Array.isArray(value)) {
         for (const item of value) remember(item);
@@ -186,9 +231,13 @@ function fixture(t) {
       marker, marker + '.guard-custody'
     ]) {
       if (!fs.existsSync(custodyPath)) continue;
-      try { remember(JSON.parse(fs.readFileSync(custodyPath, 'utf8'))); }
-      catch { unresolved.push('unreadable-custody:' + path.basename(custodyPath)); }
+      try {
+        const custody = JSON.parse(fs.readFileSync(custodyPath, 'utf8'));
+        if (custodyPath === marker) recordBoundedCustody(custody);
+        remember(custody);
+      } catch { unresolved.push('unreadable-custody:' + path.basename(custodyPath)); }
     }
+    if (boundedCustodies.length && !fs.existsSync(marker)) unresolved.push('bounded-custody-missing-marker');
     try {
       const stopped = JSON.parse(fs.readFileSync(path.join(scratch, 'worker-killed'), 'utf8'));
       for (const holder of stopped.extraHolders?.length ? stopped.extraHolders : [stopped.manager]) {
@@ -231,6 +280,26 @@ function fixture(t) {
         unresolved.push('actor-drain:' + identity.pid);
       }
     }
+    for (const identity of writerIdentities) {
+      if (!roleFixture.identityGone(identity, roleFixture.captureIdentity(identity.pid))) {
+        unresolved.push('writer-drain:' + identity.pid);
+      }
+    }
+    if (!unresolved.length) {
+      const owner = typeof process.getuid === 'function' ? process.getuid() : null;
+      for (const retained of retainedGateScratch) {
+        if (retained === path.resolve(scratch)) continue;
+        try {
+          const retainedStat = fs.lstatSync(retained);
+          if (owner === null || retainedStat.isSymbolicLink() || !retainedStat.isDirectory()
+              || retainedStat.uid !== owner) {
+            unresolved.push('retained-gate-scratch-identity:' + retained);
+            continue;
+          }
+          fs.rmSync(retained, { recursive: true, force: true });
+        } catch { unresolved.push('retained-gate-scratch-remove:' + retained); }
+      }
+    }
     if (unresolved.length) {
       const custodyPath = path.join(scratch, 'cleanup-obligation.json');
       try {
@@ -243,6 +312,18 @@ function fixture(t) {
     fs.rmSync(scratch, { recursive: true, force: true });
   });
   function launch(extra = {}, supervised = false) {
+    if (extra.FIXTURE_ESCAPE_READY && extra.FIXTURE_KILL_GUARD
+        && extra.FIXTURE_RECREATE_SCRATCH && extra.FIXTURE_HANG) {
+      boundedCustodies.push({
+        armed: extra.FIXTURE_ESCAPE_ARMED,
+        release: extra.FIXTURE_ESCAPE_RELEASE,
+        killed: extra.FIXTURE_ESCAPE_KILLED,
+        barrier: extra.FIXTURE_MONITOR_BARRIER,
+        started: extra.FIXTURE_ESCAPE_STARTED,
+        done: extra.FIXTURE_ESCAPE_DONE,
+        deletion: extra.FIXTURE_SCRATCH_REMOVED
+      });
+    }
     const launchEnv = {
       ...env, APERTURE_GATE_ADMISSION_COMMAND: admit,
       APERTURE_GATE_TIME_LEFT_S: '120', APERTURE_GATE_SLOWEST_RUN_S: '60',
@@ -479,7 +560,7 @@ test('Darwin cleanup retains a bootstrapped service when readiness identity is m
     'module._bootout=lambda *args: True',
     'module._read_job_state=lambda path: None',
     'class Owner: pass',
-    'result=module._darwin_cleanup(Owner(),"launchctl","gui/501/com.discordsurface.fullgate.fixture",None,time.monotonic()+1,sys.argv[2],False)',
+    'result=module._darwin_cleanup(Owner(),"launchctl","gui/501/com.discordsurface.fullgate.fixture",None,module.clock_now()+1,sys.argv[2],False)',
     'print("retained" if result is False else "released")'
   ].join('\n');
   const result = spawnSync('python3', ['-I', '-B', '-c', script, SUPERVISOR_SCRIPT, path.join(os.tmpdir(), 'missing-gate-state.json')], {
@@ -513,10 +594,194 @@ test('Python supervisor verdict uses the channel separate from saturated stderr'
   assert.match(output, /APERTURE-GATE-INDETERMINATE reason=timeout: bounded fixture/);
 });
 
+test('Darwin final stdout relay preserves evidence and the source snapshot reserve', { timeout: 45000 }, () => {
+  const script = [
+    "import ast, io, json, sys",
+    "from pathlib import Path",
+    "from types import SimpleNamespace",
+    "tree = ast.parse(Path(sys.argv[1]).read_text(encoding=\"utf-8\"))",
+    "relay = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == \"_stream_stdout\")",
+    "error_classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in {\"SnapshotCleanupError\", \"InvalidGateBudget\"}]",
+    "assert len(error_classes) == 2 and {n.name for n in error_classes} == {\"SnapshotCleanupError\", \"InvalidGateBudget\"}",
+    "error_types = {}",
+    "exec(compile(ast.Module(body=error_classes, type_ignores=[]), \"<relay-error-type>\", \"exec\"), error_types)",
+    "darwin = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == \"run_darwin_supervised\")",
+    "flushes = [n for n in ast.walk(darwin) if isinstance(n, ast.While) and any(",
+    "    isinstance(a, ast.Assign) and isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name)",
+    "    and a.value.func.id == \"_stream_stdout\" and any(isinstance(t, ast.Name) and t.id == \"next_offset\" for t in a.targets)",
+    "    for a in ast.walk(n))]",
+    "assert len(flushes) == 1",
+    "assert len([n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == \"_stream_stdout\"]) == 3",
+    "outer = next(n for n in darwin.body if isinstance(n, ast.Try) and flushes[0] in n.body)",
+    "final_body = outer.body[outer.body.index(flushes[0]):]",
+    "assert isinstance(final_body[-1], ast.Return) and isinstance(final_body[-1].value, ast.Name) and final_body[-1].value.id == \"result_code\"",
+    "assert any(isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == \"reason\" for n in final_body)",
+    "reserve = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)",
+    "               and any(isinstance(t, ast.Name) and t.id == \"CLEANUP_RESERVE_SECONDS\" for t in n.targets))",
+    "poll = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)",
+    "            and any(isinstance(t, ast.Name) and t.id == \"POLL_SECONDS\" for t in n.targets))",
+    "class Handle(io.BytesIO):",
+    "    def __init__(self, owner):",
+    "        super().__init__(owner.data)",
+    "        self.owner = owner",
+    "    def read(self, size=-1):",
+    "        self.owner.reads += 1",
+    "        assert self.owner.reads <= 8 and 0 < size <= 65536",
+    "        if self.owner.read_error:",
+    "            raise OSError(\"inert read failure\")",
+    "        return super().read(size)",
+    "class Fixture:",
+    "    def __init__(self, data=b\"abcdefgh\", before=False, action=None, now=0, persistent=False, body_code=0):",
+    "        self.data, self.mode, self.action, self.now = data, before, action, now",
+    "        self.persistent, self.body_code = persistent, body_code",
+    "        self.reads, self.writes, self.checks, self.snapshots, self.removals = 0, 0, 0, 0, 0",
+    "        self.missing = self.read_error = self.interrupted = self.emitted = self.invalid_budget = False",
+    "        self.accepted, self.sleeps, self.verdicts = bytearray(), [], []",
+    "    def open(self, name, mode):",
+    "        assert name == \"memory\" and mode == \"rb\"",
+    "        if self.missing:",
+    "            raise FileNotFoundError(\"inert missing output\")",
+    "        return Handle(self)",
+    "    def stat(self, name):",
+    "        assert name == \"memory\"",
+    "        if self.missing:",
+    "            raise FileNotFoundError(\"inert missing output\")",
+    "        return SimpleNamespace(st_size=len(self.data))",
+    "    def get_blocking(self, fd):",
+    "        assert fd == 73",
+    "        return self.mode",
+    "    def set_blocking(self, fd, value):",
+    "        assert fd == 73",
+    "        self.mode = value",
+    "    def write(self, fd, data):",
+    "        assert fd == 73 and self.mode is False",
+    "        self.writes += 1",
+    "        assert self.writes <= 8",
+    "        self.now += 1",
+    "        action = self.action",
+    "        if not self.persistent:",
+    "            self.action = None",
+    "        if action == \"again\":",
+    "            raise BlockingIOError(\"inert backpressure\")",
+    "        if action == \"closed\":",
+    "            raise BrokenPipeError(\"inert closed consumer\")",
+    "        if action == \"interrupt\":",
+    "            self.interrupted = True",
+    "        count = min(3, len(data)) if action in (\"partial\", \"interrupt\") else len(data)",
+    "        self.accepted.extend(data[:count])",
+    "        return count",
+    "    def monotonic(self):",
+    "        self.checks += 1",
+    "        assert self.checks <= 8",
+    "        return self.now",
+    "    def sleep(self, seconds):",
+    "        assert 0 <= seconds <= poll",
+    "        self.sleeps.append(seconds)",
+    "    def snapshot(self, root, environment, phase, deadline, interrupted, *, stop_deadline):",
+    "        assert root == \"root\" and environment == {} and phase == \"after\"",
+    "        assert deadline == stop_deadline == 100 and interrupted.is_set() == self.interrupted",
+    "        self.snapshots += 1",
+    "        if self.invalid_budget:",
+    "            raise error_types[\"InvalidGateBudget\"](\"inert invalid budget\")",
+    "        if self.interrupted:",
+    "            raise InterruptedError(\"inert interrupted snapshot\")",
+    "        if self.now >= 100:",
+    "            raise TimeoutError(\"inert expired snapshot\")",
+    "        return {\"snapshot\": \"fixed\"}",
+    "    def no_verdict(self, reason, detail):",
+    "        self.verdicts.append((reason, detail))",
+    "        return 98",
+    "    def emit(self, *args):",
+    "        self.emitted = True",
+    "    def remove(self, scratch, ignore_errors):",
+    "        assert scratch == \"private\" and ignore_errors is True",
+    "        self.removals += 1",
+    "def context(fixture):",
+    "    env = {\"__builtins__\": {\"len\": len, \"str\": str, \"min\": min, \"max\": max,",
+    "                           \"FileNotFoundError\": FileNotFoundError, \"BlockingIOError\": BlockingIOError,",
+    "                           \"BrokenPipeError\": BrokenPipeError, \"OSError\": OSError,",
+    "                           \"InterruptedError\": InterruptedError, \"TimeoutError\": TimeoutError,",
+    "                           \"ValueError\": ValueError, \"KeyError\": KeyError, \"TypeError\": TypeError, \"Exception\": Exception},",
+    "           \"open\": fixture.open, \"json\": json, \"SnapshotCleanupError\": error_types[\"SnapshotCleanupError\"],",
+    "           \"InvalidGateBudget\": error_types[\"InvalidGateBudget\"],",
+    "           \"os\": SimpleNamespace(get_blocking=fixture.get_blocking, set_blocking=fixture.set_blocking, write=fixture.write, stat=fixture.stat),",
+    "           \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73))}",
+    "    exec(compile(ast.Module(body=[relay], type_ignores=[]), \"<relay-fixture>\", \"exec\"), env)",
+    "    return env",
+    "def flush(fixture):",
+    "    env = context(fixture)",
+    "    env.update(stdout_path=\"memory\", stderr_path=\"stderr\", deadline=100, run_deadline=100-reserve,",
+    "               clock_now=fixture.monotonic, time=SimpleNamespace(sleep=fixture.sleep), POLL_SECONDS=poll,",
+    "               interrupted=SimpleNamespace(is_set=lambda: fixture.interrupted),",
+    "               result_code=fixture.body_code, root=\"root\", environment={}, before={\"snapshot\": \"fixed\"},",
+    "               scratch=\"private\", owner=None, capture_snapshot=fixture.snapshot, no_verdict=fixture.no_verdict,",
+    "               _emit_job_stderr=fixture.emit, shutil=SimpleNamespace(rmtree=fixture.remove))",
+    "    initial = ast.parse(\"output_offset = 0\\nreason = None\\nowned_service = False\").body",
+    "    final = ast.Try(body=final_body, handlers=outer.handlers, orelse=outer.orelse, finalbody=outer.finalbody)",
+    "    function = ast.FunctionDef(name=\"finish\", args=ast.arguments(posonlyargs=[], args=[], vararg=None,",
+    "                               kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),",
+    "                               body=initial+[final], decorator_list=[])",
+    "    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))",
+    "    exec(compile(module, \"<final-return-fixture>\", \"exec\"), env)",
+    "    return env[\"finish\"]()",
+    "for before in (False, True):",
+    "    f = Fixture(before=before, action=\"partial\")",
+    "    call = context(f)[\"_stream_stdout\"]",
+    "    offset = call(\"memory\", 0)",
+    "    assert offset == 3 and bytes(f.accepted) == b\"abc\" and f.mode == before",
+    "    assert call(\"memory\", offset) == 8 and bytes(f.accepted) == f.data and f.mode == before",
+    "    f = Fixture(before=before, action=\"again\")",
+    "    call = context(f)[\"_stream_stdout\"]",
+    "    assert call(\"memory\", 0) == 0 and not f.accepted and f.mode == before",
+    "    assert call(\"memory\", 0) == 8 and bytes(f.accepted) == f.data and f.mode == before",
+    "    for action in (\"again\", \"partial\"):",
+    "        f = Fixture(before=before, action=action)",
+    "        assert flush(f) == 0 and bytes(f.accepted) == f.data and f.mode == before",
+    "        assert not f.verdicts and f.emitted and f.snapshots == 1 and f.removals == 1",
+    "f = Fixture(data=b\"x\" * (65536 + 7))",
+    "call = context(f)[\"_stream_stdout\"]",
+    "offset = call(\"memory\", 0)",
+    "assert offset == 65536 and call(\"memory\", offset) == len(f.data) and bytes(f.accepted) == f.data",
+    "f = Fixture(data=b\"x\" * (65536 + 7))",
+    "assert flush(f) == 0 and bytes(f.accepted) == f.data",
+    "f = Fixture(data=b\"x\" * (5 * 65536), now=100-reserve-2)",
+    "assert flush(f) == 98 and len(f.accepted) == 2 * 65536 and f.now == 100-reserve and 100-f.now == reserve",
+    "assert f.verdicts == [(\"timeout\", \"final stdout relay incomplete after body exit 0\")] and not f.emitted",
+    "for now in (100-reserve, 101):",
+    "    f = Fixture(now=now)",
+    "    assert flush(f) == 98 and f.writes == 0 and f.now == now",
+    "    assert f.verdicts[0][0] == \"timeout\" and not f.emitted and f.removals == 1",
+    "for action in (\"again\", \"closed\"):",
+    "    f = Fixture(action=action, persistent=True, now=100-reserve-2)",
+    "    assert flush(f) == 98 and f.writes == 2 and not f.accepted and f.now == 100-reserve",
+    "    assert f.verdicts == [(\"timeout\", \"final stdout relay incomplete after body exit 0\")] and not f.emitted",
+    "    assert f.sleeps and f.snapshots == 1 and f.removals == 1",
+    "for body_code in (0, 1):",
+    "    f = Fixture(data=b\"\", body_code=body_code)",
+    "    assert flush(f) == body_code and f.writes == 0 and not f.verdicts and f.emitted and f.removals == 1",
+    "for failure in (\"missing\", \"read_error\"):",
+    "    f = Fixture()",
+    "    setattr(f, failure, True)",
+    "    assert flush(f) == 98 and not f.emitted and f.snapshots == 1 and f.removals == 1",
+    "    assert f.verdicts[0][0] == \"setup\" and \"final stdout relay failed after body exit 0\" in f.verdicts[0][1]",
+    "f = Fixture(action=\"interrupt\")",
+    "assert flush(f) == 98 and bytes(f.accepted) == b\"abc\" and f.writes == 1 and not f.emitted",
+    "assert f.verdicts == [(\"interrupted\", \"final stdout relay incomplete after body exit 0\")] and f.removals == 1",
+    "f = Fixture()",
+    "f.invalid_budget = True",
+    "assert flush(f) == 98 and f.snapshots == 1 and not f.emitted and f.removals == 1",
+    "assert f.verdicts == [(\"setup\", \"inert invalid budget\")]"
+  ].join('\n');
+  const result = spawnSync('python3', ['-I', '-B', '-c', script, SUPERVISOR_SCRIPT], {
+    encoding: 'utf8', timeout: 30000, env: pythonTestEnvironment()
+  });
+  assert.equal(result.status, 0, result.error?.message || result.stderr || result.stdout);
+});
+
 test('both public full entries decline before starting work without admission', () => {
   const env = { ...process.env };
   env.NODE_OPTIONS = '';
-  env.APERTURE_GATE_TIME_LEFT_S = '20';
+  env.APERTURE_GATE_TIME_LEFT_S = '60';
   env.APERTURE_GATE_SLOWEST_RUN_S = '5';
   env.APERTURE_GATE_ADMISSION_COMMAND = path.join(os.tmpdir(), 'gate-admission-missing-' + process.pid);
   delete env.DISCORD_SURFACE_GATE_BODY;
@@ -589,6 +854,42 @@ test('outer supervisor bounds source preflight by the caller deadline', { timeou
   assert.ok(Date.now() - started < 8000, 'preflight exceeded its caller deadline');
 });
 
+function supervisePreflight(t, extraEnv, bin) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-preflight-class-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const bodyMarker = path.join(scratch, 'body-ran');
+  const env = { ...process.env, NODE_OPTIONS: '', ...extraEnv };
+  if (bin) env.PATH = bin(scratch) + path.delimiter + process.env.PATH;
+  const result = spawnSync('python3', [
+    '-I', SUPERVISOR_SCRIPT, '--', process.execPath, '-e',
+    "require('node:fs').writeFileSync(" + JSON.stringify(bodyMarker) + ", 'ran')"
+  ], { cwd: PROJECT, env, encoding: 'utf8', timeout: 12000 });
+  return { result, bodyRan: fs.existsSync(bodyMarker) };
+}
+
+test('source preflight Git failure is a setup no-verdict, not invalid input', { timeout: 15000 }, t => {
+  const { result, bodyRan } = supervisePreflight(t, {}, scratch => {
+    const bin = path.join(scratch, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\necho "fatal: injected Git failure" >&2\nexit 128\n', { mode: 0o700 });
+    return bin;
+  });
+  assert.equal(result.status, 98, result.stderr + result.stdout);
+  assert.match(result.stdout, /APERTURE-GATE-INDETERMINATE reason=setup/);
+  assert.equal((result.stdout.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  assert.equal(bodyRan, false);
+});
+
+for (const [key, value] of [['APERTURE_GATE_SLOWEST_RUN_S', 'abc'], ['APERTURE_GATE_TIME_LEFT_S', '0123']]) {
+  test('source preflight refuses ' + key + '=' + value + ' as invalid input', { timeout: 15000 }, t => {
+    const { result, bodyRan } = supervisePreflight(t, { [key]: value });
+    assert.equal(result.status, 4, result.stderr + result.stdout);
+    assert.match(result.stderr, new RegExp(key + ' must be a positive whole number'));
+    assert.doesNotMatch(result.stdout, /APERTURE-GATE-INDETERMINATE/);
+    assert.equal(bodyRan, false);
+  });
+}
+
 test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 }, async t => {
   const f = fixture(t);
   const result = await f.launchSupervised({
@@ -616,7 +917,7 @@ test('source fingerprint and bypass decisions stay at their owners', () => {
   assert.deepEqual(relative(digestOwners), ['scripts/full-gate.js']);
   assert.deepEqual(relative(bypassOwners), []);
   assert.deepEqual(relative(gateEntrypoints), ['scripts/package-smoke.js', 'scripts/test-gate.js']);
-  assert.deepEqual(relative(bodyDispatchers), ['scripts/full-gate-watchdog.js']);
+  assert.deepEqual(relative(bodyDispatchers), ['scripts/full-gate-worker.js']);
   assert.deepEqual(relative(nodeOptionOwners), ['scripts/full-gate.js', 'scripts/package-smoke.js', 'scripts/test-gate.js']);
 });
 
@@ -1077,7 +1378,7 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
   fs.mkdirSync(root); fs.mkdirSync(bin); fs.mkdirSync(path.join(root, 'scripts')); fs.mkdirSync(path.join(root, 'test'));
   for (const file of ['test-gate.js','full-gate.js','full-gate-worker.js','full-gate-watchdog.js']) fs.copyFileSync(path.join(PROJECT,'scripts',file),path.join(root,'scripts',file));
   fs.mkdirSync(path.join(root,'scripts','full-gate'));
-  fs.copyFileSync(path.join(PROJECT,'scripts','full-gate','body-runner.js'),path.join(root,'scripts','full-gate','body-runner.js'));
+  for (const file of ['body-runner.js', 'watchdog-collector.js']) fs.copyFileSync(path.join(PROJECT,'scripts','full-gate',file),path.join(root,'scripts','full-gate',file));
   const log = path.join(scratch,'stages.log');
   const preload = path.join(scratch, 'preload --test-only');
   if (scenario.preload) fs.writeFileSync(preload, 'module.exports = {};\n');
@@ -1112,12 +1413,40 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
 });
 
 
-test('caller disconnect during final source verification is a no-verdict', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
+for (const scenario of [
+  { name: 'caller disconnect during final source verification is a no-verdict', disconnect: true, expected: 98 },
+  { name: 'caller disconnect during failed final source verification is a no-verdict', disconnect: true, brokenSource: true, expected: 98 },
+  { name: 'closed IPC during final source verification does not need its disconnect event', disconnect: true, suppressEvent: true, expected: 98 },
+  { name: 'healthy IPC during final source verification preserves the body result', expected: 0 },
+  { name: 'closed IPC control exposes a missing final connectivity check', disconnect: true, suppressEvent: true, control: true, expected: 0 }
+]) test(scenario.name, { skip: process.platform === 'win32', timeout: 180000 }, async t => {
   const f = fixture(t);
   const bin = path.join(f.scratch, 'git-wrapper');
   fs.mkdirSync(bin);
   const counter = path.join(f.scratch, 'revision-count');
   const signalMarker = path.join(f.scratch, 'final-snapshot-signal');
+  const disconnectMarker = path.join(f.scratch, 'disconnect-observed');
+  const entry = path.join(f.scratch, 'entry.js');
+  let entrySource = fs.readFileSync(entry, 'utf8');
+  if (scenario.suppressEvent) {
+    entrySource = 'if(require.main===module){const emit=process.emit;process.emit=function(event,...args){'
+      + 'if(event==="disconnect"){require("node:fs").writeFileSync(' + JSON.stringify(disconnectMarker)
+      + ',"observed");return true;}return emit.call(this,event,...args);};}\n' + entrySource;
+  }
+  if (scenario.control) {
+    const source = fs.readFileSync(GATE, 'utf8');
+    const check = '    if (process.connected === false) onDisconnect();';
+    assert.equal(source.split(check).length, 2, 'one final connectivity owner');
+    const control = source.replace(check, '');
+    const load = '(()=>{const Module=require("node:module");const owner=new Module(' + JSON.stringify(GATE)
+      + ',module);owner.filename=' + JSON.stringify(GATE)
+      + ';owner.paths=Module._nodeModulePaths(require("node:path").dirname(owner.filename));owner._compile('
+      + JSON.stringify(control) + ',owner.filename);return owner.exports;})()';
+    const ownerImport = 'require(' + JSON.stringify(GATE) + ')';
+    assert.equal(entrySource.split(ownerImport).length, 2);
+    entrySource = entrySource.replace(ownerImport, load);
+  }
+  fs.writeFileSync(entry, entrySource);
   const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
   const wrapper = path.join(bin, 'git');
   fs.writeFileSync(wrapper, '#!' + process.execPath + '\n' + [
@@ -1140,14 +1469,25 @@ test('caller disconnect during final source verification is a no-verdict', { ski
   const signal = JSON.parse(fs.readFileSync(signalMarker, 'utf8'));
   assert.equal(signal.manager, run.child.pid);
   assert.equal(run.child.connected, true);
-  run.child.disconnect();
+  if (scenario.disconnect) {
+    const disconnected = new Promise(resolve => run.child.once('disconnect', resolve));
+    run.child.disconnect();
+    await disconnected;
+  }
   run.child.ref();
+  if (scenario.brokenSource) {
+    fs.unlinkSync(path.join(f.root, 'input'));
+    fs.symlinkSync('missing-final-source', path.join(f.root, 'input'));
+  }
   fs.writeFileSync(f.emergencyRelease, 'release');
   const result = await run.done;
   assert.equal(fs.readFileSync(counter, 'utf8'), '3');
-  assert.equal(result.code, 98, result.output);
-  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
-  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  assert.equal(result.code, scenario.expected, result.output);
+  if (scenario.suppressEvent) assert.equal(fs.readFileSync(disconnectMarker, 'utf8'), 'observed');
+  if (scenario.expected === 98) {
+    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted/);
+    assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  }
 });
 
 for (const layout of ['detached', 'uncommitted', 'archive']) {
@@ -1270,15 +1610,78 @@ test('body signal crash remains a raw failure', { timeout: 180000 }, async t => 
   assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
 });
 
-test('watchdog death cleans the body while its worker still owns admission', { timeout: 180000 }, async t => {
+test('guardian loss retains scratch without positive cleanup completion', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launchSupervised({ FIXTURE_KILL_GUARD: '1', FIXTURE_HANG: '1' });
-  const result = await run.done;
-  assert.equal(result.code, 98, result.output);
-  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  const escapeArmed = path.join(f.scratch, 'escape-armed');
+  const escapeRelease = path.join(f.scratch, 'escape-release');
+  const escapeKilled = path.join(f.scratch, 'escape-killed');
+  const escapeStarted = path.join(f.scratch, 'escape-started');
+  const escapeDone = path.join(f.scratch, 'escape-done');
+  const scratchRemoved = path.join(f.scratch, 'scratch-removed');
+  const monitorBarrier = path.join(f.scratch, 'monitor-barrier');
+  const custodyPath = f.marker + '.guard-custody';
+  const scripts = path.join(f.scratch, 'copied-gate', 'scripts');
+  fs.mkdirSync(path.join(scripts, 'full-gate'), { recursive: true });
+  for (const name of ['full-gate.js', 'full-gate-worker.js', 'full-gate-watchdog.js']) fs.copyFileSync(path.join(PROJECT, 'scripts', name), path.join(scripts, name));
+  for (const name of ['body-runner.js', 'watchdog-collector.js']) fs.copyFileSync(path.join(PROJECT, 'scripts/full-gate', name), path.join(scripts, 'full-gate', name));
+  const gate = path.join(scripts, 'full-gate.js');
+  const guardian = path.join(scripts, 'full-gate-watchdog.js');
+  const guardianSource = fs.readFileSync(guardian, 'utf8');
+  const monitorPoint = 'async function monitorDescendants() {';
+  assert.equal(guardianSource.split(monitorPoint).length, 2);
+  fs.writeFileSync(guardian, guardianSource.replace(monitorPoint, monitorPoint + "\n  if (process.env.FIXTURE_MONITOR_BARRIER && !fs.existsSync(process.env.FIXTURE_MONITOR_BARRIER)) return;"));
+  const entry = path.join(f.scratch, 'entry.js');
+  fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace(JSON.stringify(GATE), JSON.stringify(gate)));
+  const run = f.launchSupervised({
+    FIXTURE_KILL_GUARD: '1',
+    FIXTURE_ESCAPE_PIPE: '1',
+    FIXTURE_ESCAPE_READY: '1',
+    FIXTURE_RECREATE_SCRATCH: '1',
+    FIXTURE_HANG: '1',
+    FIXTURE_ESCAPE_ARMED: escapeArmed,
+    FIXTURE_ESCAPE_RELEASE: escapeRelease,
+    FIXTURE_ESCAPE_KILLED: escapeKilled,
+    FIXTURE_ESCAPE_STARTED: escapeStarted,
+    FIXTURE_ESCAPE_DONE: escapeDone,
+    FIXTURE_SCRATCH_REMOVED: scratchRemoved,
+    FIXTURE_MONITOR_BARRIER: monitorBarrier
+  });
+  let custody;
+  let result;
+  const actionDeadline = Date.now() + 10000;
+  const diagnostics = () => 'output=' + (result?.output || '') + '\nfixture scratch=' + f.scratch + '\ncustody=' + JSON.stringify(custody);
+  while (Date.now() < actionDeadline) {
+    try { custody = JSON.parse(fs.readFileSync(custodyPath, 'utf8')); } catch {}
+    if (fs.existsSync(escapeArmed) && custody?.state === 'prepared') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(fs.existsSync(escapeArmed), true, diagnostics());
+  assert.equal(custody?.state, 'prepared', diagnostics());
+  assert.equal(custody?.guardian?.kind, 'present', diagnostics());
+  fs.writeFileSync(escapeRelease, 'release');
+  while (!fs.existsSync(escapeStarted) && Date.now() < actionDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(fs.existsSync(escapeStarted), true, diagnostics());
+  assert.equal(roleFixture.signalOwned(custody.guardian, 'SIGKILL'), true, diagnostics());
+  assert.equal(await waitForIdentityGone(custody.guardian, actionDeadline), true, diagnostics());
+  custody.state = 'signaled';
+  fs.writeFileSync(custodyPath, JSON.stringify(custody));
+  fs.writeFileSync(escapeKilled, 'guardian-signalled');
+  fs.writeFileSync(monitorBarrier, 'guardian-signalled');
+  result = await run.done;
+  assert.equal(result.code, 98, diagnostics());
+  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, diagnostics());
+  assert.equal(fs.existsSync(f.marker), true, diagnostics());
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
-  assert.equal(roleFixture.identityGone(body.identity, roleFixture.captureIdentity(body.pid)), true, 'body remained after guardian cleanup');
-  assert.equal(fs.existsSync(body.scratch), false);
+  assert.equal(fs.existsSync(escapeKilled), true, diagnostics());
+  assert.equal(fs.existsSync(monitorBarrier), true, diagnostics());
+  assert.equal(fs.existsSync(escapeStarted), true, diagnostics());
+  assert.equal(fs.existsSync(escapeDone), true, diagnostics());
+  assert.equal(fs.readFileSync(escapeDone, 'utf8'), 'reason=supervisor-stop', diagnostics());
+  assert.equal(await waitForIdentityGone(body.escapeIdentity, actionDeadline), true, diagnostics());
+  assert.notEqual(body.scratch, f.scratch, diagnostics());
+  assert.match(path.basename(body.scratch), /^discord-gate-/, diagnostics());
+  assert.equal(fs.existsSync(body.scratch), true, diagnostics());
+  assert.equal(fs.existsSync(scratchRemoved), false, diagnostics());
 });
 
 test('watchdog holds admission through cleanup after worker loss', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
@@ -1314,11 +1717,12 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
 
   const supervisors = stopped.extraHolders.length ? stopped.extraHolders : [stopped.manager];
   for (const holder of supervisors) assert.equal(roleFixture.signalOwned(holder, 'SIGCONT'), true, 'supervisor identity changed before resume');
+  assert.equal(roleFixture.signalOwned(stopped.guardian, 'SIGCONT'), true, 'guardian identity changed before resume');
   const firstResult = await first.done;
   assert.equal(firstResult.code, 98, firstResult.output);
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.identityGone(stopped.body, roleFixture.captureIdentity(body.pid)), true, 'body process remained after guardian cleanup');
-  assert.equal(fs.existsSync(body.scratch), false);
+  assert.equal(fs.existsSync(body.scratch), false, firstResult.output);
 
   const resumedMarker = path.join(f.scratch, 'resumed-body.json');
   const resumed = await f.launchSupervised({ FIXTURE_LEASE_ENFORCE: '1', FIXTURE_MARKER: resumedMarker }).done;
@@ -1391,6 +1795,7 @@ test('manager process-group inspection uses its remaining deadline', () => {
     module: moduleFixture,
     exports: moduleFixture.exports,
     require: name => {
+      if (name === './full-gate/watchdog-collector') return require('../scripts/full-gate/watchdog-collector');
       if (name === 'node:child_process') return { fork: () => {}, spawnSync: (command, args, options) => {
         inspections.push({ command, args, options });
         return { status: 0, stdout: '', pid: 23457 };
@@ -1403,26 +1808,46 @@ test('manager process-group inspection uses its remaining deadline', () => {
   assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
 });
 
-test('worker replaces watchdog fd 4 before starting the gate supervisor', () => {
+test('worker keeps body and admission in its group and excludes body control forgery', () => {
   const { EventEmitter } = require('node:events');
   const vm = require('node:vm');
+  const gate = require('../scripts/full-gate');
   const workerProcess = new EventEmitter();
-  Object.assign(workerProcess, { argv: ['node', 'worker', '5000', 'entry'], pid: 23456, connected: true, send: () => {}, kill: () => {}, exit: () => {} });
-  const guard = new EventEmitter();
-  Object.assign(guard, { connected: true, pid: 23457, send: () => {} });
-  let options;
+  const packets = [];
+  Object.assign(workerProcess, { argv: ['node', 'worker', '5000', 'entry'], pid: 23456, connected: true, env: {}, send: packet => packets.push(packet), kill: () => {}, exit: () => {} });
+  const admission = new EventEmitter();
+  const body = new EventEmitter();
+  Object.assign(body, { connected: true, send: () => {} });
+  let bodyOptions;
+  let admissionOptions;
   vm.runInNewContext(fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-worker.js'), 'utf8'), {
-    __dirname: path.join(PROJECT, 'scripts'),
-    process: workerProcess,
+    __dirname: path.join(PROJECT, 'scripts'), process: workerProcess, setTimeout: () => {},
     require: name => {
-      if (name === 'node:path') return path;
-      if (name === 'node:child_process') return { fork: (_file, _args, spawnOptions) => { options = spawnOptions; return guard; } };
-      if (name === './full-gate') return { MESSAGES, NO_VERDICT, canFinish: () => true, noVerdict: () => NO_VERDICT, releaseScratch: () => true, REASONS: { INTERRUPTED: 'interrupted' }, SCRATCH_ROOT: 'scratch' };
+      if (name === 'node:path' || name === 'node:os') return require(name);
+      if (name === 'node:child_process') return {
+        spawn: (_file, _args, options) => { admissionOptions = options; return admission; },
+        fork: (_file, _args, options) => { bodyOptions = options; return body; }
+      };
+      if (name === './full-gate') return gate;
       throw new Error('unexpected worker import ' + name);
     }
   }, { timeout: 1000 });
-  assert.equal(options.stdio[3], 'ipc');
-  assert.equal(options.stdio[4], 'ignore');
+  workerProcess.emit('message', { kind: MESSAGES.ADMIT, command: 'admit', args: [] });
+  admission.emit('exit', 0);
+  workerProcess.emit('message', { kind: MESSAGES.START });
+  assert.equal(admissionOptions.detached, undefined);
+  assert.equal(bodyOptions.detached, undefined);
+  assert.equal(bodyOptions.stdio[3], 'ipc');
+  assert.equal(bodyOptions.stdio[4], 'ignore');
+  const count = packets.length;
+  body.emit('message', { kind: MESSAGES.CLEANUP_COMPLETE, code: 0 });
+  body.emit('message', { kind: MESSAGES.BODY_EXIT, code: 0 });
+  assert.equal(packets.length, count, 'body data cannot report exit or guardian completion');
+  body.emit('message', { kind: MESSAGES.BODY_COMPLETE });
+  body.emit('message', { kind: MESSAGES.BODY_COMPLETE });
+  assert.equal(packets.filter(packet => packet.kind === MESSAGES.BODY_COMPLETE).length, 1);
+  body.emit('close', 17, null);
+  assert.equal(packets.find(packet => packet.kind === MESSAGES.BODY_EXIT).code, 17);
 });
 
 test('scratch cleanup subprocess is bounded by the gate deadline', () => {
@@ -1437,6 +1862,7 @@ test('scratch cleanup subprocess is bounded by the gate deadline', () => {
     module: moduleFixture,
     exports: moduleFixture.exports,
     require: name => {
+      if (name === './full-gate/watchdog-collector') return require('../scripts/full-gate/watchdog-collector');
       if (name === 'node:child_process') return { fork: () => {}, spawnSync: (command, args, options) => {
         cleanups.push({ command, args, options });
         return { status: 0 };
@@ -1450,42 +1876,6 @@ test('scratch cleanup subprocess is bounded by the gate deadline', () => {
   assert.equal(cleanups[0].args[0], '-e');
   assert.ok(cleanups[0].options.timeout > 0 && cleanups[0].options.timeout <= 5000);
   assert.equal(cleanups[0].options.killSignal, 'SIGKILL');
-});
-
-test('watchdog process-group inspection uses its remaining deadline', () => {
-  const { EventEmitter } = require('node:events');
-  const vm = require('node:vm');
-  const deadline = Date.now() + 5000;
-  const watchdogProcess = new EventEmitter();
-  const inspections = [];
-  const exits = [];
-  Object.assign(watchdogProcess, {
-    argv: ['node', 'watchdog', String(deadline), '12345', 'entry'],
-    pid: 23456,
-    connected: true,
-    send: () => {},
-    kill: () => {},
-    exit: code => exits.push(code)
-  });
-  vm.runInNewContext(fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-watchdog.js'), 'utf8'), {
-    process: watchdogProcess,
-    setTimeout: () => 1,
-    require: name => {
-      if (name === 'node:child_process') return { spawn: () => {}, spawnSync: (command, args, options) => {
-        inspections.push({ command, args, options });
-        return { status: 0, stdout: '12345 1 12345 S\n23456 12345 12345 S\n', pid: 23457 };
-      } };
-      if (name === 'node:fs') return fs;
-      if (name === 'node:os') return { constants: { signals: {} } };
-      if (name === 'node:path') return path;
-      if (name === './full-gate') return { MESSAGES, NO_VERDICT, canFinish: () => true, releaseScratch: () => true, NO_VERDICT_SECRET: 'secret', SCRATCH_ROOT: 'scratch' };
-      throw new Error('unexpected watchdog import ' + name);
-    }
-  }, { timeout: 1000 });
-  watchdogProcess.emit('message', { kind: MESSAGES.DRAIN });
-  assert.equal(inspections.length, 1);
-  assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
-  assert.deepEqual(exits, [0]);
 });
 
 test('leftover owned child produces exactly one no-verdict line', { timeout: 180000 }, async t => {
@@ -1693,6 +2083,60 @@ test('gate cleanup terminates a detached descendant before accepting a verdict',
   }
 });
 
+test('manager joins real guardian completion before final scratch removal', { skip: process.platform === 'win32', timeout: 360000 }, async t => {
+  for (const control of [true, false]) await t.test(control ? 'removed join is red' : 'restored join is green', async t => {
+    const f = fixture(t);
+    const scripts = path.join(f.scratch, 'copied-gate', 'scripts');
+    fs.mkdirSync(path.join(scripts, 'full-gate'), { recursive: true });
+    for (const name of ['full-gate.js', 'full-gate-worker.js', 'full-gate-watchdog.js']) fs.copyFileSync(path.join(PROJECT, 'scripts', name), path.join(scripts, name));
+    for (const name of ['body-runner.js', 'watchdog-collector.js']) fs.copyFileSync(path.join(PROJECT, 'scripts/full-gate', name), path.join(scripts, 'full-gate', name));
+    const gate = path.join(scripts, 'full-gate.js');
+    const guardian = path.join(scripts, 'full-gate-watchdog.js');
+    const barrier = path.join(f.scratch, 'verified-completion-waiting');
+    const release = f.emergencyRelease;
+    const guardSource = fs.readFileSync(guardian, 'utf8');
+    const point = '  completionSent = true;';
+    assert.equal(guardSource.split(point).length, 2);
+    const wait = [
+      "  fs.writeFileSync(process.env.FIXTURE_COMPLETION_BARRIER, 'verified');",
+      "  while (!fs.existsSync(process.env.FIXTURE_COMPLETION_RELEASE) && Date.now() < Number(deadline)) await new Promise(resolve => setTimeout(resolve, 10));",
+      "  if (!fs.existsSync(process.env.FIXTURE_COMPLETION_RELEASE)) return process.exit(NO_VERDICT);"
+    ].join('\n');
+    fs.writeFileSync(guardian, guardSource.replace(point, wait + '\n' + point));
+    if (control) {
+      const source = fs.readFileSync(gate, 'utf8');
+      const join = 'const guardianClosed = guardianExit ? await untilCallerDeadline(guardianExit) : { code: 0 };';
+      assert.equal(source.split(join).length, 2);
+      fs.writeFileSync(gate, source.replace(join, 'const guardianClosed = { code: null };'));
+    }
+    const entry = path.join(f.scratch, 'entry.js');
+    fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace(JSON.stringify(GATE), JSON.stringify(gate)));
+    const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1', FIXTURE_COMPLETION_BARRIER: barrier, FIXTURE_COMPLETION_RELEASE: release });
+    let finished = false;
+    run.done.then(() => { finished = true; });
+    try {
+      const end = Date.now() + 120000;
+      while (!fs.existsSync(barrier) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(fs.existsSync(barrier), true, 'actual fresh cleanup completion was not reached');
+      const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
+      assert.equal(roleFixture.identityGone(body.escapeIdentity, roleFixture.captureIdentity(body.escapePid)), true);
+      assert.equal(fs.existsSync(f.marker + '.escape-signalled'), true);
+      if (control) {
+        const result = await run.done;
+        assert.equal(result.code, 98, result.output);
+        assert.throws(() => assert.equal(fs.existsSync(body.scratch), false), assert.AssertionError, 'removing the join must violate final removal');
+      } else {
+        assert.equal(finished, false, 'manager finished before actual guardian completion');
+        fs.writeFileSync(release, 'release');
+        const result = await run.done;
+        assert.equal(result.code, 98, result.output);
+        assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+        assert.equal(fs.existsSync(body.scratch), false);
+      }
+    } finally { fs.writeFileSync(release, 'release'); }
+  });
+});
+
 test('blocked manager output stays within its deadline and releases scratch', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const run = f.launch({
@@ -1714,7 +2158,7 @@ test('blocked manager output stays within its deadline and releases scratch', { 
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(result.code, 98, result.output);
   assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=timeout/);
-  assert.equal(fs.existsSync(body.scratch), false);
+  assert.equal(fs.existsSync(body.scratch), false, result.output);
 });
 
 test('full gate preserves ignored test bytecode in its source premise', { timeout: 180000 }, async t => {
@@ -1748,7 +2192,7 @@ test('watchdog has one identity-checked escaped PID signal site and a bounded ho
   const source = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-watchdog.js'), 'utf8');
   const pidSignalSites = source.match(/process\.kill\(pid, signal\)/g) || [];
   const ownerStart = source.indexOf('function signalEscapedDescendants');
-  const ownerEnd = source.indexOf('\nfunction hasLiveEscapedDescendants', ownerStart);
+  const ownerEnd = source.indexOf('\nasync function hasLiveEscapedDescendants', ownerStart);
   const signalOwner = source.slice(ownerStart, ownerEnd);
   const identitySource = source.match(/function sameProcessIdentity[\s\S]*?\n}/)?.[0];
   const sameProcessIdentity = vm.runInNewContext(identitySource + '\nsameProcessIdentity');
@@ -1805,12 +2249,10 @@ for (const { escape, mode } of [
 }
 
 for (const connected of [true, false]) {
-  test('stopping worker cannot report success when its guard exits, manager connected ' + connected, () => {
+  test('stopping worker cannot close successfully or remove scratch, manager connected ' + connected, () => {
     const { EventEmitter } = require('node:events');
     const vm = require('node:vm');
     const gate = require('../scripts/full-gate');
-    const guard = new EventEmitter();
-    guard.connected = false;
     const processFixture = new EventEmitter();
     const exits = [];
     const signals = [];
@@ -1818,34 +2260,29 @@ for (const connected of [true, false]) {
     let declarations = 0;
     let releases = 0;
     Object.assign(processFixture, {
-      pid: 12345, connected, argv: ['node', 'worker', 'deadline', 'entry'],
-      env: { [gate.SCRATCH_ROOT]: 'owned-fixture' },
-      exit: code => exits.push(code),
-      kill: (pid, signal) => signals.push([pid, signal])
+      pid: 12345, connected, argv: ['node', 'worker', '5000', 'entry'], env: { [gate.SCRATCH_ROOT]: 'owned-fixture' },
+      send: () => {}, exit: code => exits.push(code), kill: (pid, signal) => signals.push([pid, signal])
     });
-    const source = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-worker.js'), 'utf8');
-    vm.runInNewContext(source, {
-      process: processFixture, __dirname: path.join(PROJECT, 'scripts'),
-      setTimeout: callback => { timers.push(callback); },
+    vm.runInNewContext(fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-worker.js'), 'utf8'), {
+      process: processFixture, __dirname: path.join(PROJECT, 'scripts'), setTimeout: callback => { timers.push(callback); },
       require: name => {
-        if (name === 'node:path') return path;
-        if (name === 'node:child_process') return { fork: () => guard };
+        if (name === 'node:path' || name === 'node:os') return require(name);
+        if (name === 'node:child_process') return {};
         if (name === './full-gate') return { ...gate, noVerdict: () => { declarations++; return gate.NO_VERDICT; }, releaseScratch: () => { releases++; return false; } };
         throw new Error('unexpected fixture import ' + name);
       }
     }, { timeout: 1000 });
     processFixture.emit('SIGTERM');
-    guard.emit('exit', 0);
+    processFixture.emit('message', { kind: MESSAGES.CLOSE });
     assert.deepEqual(exits, [], 'a stopping worker cannot finish0');
     assert.equal(declarations, 1);
-    assert.equal(timers.length, 1);
-    timers[0]();
+    assert.equal(timers.length, 2, 'independent deadline and unchanged two-second KILL');
+    timers[1]();
     assert.deepEqual(exits, [98]);
     assert.deepEqual(signals, [[-12345, 'SIGTERM'], [-12345, 'SIGKILL']]);
-    assert.equal(releases, connected ? 0 : 1, 'cleanup failure must not skip group termination');
+    assert.equal(releases, 0, 'only the guardian can establish escaped-writer completion');
   });
 }
-
 
 test('generated fixture entry expires imported and direct bodies independently', async t => {
   const vm = require('node:vm');
@@ -1926,7 +2363,429 @@ test('generated fixture entry expires imported and direct bodies independently',
 });
 
 
-const darwinDisappearingPidProgram = String.raw`import ast,errno,io,json,struct,sys,types
+const darwinDeadlineProgram = String.raw`import ast,copy,io,json,math,signal,sys,types
+from pathlib import Path
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.alarm(25)
+sources=[Path(p).read_text() for p in sys.argv[1:4]]
+supervisor,runner,owner=sources
+results=[]
+def declarations(source,names,namespace):
+    nodes=[n for n in ast.parse(source).body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
+    assert {n.name for n in nodes}==names
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),'<deadline declarations>','exec'),namespace)
+    return namespace
+class FixtureOracle(BaseException):pass
+oracle_failures=[]
+def oracle(value,detail):
+    if not value:
+        oracle_failures.append(detail)
+        raise FixtureOracle(detail)
+contract=next(ast.literal_eval(n.value) for n in ast.parse(owner).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='CLOCK_CONTRACT' for t in n.targets))
+literal=lambda source,name:next(ast.literal_eval(n.value) for n in ast.parse(source).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets))
+class Clock:
+    CLOCK_MONOTONIC=1
+    def __init__(self,local):self.value=1000;self.local=local;self.calls=0;self.fail=False
+    def clock_gettime(self,kind):
+        self.calls+=1;oracle(self.calls<1000,'unbounded fake clock')
+        oracle(kind==self.CLOCK_MONOTONIC,'wrong clock primitive')
+        if self.fail:raise OSError('fake unavailable clock')
+        return self.value
+    def monotonic(self):oracle(False,'process-local origin used: '+str(self.local))
+    def sleep(self,seconds):self.value+=seconds
+def clock_owner(clock):
+    return declarations(owner,{'CapabilityError','clock_now','require_clock_contract'},dict(time=clock,math=math,CLOCK_CONTRACT=contract))
+def case(name,action):
+    action();results.append(name)
+def run_case(cap='95',delay=15,change=None,ack_change=None,clock_failure=False,live=False,start_clock_failure=False,oracle_fault=None):
+    clock=Clock(-7000);clock.fail=start_clock_failure;ns=clock_owner(clock);states=[];spawns=[];drains=[]
+    controller={'pid':301,'coalition_id':300};identity={'pid':401,'coalition_id':400}
+    api=types.SimpleNamespace(**ns)
+    api.joined_identity=lambda pid:dict(identity)
+    api.identity_if_present=lambda pid:dict(controller)
+    api.same_process=lambda left,right:left==right
+    def drain(resource,deadline,preserve):
+        drains.append((resource,deadline,preserve))
+        oracle(resource==400 and deadline==1100 and preserve==identity,'wrong owned drain target')
+        if clock.fail:raise api.CapabilityError('fake cleanup clock unavailable')
+        return True
+    api.drain=drain
+    env={'APERTURE_GATE_TIME_LEFT_S':cap,'DISCORD_SURFACE_GATE_SUPERVISOR':'darwin-launchd-v1','DISCORD_SURFACE_GATE_SUPERVISOR_RECEIPT':'receipt','DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN':'token','UNCHANGED':'spaces and unicode é'}
+    spec={'state_path':'state','clock_contract':contract,'deadline':1100,'run_deadline':1095,'controller':controller,'ack_path':'ack','launch_token':'nonce','environment':env,'command':['fake-child'],'cwd':'fake-root'}
+    if change:change(spec)
+    before=copy.deepcopy(spec)
+    ack={'launch_token':'nonce','clock_contract':contract}
+    if ack_change:ack_change(ack)
+    def fake_open(path,*args,**kwargs):
+        if path=='spec':return io.StringIO(json.dumps(spec))
+        oracle(path=='ack','unexpected fake file path');clock.value+=delay
+        return io.StringIO(json.dumps(ack))
+    def popen(argv,**kwargs):
+        spawns.append((argv,kwargs));oracle(argv==['fake-child'] and kwargs['start_new_session'] is False,'wrong child launch')
+        if clock_failure:clock.fail=True
+        return types.SimpleNamespace(pid=402,poll=lambda:None if live else 0)
+    target=dict(json=json,math=math,open=fake_open,time=clock,os=types.SimpleNamespace(getpid=lambda:401),interrupted=False,receive_signal=lambda *args:None,
+        signal=types.SimpleNamespace(SIGINT=2,SIGTERM=15,SIGHUP=1,signal=lambda *args:None),subprocess=types.SimpleNamespace(Popen=popen),write_state=lambda p,v:states.append(v),DARWIN=api)
+    declarations(runner,{'run','controller_alive'},target)
+    if oracle_fault:
+        def faulty_clock():
+            if oracle_fault=='local':return clock.monotonic()
+            if oracle_fault=='bound':clock.calls=1000;return clock.clock_gettime(clock.CLOCK_MONOTONIC)
+            if oracle_fault=='primitive':return clock.clock_gettime(-1)
+            if oracle_fault=='path':return fake_open('foreign-path')
+            oracle(False,'unknown deliberate oracle fault')
+        api.clock_now=faulty_clock
+    baseline_faults=len(oracle_failures)
+    try:code=target['run']('spec')
+    finally:oracle(len(oracle_failures)==baseline_faults,'target absorbed a fatal fixture oracle')
+    assert spec==before,'original spec mutated'
+    return types.SimpleNamespace(code=code,states=states,spawns=spawns,drains=drains,env=env)
+def budget():
+    r=run_case();assert r.code==0 and len(r.spawns)==1
+    env=r.spawns[0][1]['env'];assert env['APERTURE_GATE_TIME_LEFT_S']=='80'
+    for key in ('DISCORD_SURFACE_GATE_SUPERVISOR','DISCORD_SURFACE_GATE_SUPERVISOR_RECEIPT','DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN','UNCHANGED'):assert env[key]==r.env[key]
+    assert env['DISCORD_SURFACE_GATE_SUPERVISOR_PID']=='301' and env['DISCORD_SURFACE_GATE_JOB_PID']=='401'
+    assert r.states[0]['clock_contract']==contract
+case('readiness delay is debited with capabilities and original spec preserved',budget)
+def lower_cap():
+    r=run_case(cap='7');assert r.spawns[0][1]['env']['APERTURE_GATE_TIME_LEFT_S']=='7'
+case('lower inherited cap survives',lower_cap)
+for fault in ('bound','primitive','local','path'):
+    failed=False
+    try:run_case(cap='',oracle_fault=fault)
+    except FixtureOracle:failed=True
+    assert failed,'negative guard case absorbed oracle fault '+fault
+    results.append('fatal oracle escapes negative path '+fault)
+
+for cap in ('','0','-1','nan',True,2,None):
+    r=run_case(cap=cap);assert r.code==98 and not r.spawns and r.states[-1]['state']=='failed'
+    results.append('invalid inherited cap '+repr(cap))
+r=run_case(change=lambda spec:spec['environment'].pop('APERTURE_GATE_TIME_LEFT_S'))
+assert r.code==98 and not r.spawns
+results.append('missing inherited cap refuses launch')
+r=run_case(start_clock_failure=True)
+assert r.code==98 and not r.spawns
+results.append('clock API failure before launch has no child')
+for value in (float('nan'),float('inf'),None):
+    r=run_case(change=lambda spec,value=value:spec.update(run_deadline=value))
+    assert r.code==98 and not r.spawns
+    results.append('invalid shared deadline '+repr(value))
+for delay in (95,94.5,96):
+    r=run_case(delay=delay);assert r.code==98 and not r.spawns
+    results.append('expired or subsecond launch '+str(delay))
+for field in ('spec','ack'):
+    for value in (None,'process-relative-v0'):
+        mutate=lambda record,value=value:record.pop('clock_contract',None) if value is None else record.update(clock_contract=value)
+        r=run_case(change=mutate if field=='spec' else None,ack_change=mutate if field=='ack' else None)
+        assert r.code==98 and not r.spawns
+        results.append(field+' rejects clock contract '+str(value))
+r=run_case(clock_failure=True,live=True)
+assert r.code==98 and len(r.spawns)==1 and len(r.drains)==1 and r.states[-1]['state']=='cleanup-failed'
+results.append('live clock failure attempts owned cleanup without a false pass')
+def shared():
+    clock=Clock(900000);ns=clock_owner(clock)
+    parent=declarations(supervisor,{'clock_now'},dict(sys=types.SimpleNamespace(platform='darwin'),load_darwin_owner=lambda:types.SimpleNamespace(**ns),time=Clock(-12345)))
+    assert parent['clock_now']()==ns['clock_now']()==1000
+    clock.fail=True
+    refused=False
+    try:ns['clock_now']()
+    except ns['CapabilityError']:refused=True
+    assert refused
+    for value in (float('nan'),float('inf'),-1,True):
+        clock=Clock(123)
+        clock.clock_gettime=lambda kind,value=value:value
+        invalid=clock_owner(clock);refused=False
+        try:invalid['clock_now']()
+        except invalid['CapabilityError']:refused=True
+        assert refused
+case('distinct local origins use one shared clock and never fall back',shared)
+def drain_clock():
+    clock=Clock(-100000);ns=clock_owner(clock);sent=[]
+    ns.update(TERM_SECONDS=1,POLL_SECONDS=.025,signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9))
+    ns['_drained']=lambda *args:False
+    ns['_signal_members']=lambda resource,number,deadline,excluded:sent.append((number,deadline))
+    declarations(owner,{'drain'},ns)
+    assert ns['drain'](400,1001.5) is False
+    assert {number for number,deadline in sent}=={15,9} and all(deadline==1001.5 for number,deadline in sent)
+case('TERM and KILL drain use the shared deadline',drain_clock)
+def darwin_group_stop():
+    # The verifier leader and its git child each die on any signal they do not ignore.
+    # lag: polls an exited leader misses while XNU already skips it in killpg but cannot reap it yet.
+    def stop(ignores={},reaped=False,deadline=1005,lingers=0,child=True,zombie=0,lag=0,clock_fails=False,sent=None):
+        now=[1000.0];sent=[] if sent is None else sent;live={'leader':not reaped,'child':child};state={'reaped':reaped,'zombie':zombie,'lag':lag}
+        class Leader:
+            pid=701
+            returncode=-15 if reaped else None
+            def poll(self):
+                oracle(not any(live.values()),'verifier leader reaped while its group was live')
+                if not live['leader'] and self.returncode is None:
+                    if state['lag']:state['lag']-=1
+                    else:state['reaped']=True;self.returncode=-15
+                return self.returncode
+        def killpg(pgid,number):
+            oracle(pgid==701 and len(sent)<1000,'verifier stop left its group or did not end')
+            oracle(number==0 or not state['reaped'],'verifier group signaled after its leader was reaped')
+            sent.append(number)
+            members=[name for name in live if live[name]]
+            if not members:
+                if state['zombie'] or not state['reaped']:raise PermissionError(1,'only exited members')
+                raise ProcessLookupError(3,'no group')
+            for name in members:
+                if number and number not in ignores.get(name,()):
+                    live[name]=False
+                    if name=='child':state['zombie']=lingers
+        def sleep(seconds):
+            now[0]+=max(seconds,.025)
+            if state['zombie']:state['zombie']-=1
+        def clock_now():
+            if clock_fails:raise OSError('fake clock failure')
+            return now[0]
+        ns=dict(sys=types.SimpleNamespace(platform='darwin'),os=types.SimpleNamespace(killpg=killpg),signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9),clock_now=clock_now,time=types.SimpleNamespace(sleep=sleep),TERMINATION_GRACE_SECONDS=1,POLL_SECONDS=.025)
+        declarations(supervisor,{'stop_owned_processes','signal_group','wait_for_group_exit'},ns)
+        before=len(oracle_failures)
+        try:result=ns['stop_owned_processes'](Leader(),deadline)
+        finally:oracle(len(oracle_failures)==before,'Darwin stop absorbed a fixture oracle')
+        return result,sent,state['reaped'],now[0]
+    result,sent,reaped,ended=stop()
+    assert result is True and reaped and sent[0]==15 and 9 not in sent and sent[-1]==0
+    for member in ('leader','child'):
+        result,sent,reaped,ended=stop(ignores={member:{15}})
+        assert result is True and reaped and sent.index(9)>sent.index(15)
+    result,sent,reaped,ended=stop(ignores={'child':{15,9}})
+    assert result is False and not reaped and sent[-1]==9
+    result,sent,reaped,ended=stop(ignores={'child':{15}},deadline=1000.5)
+    assert result is False and 9 in sent
+    result,sent,reaped,ended=stop(lingers=3)
+    assert result is True and sent.count(0)>1
+    result,sent,reaped,ended=stop(reaped=True)
+    assert result is False and set(sent)=={0} and ended<=1001.05
+    result,sent,reaped,ended=stop(reaped=True,child=False)
+    assert result is True and sent==[0]
+    result,sent,reaped,ended=stop(reaped=True,child=False,zombie=10**6)
+    assert result is False and set(sent)=={0}
+    result,sent,reaped,ended=stop(reaped=True,deadline=1000.5)
+    assert result is False and set(sent)=={0} and ended<=1000.55
+    result,sent,reaped,ended=stop(ignores={'child':{15}},deadline=1001.03)
+    assert result is True and reaped
+    for member in ('leader','child'):
+        result,sent,reaped,ended=stop(ignores={member:{15}},lag=3)
+        assert result is True and reaped and set(sent[sent.index(0):])=={0}
+    failed=None;sent=[]
+    try:stop(clock_fails=True,sent=sent)
+    except OSError as error:failed=error
+    assert failed is not None and sent==[15]
+case('Darwin verifier stop proves its group drained before and after reaping the leader',darwin_group_stop)
+def ready_contract(value):
+    clock=Clock(99999);ns=clock_owner(clock);writes=[]
+    api=types.SimpleNamespace(**ns,joined_identity=lambda pid:{'pid':401,'coalition_id':400},same_process=lambda a,b:a==b,task_counts=lambda rid:(1,0))
+    body=next(n for n in ast.walk(ast.parse(supervisor)) if isinstance(n,ast.If) and isinstance(n.test,ast.BoolOp) and 'ready_validated' in ast.unparse(n.test) and "'ready'" in ast.unparse(n.test))
+    scope=dict(job_state={'state':'ready','identity':{'pid':401,'coalition_id':400},'clock_contract':value},ready_validated=False,owner=api,controller={'coalition_id':300},launchctl='launchctl',service='service',deadline=1100,nonce='nonce',ack_path='ack',json=json,
+        _service_state=lambda *args:{'present':True,'pid':401,'state':'running'},_write_private_file=lambda path,payload:writes.append(json.loads(payload)))
+    loop=ast.For(target=ast.Name(id='_once',ctx=ast.Store()),iter=ast.List(elts=[ast.Constant(None)],ctx=ast.Load()),body=[body],orelse=[])
+    tree=ast.fix_missing_locations(ast.Module(body=[loop],type_ignores=[]))
+    refused=False
+    try:exec(compile(tree,'<actual ready consumer>','exec'),scope)
+    except ns['CapabilityError']:refused=True
+    if value==contract:assert not refused and writes==[{'launch_token':'nonce','clock_contract':contract}]
+    else:assert refused and not writes
+for value in (contract,None,'process-relative-v0'):ready_contract(value)
+results.append('parent ready consumer rejects mixed or missing contracts before ack')
+def snapshot_case(mode,cleanup='ok',platform='darwin',stop_deadline=1105,now_after=None):
+    events=[];spawned=[];clock_calls=[];waits=[];seen=[1000];faults_before=len(oracle_failures)
+    injected=OSError('fake post-spawn clock or communication failure')
+    class Pipe:
+        def __init__(self,name):self.name=name;self.closed=False
+        def close(self):
+            events.append('close-'+self.name);self.closed=True
+            if cleanup=='close' and self.name=='stdout':raise OSError('fake close failure')
+    process=types.SimpleNamespace(pid=501,returncode=None,stdout=Pipe('stdout'),stderr=Pipe('stderr'))
+    def communicate(timeout):
+        oracle(timeout>0,'snapshot communicate is not bounded')
+        events.append('communicate')
+        if mode=='communicate':raise injected
+        process.returncode={'budget':4,'noverdict':target['NO_VERDICT'],'failed':1}.get(mode,0)
+        return ('bad-json' if mode=='parse' else '{"snapshot":"stable"}','')
+    def wait(timeout):
+        oracle(timeout==0,'snapshot reap gained a fresh wait')
+        events.append('reap')
+        if cleanup=='reap':raise OSError('fake reap failure')
+        oracle(process.returncode is not None,'reap before proved stop')
+        return process.returncode
+    process.communicate=communicate;process.wait=wait
+    def clock_now():
+        clock_calls.append(None);oracle(len(clock_calls)<1000,'unbounded snapshot clock loop')
+        if spawned and mode=='clock':raise injected
+        value=1000
+        if spawned and mode=='expired':value=1100
+        if spawned and now_after is not None:value=now_after
+        seen[0]=value;return value
+    def popen(argv,**kwargs):
+        oracle(argv==['node','-e','snapshot-program','after'],'unexpected verifier command')
+        oracle(kwargs['start_new_session'] is True,'verifier ownership lost')
+        spawned.append(process);events.append('spawn');return process
+    def stop(owned,deadline):
+        oracle(owned is process and deadline==stop_deadline,'snapshot cleanup changed custody or deadline')
+        events.append('stop')
+        if cleanup=='throw':raise OSError('fake stop clock failure')
+        if cleanup=='false' or seen[0]>=deadline:return False
+        if process.returncode is None:process.returncode=-15
+        return True
+    target=dict(clock_now=clock_now,subprocess=types.SimpleNamespace(Popen=popen,PIPE=-1,TimeoutExpired=TimeoutError),SNAPSHOT_PROGRAM='snapshot-program',POLL_SECONDS=.025,CLEANUP_RESERVE_SECONDS=5,
+        stop_owned_processes=stop,wait_for_owned_children=lambda deadline:oracle(platform=='linux','Linux child wait ran on Darwin') or waits.append(deadline) or mode!='descendants',
+        wait_for_group_exit=lambda owned,deadline:oracle(platform=='darwin' and owned is process,'Darwin group wait ran on Linux or for another process') or waits.append(deadline) or mode!='descendants',sys=types.SimpleNamespace(platform=platform),json=json,
+        NO_VERDICT=literal(supervisor,'NO_VERDICT'),SNAPSHOT_STOP_RESERVE_SECONDS=literal(supervisor,'SNAPSHOT_STOP_RESERVE_SECONDS'))
+    declarations(supervisor,{'capture_snapshot','SnapshotCleanupError','InvalidGateBudget'},target)
+    failure=None;result=None
+    try:
+        try:result=target['capture_snapshot']('fake-root',{},'after',1100,types.SimpleNamespace(is_set=lambda:mode=='interrupted' or (mode=='interrupted-late' and bool(spawned))),stop_deadline=stop_deadline)
+        except BaseException as error:failure=error
+    finally:oracle(len(oracle_failures)==faults_before,'snapshot target absorbed a fixture oracle')
+    if mode=='interrupted':
+        assert not spawned and not events and isinstance(failure,InterruptedError) and result is None
+        return waits
+    assert len(spawned)==1 and process.stdout.closed and process.stderr.closed
+    assert events.count('close-stdout')==events.count('close-stderr')==1
+    if cleanup in ('false','throw','reap','close'):
+        assert isinstance(failure,target['SnapshotCleanupError']) and result is None
+    elif mode=='normal':assert failure is None and result=={'snapshot':'stable'} and 'stop' not in events
+    else:
+        assert failure is not None and not isinstance(failure,target['SnapshotCleanupError']) and result is None
+        assert events.count('stop')==1 and events.count('reap')==1
+        if mode in ('clock','communicate'):assert failure is injected
+        elif mode=='parse':assert isinstance(failure,json.JSONDecodeError)
+        elif mode=='interrupted-late':assert isinstance(failure,InterruptedError)
+        elif mode in ('expired','descendants'):assert isinstance(failure,TimeoutError)
+        elif mode=='budget':assert isinstance(failure,target['InvalidGateBudget'])
+        elif mode=='noverdict':assert isinstance(failure,TimeoutError)
+        elif mode=='failed':assert type(failure) is OSError
+    if cleanup!='close':assert events.index('stop')<events.index('close-stdout') if mode!='normal' else True
+    return waits
+for mode in ('normal','clock','communicate','parse','interrupted','interrupted-late','expired','budget','noverdict','failed'):
+    snapshot_case(mode);results.append('snapshot custody '+mode)
+snapshot_case('descendants',platform='linux');results.append('snapshot Linux descendant failure keeps custody')
+snapshot_case('descendants');results.append('snapshot Darwin descendant failure keeps custody')
+for cleanup in ('false','throw','reap','close'):
+    snapshot_case('clock',cleanup);results.append('snapshot cleanup uncertainty '+cleanup)
+snapshot_case('normal','close');results.append('completed snapshot close failure cannot pass')
+snapshot_case('expired',stop_deadline=1100,now_after=1099);results.append('snapshot leaves its stop a reserve when both bounds are one deadline')
+for platform in ('linux','darwin'):
+    assert snapshot_case('normal',platform=platform,stop_deadline=1100,now_after=1097)==[1098]
+    assert snapshot_case('normal',platform=platform)==[1005]
+results.append('snapshot descendant wait stays inside the stop reserve')
+def before_site(function,platform,make_error):
+    written=[];calls=[];stderr=io.StringIO();faults_before=len(oracle_failures)
+    def capture(root,environment,phase,deadline,interrupted,*,stop_deadline):
+        oracle(phase=='before' and deadline==1115 and stop_deadline==1120,'before snapshot window changed')
+        calls.append(phase);raise make_error(target)
+    def write(fd,data):
+        oracle(fd==1,'no-verdict marker left the verdict channel');written.append(data);return len(data)
+    target=dict(os=types.SimpleNamespace(write=write,getpid=lambda:4242),sys=types.SimpleNamespace(platform=platform,stdout=types.SimpleNamespace(fileno=lambda:1),stderr=stderr),
+        clock_now=lambda:1000,capture_snapshot=capture,json=json,
+        **{name:literal(supervisor,name) for name in ('SUPERVISOR_ENVIRONMENT','LINUX_SUBREAPER','DARWIN_LAUNCHD','SUPERVISOR_RECEIPT_ENVIRONMENT','SUPERVISOR_TOKEN_ENVIRONMENT','NO_VERDICT','CLEANUP_RESERVE_SECONDS')})
+    declarations(supervisor,{function,'no_verdict','caller_budget','InvalidGateBudget','SnapshotCleanupError'},target)
+    try:code=target[function](Path('fake-root'),['true'],{'APERTURE_GATE_TIME_LEFT_S':'120'},1000,types.SimpleNamespace(path='/fake/receipt',token='fake-token'),types.SimpleNamespace(is_set=lambda:False))
+    finally:oracle(len(oracle_failures)==faults_before,'before snapshot target absorbed a fixture oracle')
+    assert calls==['before']
+    return code,written,stderr.getvalue()
+for function,platform in (('run_supervised','linux'),('run_darwin_supervised','darwin')):
+    code,written,err=before_site(function,platform,lambda t:OSError('cannot read the gate repository: injected'))
+    assert code==98 and len(written)==1 and written[0].startswith(b'APERTURE-GATE-INDETERMINATE reason=setup: cannot read the gate repository'),(platform,code,written)
+    code,written,err=before_site(function,platform,lambda t:t['InvalidGateBudget']('APERTURE_GATE_SLOWEST_RUN_S must be a positive whole number'))
+    assert code==4 and written==[] and 'APERTURE_GATE_SLOWEST_RUN_S must be a positive whole number' in err,(platform,code,written,err)
+    for make,reason in ((lambda t:TimeoutError('late'),'timeout'),(lambda t:InterruptedError('stopped'),'interrupted'),(lambda t:t['SnapshotCleanupError']('unknown'),'cleanup'),(lambda t:ValueError('bad'),'setup')):
+        code,written,err=before_site(function,platform,make)
+        assert code==98 and len(written)==1 and written[0].startswith(('APERTURE-GATE-INDETERMINATE reason='+reason+':').encode()),(platform,reason,code,written)
+    results.append('before snapshot separates infrastructure no-verdicts from invalid input on '+platform)
+def snapshot_callers():
+    tree=ast.parse(supervisor);parents={child:node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found=[]
+    for node in ast.walk(tree):
+        if not isinstance(node,ast.Call) or not isinstance(node.func,ast.Name) or node.func.id!='capture_snapshot':continue
+        ancestor=parents[node];handler=None;function=None
+        while ancestor in parents:
+            if handler is None and isinstance(ancestor,ast.Try):
+                try_node=ancestor
+                handler=next((h for h in ancestor.handlers if isinstance(h.type,ast.Name) and h.type.id=='SnapshotCleanupError'),None)
+                assert handler is not None,'snapshot caller has no cleanup priority'
+            if isinstance(ancestor,ast.FunctionDef):function=ancestor.name;break
+            ancestor=parents[ancestor]
+        found.append(function)
+        assert handler is not None
+        assert len(node.args)>4 and isinstance(node.args[4],ast.Name) and node.args[4].id=='interrupted','snapshot caller drops interruption'
+        handled={n.id for h in try_node.handlers for n in ([h.type] if isinstance(h.type,ast.Name) else getattr(h.type,'elts',[])) if isinstance(n,ast.Name)}
+        assert handled&{'InvalidGateBudget','Exception'},'snapshot caller lets a verifier error escape'
+        bound=[k.value for k in node.keywords if k.arg=='stop_deadline']
+        assert len(bound)==1 and isinstance(bound[0],ast.Name) and bound[0].id=='deadline','snapshot stop is not bounded by the caller deadline'
+        window=node.args[3];phase=node.args[2].value
+        assert isinstance(window,ast.Name) and window.id==('preflight_deadline' if phase=='before' else 'deadline'),'snapshot window changed'
+        for prior in (None,'interrupted','timeout','stale'):
+            error=OSError('owned verifier cleanup unknown')
+            namespace=dict(error=error,snapshot_error=error,reason=prior,detail='prior',no_verdict=lambda reason,detail:(98,reason,detail))
+            body=copy.deepcopy(handler.body)
+            returns=any(isinstance(n,ast.Return) for stmt in body for n in ast.walk(stmt))
+            if not returns:body.append(ast.Return(value=ast.Tuple(elts=[ast.Name(id='reason',ctx=ast.Load()),ast.Name(id='detail',ctx=ast.Load())],ctx=ast.Load())))
+            fn=ast.FunctionDef(name='classify',args=ast.arguments(posonlyargs=[],args=[],vararg=None,kwonlyargs=[],kw_defaults=[],kwarg=None,defaults=[]),body=body,decorator_list=[],returns=None,type_comment=None)
+            program=ast.fix_missing_locations(ast.Module(body=[fn],type_ignores=[]))
+            exec(compile(program,'<actual snapshot cleanup handler>','exec'),namespace)
+            outcome=namespace['classify']()
+            assert outcome[1 if returns else 0]=='cleanup'
+    assert sorted(found)==['run_darwin_supervised']*3+['run_supervised']*3
+case('all six snapshot callers give cleanup uncertainty priority',snapshot_callers)
+def inventory(texts):
+    raw=[];primitive=[]
+    for name,source in zip(('supervisor','runner','owner'),texts):
+        tree=ast.parse(source)
+        aliases={'time'}
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Import):aliases.update(alias.asname or alias.name for alias in node.names if alias.name=='time')
+        class Sites(ast.NodeVisitor):
+            def __init__(self):self.context=[]
+            def scoped(self,node):
+                self.context.append(node.name);self.generic_visit(node);self.context.pop()
+            visit_FunctionDef=scoped
+            visit_AsyncFunctionDef=scoped
+            visit_ClassDef=scoped
+            def visit_Lambda(self,node):
+                self.context.append('<lambda>');self.generic_visit(node);self.context.pop()
+            def record(self,kind):
+                (raw if kind=='monotonic' else primitive).append((name,tuple(self.context)))
+            def visit_Attribute(self,node):
+                if isinstance(node.value,ast.Name) and node.value.id in aliases and node.attr in ('monotonic','clock_gettime'):self.record(node.attr)
+                self.generic_visit(node)
+            def visit_ImportFrom(self,node):
+                if node.module=='time':
+                    for alias in node.names:
+                        if alias.name in ('monotonic','clock_gettime'):self.record(alias.name)
+            def visit_Call(self,node):
+                if isinstance(node.func,ast.Name) and node.func.id=='getattr' and len(node.args)>1 and isinstance(node.args[0],ast.Name) and node.args[0].id in aliases and isinstance(node.args[1],ast.Constant) and node.args[1].value in ('monotonic','clock_gettime'):self.record(node.args[1].value)
+                self.generic_visit(node)
+        Sites().visit(tree)
+    assert raw==[('supervisor',('clock_now',))] and primitive==[('owner',('clock_now',))]
+inventory(sources)
+for addition in ('\ntime.monotonic()\n','\ndef accidental_local_deadline():\n return time.monotonic()\n','\nclass AccidentalDeadline:\n def remaining(self):\n  return time.monotonic()\n','\ndef outer():\n def inner():\n  return time.monotonic()\n return inner\n','\naccidental=lambda:time.monotonic()\n'):
+    refused=False
+    try:inventory([supervisor,runner+addition,owner])
+    except AssertionError:refused=True
+    assert refused
+results.append('module, free, nested, class-method and lambda raw clock sites are rejected')
+print('DARWIN_DEADLINE_RESULT='+json.dumps({'cases':results,'realProcessStarts':0,'nativeQueries':0}))
+`;
+
+test('Darwin gate shared deadline survives startup and rejects mixed clock participants', { timeout: 40000 }, () => {
+  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-B', '-c', darwinDeadlineProgram,
+    path.join(PROJECT, 'scripts/full-gate/supervisor.py'),
+    path.join(PROJECT, 'scripts/full-gate/darwin-runner.py'),
+    path.join(PROJECT, 'scripts/full-gate/darwin.py')
+  ], { cwd: PROJECT, encoding: 'utf8', timeout: 30000 });
+  assert.equal(result.status, 0, result.stdout + '\n' + result.stderr);
+  const line = result.stdout.split('\n').find(value => value.startsWith('DARWIN_DEADLINE_RESULT='));
+  assert.ok(line, result.stdout);
+  const report = JSON.parse(line.slice('DARWIN_DEADLINE_RESULT='.length));
+  assert.equal(report.realProcessStarts, 0);
+  assert.equal(report.nativeQueries, 0);
+});
+
+const darwinDisappearingPidProgram = String.raw`import ast,errno,io,json,math,struct,sys,types
 import signal as fixture_signal
 from pathlib import Path
 fixture_signal.signal(fixture_signal.SIGALRM,fixture_signal.SIG_DFL)
@@ -1934,7 +2793,7 @@ fixture_signal.alarm(25)
 SOURCE=Path(sys.argv[1]).read_text(encoding='utf-8')
 RUNNER_SOURCE=Path(sys.argv[2]).read_text(encoding='utf-8')
 MODE=sys.argv[3]
-OWNER_NAMES={'CapabilityError','CoalitionGone','process_identity','process_start','coalition_id','joined_identity','identity_if_present','same_process','task_counts','_coalition_members','_signal','signal_identity','_signal_members','_drained','drain'}
+OWNER_NAMES={'CapabilityError','CoalitionGone','clock_now','require_clock_contract','process_identity','process_start','coalition_id','joined_identity','identity_if_present','same_process','task_counts','_coalition_members','_signal','signal_identity','_signal_members','_drained','drain'}
 results=[]
 
 class FakeArrayType:
@@ -1942,7 +2801,11 @@ class FakeArrayType:
         return lambda: [0] * count
 
 class FakeClock:
+    CLOCK_MONOTONIC = 1
     def __init__(self): self.value = 0
+    def clock_gettime(self, clock):
+        assert clock == self.CLOCK_MONOTONIC
+        return self.monotonic()
     def monotonic(self):
         self.value += 0.01
         assert self.value < 100, 'unexpected unbounded mock loop'
@@ -1980,7 +2843,7 @@ def extract(source, names, namespace):
 
 def owner(source):
     fake_ctypes = FakeCtypes()
-    namespace = dict(errno=errno, struct=struct, ctypes=fake_ctypes,
+    namespace = dict(errno=errno, struct=struct, ctypes=fake_ctypes, math=math, CLOCK_CONTRACT="CLOCK_MONOTONIC_V1",
         os=types.SimpleNamespace(getpid=lambda:500, strerror=lambda value:'mock errno '+str(value), environ={}),
         subprocess=types.SimpleNamespace(run=lambda *args,**kwargs:throw(AssertionError('unconfigured fake enumeration'))),
         signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9),time=FakeClock(),
@@ -2127,17 +2990,18 @@ def guardian(scenario):
     before=scenario in ['before-gone','before-unknown']
     response=namespace['CapabilityError']('unknown') if scenario=='before-unknown' else gone()
     fake_lookup(namespace,[guardian,response] if before else [guardian,controller,gone()])
-    owner_api=types.SimpleNamespace(**{key:value for key,value in namespace.items() if key in ['joined_identity','identity_if_present','same_process','CapabilityError']})
+    owner_api=types.SimpleNamespace(**{key:value for key,value in namespace.items() if key in ['joined_identity','identity_if_present','same_process','CapabilityError','require_clock_contract','CLOCK_CONTRACT']})
     def drain(resource,deadline,preserve):
         drains.append((resource,deadline,preserve))
         assert resource==400 and deadline==10 and preserve==guardian
         if scenario=='drain-gone':raise gone()
         return scenario=='drain-true'
     owner_api.drain=drain
-    spec={'state_path':'state','deadline':10,'run_deadline':5,'controller':controller,'ack_path':'ack','launch_token':'token','environment':{},'command':['fake-child'],'cwd':'fake-root'}
+    owner_api.clock_now=clock.monotonic
+    spec={'state_path':'state','deadline':10,'run_deadline':5,'controller':controller,'ack_path':'ack','launch_token':'token','clock_contract':'CLOCK_MONOTONIC_V1','environment':{'APERTURE_GATE_TIME_LEFT_S':'5'},'command':['fake-child'],'cwd':'fake-root'}
     def fake_open(path,*args,**kwargs):
         assert path in ['spec','ack']
-        return io.StringIO(json.dumps(spec) if path=='spec' else 'token\n')
+        return io.StringIO(json.dumps(spec) if path=='spec' else json.dumps({'launch_token':'token','clock_contract':'CLOCK_MONOTONIC_V1'}))
     polls=[]
     def popen(*args,**kwargs):
         spawns.append((args,kwargs))
@@ -2146,7 +3010,7 @@ def guardian(scenario):
             polls.append(None);assert len(polls)<=10,'unbounded fake guardian polling'
             return None
         return types.SimpleNamespace(pid=402,poll=poll)
-    target=dict(json=json,open=fake_open,time=clock,os=types.SimpleNamespace(getpid=lambda:401),interrupted=False,receive_signal=lambda *args:None,
+    target=dict(json=json,math=math,open=fake_open,time=clock,os=types.SimpleNamespace(getpid=lambda:401),interrupted=False,receive_signal=lambda *args:None,
         signal=types.SimpleNamespace(SIGINT=2,SIGTERM=15,SIGHUP=1,signal=lambda *args:None),subprocess=types.SimpleNamespace(Popen=popen),
         write_state=lambda path,value:states.append(dict(value)),DARWIN=owner_api)
     extract(RUNNER_SOURCE,{'controller_alive','run'},target)
@@ -2241,3 +3105,975 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
   assert.notEqual(withoutIdentityFlag, identitySource);
   assert.throws(() => verify(entrySource, withoutIdentityFlag));
 });
+
+function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watchdogSource, collectorSource, evidenceInventory, gate }) {
+  test('watchdog collection keeps cancellation live and phase evidence fresh', { timeout: 10000 }, async t => {
+    const flush = async () => { for (let i = 0; i < 32; i++) await Promise.resolve(); };
+    function harness(options = {}) {
+      const source = options.source ?? watchdogSource;
+      const deadlines = [String(options.deadline ?? 10000)];
+      if (source.includes('const [deadline, callerDeadline, leader, entry, ...args]')) deadlines.push(String(options.cleanupDeadline ?? (Number(options.deadline ?? 10000) + 5000)));
+      let now = 0;
+      let wallOffset = 0;
+      let timerId = 0;
+      let childId = 100;
+      const timers = new Map();
+      const children = [];
+      const starts = {};
+      const ends = [];
+      const signals = [];
+      const packets = [];
+      const exits = [];
+      let releases = 0;
+      const schedule = (fn, delay, interval = false) => {
+        const id = ++timerId;
+        const duration = Number.isFinite(delay) && delay >= 0 ? delay : 1;
+        timers.set(id, { id, fn, at: now + duration, interval: interval ? duration : 0 });
+        return { id, unref() {} };
+      };
+      const clear = handle => timers.delete(handle?.id);
+      class Child extends EventEmitter {
+        constructor() {
+          super();
+          this.pid = ++childId;
+          this.stdout = new EventEmitter();
+          this.stderr = new EventEmitter();
+          this.connected = true;
+          this.closed = false;
+          this.sent = [];
+          this.signals = [];
+        }
+        kill(signal) {
+          this.signals.push({ signal, at: now });
+          if (options.childKillThrows) throw Object.assign(new Error('fixture'), { code: 'EPERM' });
+          return true;
+        }
+        send(packet, callback) {
+          this.sent.push(packet);
+          if (options.bodySendThrows) throw Object.assign(new Error('fixture'), { code: 'EPIPE' });
+          callback?.(options.bodyCallbackError ? { code: 'EPIPE' } : undefined);
+        }
+      }
+      const admission = new Child();
+      const body = new Child();
+      const proc = new EventEmitter();
+      Object.assign(proc, {
+        argv: ['node', 'watchdog', ...deadlines, '20', 'body.js'],
+        platform: options.platform ?? 'darwin', pid: 10, env: {}, connected: true,
+        kill(pid, signal) {
+          signals.push({ pid, signal, at: now });
+          if (options.groupKillThrows) throw Object.assign(new Error('fixture'), { code: 'EPERM' });
+        },
+        exit(code) { exits.push(code); },
+        send(packet, callback) {
+          packets.push(packet);
+          if (packet.kind === 'STOP' && options.diagnosticThrows) throw new Error('fixture');
+          if (packet.kind === 'BODY_SCAN_COMPLETE') {
+            body.sent.push(packet);
+            if (options.bodySendThrows) throw Object.assign(new Error('fixture'), { code: 'EPIPE' });
+            callback?.(options.bodyCallbackError ? { code: 'EPIPE' } : undefined);
+          } else callback?.();
+          if (packet.kind === 'CUSTODY' && packet.state === 'BEGIN' && !options.noCustodyAck) proc.emit('message', { kind: 'CUSTODY', state: 'ACK', phase: packet.phase });
+        }
+      });
+      body.on('message', packet => proc.emit('message', packet));
+      body.on('close', code => proc.emit('message', { kind: 'BODY_EXIT', code }));
+      const spawn = (command, args, opts) => {
+        assert.ok(children.length < 32, 'fixed mock child limit');
+        assert.equal(opts.env.LC_ALL, 'C');
+        assert.deepEqual(Array.from(opts.stdio), ['ignore', 'pipe', 'pipe']);
+        if (options.spawnThrows) throw Object.assign(new Error('fixture'), { code: options.spawnErrorCode || 'EIO' });
+        const child = new Child();
+        Object.assign(child, { command, args, opts });
+        children.push(child);
+        return child;
+      };
+      const globals = {
+        Buffer, Date: { now: () => now + wallOffset }, performance: { now: () => now },
+        setTimeout: (fn, delay) => schedule(fn, delay), clearTimeout: clear,
+        setInterval: (fn, delay) => schedule(fn, delay, true), clearInterval: clear
+      };
+      const module = { exports: {} };
+      vm.runInNewContext(collectorSource, { ...globals, module }, { timeout: 1000 });
+      const factory = module.exports.createWatchdogCollector;
+      module.exports.createWatchdogCollector = options => {
+        const owner = factory(options);
+        const begin = owner.begin;
+        owner.begin = end => { ends.push(end); return begin(end); };
+        return owner;
+      };
+      const vocabulary = new Proxy({}, { get: (_, key) => key });
+      const context = vm.createContext({
+        ...globals, process: proc, __dirname: '/fixture/scripts',
+        require(name) {
+          if (name === 'node:child_process') return { spawn, fork() { assert.fail('guardian cannot spawn a body'); }, spawnSync() { assert.fail('synchronous collection'); } };
+          if (name === 'node:fs') return { readFileSync() { assert.fail('unexpected filesystem access'); } };
+          if (name === 'node:os') return { constants: { signals: { SIGTERM: 15, SIGKILL: 9 } } };
+          if (name === 'node:path') return { join: (...parts) => parts.join('/') };
+          if (name === './full-gate/watchdog-collector') return module.exports;
+          if (name === './full-gate') return {
+            MESSAGES: vocabulary, CUSTODY: vocabulary, WATCHDOG_STOP_EVENTS: vocabulary, NO_VERDICT: 98,
+            NO_VERDICT_SECRET: 'secret', SCRATCH_ROOT: 'scratch', REASONS: {},
+            canFinish: stopping => !stopping,
+            gateSyscallObservation: value => ({ ...value }),
+            watchdogStopObservation: value => ({ ...value, upstreamOrigin: 'UNKNOWN' }),
+            releaseScratch() { releases++; return true; }
+          };
+          assert.fail('unexpected import ' + name);
+        }
+      });
+      vm.runInContext(source, context, { timeout: 1000 });
+      const inspect = expression => vm.runInContext(expression, context, { timeout: 1000 });
+      Object.defineProperties(starts, { admission: { enumerable: true, get: () => inspect('Number(admission)') }, body: { enumerable: true, get: () => inspect('Number(body)') } });
+      const respond = async (child, output, code = 0) => {
+        assert.ok(child && !child.closed, 'one close per mock child');
+        if (output) child.stdout.emit('data', Buffer.from(output));
+        child.closed = true;
+        child.emit('close', code, null);
+        await flush();
+      };
+      const table = (child, extra = '') => '10 20 20 S\n20 1 20 S\n' + extra + child.pid + ' 10 20 S\n';
+      const pending = () => children.find(child => !child.closed);
+      return {
+        children, starts, ends, signals, packets, exits, body, proc, inspect, respond, table, pending,
+        owner: inspect('collector'), failureOrigins: module.exports.COLLECTOR_FAILURE_ORIGINS,
+        elapseWithoutTimers(duration) { now += duration; },
+        shiftWall(duration) { wallOffset += duration; },
+        releases: () => releases,
+        queue: (delay, callback) => schedule(callback, delay),
+        async start() {
+          proc.emit('message', { kind: 'ADMIT', command: 'admit', args: [] });
+          proc.emit('message', { kind: 'ADMISSION_EXIT', code: 0 });
+          proc.emit('message', { kind: 'START' });
+          await flush();
+        },
+        async advance(duration) {
+          const target = now + duration;
+          let steps = 0;
+          for (;;) {
+            const next = [...timers.values()].filter(timer => timer.at <= target).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+            if (!next) break;
+            assert.ok(++steps <= 256, 'fixed timer-step limit');
+            now = next.at;
+            if (next.interval) next.at += next.interval;
+            else timers.delete(next.id);
+            next.fn();
+            await flush();
+          }
+          now = target;
+          await flush();
+        }
+      };
+    }
+    const stopCount = h => h.signals.filter(value => value.pid === -20 && value.signal === 'SIGTERM').length;
+    const ackCount = h => h.body.sent.filter(value => value.kind === 'BODY_SCAN_COMPLETE').length;
+    const escape = '21 20 20 S\n30 21 30 S\n';
+
+    await t.test('C19 native monitoring retains custody until fresh complete boundary scans', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const monitor = h.pending();
+      await h.respond(monitor, h.table(monitor));
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
+      assert.equal(monitor.command, 'python3');
+      assert.deepEqual(Array.from(monitor.args.slice(0, 3)), ['-I', '-B', '-c']);
+      assert.deepEqual(Array.from(monitor.args.slice(4)), ['--table', String(h.inspect('group')), String(h.inspect('process.pid'))]);
+      assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, 0);
+      h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
+      const complete = h.pending();
+      assert.equal(complete.command, 'ps');
+      assert.equal(ackCount(h), 0);
+      await h.respond(complete, h.table(complete));
+      assert.equal(ackCount(h), 1);
+      h.body.emit('close', 0, null); h.proc.emit('message', { kind: 'DRAIN' }); await flush();
+      const drain = h.pending();
+      assert.equal(drain.command, 'ps');
+      assert.equal(h.exits.length, 0);
+      await h.respond(drain, h.table(drain));
+      assert.deepEqual(h.exits, [0]);
+    });
+    await t.test('C19 Linux monitoring retains the existing complete process-table path', async () => {
+      const h = harness({ platform: 'linux' }); await h.start(); await h.advance(1000);
+      const monitor = h.pending();
+      assert.equal(monitor.command, 'ps');
+      await h.respond(monitor, h.table(monitor));
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 1);
+    });
+    await t.test('C19 missing native rows never retire remembered escaped identities', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const monitor = h.pending(); await h.respond(monitor, h.table(monitor, escape));
+      await h.respond(h.pending(), '{"30":"start-A"}');
+      await h.advance(1000);
+      const partial = h.pending(); await h.respond(partial, h.table(partial));
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
+      assert.deepEqual(h.exits, []);
+    });
+    await t.test('C24 unresolved remembered escapes are observed after reparenting', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const first = h.pending(); await h.respond(first, h.table(first, escape));
+      await h.respond(h.pending(), '{}');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
+      await h.advance(1000);
+      const next = h.pending();
+      assert.equal(next.args.at(-1), '30');
+      await h.respond(next, h.table(next, '30 1 30 S\n'));
+      const identity = h.pending();
+      assert.equal(identity.args.includes('--table'), false);
+      assert.equal(identity.args.at(-1), '30');
+      await h.respond(identity, '{"30":"start-A"}');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      await h.advance(1000);
+      const resolved = h.pending();
+      assert.equal(resolved.args.includes('30'), false);
+      await h.respond(resolved, h.table(resolved));
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      assert.equal(h.packets.some(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR'), false);
+    });
+    await t.test('C21 a stalled PS query cannot stop monitoring but still blocks completion', async () => {
+      const predicate = "process.platform === 'darwin' && phase.kind === 'monitor'";
+      assert.equal(watchdogSource.split(predicate).length, 2, 'one monitor selection owner');
+      const psControl = watchdogSource.replace(predicate, 'false');
+      for (const scenario of [
+        { source: watchdogSource, stoppedDuringMonitor: 0 },
+        { source: psControl, stoppedDuringMonitor: 1 }
+      ]) {
+        const h = harness({ source: scenario.source });
+        await h.start(); await h.advance(1000);
+        const first = h.pending();
+        if (first.command !== 'ps') await h.respond(first, h.table(first));
+        await h.advance(1000);
+        assert.equal(stopCount(h), scenario.stoppedDuringMonitor);
+        assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
+        if (scenario.stoppedDuringMonitor) continue;
+        const second = h.pending(); await h.respond(second, h.table(second));
+        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
+        assert.equal(h.pending().command, 'ps');
+        await h.advance(1000);
+        assert.equal(stopCount(h), 1, 'the unchanged completion query still expires');
+        assert.equal(ackCount(h), 0);
+        assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
+      }
+    });
+    await t.test('C20 native metadata refuses query faults without treating unknown state as dead', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const script = h.pending().args[3];
+      const program = String.raw`
+import contextlib
+import ctypes
+import errno
+import io
+import json
+import os
+import signal
+import struct
+import sys
+
+signal.alarm(8)
+source = sys.argv[1]
+original_loader = ctypes.CDLL
+original_argv = sys.argv
+original_parent = os.getppid
+
+def run(mode, program=source):
+    pids = [0, 10, 20, 30, 40, 50, 60, 70]
+    looked_up = []
+    def listing(buffer, length):
+        assert ctypes.get_errno() == 0
+        if buffer is None:
+            return 0 if mode == 'zero-count' else -1 if mode == 'negative-count' else len(pids)
+        if mode == 'zero-fill':
+            return 0
+        if mode == 'truncated':
+            return len(buffer)
+        values = [0, 10, 20] if mode == 'partial' else [-1] if mode == 'negative-pid' else pids
+        for index, pid in enumerate(values):
+            buffer[index] = pid
+        return len(values)
+    def children(kind, parent, buffer, length):
+        assert kind == 6 and length == ctypes.sizeof(buffer)
+        assert ctypes.get_errno() == 0
+        if mode == 'child-error':
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        if mode == 'child-truncated':
+            return length
+        if mode == 'child-short':
+            return 3
+        values = {20: [10, 30], 30: [40]}.get(parent, [])
+        if mode == 'child-negative':
+            values = [-1]
+        if mode == 'birth' and parent == 20:
+            values = values + [80]
+        if mode == 'cycle' and parent == 10:
+            values = [20]
+        for index, pid in enumerate(values):
+            buffer[index] = pid
+        return len(values) * ctypes.sizeof(ctypes.c_int)
+    def metadata(pid, flavor, argument, buffer, length):
+        assert flavor == 13 and argument == 0 and length == 64
+        assert ctypes.get_errno() == 0
+        looked_up.append(pid)
+        if pid in [50, 70]:
+            raise OSError(errno.ETIMEDOUT, 'unrelated process transition')
+        if pid == 40:
+            ctypes.set_errno(errno.EPERM if mode == 'permission' else errno.ESRCH)
+            return 32 if mode == 'short-esrch' else 0
+        if mode == 'short':
+            return 32
+        parent, group, state = {10: (20, 20, 2), 20: (1, 20, 0), 30: (20, 30, 5), 60: (1, 60, 2)}[pid]
+        if mode == 'unknown':
+            state = 255
+        raw = struct.pack('=IIII', pid + 1 if mode == 'wrong-pid' else pid, parent, group, state) + bytes(48)
+        ctypes.memmove(buffer, raw, 64)
+        return 64
+    class Library:
+        pass
+    library = Library()
+    library.proc_listallpids = listing
+    library.proc_listpids = children
+    library.proc_pidinfo = metadata
+    output = io.StringIO()
+    failed = False
+    ctypes.CDLL = lambda *args, **kwargs: library
+    sys.argv = ['fixture', '--table', '20', '10', '60']
+    os.getppid = lambda: 11 if mode == 'caller-changed' else 10
+    try:
+        with contextlib.redirect_stdout(output):
+            try:
+                exec(compile(program, '<actual native collector>', 'exec'), {})
+            except SystemExit as error:
+                assert error.code == 0
+            except (OSError, ValueError):
+                failed = True
+    finally:
+        ctypes.CDLL = original_loader
+        sys.argv = original_argv
+        os.getppid = original_parent
+    return failed, output.getvalue(), looked_up
+
+def output(mode, program=source):
+    failed, text, looked_up = run(mode, program)
+    lines = text.splitlines()
+    return failed, [line for line in lines if not line.startswith('WQ')], [line for line in lines if line.startswith('WQ')], looked_up
+
+complete = ['WQ1', 'WQ2', 'WQ3', 'WQ4']
+normal_rows = ['10 20 20 ?', '20 1 20 ?', '30 20 30 Z', '60 1 60 ?']
+assert output('normal') == (False, normal_rows, complete, [10, 20, 30, 40, 60])
+assert output('partial') == (False, ['10 20 20 ?', '20 1 20 ?'], complete, [10, 20])
+assert output('unknown') == (False, ['10 20 20 ?', '20 1 20 ?', '30 20 30 ?', '60 1 60 ?'], complete, [10, 20, 30, 40, 60])
+assert output('birth') == output('normal'), 'new births outside the initial PID set remain partial'
+assert output('cycle') == output('normal'), 'parent-list cycles must stay bounded'
+site = 'for pid in sorted(candidates):'
+assert source.count(site) == 1
+control = source.replace(site, 'for pid in sorted(all_pids):')
+assert output('normal', control)[0] is True
+assert 50 in output('normal', control)[3], 'global lookup control must reach the unrelated blocked PID'
+faults = ['zero-count', 'negative-count', 'zero-fill', 'truncated', 'negative-pid',
+          'permission', 'short', 'short-esrch', 'wrong-pid',
+          'child-error', 'child-truncated', 'child-short', 'child-negative', 'caller-changed']
+for mode in faults:
+    failed, rows, checkpoints, _ = output(mode)
+    assert failed and rows == [], mode
+    assert checkpoints == complete[:3 if mode in ['permission', 'short', 'short-esrch', 'wrong-pid'] else 2], mode
+print(json.dumps({'faults': len(faults), 'liveUnknownAndZombie': True, 'partialIsPositiveOnly': True, 'unrelatedLookupControlRed': True, 'reparentedNullEscapePreserved': True}))
+`;
+      const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-B', '-c', program, script], {
+        encoding: 'utf8', timeout: 10000
+      });
+      assert.equal(result.status, 0, result.stderr || result.error?.message);
+      assert.deepEqual(JSON.parse(result.stdout), { faults: 14, liveUnknownAndZombie: true, partialIsPositiveOnly: true, unrelatedLookupControlRed: true, reparentedNullEscapePreserved: true });
+    });
+    await t.test('C22 query checkpoints survive fragmented output without accepting partial results', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const scan = h.pending();
+      await h.advance(100); scan.stdout.emit('data', Buffer.from('W'));
+      await h.advance(100); scan.stdout.emit('data', Buffer.from('Q1\nWQ2\nWQ'));
+      await h.advance(100); scan.stdout.emit('data', Buffer.from('3\n'));
+      await h.advance(700);
+      const stopped = h.packets.find(packet => packet.kind === 'STOP').observation;
+      assert.equal(stopped.lastTable.timing.checkpoint, 3);
+      assert.equal(stopCount(h), 1);
+      assert.equal(ackCount(h), 0);
+      assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
+      scan.stdout.emit('data', Buffer.from('WQ4\n'));
+      await h.respond(scan, h.table(scan));
+      assert.equal(stopped.lastTable.timing.checkpoint, 3, 'late output cannot rewrite the first refusal');
+      for (const bytes of [
+        Buffer.from('WQ9\n'),
+        Buffer.from('\xD7Q4\n', 'latin1'),
+        Buffer.from('private-output-WQ4\n')
+      ]) {
+        const unknown = harness(); await unknown.start(); await unknown.advance(1000);
+        const query = unknown.pending(); query.stdout.emit('data', bytes);
+        await unknown.advance(1000);
+        const observation = unknown.packets.find(packet => packet.kind === 'STOP').observation;
+        assert.equal(observation.lastTable.timing.checkpoint, null);
+        assert.equal(JSON.stringify(observation).includes('private-output'), false);
+        await unknown.respond(query, '');
+      }
+    });
+
+    await t.test('C1 invalid and expired budgets launch no collector', async () => {
+      for (const deadline of [0, NaN, Infinity, 'missing']) {
+        const h = harness({ deadline });
+        await h.start();
+        await h.advance(1);
+        assert.equal(h.children.length, 0);
+        assert.equal(stopCount(h), 1);
+        assert.equal(ackCount(h), 0);
+      }
+    });
+    await t.test('C1 drain clamps its observation to the remaining deadline', async () => {
+      const h = harness({ deadline: 500 });
+      h.proc.emit('message', { kind: 'DRAIN' }); await flush();
+      assert.deepEqual(h.ends, [500]);
+      const scan = h.pending(); await h.respond(scan, h.table(scan));
+      assert.deepEqual(h.exits, [0]);
+    });
+    await t.test('C2 bounded output uses the existing table and identity guards', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const scan = h.pending();
+      assert.equal(scan.command, 'python3');
+      assert.equal(scan.args[4], '--table');
+      await h.respond(scan, h.table(scan, escape));
+      assert.equal(h.pending().command, 'python3');
+      await h.respond(h.pending(), '{"30":"start-A"}');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      assert.equal(h.inspect('collector.owned()'), false);
+      assert.equal(stopCount(h), 0);
+      assert.equal(scan.stdout.listenerCount('data'), 0);
+    });
+    await t.test('C2 failure and bounded output never become table evidence', async () => {
+      for (const mode of ['missing-self', 'nonzero', 'overflow', 'stream-error', 'spawn-error']) {
+        const h = harness({ spawnThrows: mode === 'spawn-error' }); await h.start(); await h.advance(1000);
+        const child = h.pending();
+        if (mode === 'overflow') child.stdout.emit('data', Buffer.alloc(1024 * 1024 + 1));
+        else if (mode === 'stream-error') child.stdout.emit('error', { code: 'EIO' });
+        else if (child) await h.respond(child, mode === 'missing-self' ? '20 1 20 S\n' : h.table(child), mode === 'nonzero' ? 1 : 0);
+        await flush();
+        assert.equal(stopCount(h), 1, mode);
+        assert.equal(ackCount(h), 0);
+        assert.ok(!h.exits.includes(0));
+        const origin = { 'missing-self': null, nonzero: h.failureOrigins.CHILD_EXIT, overflow: h.failureOrigins.STDOUT_LIMIT, 'stream-error': h.failureOrigins.STDOUT_ERROR, 'spawn-error': h.failureOrigins.SPAWN_THROW }[mode];
+        const packet = h.packets.find(packet => packet.kind === 'STOP');
+        const projected = gate.watchdogStopObservation({ ...packet.observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
+        assert.equal(projected.lastTable.failureOrigin, origin);
+      }
+    });
+    await t.test('C3 delayed table and identity share one deadline without overlap', async () => {
+      for (const identity of [false, true]) {
+        const h = harness(); await h.start(); await h.advance(1000);
+        if (identity) { await h.advance(500); const scan = h.pending(); await h.respond(scan, h.table(scan, escape)); }
+        const pendingIdentity = identity ? h.pending() : null;
+        if (identity) {
+          assert.equal(pendingIdentity.command, 'python3');
+          assert.equal(h.ends[0], 2000, 'identity retains the table phase deadline');
+        }
+        const count = h.children.length;
+        await h.advance(identity ? 500 : 1000);
+        assert.equal(h.children.length, count);
+        assert.equal(stopCount(h), 1);
+        assert.equal(h.inspect('collector.owned()'), true);
+        const observation = h.packets.find(packet => packet.kind === 'STOP')?.observation;
+        const projected = gate.watchdogStopObservation({ ...observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
+        assert.equal((identity ? projected.lastIdentity : projected.lastTable).failureOrigin, h.failureOrigins.PHASE_TIMER);
+        if (identity) {
+          assert.equal(observation?.lastTable?.status, 0);
+          assert.equal(observation?.lastIdentity?.errorCode, 'ETIMEDOUT');
+          await h.respond(pendingIdentity, '{"30":"start-A"}');
+          assert.equal(h.inspect('escapedDescendants.get(30)'), null, 'late identity cannot acquire PID custody');
+          assert.equal(ackCount(h), 0);
+          assert.equal(h.signals.some(value => value.pid === 30), false);
+        }
+      }
+    });
+    await t.test('C4 pending table or identity cannot block stop or two-second group KILL', async () => {
+      for (const kind of ['STOP', 'disconnect', 'SIGTERM']) for (const identity of [false, true]) {
+        const h = harness(); await h.start(); await h.advance(1000);
+        if (identity) { const scan = h.pending(); await h.respond(scan, h.table(scan, escape)); }
+        if (kind === 'STOP') h.proc.emit('message', { kind }); else h.proc.emit(kind);
+        assert.equal(stopCount(h), 1);
+        assert.equal(h.signals.find(value => value.signal === 'SIGTERM').at, 1000);
+        await h.advance(2000);
+        assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
+        assert.equal(h.inspect('collector.owned()'), true);
+        const old = h.pending(); await h.respond(old, old.command === 'ps' || old.args.includes('--table') ? h.table(old) : '{"30":"late"}');
+        assert.equal(ackCount(h), 0);
+        assert.ok(!h.exits.includes(0));
+      }
+    });
+    await t.test('C5 completion requires a scan begun after its boundary', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const old = h.pending();
+      h.body.emit('message', { kind: 'BODY_COMPLETE' });
+      h.body.emit('message', { kind: 'BODY_COMPLETE' });
+      await flush(); assert.equal(h.children.length, 1);
+      await h.respond(old, h.table(old, escape));
+      assert.equal(h.pending().command, 'python3');
+      await h.respond(h.pending(), '{"30":"start-A"}');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      assert.equal(ackCount(h), 0); assert.equal(h.children.length, 3);
+      const fresh = h.pending(); assert.equal(fresh.command, 'ps'); await h.respond(fresh, h.table(fresh));
+      assert.equal(ackCount(h), 1);
+    });
+    await t.test('C5 drain supersedes a pending completion scan', async () => {
+      const h = harness(); await h.start();
+      h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
+      const old = h.pending(); h.body.emit('close', 0, null);
+      h.proc.emit('message', { kind: 'DRAIN' }); h.proc.emit('message', { kind: 'DRAIN' }); await flush();
+      assert.equal(h.children.length, 1);
+      await h.respond(old, h.table(old));
+      assert.equal(h.children.length, 2);
+      const fresh = h.pending(); await h.respond(fresh, h.table(fresh));
+      assert.equal(ackCount(h), 0); assert.deepEqual(h.exits, [0]);
+    });
+    await t.test('C5 drain and stop reject late admission and body starts', async () => {
+      for (const kind of ['DRAIN', 'STOP']) {
+        const h = harness(); h.proc.emit('message', { kind }); await flush();
+        h.proc.emit('message', { kind: 'ADMIT', command: 'admit', args: [] });
+        h.proc.emit('message', { kind: 'START' }); await flush();
+        assert.deepEqual(h.starts, { admission: 0, body: 0 });
+      }
+    });
+    await t.test('C6 escaped signals require an unchanged fresh identity', async () => {
+      for (const actual of ['start-A', 'start-B', null]) {
+        const h = harness(); await h.start(); await h.advance(1000);
+        let scan = h.pending(); await h.respond(scan, h.table(scan, escape));
+        await h.respond(h.pending(), '{"30":"start-A"}');
+        h.proc.emit('SIGTERM'); await flush();
+        scan = h.pending(); await h.respond(scan, h.table(scan, '30 1 30 S\n'));
+        await h.respond(h.pending(), JSON.stringify(actual ? { 30: actual } : {}));
+        assert.equal(h.signals.filter(value => value.pid === 30).length, actual === 'start-A' ? 1 : 0);
+      }
+    });
+    await t.test('C6 empty and malformed identities cannot prove escaped absence', async () => {
+      for (const identity of ['{}', '{broken']) {
+        const h = harness(); await h.start(); await h.advance(1000);
+        let scan = h.pending(); await h.respond(scan, h.table(scan, escape)); await h.respond(h.pending(), identity);
+        h.body.emit('close', 0, null); h.proc.emit('message', { kind: 'DRAIN' }); await flush();
+        scan = h.pending(); await h.respond(scan, h.table(scan, '30 1 30 S\n'));
+        await h.respond(h.pending(), identity); await h.respond(h.pending(), identity);
+        assert.equal(stopCount(h), 1); assert.ok(!h.exits.includes(0));
+        assert.equal(h.signals.filter(value => value.pid === 30).length, 0);
+      }
+    });
+    await t.test('C7 expiry does not launch an identity successor or accept late output', async () => {
+      const h = harness({ deadline: 1500 }); await h.start(); await h.advance(1000);
+      const scan = h.pending(); await h.advance(500); await h.respond(scan, h.table(scan, escape));
+      assert.equal(h.children.filter(child => child.command === 'python3' && !child.args.includes('--table')).length, 0);
+      assert.equal(stopCount(h), 1); assert.equal(ackCount(h), 0);
+    });
+    await t.test('C8 failed signals and missing close retain ownership without postponing KILL', async () => {
+      const h = harness({ groupKillThrows: true, childKillThrows: true }); await h.start(); await h.advance(1000);
+      h.proc.emit('SIGTERM'); await h.advance(2000);
+      assert.equal(h.children.length, 1); assert.equal(h.inspect('collector.owned()'), true);
+      assert.equal(h.exits.length, 0);
+      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
+      assert.ok(h.pending().signals.some(value => value.signal === 'SIGKILL'));
+    });
+    await t.test('C9 simultaneous close, expiry and cancellation settle once', async () => {
+      for (const order of ['completion-first', 'timeout-first']) {
+        const h = harness(); await h.start();
+        const completeAndCancel = () => {
+          const child = h.pending(); h.respond(child, h.table(child)); h.proc.emit('SIGTERM');
+        };
+        if (order === 'completion-first') h.queue(2000, completeAndCancel);
+        await h.advance(1000);
+        const scan = h.pending();
+        if (order === 'timeout-first') h.queue(1000, completeAndCancel);
+        await h.advance(1000);
+        assert.equal(stopCount(h), 1); assert.equal(ackCount(h), 0);
+        assert.equal(h.packets.filter(value => value.kind === 'STOP').length, 1);
+        assert.equal(scan.stdout.listenerCount('data'), 0);
+      }
+    });
+    await t.test('C10 orphan release requires a fresh complete absence check', async () => {
+      for (const failed of [false, true]) {
+        const h = harness(); await h.start(); h.proc.emit('disconnect'); await flush();
+        let scan = h.pending(); await h.respond(scan, h.table(scan));
+        await h.advance(2000); scan = h.pending(); await h.respond(scan, h.table(scan));
+        await h.advance(50); scan = h.pending(); await h.respond(scan, failed ? '' : h.table(scan), failed ? 1 : 0);
+        assert.equal(h.releases(), failed ? 0 : 1); assert.deepEqual(h.exits, [98]);
+      }
+    });
+    await t.test('C11 body and diagnostic send failures leave cleanup armed', async () => {
+      for (const mode of ['bodySendThrows', 'bodyCallbackError']) {
+        const h = harness({ [mode]: true, diagnosticThrows: true }); await h.start();
+        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
+        const scan = h.pending(); await h.respond(scan, h.table(scan));
+        assert.equal(stopCount(h), 1); await h.advance(2000);
+        assert.ok(h.signals.some(value => value.pid === -20 && value.signal === 'SIGKILL'));
+      }
+    });
+    await t.test('C13 collection waits for custody ACK and rejects a late ACK', async () => {
+      const h = harness({ noCustodyAck: true }); await h.start(); await h.advance(1000);
+      assert.equal(h.children.length, 0);
+      const begin = h.packets.find(packet => packet.kind === 'CUSTODY' && packet.state === 'BEGIN');
+      assert.ok(begin);
+      await h.advance(1000);
+      h.proc.emit('message', { kind: 'CUSTODY', state: 'ACK', phase: begin.phase }); await flush();
+      assert.equal(h.children.length, 0);
+      assert.equal(stopCount(h), 1);
+      assert.ok(!h.exits.includes(0));
+    });
+    await t.test('C13 guardian ancestry remains covered after manager reparenting', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const scan = h.pending(); await h.respond(scan, h.table(scan, '30 10 30 S\n'));
+      await h.respond(h.pending(), '{"30":"start-A"}');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.escaped).length, 1);
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
+    });
+    await t.test('C13 live guardian completion follows fresh post-KILL absence', async () => {
+      for (const failed of [false, true]) {
+        const h = harness(); await h.start(); h.proc.emit('SIGTERM'); await flush();
+        let scan = h.pending(); await h.respond(scan, h.table(scan));
+        await h.advance(2000); scan = h.pending(); await h.respond(scan, h.table(scan));
+        assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, 0);
+        await h.advance(50); scan = h.pending(); await h.respond(scan, failed ? '' : h.table(scan), failed ? 1 : 0);
+        assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, failed ? 0 : 1);
+        assert.equal(h.releases(), 0, 'connected manager retains final removal');
+        assert.deepEqual(h.exits, [98]);
+      }
+    });
+    async function cleanupAtWorkDeadline(options = {}) {
+      const h = harness({ deadline: 1000, cleanupDeadline: 6000, ...options });
+      const answer = async (failed = false) => {
+        for (let step = 0; h.pending(); step++) {
+          assert.ok(step < 8, 'finite observation reply count');
+          const child = h.pending();
+          if (child.command === 'ps') await h.respond(child, failed ? '' : h.table(child, options.unknownIdentity ? '30 1 30 S\n' : ''), failed ? 1 : 0);
+          else { assert.equal(child.command, 'python3'); await h.respond(child, '{}'); }
+        }
+      };
+      await h.start();
+      if (options.unknownIdentity) {
+        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
+        const scan = h.pending(); await h.respond(scan, h.table(scan, escape));
+        await h.respond(h.pending(), '{}');
+      }
+      await h.advance(1000);
+      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGTERM').at, 1000);
+      if (!options.pendingClose) await answer();
+      await h.advance(2000);
+      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
+      if (!options.pendingClose) await answer();
+      assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, 0);
+      await h.advance(50);
+      if (!options.pendingClose) await answer(options.failedAbsence);
+      return h;
+    }
+    const cleanupCount = h => h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE' && packet.code === 98).length;
+    await t.test('C15 expired work keeps the original reserve for fresh stopped cleanup', async () => {
+      const oldRouting = "if (scope === 'cleanup' && stopping) return cleanupEnd;";
+      const workOnly = watchdogSource.includes(oldRouting)
+        ? watchdogSource.replace(oldRouting, "if (scope === 'cleanup' && stopping) return workEnd;")
+        : watchdogSource;
+      const red = await cleanupAtWorkDeadline({ source: workOnly });
+      assert.throws(() => assert.equal(cleanupCount(red), 1, 'fresh post-KILL completion must remain possible after work expiry'), assert.AssertionError);
+      const green = await cleanupAtWorkDeadline();
+      assert.equal(cleanupCount(green), 1, 'fresh post-KILL completion must remain possible after work expiry');
+      assert.deepEqual(green.ends, [2000, 4000, 4050]);
+      assert.equal(green.children.length, 3);
+      assert.equal(green.inspect('Date.now()'), 3050);
+      assert.deepEqual(green.exits, [98]);
+      assert.equal(green.releases(), 0, 'connected manager retains final scratch removal');
+      assert.equal(green.inspect('beginObservation("monitor")'), null, 'cleanup cannot resume normal work');
+      green.proc.emit('message', { kind: 'ADMIT' }); green.proc.emit('message', { kind: 'START' }); await flush();
+      assert.deepEqual(green.starts, { admission: 1, body: 1 });
+    });
+    await t.test('C15 invalid or exhausted cleanup bounds never establish completion', async () => {
+      for (const cleanupDeadline of [NaN, Infinity, 'missing', 0, 999, 1000, 1001, 2500, 3050]) {
+        const h = await cleanupAtWorkDeadline({ cleanupDeadline });
+        await h.advance(4000);
+        assert.equal(cleanupCount(h), 0, String(cleanupDeadline));
+        assert.equal(h.releases(), 0);
+        assert.ok(!h.exits.includes(0));
+      }
+    });
+    await t.test('C15 custody, observation and child-close failures remain closed after work expiry', async () => {
+      for (const options of [{ noCustodyAck: true }, { unknownIdentity: true }, { failedAbsence: true }, { pendingClose: true }]) {
+        const h = await cleanupAtWorkDeadline(options);
+        await h.advance(4000);
+        assert.equal(cleanupCount(h), 0, JSON.stringify(options));
+        assert.equal(h.releases(), 0);
+        assert.ok(!h.exits.includes(0));
+        assert.equal(h.signals.some(value => value.pid === 30), false);
+        if (options.pendingClose) assert.equal(h.owner.owned(), true);
+      }
+    });
+    await t.test('C16 observation phases and callsites require explicit bound classification', () => {
+      const expected = { monitor: 'work', drain: 'work', 'body-complete': 'work', SIGTERM: 'cleanup', SIGKILL: 'cleanup', orphan: 'cleanup' };
+      const calls = [
+        'observationDeadline:kind', 'beginObservation:kind,phaseDeadline', 'observationDeadline:kind',
+        'freshObservation:kind', 'beginObservation:kind', "beginObservation:'monitor'",
+        'stopObservation:signal,phaseDeadline', 'beginObservation:signal,phaseDeadline',
+        "observationDeadline:code===0?'drain':'orphan'", "beginObservation:'orphan'", "observationDeadline:'orphan'",
+        "stopObservation:'SIGKILL'", "stopObservation:'SIGTERM',killAt", "freshObservation:'drain'", "freshObservation:'body-complete'"
+      ].sort();
+      const verify = source => {
+        const found = [...source.matchAll(/\b(observationDeadline|beginObservation|freshObservation|stopObservation)\(([^)]*)\)/g)]
+          .map(value => value[1] + ':' + value[2].replace(/\s/g, '')).sort();
+        assert.deepEqual(found, calls, 'new observation phase or callsite needs explicit review');
+        assert.equal((source.match(/\bcollector\.begin\(/g) || []).length, 1, 'all observations use the bound owner');
+        const h = harness({ source });
+        assert.deepEqual(JSON.parse(JSON.stringify(h.inspect('OBSERVATION_PHASE_BOUNDS'))), expected);
+        assert.equal(h.inspect('beginObservation("future-phase")'), null);
+        assert.equal(h.inspect('beginObservation("SIGTERM")'), null, 'cleanup authority is unavailable before stop');
+      };
+      verify(watchdogSource);
+      assert.throws(() => verify(watchdogSource + "\nbeginObservation('future-phase');\n"), assert.AssertionError);
+      assert.throws(() => verify(watchdogSource + "\nbeginObservation('monitor');\n"), assert.AssertionError);
+      assert.throws(() => verify(watchdogSource + '\ncollector.begin(10000);\n'), assert.AssertionError);
+      const extraPhase = watchdogSource.replace("monitor: 'work',", "future: 'cleanup', monitor: 'work',");
+      assert.notEqual(extraPhase, watchdogSource);
+      assert.throws(() => verify(extraPhase), assert.AssertionError);
+    });
+    await t.test('C14 collector origins identify each existing failure branch', async () => {
+      const cases = [
+        ['expired', 'RUN_EXPIRED'], ['busy', 'RUN_BUSY'], ['timer', 'PHASE_TIMER'],
+        ['cancel', 'CANCEL_REQUEST'], ['finish', 'FINISH_CANCEL'], ['spawn', 'SPAWN_THROW'],
+        ['stdout-limit', 'STDOUT_LIMIT'], ['stderr-limit', 'STDERR_LIMIT'],
+        ['stdout-error', 'STDOUT_ERROR'], ['stderr-error', 'STDERR_ERROR'],
+        ['child-error', 'CHILD_ERROR'], ['close-invalid', 'CLOSE_INVALID'], ['exit', 'CHILD_EXIT']
+      ];
+      const origins = harness().failureOrigins;
+      assert.equal(new Set(Object.values(origins)).size, 13);
+      assert.deepEqual(cases.map(([, key]) => key).sort(), Object.keys(origins).sort());
+      for (const [mode, key] of [...cases, ['success', null]]) {
+        const h = harness({ spawnThrows: mode === 'spawn', spawnErrorCode: 'ETIMEDOUT' });
+        const phase = h.owner.begin(1000);
+        if (mode === 'expired') h.elapseWithoutTimers(1000);
+        const pendingResult = h.owner.run(phase, 'ps', [], { LC_ALL: 'C' });
+        let result;
+        const child = h.pending();
+        if (mode === 'expired' || mode === 'spawn') result = await pendingResult;
+        else if (mode === 'busy') {
+          result = await h.owner.run(phase, 'ps', [], { LC_ALL: 'C' });
+          assert.equal(result.error.code, 'EBUSY');
+          h.owner.cancel();
+          assert.equal((await pendingResult).failureOrigin, origins.CANCEL_REQUEST);
+        } else {
+          if (mode === 'timer') await h.advance(1000);
+          if (mode === 'cancel') h.owner.cancel();
+          if (mode === 'finish') h.owner.finish(phase);
+          if (mode.endsWith('-limit')) child[mode.startsWith('stdout') ? 'stdout' : 'stderr'].emit('data', Buffer.alloc(1024 * 1024 + 1));
+          if (mode.endsWith('-error') && mode !== 'child-error') child[mode.startsWith('stdout') ? 'stdout' : 'stderr'].emit('error', { code: 'ETIMEDOUT' });
+          if (mode === 'child-error') child.emit('error', { code: 'ETIMEDOUT' });
+          if (mode === 'close-invalid') h.elapseWithoutTimers(1000);
+          if (['child-error', 'close-invalid', 'exit', 'success'].includes(mode)) await h.respond(child, '', mode === 'exit' ? 1 : mode === 'child-error' ? null : 0);
+          result = await pendingResult;
+        }
+        assert.equal(result.failureOrigin, key ? origins[key] : null, mode);
+        if (['expired', 'timer', 'spawn', 'stdout-error', 'stderr-error', 'child-error'].includes(mode)) {
+          assert.equal(result.status, null, mode);
+          assert.equal(result.signal, null, mode);
+          assert.equal(result.error.code, 'ETIMEDOUT', mode);
+        }
+        if (child && !child.closed) {
+          assert.equal(h.owner.owned(), true, 'owned child remains until close');
+          await h.respond(child, '', 0);
+        }
+        h.owner.finish(phase);
+        await h.owner.whenClosed();
+        assert.equal(h.owner.owned(), false, mode);
+        assert.equal(h.children.length, mode === 'expired' || mode === 'spawn' ? 0 : 1, mode);
+        if (mode === 'timer') assert.deepEqual(child.signals.map(value => value.signal), ['SIGTERM']);
+      }
+    });
+    await t.test('C14 manager allowlists origins and rejects raw diagnostic data', () => {
+      const origins = harness().failureOrigins;
+      for (const failureOrigin of Object.values(origins)) {
+        const observed = gate.watchdogStopObservation({ event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE, lastTable: { outcome: 'command-failed', status: null, signal: null, errorCode: 'ETIMEDOUT', failureOrigin } });
+        assert.equal(observed.lastTable.failureOrigin, failureOrigin);
+      }
+      const privateMarker = 'private fixture detail';
+      const observed = gate.gateSyscallObservation({ outcome: 'command-failed', errorCode: 'EIO', failureOrigin: privateMarker });
+      assert.equal(observed.failureOrigin, null);
+      assert.equal(JSON.stringify(observed).includes(privateMarker), false);
+      assert.equal(gate.gateSyscallObservation({ outcome: 'subprocess-complete', status: 0 }).failureOrigin, null);
+      for (const pid of [-1, 1, NaN, Infinity, '123', {}]) {
+        assert.equal(gate.gateSyscallObservation({ outcome: 'command-failed', pid }).pid, null);
+      }
+      assert.equal(gate.gateSyscallObservation({ outcome: 'command-failed', childErrorCode: privateMarker }).childErrorCode, null);
+    });
+    await t.test('C18 refusal identifies its child and separates wall adjustment from elapsed time', async () => {
+      const h = harness();
+      const phase = h.owner.begin(1000);
+      const pending = h.owner.run(phase, 'ps', [], { LC_ALL: 'C' });
+      const child = h.pending();
+      await h.advance(100);
+      child.stderr.emit('data', Buffer.from('private stderr'));
+      await h.advance(100);
+      child.emit('error', { code: 'EAGAIN' });
+      h.shiftWall(970);
+      await h.advance(800);
+      const failed = await pending;
+      assert.equal(failed.error.code, 'ETIMEDOUT');
+      assert.equal(failed.childErrorCode, 'EAGAIN');
+      assert.equal(failed.timing.wallStarted, 0);
+      assert.equal(failed.timing.elapsed, 1970);
+      assert.equal(failed.timing.monoElapsed, 1000);
+      assert.equal(failed.timing.stderr, 100);
+      assert.equal(failed.timing.error, 200);
+      const projected = gate.gateSyscallObservation({ ...failed, outcome: 'command-failed', errorCode: failed.error.code });
+      assert.equal(projected.pid, child.pid);
+      assert.equal(projected.childErrorCode, 'EAGAIN');
+      assert.equal(JSON.stringify(projected).includes('private stderr'), false);
+      await h.respond(child, '');
+      assert.equal(failed.timing.close, null, 'late closure cannot rewrite the first refusal');
+      assert.equal(h.owner.owned(), false);
+    });
+    await t.test('C17 timeout timing separates custody delay from collection time', async () => {
+      const h = harness({ noCustodyAck: true }); await h.start(); await h.advance(1000);
+      const begin = h.packets.find(packet => packet.kind === 'CUSTODY' && packet.state === 'BEGIN');
+      await h.advance(750);
+      h.proc.emit('message', { kind: 'CUSTODY', state: 'ACK', phase: begin.phase }); await flush();
+      const scan = h.pending();
+      await h.advance(250);
+      const timing = h.packets.find(packet => packet.kind === 'STOP').observation.lastTable.timing;
+      assert.ok(timing, 'refusal records the timing needed to separate custody and collection');
+      assert.deepEqual(JSON.parse(JSON.stringify(timing)), {
+        budget: 1000, custody: 750, run: 750, returned: 750, spawn: null, data: null, exit: null, close: null, elapsed: 1000,
+        wallStarted: 1000, monoElapsed: 1000, stderr: null, error: null, checkpoint: null
+      });
+      assert.equal(stopCount(h), 1);
+      await h.respond(scan, '');
+      assert.equal(timing.close, null, 'late close cannot rewrite the refusal snapshot');
+    });
+    await t.test('C17 timeout retains observed exit while close is pending', async () => {
+      const h = harness(); await h.start(); await h.advance(1000);
+      const scan = h.pending();
+      await h.advance(100); scan.emit('spawn');
+      await h.advance(100); scan.stdout.emit('data', Buffer.from(h.table(scan)));
+      await h.advance(100); scan.emit('exit', 0, null);
+      await h.advance(700);
+      const observation = h.packets.find(packet => packet.kind === 'STOP').observation;
+      const projected = gate.watchdogStopObservation({ ...observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
+      assert.ok(projected.lastTable.timing, 'refusal retains observed exit and pending close');
+      assert.deepEqual(JSON.parse(JSON.stringify(projected.lastTable.timing)), {
+        budget: 1000, custody: 0, run: 0, returned: 0, spawn: 100, data: 200, exit: 300, close: null, elapsed: 1000,
+        wallStarted: 1000, monoElapsed: 1000, stderr: null, error: null, checkpoint: null
+      });
+      assert.equal(projected.lastTable.failureOrigin, h.failureOrigins.PHASE_TIMER);
+      assert.equal(stopCount(h), 1);
+      await h.respond(scan, '');
+      assert.equal(scan.listenerCount('spawn'), 0);
+      assert.equal(scan.listenerCount('exit'), 0);
+    });
+    await t.test('C17 timing projection rejects unknown fields and non-numeric detail', () => {
+      const timing = { budget: 1000, custody: 0, run: 0, returned: 0, spawn: 0, data: null, exit: null, close: null, elapsed: 1000,
+        wallStarted: 0, monoElapsed: 1000, stderr: null, error: null, checkpoint: null };
+      const input = { outcome: 'command-failed', errorCode: 'ETIMEDOUT', failureOrigin: harness().failureOrigins.PHASE_TIMER, timing };
+      assert.deepEqual(gate.gateSyscallObservation(input).timing, timing);
+      for (const invalid of [{ ...timing, command: 'private detail' }, { ...timing, run: 'private detail' }, { ...timing, elapsed: Infinity }, { ...timing, checkpoint: 9 }, Object.values(timing)]) {
+        assert.equal(gate.gateSyscallObservation({ ...input, timing: invalid }).timing, undefined);
+      }
+      assert.equal(gate.gateSyscallObservation({ ...input, outcome: 'subprocess-complete', status: 0 }).timing, undefined);
+      const packet = gate.watchdogStopObservation({ event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE, lastTable: input });
+      const retained = { stage: 'cleanup', firstStop: null, workerError: false, workerErrorCode: null,
+        workerExit: { code: null, signal: 'SIGKILL', stage: 'cleanup' }, bodyExit: { code: 143, stage: 'body' },
+        watchdogStop: packet, workerStop: { event: 'SIGTERM', errorCode: null, guardCode: null, upstreamOrigin: 'UNKNOWN' },
+        initialGroupProbe: { ok: true, count: 0, errorCode: null }, finalGroupProbe: null, upstreamOrigin: 'UNKNOWN' };
+      assert.ok(Buffer.byteLength(' observed=' + JSON.stringify(retained), 'utf8') <= 1024, 'timing survives the existing terminal diagnostic bound');
+      const identityFailure = gate.watchdogStopObservation({
+        event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE,
+        lastTable: { outcome: 'subprocess-complete', status: 0, pid: 123456 },
+        lastIdentity: { ...input, pid: 123457, childErrorCode: 'E'.repeat(40),
+          timing: { ...timing, wallStarted: 1793950556000, stderr: 100, error: 200 } }
+      });
+      assert.ok(Buffer.byteLength(' observed=' + JSON.stringify({ ...retained, watchdogStop: identityFailure }), 'utf8') <= 1024,
+        'a completed table cannot crowd out the failed identity observation');
+    });
+    await t.test('C14 new collector producer sites require an explicit origin review', () => {
+      const verify = source => {
+        assert.equal((source.match(/\bfailure\(/g) || []).length, 5);
+        assert.equal((source.match(/\bcancel\(/g) || []).length, 8);
+      };
+      verify(collectorSource);
+      assert.throws(() => verify(collectorSource + "\nfailure(phase, 'ETIMEDOUT');\n"), assert.AssertionError);
+      assert.throws(() => verify(collectorSource + "\ncancel('ETIMEDOUT');\n"), assert.AssertionError);
+    });
+    await t.test('C12 the complete evidence inventory rejects new collectors and PID signals', () => {
+      const watchdog = 'scripts/full-gate-watchdog.js';
+      const collector = 'scripts/full-gate/watchdog-collector.js';
+      const manager = 'scripts/full-gate.js';
+      const worker = 'scripts/full-gate-worker.js';
+      const body = 'scripts/full-gate/body-runner.js';
+      const expectedModules = [watchdog, collector, manager, worker, body].sort();
+      const expectedFiles = [...expectedModules, 'scripts/full-gate/darwin.py', 'scripts/full-gate/darwin-runner.py', 'scripts/full-gate/supervisor.py'].sort();
+      const expectedImports = {
+        [watchdog]: ['./full-gate', './full-gate/watchdog-collector', 'node:child_process', 'node:fs'],
+        [collector]: [],
+        [manager]: ['./full-gate/watchdog-collector', 'node:child_process', 'node:crypto', 'node:fs', 'node:fs', 'node:os', 'node:path', 'node:stream/promises'],
+        [worker]: ['./full-gate', 'node:child_process', 'node:os', 'node:path'],
+        [body]: ['../full-gate', 'node:path']
+      };
+      const expectedCalls = { [watchdog]: [0, 0, 0], [collector]: [1, 0, 0], [manager]: [0, 4, 2], [worker]: [1, 0, 1], [body]: [0, 0, 0] };
+      const expectedSignals = {
+        [watchdog]: ["-group,'SIGKILL'", "-group,'SIGTERM'", 'pid,signal'].sort(),
+        [manager]: ["-worker.pid,'SIGKILL'"],
+        [worker]: ["-process.pid,'SIGKILL'", "-process.pid,'SIGTERM'"].sort(),
+        [collector]: [], [body]: []
+      };
+      function assertEvidenceOwners(inventory) {
+        assert.deepEqual([...inventory.files].sort(), expectedFiles, 'new evidence module needs explicit review');
+        assert.deepEqual(Object.keys(inventory.sources).sort(), expectedModules, 'every scoped JavaScript module must be inspected');
+        for (const [name, source] of Object.entries(inventory.sources)) {
+          const imports = [...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g)].map(value => value[1]).sort();
+          assert.deepEqual(imports, [...expectedImports[name]].sort(), 'unapproved import in ' + name);
+          assert.equal((source.match(/\brequire\s*\(/g) || []).length, imports.length + (name === body ? 1 : 0), 'unapproved dynamic require in ' + name);
+          assert.doesNotMatch(source, /\bimport\s*\(/, 'unapproved dynamic import in ' + name);
+          assert.deepEqual(['spawn', 'spawnSync', 'fork'].map(call => (source.match(new RegExp('\\b' + call + '\\(', 'g')) || []).length), expectedCalls[name], 'second subprocess owner in ' + name);
+          const calls = [...source.matchAll(/\bprocess\s*(?:\.\s*kill|\[\s*['"]kill['"]\s*\])\s*\(([^)]*)\)/g)];
+          const references = source.match(/\bprocess\s*(?:\.\s*kill|\[\s*['"]kill['"]\s*\])/g) || [];
+          assert.equal(references.length, calls.length, 'aliased PID signal in ' + name);
+          assert.deepEqual(calls.map(value => value[1].replace(/\s/g, '').replace(/"/g, "'")).sort(), expectedSignals[name], 'direct PID signal bypass in ' + name);
+        }
+        const owner = inventory.sources[watchdog].match(/async function signalEscapedDescendants[\s\S]*?\n}/)?.[0];
+        assert.ok(owner);
+        assert.equal((owner.match(/process\.kill\(pid, signal\)/g) || []).length, 1);
+        assert.match(owner, /sameProcessIdentity\(expected, identities\.get\(pid\)\)/);
+        assert.match(owner, /currentObservation\(phase\)/);
+        assert.doesNotMatch(inventory.sources[watchdog], /spawnSync/);
+        assert.match(inventory.sources[worker], /admission = spawn\(message\.command, message\.args, \{ stdio: 'inherit' \}\)/);
+        assert.match(inventory.sources[watchdog], /const \{ spawn \} = require\('node:child_process'\)/);
+        assert.match(inventory.sources[worker], /const \{ fork, spawn \} = require\('node:child_process'\)/);
+        assert.match(inventory.sources[manager], /const \{ fork, spawnSync \} = require\('node:child_process'\)/);
+        const peers = inventory.sources[manager].match(/function groupPeers\(group, deadline\) \{[\s\S]*?\n}/)?.[0];
+        assert.ok(peers);
+        assert.equal((inventory.sources[manager].match(/spawnSync\(['"]ps['"]/g) || []).length, 1, 'manager process evidence stays at groupPeers');
+        assert.equal((peers.match(/spawnSync\(['"]ps['"]/g) || []).length, 1);
+        assert.equal((inventory.sources[collector].match(/\.kill\(signal\)/g) || []).length, 1, 'only the owned child handle may be signaled');
+        assert.match(inventory.sources[collector], /owner\?\.child\?\.kill\(signal\)/);
+      }
+      const inventory = { files: evidenceInventory.files, sources: { ...evidenceInventory.sources, [watchdog]: watchdogSource, [collector]: collectorSource } };
+      assertEvidenceOwners(inventory);
+      const append = (name, text) => ({ files: inventory.files, sources: { ...inventory.sources, [name]: inventory.sources[name] + text } });
+      const sibling = 'scripts/full-gate/future-evidence.js';
+      const mutants = [
+        append(collector, '\nprocess.kill(pid, signal);\n'),
+        append(body, '\nprocess.kill(pid, signal);\n'),
+        append(collector, '\nspawn("ps", []);\n'),
+        append(collector, '\nrequire("../future-evidence");\n'),
+        { files: [...inventory.files, sibling], sources: { ...inventory.sources, [sibling]: 'process.kill(pid, signal);\nspawn("ps", []);\n' } }
+      ];
+      assert.equal(mutants.length, 5);
+      for (const mutant of mutants) assert.throws(() => assertEvidenceOwners(mutant), assert.AssertionError);
+    });
+  });
+}
+
+{
+  const inventoryRoots = ['scripts/full-gate.js', 'scripts/full-gate-worker.js', 'scripts/full-gate-watchdog.js'];
+  const inventoryFiles = [...inventoryRoots, ...filesUnder(path.join(PROJECT, 'scripts/full-gate')).filter(file => /\.(?:js|cjs|mjs|py)$/.test(file)).map(file => path.relative(PROJECT, file).split(path.sep).join('/'))].sort();
+  const evidenceInventory = {
+    files: inventoryFiles,
+    sources: Object.fromEntries(inventoryFiles.filter(file => /\.(?:js|cjs|mjs)$/.test(file)).map(file => [file, fs.readFileSync(path.join(PROJECT, file), 'utf8')]))
+  };
+  watchdogCollectorLifecycleTests({
+    test, assert, vm: require('node:vm'), EventEmitter: require('node:events').EventEmitter, evidenceInventory, gate: require('../scripts/full-gate'),
+    watchdogSource: evidenceInventory.sources['scripts/full-gate-watchdog.js'],
+    collectorSource: evidenceInventory.sources['scripts/full-gate/watchdog-collector.js']
+  });
+}

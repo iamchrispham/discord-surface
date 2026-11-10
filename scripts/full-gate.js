@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { fork, spawnSync } = require('node:child_process');
 const { finished: streamFinished } = require('node:stream/promises');
+const { COLLECTOR_FAILURE_ORIGINS, COLLECTOR_TIMING_FIELDS, COLLECTOR_CHECKPOINTS } = require('./full-gate/watchdog-collector');
 
 const SCRATCH_ROOT = 'DISCORD_SURFACE_GATE_SCRATCH';
 const NO_VERDICT_SECRET = 'DISCORD_SURFACE_GATE_NO_VERDICT_SECRET';
@@ -17,7 +18,58 @@ const SUPERVISOR = Object.freeze({
   TOKEN: 'DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN'
 });
 const MARKER = 'APERTURE-GATE-INDETERMINATE';
-const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop' });
+const WATCHDOG_STOP_EVENTS = Object.freeze({
+  MONITOR_TABLE: 'monitor-table-unavailable', CHECK_DEADLINE: 'check-deadline',
+  DRAIN_TABLE: 'drain-table-unavailable', DRAIN_PEERS: 'drain-peers', DRAIN_ESCAPES: 'drain-escapes',
+  START_UNADMITTED: 'start-without-admission', BODY_TABLE: 'body-table-unavailable',
+  BODY_SCAN_UNAVAILABLE: 'body-scan-unavailable', BODY_SCAN_SEND: 'body-scan-send-error',
+  PARENT_STOP: 'parent-stop', PARENT_DISCONNECT: 'parent-disconnect', SIGTERM: 'SIGTERM', TIMER: 'deadline'
+});
+const WORKER_STOP_EVENTS = Object.freeze({
+  PARENT_STOP: 'parent-stop', SIGTERM: 'SIGTERM', PARENT_DISCONNECT: 'parent-disconnect',
+  GUARD_EXIT: 'guard-exit', GUARD_ERROR: 'guard-error'
+});
+function gateErrorCode(value) {
+  return typeof value === 'string' && /^[A-Z0-9_]{1,40}$/.test(value) ? value : null;
+}
+function workerStopObservation(value) {
+  if (!value || !Object.values(WORKER_STOP_EVENTS).includes(value.event)) return null;
+  return {
+    event: value.event, errorCode: gateErrorCode(value.errorCode),
+    guardCode: Number.isSafeInteger(value.guardCode) ? value.guardCode : null, upstreamOrigin: 'UNKNOWN'
+  };
+}
+function gateSyscallObservation(value) {
+  if (!value || !['command-failed', 'self-missing', 'subprocess-complete', 'parse-failed'].includes(value.outcome)) return null;
+  const observation = {
+    outcome: value.outcome,
+    status: Number.isSafeInteger(value.status) ? value.status : null,
+    signal: typeof value.signal === 'string' && /^SIG[A-Z0-9]{1,12}$/.test(value.signal) ? value.signal : null,
+    errorCode: gateErrorCode(value.errorCode),
+    failureOrigin: Object.values(COLLECTOR_FAILURE_ORIGINS).includes(value.failureOrigin) ? value.failureOrigin : null
+  };
+  if (value.outcome !== 'subprocess-complete') {
+    observation.pid = Number.isSafeInteger(value.pid) && value.pid > 1 ? value.pid : null;
+    observation.childErrorCode = gateErrorCode(value.childErrorCode);
+  }
+  const timing = value.timing;
+  if (value.outcome !== 'subprocess-complete' && timing && typeof timing === 'object' && !Array.isArray(timing)
+      && Object.keys(timing).length === COLLECTOR_TIMING_FIELDS.length
+      && (timing.checkpoint === null || Object.values(COLLECTOR_CHECKPOINTS).includes(timing.checkpoint))
+      && COLLECTOR_TIMING_FIELDS.every(field => Object.hasOwn(timing, field) && (timing[field] === null || Number.isSafeInteger(timing[field])))) {
+    observation.timing = Object.fromEntries(COLLECTOR_TIMING_FIELDS.map(field => [field, timing[field]]));
+  }
+  return observation;
+}
+function watchdogStopObservation(value) {
+  if (!value || !Object.values(WATCHDOG_STOP_EVENTS).includes(value.event)) return null;
+  return {
+    event: value.event, errorCode: gateErrorCode(value.errorCode), lastTable: gateSyscallObservation(value.lastTable),
+    lastIdentity: gateSyscallObservation(value.lastIdentity), upstreamOrigin: 'UNKNOWN'
+  };
+}
+const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop', CUSTODY: 'custody', CLEANUP_COMPLETE: 'cleanup-complete' });
+const CUSTODY = Object.freeze({ BEGIN: 'begin', ACK: 'ack', CLEAR: 'clear' });
 const DARWIN_LAUNCHD = 'darwin-launchd-v1';
 const SUPERVISOR_HOLDER_ENVIRONMENTS = Object.freeze([
   'DISCORD_SURFACE_GATE_SUPERVISOR_PID',
@@ -355,8 +407,17 @@ async function runFullGate(root, label, entry, args) {
   let scratch;
   let sentinelSecret;
   let declined = false;
+  const observed = { stage: 'setup', firstStop: null, workerError: false, workerErrorCode: null, workerExit: null, bodyExit: null, watchdogStop: null, workerStop: null, initialGroupProbe: null, finalGroupProbe: null, upstreamOrigin: 'UNKNOWN' };
   const decline = (reason, detail) => {
-    if (!declined) { declined = true; noVerdict(reason, detail, scratch, reason === REASONS.TIMEOUT ? 1 : 2, sentinelSecret); }
+    if (!declined) {
+      declined = true;
+      let diagnostic = detail;
+      try {
+        const suffix = ' observed=' + JSON.stringify(observed);
+        if (Buffer.byteLength(suffix, 'utf8') <= 1024) diagnostic = String(detail) + suffix;
+      } catch {}
+      noVerdict(reason, diagnostic, scratch, reason === REASONS.TIMEOUT ? 1 : 2, sentinelSecret);
+    }
     return NO_VERDICT;
   };
   const started = Date.now();
@@ -381,6 +442,20 @@ async function runFullGate(root, label, entry, args) {
   const deadline = callerDeadline - 5000;
   let worker;
   let workerExit;
+  let guardian;
+  let guardianExit;
+  let guardianEnded = false;
+  let guardianCompletion;
+  let custodyPhase = 0;
+  let cleanupVerified = false;
+  const releaseOwnedScratch = () => (!worker || cleanupVerified) && releaseScratch(scratch, callerDeadline);
+  const send = (child, message) => {
+    try { if (child?.connected) child.send(message, () => {}); } catch {}
+  };
+  const untilCallerDeadline = promise => new Promise(resolve => {
+    const timeout = setTimeout(() => resolve({ timedOut: true }), Math.max(0, callerDeadline - Date.now()));
+    promise.then(value => { clearTimeout(timeout); resolve(value); });
+  });
   let bodyStarted = false;
   let bodyFinished = false;
   let stopped;
@@ -392,21 +467,28 @@ async function runFullGate(root, label, entry, args) {
   let premise;
   let bodyResult;
   let finalSnapshotRequired = false;
-  const stop = signal => {
+  const stop = (signal, event) => {
+    observed.firstStop ||= { event, stage: observed.stage, reason: signal };
     stopped ||= signal;
     if (signal !== REASONS.TIMEOUT) finishOutputWait?.(false);
-    if (worker?.connected) worker.send({ kind: MESSAGES.STOP, reason: signal });
+    send(guardian, { kind: MESSAGES.STOP, reason: signal });
+    send(worker, { kind: MESSAGES.STOP, reason: signal });
   };
   const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => {
-    const handler = () => stop(REASONS.INTERRUPTED); process.on(signal, handler); return [signal, handler];
+    const handler = () => stop(REASONS.INTERRUPTED, signal); process.on(signal, handler); return [signal, handler];
   });
-  const onDisconnect = () => stop(REASONS.INTERRUPTED);
+  const onDisconnect = () => stop(REASONS.INTERRUPTED, 'parent-disconnect');
   process.on('disconnect', onDisconnect);
+  const observePendingInterrupts = async () => {
+    // Cross a poll turn before classifying a synchronous source read.
+    await new Promise(resolve => setImmediate(() => setImmediate(resolve)));
+    if (process.connected === false) onDisconnect();
+  };
   const removeInterruptHandlers = () => {
     process.removeListener('disconnect', onDisconnect);
     for (const [signal, handler] of handlers) process.removeListener(signal, handler);
   };
-  timer = setTimeout(() => stop(REASONS.TIMEOUT), Math.max(1, deadline - Date.now()));
+  timer = setTimeout(() => stop(REASONS.TIMEOUT, 'deadline'), Math.max(1, deadline - Date.now()));
   const runAdmission = guardianPid => new Promise(resolve => {
     const received = message => {
       if (message.kind === MESSAGES.ADMISSION_EXIT) {
@@ -415,7 +497,7 @@ async function runFullGate(root, label, entry, args) {
       }
     };
     worker.on('message', received);
-    workerExit.then(() => { worker.removeListener('message', received); resolve({ code: NO_VERDICT, interrupted: true }); });
+    Promise.race([workerExit, guardianExit]).then(() => { worker.removeListener('message', received); resolve({ code: NO_VERDICT, interrupted: true }); });
     const maxWait = Math.floor((deadline - Date.now()) / 1000) - slowest;
     if (maxWait < 1) {
       worker.removeListener('message', received);
@@ -437,6 +519,7 @@ async function runFullGate(root, label, entry, args) {
     const args = ['discord-surface-' + label, '--full-gate'];
     for (const holder of holders) args.push('--holder', String(holder));
     args.push('--max-wait', String(maxWait), '--ticket', ticket);
+    send(guardian, { kind: MESSAGES.ADMIT });
     worker.send({
       kind: MESSAGES.ADMIT,
       command,
@@ -465,8 +548,9 @@ async function runFullGate(root, label, entry, args) {
     delete workerEnvironment[SUPERVISOR.RECEIPT];
     delete workerEnvironment[SUPERVISOR.TOKEN];
     workerEnvironment[SCRATCH_ROOT] = scratch;
+    observed.stage = 'worker-start';
     worker = fork(path.join(__dirname, 'full-gate-worker.js'), [String(deadline), entry, ...args], {
-      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: workerEnvironment
+      cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc', 'ignore'], env: workerEnvironment
     });
     outputDrain = Promise.all([
       relay(worker.stdout, process.stdout),
@@ -474,22 +558,62 @@ async function runFullGate(root, label, entry, args) {
       streamFinished(worker.stdout, { cleanup: true }),
       streamFinished(worker.stderr, { cleanup: true })
     ]).then(results => results[0] && results[1], () => false);
+    worker.on('message', message => {
+      if ([MESSAGES.ADMISSION_EXIT, MESSAGES.BODY_COMPLETE, MESSAGES.BODY_EXIT].includes(message.kind)) send(guardian, message);
+      if (message.kind === MESSAGES.STOP) {
+        try { observed.workerStop ||= workerStopObservation(message.workerObservation); } catch {}
+      }
+    });
     workerExit = new Promise(resolve => {
-      worker.once('error', error => resolve({ error }));
-      worker.once('exit', (code, signal) => resolve({ code, signal }));
+      worker.once('error', error => { observed.workerError = true; observed.workerErrorCode = gateErrorCode(error.code); resolve({ error }); });
+      worker.once('exit', (code, signal) => {
+        observed.workerExit = { code: Number.isSafeInteger(code) ? code : null, signal, stage: observed.stage };
+        resolve({ code, signal });
+      });
+    });
+    guardian = fork(path.join(__dirname, 'full-gate-watchdog.js'), [String(deadline), String(callerDeadline), String(worker.pid), entry, ...args], {
+      cwd: root, detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc', 'ignore'], env: workerEnvironment
+    });
+    guardian.on('message', message => {
+      if (message.kind === MESSAGES.STOP) {
+        try { observed.watchdogStop ||= watchdogStopObservation(message.observation); } catch {}
+      }
+      if (message.kind === MESSAGES.CUSTODY && Number.isSafeInteger(message.phase) && message.phase > 0) {
+        if (message.state === CUSTODY.BEGIN && message.phase > custodyPhase) {
+          custodyPhase = message.phase;
+          send(guardian, { kind: MESSAGES.CUSTODY, state: CUSTODY.ACK, phase: message.phase });
+        }
+      }
+      if (message.kind === MESSAGES.CLEANUP_COMPLETE && !guardianEnded && !guardianCompletion && [0, NO_VERDICT].includes(message.code) && Date.now() < callerDeadline) {
+        guardianCompletion = { code: message.code };
+      }
+      if (message.kind === MESSAGES.START && bodyStarted && !stopped) send(worker, { kind: MESSAGES.START });
+      if (message.kind === MESSAGES.BODY_SCAN_COMPLETE && bodyStarted && !stopped) send(worker, { kind: MESSAGES.BODY_SCAN_COMPLETE });
+    });
+    guardianExit = new Promise(resolve => {
+      guardian.once('error', () => { stop(REASONS.INTERRUPTED, 'guardian-error'); });
+      guardian.once('exit', (code, signal) => {
+        guardianEnded = true;
+        if (!guardianCompletion) stop(REASONS.INTERRUPTED, 'guardian-exit');
+      });
+      guardian.once('close', (code, signal) => resolve({ code, signal }));
     });
     const ready = await Promise.race([
-      new Promise(resolve => worker.on('message', message => { if (message.kind === MESSAGES.READY) resolve(message); })),
-      workerExit.then(() => null)
+      Promise.all([
+        new Promise(resolve => worker.on('message', message => { if (message.kind === MESSAGES.READY) resolve(message); })),
+        new Promise(resolve => guardian.on('message', message => { if (message.kind === MESSAGES.READY) resolve(message); }))
+      ]),
+      workerExit.then(() => null), guardianExit.then(() => null)
     ]);
     if (!ready || stopped) {
       const reason = stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED;
       return decline(reason, stopped || 'watchdog unavailable; nothing ran');
     }
-    if (!Number.isSafeInteger(ready.guardian) || ready.guardian < 1) {
+    if (!Number.isSafeInteger(guardian.pid) || guardian.pid < 1) {
       return decline(REASONS.SETUP, 'watchdog did not identify its admission holder; nothing ran');
     }
-    const admitted = await runAdmission(ready.guardian);
+    observed.stage = 'admission';
+    const admitted = await runAdmission(guardian.pid);
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
     if (admitted.capacity) return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
     if (admitted.interrupted) return decline(REASONS.INTERRUPTED, 'worker exited during admission; nothing ran');
@@ -505,10 +629,14 @@ async function runFullGate(root, label, entry, args) {
     const captured = JSON.parse(premise);
     process.stdout.write('FULL_GATE_SOURCE=' + JSON.stringify({ head: captured.head, target: captured.target, source: captured.files }) + '\n');
     const finished = new Promise(resolve => worker.on('message', message => {
-      if (message.kind === MESSAGES.BODY_EXIT) { bodyFinished = true; resolve(message); }
+      if (message.kind === MESSAGES.BODY_EXIT) {
+        observed.bodyExit = { code: Number.isSafeInteger(message.code) ? message.code : null, stage: observed.stage };
+        bodyFinished = true; resolve(message);
+      }
     }));
-    worker.send({ kind: MESSAGES.START }); bodyStarted = true;
-    const result = await Promise.race([finished, workerExit.then(value => ({ workerExited: true, signal: value.signal }))]);
+    bodyStarted = true; send(guardian, { kind: MESSAGES.START });
+    observed.stage = 'body';
+    const result = await Promise.race([finished, workerExit.then(value => ({ workerExited: true, signal: value.signal })), guardianExit.then(value => ({ workerExited: true, signal: value.signal }))]);
     if (stopped || result.workerExited) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker exited before reporting the body result');
     bodyResult = result.code;
     finalSnapshotRequired = true;
@@ -517,37 +645,61 @@ async function runFullGate(root, label, entry, args) {
     return decline(REASONS.SETUP, error.message);
   }
   finally {
+    observed.stage = 'cleanup';
     if (worker) {
-      if (bodyStarted && !bodyFinished) stop(stopped || REASONS.INTERRUPTED);
-      else {
-        if (worker.connected) worker.send({ kind: MESSAGES.CLOSE });
+      if (bodyStarted && !bodyFinished) stop(stopped || REASONS.INTERRUPTED, 'cleanup-stop');
+      else send(guardian, { kind: MESSAGES.DRAIN });
+      const guardianClosed = guardianExit ? await untilCallerDeadline(guardianExit) : { code: 0 };
+      if (guardianClosed.timedOut) {
+        stop(REASONS.TIMEOUT, 'guardian-cleanup-deadline');
+        try { guardian.kill('SIGKILL'); } catch {}
       }
-      const closed = await workerExit;
+      if ((!guardian || guardianCompletion?.code === 0) && !stopped) send(worker, { kind: MESSAGES.CLOSE });
+      else send(worker, { kind: MESSAGES.STOP, reason: stopped || REASONS.INTERRUPTED });
+      const closed = await untilCallerDeadline(workerExit);
       let peers;
-      try { peers = groupPeers(worker.pid, callerDeadline); } catch { peers = [null]; }
+      try {
+        peers = groupPeers(worker.pid, callerDeadline);
+        observed.initialGroupProbe = { ok: true, count: peers.length, errorCode: null };
+      } catch (error) {
+        peers = [null];
+        try { observed.initialGroupProbe = { ok: false, count: null, errorCode: gateErrorCode(error?.code) }; } catch {}
+      }
       const hadPeers = peers.length > 0;
       if (peers.length) {
         try { process.kill(-worker.pid, 'SIGKILL'); } catch {}
         await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, callerDeadline - Date.now()))));
-        try { peers = groupPeers(worker.pid, callerDeadline); } catch { peers = [null]; }
+        try {
+          peers = groupPeers(worker.pid, callerDeadline);
+          observed.finalGroupProbe = { ok: true, count: peers.length, errorCode: null };
+        } catch (error) {
+          peers = [null];
+          try { observed.finalGroupProbe = { ok: false, count: null, errorCode: gateErrorCode(error?.code) }; } catch {}
+        }
       }
       if (peers.length) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.CLEANUP, 'owned process group could not be verified as drained');
-        releaseScratch(scratch, callerDeadline);
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
       }
-      if (closed.code !== 0 || hadPeers) {
+      cleanupVerified = !guardian || (Boolean(guardianCompletion) && guardianCompletion.code === guardianClosed.code && !guardianClosed.signal);
+      if (!cleanupVerified) {
+        worker.stdout.destroy(); worker.stderr.destroy();
+        clearTimeout(timer);
+        removeInterruptHandlers();
+        return decline(REASONS.CLEANUP, 'owned writer completion is unknown; scratch custody retained');
+      }
+      if (closed.code !== 0 || hadPeers || guardianClosed.code !== 0) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const code = decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
-        releaseScratch(scratch, callerDeadline);
+        releaseOwnedScratch();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
       }
-      if (!releaseScratch(scratch, callerDeadline)) {
+      if (!releaseOwnedScratch()) {
         worker.stdout.destroy(); worker.stderr.destroy();
         clearTimeout(timer);
         removeInterruptHandlers();
@@ -563,13 +715,13 @@ async function runFullGate(root, label, entry, args) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const reason = stopped && stopped !== REASONS.TIMEOUT ? REASONS.INTERRUPTED : REASONS.TIMEOUT;
         const code = decline(reason, 'owned output did not finish within the gate deadline');
-        releaseScratch(scratch, callerDeadline);
+        releaseOwnedScratch();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
       }
     }
-    const released = releaseScratch(scratch, callerDeadline);
+    const released = releaseOwnedScratch();
     if (!released) {
       clearTimeout(timer);
       removeInterruptHandlers();
@@ -581,15 +733,16 @@ async function runFullGate(root, label, entry, args) {
     }
   }
   if (finalSnapshotRequired) {
+    observed.stage = 'source-verification';
     try {
       const finalRevision = revision(root, deadline);
-      await new Promise(resolve => setTimeout(resolve, 1));
+      await observePendingInterrupts();
       const sourceChanged = !sameSource(premise, finalRevision);
       if (stopped === REASONS.TIMEOUT || Date.now() >= deadline) return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
       if (stopped) return decline(REASONS.INTERRUPTED, 'source verification was interrupted');
       if (sourceChanged) return decline(REASONS.STALE, 'source changed during execution');
     } catch (error) {
-      await new Promise(resolve => setTimeout(resolve, 1));
+      await observePendingInterrupts();
       if (error.code === 'ETIMEDOUT' || stopped === REASONS.TIMEOUT || Date.now() >= deadline) {
         return decline(REASONS.TIMEOUT, 'source verification exceeded the gate deadline');
       }
@@ -603,4 +756,4 @@ async function runFullGate(root, label, entry, args) {
   return bodyResult;
 }
 
-module.exports = { canFinish, releaseScratch, noVerdict, REASONS, runFullGate, SCRATCH_ROOT, NO_VERDICT_SECRET, NO_VERDICT, MESSAGES, revision, relay, groupPeers, nodeOptionTokens, supervisorSnapshot, SUPERVISOR };
+module.exports = { WORKER_STOP_EVENTS, workerStopObservation, WATCHDOG_STOP_EVENTS, gateSyscallObservation, watchdogStopObservation, canFinish, releaseScratch, noVerdict, REASONS, runFullGate, SCRATCH_ROOT, NO_VERDICT_SECRET, NO_VERDICT, MESSAGES, CUSTODY, revision, relay, groupPeers, nodeOptionTokens, supervisorSnapshot, SUPERVISOR };
