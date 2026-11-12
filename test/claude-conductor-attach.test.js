@@ -37,13 +37,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function expectWithin(predicate, label, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
+async function expectWithin(predicate, label, fixtureProcess) {
+  let closed = false;
+  let failure;
+  fixtureProcess.closed.then(() => { closed = true; }, error => { closed = true; failure = error; });
+  while (!closed) {
+    if (await predicate() && !closed) return;
     await sleep(10);
   }
-  throw new Error(`${label} did not happen within ${timeoutMs}ms`);
+  if (failure) throw failure;
+  throw new Error(`${label} did not happen before the fixture process closed\n${fixtureProcess.stderr()}`);
 }
 
 function conductorFixture(t) {
@@ -155,7 +158,7 @@ deadline.unref();
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     await closed;
   });
-  return { child, stderr: () => stderr };
+  return { child, closed, stderr: () => stderr };
 }
 
 function spawnListener(t, f, command) {
@@ -184,11 +187,37 @@ function spawnListener(t, f, command) {
     await closed;
     fs.rmSync(deadlineDir, { recursive: true, force: true });
   });
-  return { child, stdout: () => stdout, stderr: () => stderr, async terminate() {
+  return { child, closed, stdout: () => stdout, stderr: () => stderr, async terminate() {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     await closed;
   } };
 }
+
+test('fixture waits accept readiness while the process is live', async () => {
+  let finish;
+  const closed = new Promise(resolve => { finish = resolve; });
+  let ready = false;
+  const waiting = expectWithin(() => ready, 'fixture readiness', { closed, stderr: () => '' });
+  queueMicrotask(() => { ready = true; });
+  await waiting;
+  finish();
+});
+
+test('fixture waits fail when the process closes before readiness', async () => {
+  let finish;
+  const closed = new Promise(resolve => { finish = resolve; });
+  const waiting = expectWithin(() => false, 'fixture readiness', { closed, stderr: () => '' });
+  finish();
+  await assert.rejects(waiting, /before the fixture process closed/);
+});
+
+test('fixture waits preserve startup errors', async () => {
+  const failure = new Error('fixture spawn failed');
+  const waiting = expectWithin(() => false, 'fixture readiness', {
+    closed: Promise.reject(failure), stderr: () => ''
+  });
+  await assert.rejects(waiting, error => error === failure);
+});
 
 test('conductor attach refuses changed identity before waking', () => {
   for (const change of [
@@ -227,13 +256,13 @@ async function runConductorCliScenario(t, command) {
   const messageId = command === 'claude-channel' ? '101' : '102';
   const content = `deliver through ${command}`;
   const f = conductorFixture(t);
-  spawnGateway(t, f, { messageId, content });
-  await expectWithin(() => fs.existsSync(path.join(f.dir, 'runtime.pid')), `${command} Gateway runtime pid`);
+  const gateway = spawnGateway(t, f, { messageId, content });
+  await expectWithin(() => fs.existsSync(path.join(f.dir, 'runtime.pid')), `${command} Gateway runtime pid`, gateway);
   const recovered = new SurfaceState(f.db);
   try {
     await expectWithin(() => recovered.getBinding(f.binding.channelId)?.readiness === READINESS.READY &&
       recovered.getIntakeWatermark(f.binding.channelId)?.state === READINESS.READY,
-    `${command} initial Gateway recovery`);
+    `${command} initial Gateway recovery`, gateway);
   } finally {
     recovered.close();
   }
@@ -247,17 +276,16 @@ async function runConductorCliScenario(t, command) {
   assert.equal(acceptedState.getMessage(messageId)?.state, MESSAGE_STATES.ACCEPTED);
   acceptedState.close();
   const listener = spawnListener(t, f, command);
-  try {
-    await expectWithin(() => fs.existsSync(f.socketPath), `${command} listener socket`);
-  } catch (error) {
-    error.message += `\n${listener.stderr()}`;
-    throw error;
-  }
-  await expectWithin(() => listener.stdout().includes(messageId), `held message delivery through ${command}`);
+  const delivery = {
+    closed: Promise.race([gateway.closed, listener.closed]),
+    stderr: () => `${gateway.stderr()}\n${listener.stderr()}`
+  };
+  await expectWithin(() => fs.existsSync(f.socketPath), `${command} listener socket`, delivery);
+  await expectWithin(() => listener.stdout().includes(messageId), `held message delivery through ${command}`, delivery);
   const observed = new SurfaceState(f.db);
   t.after(() => { try { observed.close(); } catch {} });
   await expectWithin(() => observed.getMessage(messageId)?.state === MESSAGE_STATES.SUBMITTED,
-    `${command} submitted held message`);
+    `${command} submitted held message`, delivery);
   if (command === 'claude-monitor') {
     const pointer = listener.stdout().trim().split('\n').map(line => {
       try { return JSON.parse(line); } catch { return null; }

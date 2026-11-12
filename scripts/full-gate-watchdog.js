@@ -16,6 +16,7 @@ const OBSERVATION_PHASE_BOUNDS = Object.freeze({
   SIGKILL: 'cleanup',
   orphan: 'cleanup'
 });
+const DARWIN_PROCESS_IDENTITY_FLAGS = Object.freeze(['-I', '-S', '-B']);
 const DARWIN_PROCESS_IDENTITY_SCRIPT = `
 import sys
 if sys.argv[1:2] == ['--table']:
@@ -57,11 +58,28 @@ def unique_identity(pid):
         return None
     return unique_id, pid_version
 
+def bsd_identity(pid):
+    before = unique_identity(pid)
+    if before is None:
+        return None
+    info = ProcBsdInfo()
+    if proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+        return None
+    after = unique_identity(pid)
+    if (before != after or info.pbi_pid != pid or info.pbi_start_tvsec <= 0
+            or info.pbi_start_tvusec >= 1000000):
+        return None
+    identity = ':'.join(map(str, (
+        info.pbi_start_tvsec, info.pbi_start_tvusec, before[0], before[1]
+    )))
+    return info, identity
+
 if sys.argv[1:2] == ['--table']:
     print('${COLLECTOR_CHECKPOINT_PREFIX}${COLLECTOR_CHECKPOINTS.IMPORTS}', flush=True)
     if len(sys.argv) < 4 or any(not value.isascii() or not value.isdecimal() for value in sys.argv[2:]):
         raise ValueError('invalid process scope')
     scope = [int(value) for value in sys.argv[2:]]
+    unresolved_scope = set(scope[2:])
     if any(pid <= 1 or pid > 0x7fffffff for pid in scope) or scope[1] != os.getppid():
         raise ValueError('process scope does not match its caller')
     list_pids = libproc.proc_listallpids
@@ -118,7 +136,16 @@ if sys.argv[1:2] == ['--table']:
         actual, parent, group, status = struct.unpack_from('=IIII', info.raw)
         if actual != pid:
             raise ValueError('process identifier changed')
-        rows.append(str(pid) + ' ' + str(parent) + ' ' + str(group) + ' ' + ('Z' if status == 5 else '?'))
+        identity = None
+        if pid != scope[1] and status != 5 and (group != scope[0] or pid in unresolved_scope):
+            observed = bsd_identity(pid)
+            if observed is not None:
+                captured_info, captured = observed
+                if (captured_info.pbi_pid, captured_info.pbi_ppid,
+                        captured_info.pbi_pgid, captured_info.pbi_status) == (pid, parent, group, status):
+                    identity = 'darwin:' + captured
+        row = str(pid) + ' ' + str(parent) + ' ' + str(group) + ' ' + ('Z' if status == 5 else '?')
+        rows.append(row + (' ' + identity if identity is not None else ''))
     print('${COLLECTOR_CHECKPOINT_PREFIX}${COLLECTOR_CHECKPOINTS.ROWS}', flush=True)
     print('\\n'.join(rows))
     sys.exit(0)
@@ -126,19 +153,9 @@ if sys.argv[1:2] == ['--table']:
 identities = {}
 for raw_pid in sys.argv[1:]:
     pid = int(raw_pid)
-    before = unique_identity(pid)
-    if before is None:
-        continue
-    info = ProcBsdInfo()
-    if proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-        continue
-    after = unique_identity(pid)
-    if (before != after or info.pbi_pid != pid or info.pbi_start_tvsec <= 0
-            or info.pbi_start_tvusec >= 1000000):
-        continue
-    identities[raw_pid] = ':'.join(map(str, (
-        info.pbi_start_tvsec, info.pbi_start_tvusec, before[0], before[1]
-    )))
+    observed = bsd_identity(pid)
+    if observed is not None:
+        identities[raw_pid] = observed[1]
 print(json.dumps(identities))
 `;
 let stopping = false;
@@ -237,7 +254,7 @@ async function readProcessIdentities(pids, phase) {
     return currentObservation(phase) ? identities : new Map();
   }
   if (process.platform !== 'darwin') return identities;
-  const result = await collector.run(phase, process.env.PYTHON || 'python3', ['-c', DARWIN_PROCESS_IDENTITY_SCRIPT, ...uniquePids.map(String)], { ...process.env, LC_ALL: 'C' });
+  const result = await collector.run(phase, process.env.PYTHON || 'python3', [...DARWIN_PROCESS_IDENTITY_FLAGS, '-c', DARWIN_PROCESS_IDENTITY_SCRIPT, ...uniquePids.map(String)], { ...process.env, LC_ALL: 'C' });
   try {
     identityObservation = gateSyscallObservation({ outcome: result.status === 0 ? 'subprocess-complete' : 'command-failed', pid: result.pid, status: result.status, signal: result.signal, errorCode: result.error?.code, childErrorCode: result.childErrorCode, failureOrigin: result.failureOrigin, timing: result.timing });
   } catch {}
@@ -255,22 +272,32 @@ function sameProcessIdentity(expected, actual) {
 }
 async function readProcessTable(phase) {
   processTableObservation = null;
-  if (!await holdCustody(phase)) return null;
   const nativeMonitor = process.platform === 'darwin' && phase.kind === 'monitor';
+  phase.nativeMonitor = nativeMonitor;
+  if (nativeMonitor) identityObservation = null;
+  if (!await holdCustody(phase)) return null;
+  const unresolvedScope = new Set([...escapedDescendants].filter(([, identity]) => identity === null).map(([pid]) => pid));
   const command = nativeMonitor ? process.env.PYTHON || 'python3' : 'ps';
   const args = nativeMonitor
-    ? ['-I', '-B', '-c', DARWIN_PROCESS_IDENTITY_SCRIPT, '--table', String(group), String(process.pid),
-      ...[...escapedDescendants].filter(([, identity]) => identity === null).map(([pid]) => String(pid))]
+    ? [...DARWIN_PROCESS_IDENTITY_FLAGS, '-c', DARWIN_PROCESS_IDENTITY_SCRIPT, '--table', String(group), String(process.pid),
+      ...[...unresolvedScope].map(String)]
     : ['-A', '-o', 'pid=,ppid=,pgid=,stat='];
   const result = await collector.run(phase, command, args, { ...process.env, LC_ALL: 'C' });
   try {
     processTableObservation = gateSyscallObservation({ outcome: result.status === 0 ? 'subprocess-complete' : 'command-failed', pid: result.pid, status: result.status, signal: result.signal, errorCode: result.error?.code, childErrorCode: result.childErrorCode, failureOrigin: result.failureOrigin, timing: result.timing });
   } catch {}
   if (result.status !== 0 || !currentObservation(phase)) return null;
+  const identities = new Map();
   const rows = result.stdout.split('\n').map(line => {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)$/);
+    const match = line.trim().match(nativeMonitor
+      ? /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)(?:\s+(\S+))?$/
+      : /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)$/);
     if (!match) return null;
-    return { pid: Number(match[1]), parent: Number(match[2]), pgid: Number(match[3]), state: match[4] };
+    const row = { pid: Number(match[1]), parent: Number(match[2]), pgid: Number(match[3]), state: match[4] };
+    const rememberedUnresolved = unresolvedScope.has(row.pid) && escapedDescendants.get(row.pid) === null;
+    if (nativeMonitor && row.pid !== process.pid && row.pid !== result.pid && (row.pgid !== group || rememberedUnresolved) && !row.state.startsWith('Z')
+        && /^darwin:[1-9]\d*:\d{1,6}:[1-9]\d*:[1-9]\d*$/.test(match[5] || '')) identities.set(row.pid, match[5]);
+    return row;
   }).filter(Boolean).filter(row => row.pid !== result.pid);
   if (!rows.some(row => row.pid === process.pid)) {
     if (processTableObservation) processTableObservation.outcome = 'self-missing';
@@ -278,9 +305,11 @@ async function readProcessTable(phase) {
   }
   // Native enumeration can truncate during churn, so only a full ps boundary may clear custody.
   phase.tableComplete = !nativeMonitor;
-  return { rows, scannerPid: result.pid };
+  const monitorIdentities = nativeMonitor ? Object.freeze({ phase, generation: phase.generation, rows, identities }) : undefined;
+  phase.monitorIdentities = monitorIdentities;
+  return { rows, scannerPid: result.pid, monitorIdentities };
 }
-async function rememberEscapedDescendants(rows, phase) {
+async function rememberEscapedDescendants(rows, phase, monitorIdentities) {
   const descendants = new Set([group, process.pid]);
   let changed = true;
   while (changed) {
@@ -297,9 +326,20 @@ async function rememberEscapedDescendants(rows, phase) {
     }
   }
   const unresolved = [...escapedDescendants]
-    .filter(([pid, identity]) => identity === null && rows.some(row => row.pid === pid && !row.state.startsWith('Z')))
+    .filter(([pid, identity]) => identity === null && descendants.has(pid)
+      && rows.some(row => row.pid === pid && !row.state.startsWith('Z')))
     .map(([pid]) => pid);
-  const identities = await readProcessIdentities(unresolved, phase);
+  let identities;
+  if (phase.nativeMonitor) {
+    identities = new Map();
+    if (monitorIdentities === phase.monitorIdentities && monitorIdentities?.phase === phase
+        && monitorIdentities.generation === phase.generation && monitorIdentities.rows === rows && currentObservation(phase)) {
+      for (const pid of unresolved) {
+        const identity = monitorIdentities.identities.get(pid);
+        if (identity) identities.set(pid, identity);
+      }
+    }
+  } else identities = await readProcessIdentities(unresolved, phase);
   if (!currentObservation(phase)) return;
   for (const [pid, identity] of identities) escapedDescendants.set(pid, identity);
 }
@@ -310,6 +350,7 @@ async function signalEscapedDescendants(signal, rows, phase) {
   const identities = await readProcessIdentities(candidates.map(([pid]) => pid), phase);
   if (!currentObservation(phase)) return;
   for (const [pid, expected] of candidates) {
+    if (!currentObservation(phase)) return;
     const row = byPid.get(pid);
     if (!row || row.state.startsWith('Z') || !sameProcessIdentity(expected, identities.get(pid))) continue;
     try { process.kill(pid, signal); } catch {}
@@ -339,7 +380,7 @@ async function monitorDescendants() {
     const snapshot = await readProcessTable(phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!snapshot) return stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
-    await rememberEscapedDescendants(snapshot.rows, phase);
+    await rememberEscapedDescendants(snapshot.rows, phase, snapshot.monitorIdentities);
     if (!stopping && phase.generation === observationGeneration && !currentObservation(phase)) stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
   } catch (error) { stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE, error); }
   finally { finishObservation(phase); }

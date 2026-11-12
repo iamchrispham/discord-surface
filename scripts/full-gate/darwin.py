@@ -166,15 +166,23 @@ def task_counts(resource_id):
     return started, exited
 
 
-def _coalition_members(resource_id, timeout, excluded=()):
-    result = subprocess.run(
-        ["ps", "-A", "-o", "pid="], capture_output=True, text=True,
-        check=False, timeout=max(0.01, timeout), env={**os.environ, "LC_ALL": "C"},
-    )
+def _coalition_members(resource_id, deadline, excluded=()):
+    remaining = deadline - clock_now()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline")
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid="], capture_output=True, text=True,
+            check=False, timeout=remaining, env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline") from error
     if result.returncode != 0:
         raise CapabilityError("process enumeration failed during coalition cleanup")
     members = []
     for field in result.stdout.split():
+        if not clock_now() < deadline:
+            raise CapabilityError("coalition enumeration exceeded the caller deadline")
         if not field.isdecimal():
             raise CapabilityError("process enumeration returned an invalid PID")
         pid = int(field)
@@ -186,10 +194,12 @@ def _coalition_members(resource_id, timeout, excluded=()):
             continue
         if identity is not None and identity["coalition_id"] == resource_id:
             members.append(identity)
+    if not clock_now() < deadline:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline")
     return members
 
 
-def _signal(identity, signal_number):
+def _signal(identity, signal_number, deadline):
     _, _, signal_with_token = _apis()
     current = identity_if_present(identity["pid"])
     if current is None or not same_process(identity, current):
@@ -197,6 +207,8 @@ def _signal(identity, signal_number):
     token = (ctypes.c_uint32 * 8)()
     token[5] = identity["pid"]
     token[7] = identity["pid_version"]
+    if deadline is not None and not clock_now() < deadline:
+        raise CapabilityError("identity-safe signal exceeded the caller deadline")
     result = signal_with_token(ctypes.byref(token), signal_number)
     if result == 0:
         return True
@@ -211,14 +223,15 @@ def _signal(identity, signal_number):
     return False
 
 
-def signal_identity(identity, signal_number):
-    return _signal(identity, signal_number)
+# Standalone fixture callers retain their existing external timeout.
+def signal_identity(identity, signal_number, deadline=None):
+    return _signal(identity, signal_number, deadline)
 
 
 def _signal_members(resource_id, signal_number, deadline, excluded=()):
-    members = _coalition_members(resource_id, deadline - clock_now(), excluded)
+    members = _coalition_members(resource_id, deadline, excluded)
     for identity in members:
-        _signal(identity, signal_number)
+        _signal(identity, signal_number, deadline)
 
 
 def _drained(resource_id, preserve, allow_reaped):
