@@ -19,18 +19,25 @@ from pathlib import Path
 SUPERVISOR_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR"
 LINUX_SUBREAPER = "linux-subreaper-v1"
 DARWIN_LAUNCHD = "darwin-launchd-v1"
+_DARWIN_OWNER = None
 SUPERVISOR_RECEIPT_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR_RECEIPT"
 SUPERVISOR_TOKEN_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN"
 NO_VERDICT = 98
 CLEANUP_RESERVE_SECONDS = 5
 TERMINATION_GRACE_SECONDS = 1
+SNAPSHOT_STOP_RESERVE_SECONDS = 2
 POLL_SECONDS = 0.025
 GATE_MODULE = Path(__file__).resolve().parents[2] / "scripts" / "full-gate.js"
+# Exit 4 is only the gate's own budget refusal. Any other snapshot failure is source or Git
+# infrastructure, which capture_snapshot raises as OSError so every caller reports no verdict.
 SNAPSHOT_PROGRAM = (
     "const gate = require(" + json.dumps(str(GATE_MODULE)) + ");"
     "try { process.stdout.write(gate.supervisorSnapshot(process.cwd(), "
     "process.argv[1])); } catch (error) {"
-    "process.stderr.write(error.message + '\\n'); process.exitCode = error.code === 'ETIMEDOUT' ? 98 : 4; }"
+    "process.stderr.write(error.message + '\\n'); process.exitCode = 1;"
+    "if (error.code === 'ETIMEDOUT') process.exitCode = 98;"
+    "else if (/^APERTURE_GATE_(?:TIME_LEFT_S|SLOWEST_RUN_S) must be a positive whole number$/.test(error.message))"
+    " process.exitCode = 4; }"
 )
 
 
@@ -38,10 +45,63 @@ class InvalidGateBudget(Exception):
     pass
 
 
-def no_verdict(reason, detail):
-    line = "APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + detail + "\n"
+class SnapshotCleanupError(OSError):
+    pass
+
+
+class JobRequestCancelled(InterruptedError):
+    pass
+
+
+def _write_job_output(descriptor, payload, deadline=None):
+    offset = 0
+    attempted = False
+    while offset < len(payload):
+        if attempted:
+            try:
+                if not clock_now() < deadline:
+                    break
+            except OSError:
+                break
+        attempted = True
+        written = 0
+        was_blocking = None
+        try:
+            was_blocking = os.get_blocking(descriptor)
+            os.set_blocking(descriptor, False)
+            written = os.write(descriptor, payload[offset:offset + 64 * 1024])
+        except (BlockingIOError, BrokenPipeError, OSError):
+            pass
+        finally:
+            if was_blocking is not None:
+                try:
+                    os.set_blocking(descriptor, was_blocking)
+                except OSError:
+                    pass
+        offset += written
+        if deadline is None or offset == len(payload):
+            break
+        try:
+            remaining = deadline - clock_now()
+        except OSError:
+            break
+        if not remaining > 0:
+            break
+        if not written:
+            time.sleep(min(POLL_SECONDS, remaining))
+    return offset
+
+
+def no_verdict(reason, detail, *, stdout_cursor=None, stdout_deadline=None):
+    prefix = "\n" if stdout_cursor and not stdout_cursor["output_line_start"] else ""
+    line = prefix + "APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + detail + "\n"
     try:
-        os.write(sys.stdout.fileno(), line.encode("utf-8", errors="replace"))
+        payload = line.encode("utf-8", errors="replace")
+        if stdout_cursor is None:
+            os.write(sys.stdout.fileno(), payload)
+        else:
+            stdout_cursor["verdict_delivery_complete"] = _write_job_output(sys.stdout.fileno(), payload, stdout_deadline) == len(payload)
+            stdout_cursor["retain_output"] = stdout_cursor.get("retain_output", False) or not stdout_cursor["verdict_delivery_complete"]
     except OSError:
         pass
     return NO_VERDICT
@@ -112,7 +172,33 @@ def wait_for_owned_children(deadline):
     while True:
         if not live_owned_children():
             return True
-        remaining = deadline - time.monotonic()
+        remaining = deadline - clock_now()
+        if remaining <= 0:
+            return False
+        time.sleep(min(POLL_SECONDS, remaining))
+
+
+def signal_group(pgid, signal_number):
+    # EPERM means the group remains but holds no live member, such as an exited leader not yet reaped.
+    try:
+        os.killpg(pgid, signal_number)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def wait_for_group_exit(process, deadline):
+    # The group id names no group only once every member, exited ones included, has been reaped.
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            # An exiting leader stops taking signals a moment before it can be reaped. Probe again once it is.
+            if process.returncode is None and process.poll() is not None:
+                continue
+        remaining = deadline - clock_now()
         if remaining <= 0:
             return False
         time.sleep(min(POLL_SECONDS, remaining))
@@ -120,30 +206,27 @@ def wait_for_owned_children(deadline):
 
 def stop_owned_processes(process, deadline):
     if sys.platform == "darwin":
-        if process is None or process.poll() is not None:
+        if process is None:
             return True
-        try:
-            process.terminate()
-        except ProcessLookupError:
-            pass
-        term_deadline = min(deadline, time.monotonic() + TERMINATION_GRACE_SECONDS)
-        while process.poll() is None and time.monotonic() < term_deadline:
-            time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
-        if process.poll() is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        while process.poll() is None and time.monotonic() < deadline:
-            time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
-        return process.poll() is not None
+        if process.returncode is None:
+            # The verifier leads its own group. Until it is reaped, its pid keeps the group id from naming another group.
+            signal_group(process.pid, signal.SIGTERM)
+            term_deadline = min(deadline, clock_now() + TERMINATION_GRACE_SECONDS)
+            while True:
+                now = clock_now()
+                if not signal_group(process.pid, signal.SIGTERM if now < term_deadline else signal.SIGKILL):
+                    break
+                if now >= deadline:
+                    return False
+                time.sleep(min(POLL_SECONDS, max(0, deadline - now)))
+        return wait_for_group_exit(process, min(deadline, clock_now() + TERMINATION_GRACE_SECONDS))
     if process is not None and process.poll() is None:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    term_deadline = min(deadline, time.monotonic() + TERMINATION_GRACE_SECONDS)
-    while time.monotonic() < term_deadline:
+    term_deadline = min(deadline, clock_now() + TERMINATION_GRACE_SECONDS)
+    while clock_now() < term_deadline:
         process_live = process is not None and process.poll() is None
         excluded = {process.pid} if process_live else set()
         children = live_owned_children(excluded)
@@ -151,14 +234,14 @@ def stop_owned_processes(process, deadline):
             signal_owned_child(pid, signal.SIGTERM)
         if not process_live and not children:
             return True
-        time.sleep(min(POLL_SECONDS, max(0, term_deadline - time.monotonic())))
+        time.sleep(min(POLL_SECONDS, max(0, term_deadline - clock_now())))
 
     if process is not None and process.poll() is None:
         try:
             process.kill()
         except ProcessLookupError:
             pass
-    while time.monotonic() < deadline:
+    while clock_now() < deadline:
         process_live = process is not None and process.poll() is None
         excluded = {process.pid} if process_live else set()
         children = live_owned_children(excluded)
@@ -166,12 +249,16 @@ def stop_owned_processes(process, deadline):
             signal_owned_child(pid, signal.SIGKILL)
         if not process_live and not children:
             return True
-        time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+        time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
     return not (process is not None and process.poll() is None) and not live_owned_children()
 
 
-def capture_snapshot(root, environment, phase, deadline, interrupted=None):
-    remaining = deadline - time.monotonic()
+def capture_snapshot(root, environment, phase, deadline, interrupted, *, stop_deadline):
+    # Leave the stop TERM grace plus time to see KILL land before stop_deadline.
+    window = min(deadline, stop_deadline - SNAPSHOT_STOP_RESERVE_SECONDS)
+    if interrupted is not None and interrupted.is_set():
+        raise InterruptedError("source verification interrupted")
+    remaining = window - clock_now()
     if remaining <= 0:
         raise TimeoutError("source verification exceeded the gate deadline")
     process = subprocess.Popen(
@@ -183,32 +270,56 @@ def capture_snapshot(root, environment, phase, deadline, interrupted=None):
         text=True,
         start_new_session=True,
     )
-    while True:
-        remaining = deadline - time.monotonic()
-        if interrupted is not None and interrupted.is_set():
-            if not stop_owned_processes(process, deadline):
-                raise TimeoutError("interrupted source verifier did not stop before the caller deadline")
-            raise InterruptedError("source verification interrupted")
-        if remaining <= 0:
-            stop_owned_processes(process, deadline)
-            raise TimeoutError("source verification exceeded the gate deadline")
-        try:
-            output, error = process.communicate(timeout=min(remaining, POLL_SECONDS))
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    if sys.platform == "linux":
-        cleanup_deadline = min(deadline, time.monotonic() + CLEANUP_RESERVE_SECONDS)
-        if not wait_for_owned_children(cleanup_deadline):
-            stop_owned_processes(None, deadline)
+    failure = None
+    result = None
+    try:
+        while True:
+            remaining = window - clock_now()
+            if interrupted is not None and interrupted.is_set():
+                raise InterruptedError("source verification interrupted")
+            if remaining <= 0:
+                raise TimeoutError("source verification exceeded the gate deadline")
+            try:
+                output, error = process.communicate(timeout=min(remaining, POLL_SECONDS))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        cleanup_deadline = min(window, clock_now() + CLEANUP_RESERVE_SECONDS)
+        if sys.platform == "linux":
+            drained = wait_for_owned_children(cleanup_deadline)
+        else:
+            drained = wait_for_group_exit(process, cleanup_deadline)
+        if not drained:
             raise TimeoutError("source snapshot left live descendants")
-    if process.returncode == 4:
-        raise InvalidGateBudget(error.strip() or "gate budget is invalid")
-    if process.returncode == NO_VERDICT:
-        raise TimeoutError(error.strip() or "source verification exceeded the gate deadline")
-    if process.returncode != 0:
-        raise OSError(error.strip() or "source snapshot failed")
-    return json.loads(output)
+        if process.returncode == 4:
+            raise InvalidGateBudget(error.strip() or "gate budget is invalid")
+        if process.returncode == NO_VERDICT:
+            raise TimeoutError(error.strip() or "source verification exceeded the gate deadline")
+        if process.returncode != 0:
+            raise OSError(error.strip() or "source snapshot failed")
+        result = json.loads(output)
+    except BaseException as error:
+        failure = error
+    finally:
+        cleanup_error = None
+        if failure is not None:
+            try:
+                if not stop_owned_processes(process, stop_deadline):
+                    raise OSError("bounded verifier stop did not establish completion")
+                process.wait(timeout=0)
+            except BaseException as error:
+                cleanup_error = error
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except BaseException as error:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise SnapshotCleanupError("source verifier cleanup uncertain for owned pid " + str(process.pid)) from cleanup_error
+    if failure is not None:
+        raise failure
+    return result
 
 
 class SupervisorReceipt:
@@ -263,10 +374,12 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         return 4
     deadline = started + budget
     preflight_deadline = deadline - CLEANUP_RESERVE_SECONDS
-    if preflight_deadline <= time.monotonic():
+    if preflight_deadline <= clock_now():
         return no_verdict("capacity", "caller budget leaves no time for source verification and cleanup")
     try:
-        before = capture_snapshot(root, environment, "before", preflight_deadline, interrupted)
+        before = capture_snapshot(root, environment, "before", preflight_deadline, interrupted, stop_deadline=deadline)
+    except SnapshotCleanupError as error:
+        return no_verdict("cleanup", str(error))
     except InvalidGateBudget as error:
         print(str(error), file=sys.stderr)
         return 4
@@ -278,7 +391,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         return no_verdict("setup", str(error))
 
     deadline = started + min(budget, before["budget"])
-    remaining = int(deadline - time.monotonic() - CLEANUP_RESERVE_SECONDS)
+    remaining = int(deadline - clock_now() - CLEANUP_RESERVE_SECONDS)
     if remaining - before["slowest"] < 1:
         return no_verdict("capacity", "caller budget leaves no time for admission plus execution")
     environment["APERTURE_GATE_TIME_LEFT_S"] = str(remaining)
@@ -298,10 +411,10 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
             if interrupted.is_set():
                 reason, detail = "interrupted", "full gate was interrupted"
                 break
-            if time.monotonic() >= run_deadline:
+            if clock_now() >= run_deadline:
                 reason, detail = "timeout", "full gate exceeded the caller deadline"
                 break
-            time.sleep(min(POLL_SECONDS, max(0, run_deadline - time.monotonic())))
+            time.sleep(min(POLL_SECONDS, max(0, run_deadline - clock_now())))
         if reason:
             if not stop_owned_processes(process, deadline):
                 reason, detail = "cleanup", "supervised process tree did not stop before the caller deadline"
@@ -314,7 +427,9 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                     reason, detail = "timeout", "descendant ownership could not be established before the caller deadline"
 
         try:
-            after = capture_snapshot(root, environment, "after", deadline, interrupted)
+            after = capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
+        except SnapshotCleanupError as error:
+            reason, detail = "cleanup", str(error)
         except InterruptedError as error:
             if reason is None:
                 reason, detail = "interrupted", str(error)
@@ -342,7 +457,9 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
             if not stop_owned_processes(process, deadline):
                 return no_verdict("cleanup", "supervised process tree did not stop before the caller deadline")
         try:
-            capture_snapshot(root, environment, "after", deadline, interrupted)
+            capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
+        except SnapshotCleanupError as snapshot_error:
+            return no_verdict("cleanup", str(snapshot_error))
         except Exception:
             return no_verdict("stale", "unable to verify source after setup failure")
         return no_verdict("setup", "full gate command could not start: " + str(error))
@@ -351,18 +468,27 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
 
 
 def load_darwin_owner():
-    sys.dont_write_bytecode = True
-    module_path = Path(__file__).resolve().with_name("darwin.py")
-    spec = importlib.util.spec_from_file_location("full_gate_darwin", module_path)
-    if spec is None or spec.loader is None:
-        raise OSError("Darwin process-ownership helper could not load")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    global _DARWIN_OWNER
+    if _DARWIN_OWNER is None:
+        sys.dont_write_bytecode = True
+        module_path = Path(__file__).resolve().with_name("darwin.py")
+        spec = importlib.util.spec_from_file_location("full_gate_darwin", module_path)
+        if spec is None or spec.loader is None:
+            raise OSError("Darwin process-ownership helper could not load")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _DARWIN_OWNER = module
+    return _DARWIN_OWNER
+
+
+def clock_now():
+    if sys.platform == "darwin":
+        return load_darwin_owner().clock_now()
+    return time.monotonic()
 
 
 def _launchctl(launchctl, arguments, deadline):
-    remaining = deadline - time.monotonic()
+    remaining = deadline - clock_now()
     if remaining <= 0:
         raise TimeoutError("launchd operation exceeded the caller deadline")
     try:
@@ -399,8 +525,8 @@ def _bootout(launchctl, service, deadline):
         return True
     if result.returncode != 0:
         return False
-    while time.monotonic() < deadline:
-        time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+    while clock_now() < deadline:
+        time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
         state = _service_state(launchctl, service, deadline)
         if not state["present"]:
             return True
@@ -424,86 +550,232 @@ def _copy_private_source(source, destination):
         raise OSError("private launchd source copy failed verification")
 
 
-def _read_job_state(path):
+def _read_job_state(path, owner, token, identity=None):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             state = json.load(handle)
     except FileNotFoundError:
         return None
-    if not isinstance(state, dict) or not isinstance(state.get("state"), str):
-        raise ValueError("launchd guardian returned an invalid state record")
+    if not isinstance(state, dict) or state.get("launch_token") != token:
+        raise ValueError("guardian state run did not match")
+    owner.require_clock_contract(state.get("clock_contract"))
+    contracts = {
+        "ready": ("ready", False, False),
+        "command": ("running", False, False),
+        "body-quiescent": ("running", False, False),
+        "normal-after-complete": ("running", False, False),
+        "fallback-complete": ("running", False, False),
+        "retired": ("finished", True, True),
+        "cleanup-hold": ("cleanup-failed", True, False),
+        "failed": ("failed", True, False),
+    }
+    phase = state.get("phase")
+    if not isinstance(phase, str) or phase not in contracts:
+        raise ValueError("guardian state phase is invalid")
+    expected_state, sealed, quiescent = contracts[phase]
+    if (state.get("state") != expected_state
+            or type(state.get("sealed")) is not bool or state["sealed"] is not sealed
+            or type(state.get("quiescent")) is not bool or state["quiescent"] is not quiescent
+            or type(state.get("body_quiescent")) is not bool
+            or state["body_quiescent"] is not (phase == "body-quiescent")
+            or type(state.get("sequence")) is not int or state["sequence"] < 0):
+        raise ValueError("guardian state lifecycle fields are invalid")
+    reported = state.get("identity")
+    if reported is None:
+        if phase != "failed" or identity is not None:
+            raise ValueError("guardian state identity is missing")
+    else:
+        keys = ("pid", "unique_id", "pid_version", "start_sec", "start_usec", "coalition_id")
+        if (not isinstance(reported, dict)
+                or any(type(reported.get(key)) is not int for key in keys)
+                or reported["pid"] < 1 or reported["coalition_id"] < 1
+                or any(reported[key] < 0 for key in keys)):
+            raise ValueError("guardian state identity is invalid")
+        if identity is not None and not owner.same_process(identity, reported):
+            raise OSError("guardian phase identity changed")
+    for key in ("reason", "detail", "body_reason", "body_detail"):
+        if state.get(key) is not None and not isinstance(state[key], str):
+            raise ValueError("guardian state diagnostic is invalid")
+    if phase in ("retired", "cleanup-hold", "failed"):
+        if type(state.get("code")) is not int or phase != "retired" and state["code"] != NO_VERDICT:
+            raise ValueError("guardian terminal result is invalid")
+    if phase == "ready" and state["sequence"] != 0:
+        raise ValueError("guardian readiness sequence is invalid")
+    if phase == "body-quiescent" and type(state.get("body_code")) is not int:
+        raise ValueError("guardian body result is invalid")
+    if phase in ("normal-after-complete", "fallback-complete"):
+        failure = state.get("after_failure")
+        if failure is None:
+            if not isinstance(state.get("after"), dict) or "snapshot" not in state["after"]:
+                raise ValueError("guardian comparison data is invalid")
+        elif (not isinstance(failure, dict)
+                or failure.get("reason") not in ("cleanup", "setup", "interrupted", "timeout", "stale")
+                or not isinstance(failure.get("detail"), str)):
+            raise ValueError("guardian comparison failure is invalid")
     return state
 
 
-def _stream_stdout(path, offset):
+def _stream_stdout(path, cursor, final=False):
+    offset = cursor["offset"]
     try:
         with open(path, "rb") as handle:
             handle.seek(offset)
-            payload = handle.read()
+            payload = handle.read(64 * 1024)
     except FileNotFoundError:
         return offset
+    marker = b"APERTURE-GATE-INDETERMINATE reason="
+    pending = cursor.get("pending_marker")
+    if pending is not None:
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            end = offset + newline + 1
+            if cursor.get("verdict") is None:
+                cursor["verdict"] = (pending, end)
+            cursor.update(offset=end, pending_marker=None, source_line_start=True)
+            return end
+        if final and len(payload) < 64 * 1024:
+            cursor.update(offset=pending, pending_marker=None, ordinary_until=offset + len(payload))
+            return pending
+        cursor["offset"] += len(payload)
+        return cursor["offset"]
     if not payload:
         return offset
-    try:
-        was_blocking = os.get_blocking(sys.stdout.fileno())
-        os.set_blocking(sys.stdout.fileno(), False)
-        os.write(sys.stdout.fileno(), payload)
-        os.set_blocking(sys.stdout.fileno(), was_blocking)
-        return offset + len(payload)
-    except (BlockingIOError, BrokenPipeError, OSError):
-        try:
-            os.set_blocking(sys.stdout.fileno(), True)
-        except OSError:
-            pass
-        return offset + len(payload)
+    ordinary_until = cursor.get("ordinary_until", 0)
+    if offset < ordinary_until:
+        payload = payload[:ordinary_until - offset]
+    else:
+        at = 0 if cursor["source_line_start"] and payload.startswith(marker) else payload.find(b"\n" + marker) + 1
+        if at == 0 and not (cursor["source_line_start"] and payload.startswith(marker)):
+            at = -1
+        if at == 0:
+            newline = payload.find(b"\n")
+            if newline >= 0:
+                end = offset + newline + 1
+                if cursor.get("verdict") is None:
+                    cursor["verdict"] = (offset, end)
+                cursor.update(offset=end, source_line_start=True)
+                return end
+            if not final or len(payload) == 64 * 1024:
+                cursor.update(offset=offset + len(payload), pending_marker=offset)
+                return cursor["offset"]
+        elif at > 0:
+            payload = payload[:at]
+        if at < 0 and (not final or len(payload) == 64 * 1024):
+            tail_at = payload.rfind(b"\n") + 1
+            if tail_at or cursor["source_line_start"]:
+                tail = payload[tail_at:]
+                if tail and marker.startswith(tail):
+                    payload = payload[:tail_at]
+    if not payload:
+        return offset
+    written = _write_job_output(sys.stdout.fileno(), payload)
+    if written:
+        cursor["source_line_start"] = cursor["output_line_start"] = payload[written - 1:written] == b"\n"
+        cursor["offset"] += written
+    return cursor["offset"]
 
 
-def _emit_job_stderr(path, stdout_path, result, emit):
+def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
     if not emit:
-        return
+        return True
     try:
         output = Path(path).read_bytes()
     except OSError:
-        return
-    marker = b"APERTURE-GATE-INDETERMINATE"
+        output = b""
+    marker = b"APERTURE-GATE-INDETERMINATE reason="
     if result == NO_VERDICT:
-        try:
-            if marker in Path(stdout_path).read_bytes():
-                return
-        except OSError:
-            pass
-        for line in output.splitlines(keepends=True):
-            if marker in line:
-                os.write(sys.stderr.fileno(), line)
-                return
-    if output:
-        os.write(sys.stderr.fileno(), output)
+        saved = cursor.get("verdict")
+        verdict = None
+        if saved is not None:
+            with open(stdout_path, "rb") as handle:
+                handle.seek(saved[0])
+                verdict = handle.read(saved[1] - saved[0])
+        else:
+            verdict = next((line for line in output.splitlines(keepends=True)
+                if line.startswith(marker) and line.endswith(b"\n")), None)
+        if verdict is not None:
+            prefix = b"\n" if not cursor["output_line_start"] else b""
+            cursor["verdict_delivery_complete"] = _write_job_output(sys.stdout.fileno(), prefix + verdict, deadline) == len(prefix + verdict)
+            cursor["retain_output"] = cursor.get("retain_output", False) or not cursor["verdict_delivery_complete"]
+            return True
+    # Terminal selection has already rejected any earlier child verdict.
+    output = b"".join(line for line in output.splitlines(keepends=True)
+        if not (line.startswith(marker) and line.endswith(b"\n")))
+    complete = _write_job_output(sys.stderr.fileno(), output, deadline) == len(output)
+    cursor["retain_output"] = cursor.get("retain_output", False) or not complete
+    return complete
 
 
-def _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path=None, identity_verified=False):
+def _write_job_request(path, token, owner, identity, sequence, phase, interrupted, **values):
+    cancelled = interrupted.is_set()
+    requested_phase = phase
+    if cancelled:
+        phase = "stop"
+        values = {"result_code": NO_VERDICT, "reason": "interrupted", "detail": "caller cancelled before phase publication"}
+    payload = {"launch_token": token, "clock_contract": owner.CLOCK_CONTRACT,
+        "identity": identity, "sequence": sequence, "phase": phase, "cancelled": cancelled, **values}
+    temporary = path + ".phase-" + str(sequence)
+    _write_private_file(temporary, json.dumps(payload, separators=(",", ":")).encode("ascii"))
+    os.replace(temporary, path)
+    if cancelled and requested_phase != "stop":
+        raise JobRequestCancelled("caller cancellation sealed productive dispatch")
+
+
+def _wait_job_phase(path, owner, identity, token, phases, sequence, deadline, interrupted, stdout_path, cursor):
+    while clock_now() < deadline and not interrupted.is_set():
+        _stream_stdout(stdout_path, cursor)
+        state = _read_job_state(path, owner, token, identity)
+        if state is not None:
+            observed = state["sequence"]
+            if observed > sequence or state["sealed"] is True and observed != sequence:
+                raise OSError("guardian phase sequence changed")
+            if state["sealed"] is True:
+                return state, cursor["offset"]
+            if state["phase"] in phases and observed == sequence:
+                return state, cursor["offset"]
+        time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
+    return None, cursor["offset"]
+
+
+def _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path=None, identity_verified=False, *, token=None, sequence=None, terminal_state=None):
+    if not status_path or not isinstance(token, str) or type(sequence) is not int or sequence < 0:
+        return False
     try:
-        removed = _bootout(launchctl, service, deadline)
-    except (OSError, TimeoutError):
-        return False
-    if not removed:
-        return False
-    if identity is None and status_path:
-        try:
-            state = _read_job_state(status_path)
-            reported = state.get("identity") if state else None
-            if isinstance(reported, dict):
-                identity = owner.joined_identity(int(reported["pid"]))
-                if not owner.same_process(reported, identity):
+        state = _read_job_state(status_path, owner, token, identity)
+        reported = state.get("identity") if state else None
+        if identity is None and isinstance(reported, dict):
+            identity = reported
+            actual = owner.identity_if_present(int(identity["pid"]))
+            if actual is not None and not owner.same_process(identity, actual):
+                return False
+        if identity is None:
+            return False
+        signalled = False
+        while True:
+            if (state and state["phase"] == "retired" and state["sequence"] == sequence
+                    and state["sealed"] is True and state["quiescent"] is True):
+                if terminal_state is not None:
+                    terminal_state.update(state)
+                if not clock_now() < deadline:
                     return False
-        except (owner.CapabilityError, OSError, ValueError, KeyError, TypeError):
-            return False
-    if identity is None:
-        return False
-    try:
-        if not owner.drain(identity["coalition_id"], deadline, allow_reaped=identity_verified):
-            return False
-        return not _service_state(launchctl, service, deadline)["present"]
-    except (owner.CapabilityError, OSError, TimeoutError):
+                if not owner.drain(identity["coalition_id"], deadline, preserve=identity, allow_reaped=identity_verified):
+                    return False
+                if not _bootout(launchctl, service, deadline):
+                    return False
+                return owner.drain(identity["coalition_id"], deadline, allow_reaped=identity_verified) and not _service_state(launchctl, service, deadline)["present"]
+            if not clock_now() < deadline:
+                return False
+            current = owner.identity_if_present(int(identity["pid"]))
+            if current is None or not owner.same_process(identity, current):
+                return False
+            if not clock_now() < deadline:
+                return False
+            if not signalled:
+                owner.signal_identity(identity, signal.SIGTERM, deadline)
+                signalled = True
+            time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
+            state = _read_job_state(status_path, owner, token, identity)
+    except (owner.CapabilityError, OSError, TimeoutError, ValueError, KeyError, TypeError):
         return False
 
 
@@ -520,10 +792,12 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         return 4
     deadline = started + budget
     preflight_deadline = deadline - CLEANUP_RESERVE_SECONDS
-    if preflight_deadline <= time.monotonic():
+    if preflight_deadline <= clock_now():
         return no_verdict("capacity", "caller budget leaves no time for source verification and cleanup")
     try:
-        before = capture_snapshot(root, environment, "before", preflight_deadline, interrupted)
+        before = capture_snapshot(root, environment, "before", preflight_deadline, interrupted, stop_deadline=deadline)
+    except SnapshotCleanupError as error:
+        return no_verdict("cleanup", str(error))
     except InvalidGateBudget as error:
         print(str(error), file=sys.stderr)
         return 4
@@ -534,10 +808,17 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return no_verdict("setup", str(error))
 
-    remaining = int(deadline - time.monotonic() - CLEANUP_RESERVE_SECONDS)
+    remaining = int(deadline - clock_now() - CLEANUP_RESERVE_SECONDS)
     if remaining - before["slowest"] < 1:
         return no_verdict("capacity", "caller budget leaves no time for admission plus execution")
     environment["APERTURE_GATE_TIME_LEFT_S"] = str(remaining)
+    reason = None
+    detail = None
+    sequence = 0
+    output_offset = 0
+    output_cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    retirement = {}
+    after_failure = None
     owner = None
     scratch = None
     owned_service = False
@@ -569,6 +850,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             return no_verdict("setup", "the unique launchd label was already occupied")
         spec_payload = json.dumps({
             "state_path": status_path,
+            "clock_contract": owner.CLOCK_CONTRACT,
             "ack_path": ack_path,
             "deadline": deadline,
             "run_deadline": deadline - CLEANUP_RESERVE_SECONDS,
@@ -577,6 +859,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             "command": command,
             "cwd": str(root),
             "environment": environment,
+            "snapshot_program": SNAPSHOT_PROGRAM,
         }, separators=(",", ":")).encode("utf-8")
         _write_private_file(spec_path, spec_payload)
         runner = Path(__file__).resolve().with_name("darwin-runner.py")
@@ -584,6 +867,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         owner_copy = os.path.join(scratch, "darwin.py")
         _copy_private_source(runner, runner_copy)
         _copy_private_source(runner.with_name("darwin.py"), owner_copy)
+        _copy_private_source(Path(__file__).resolve(), os.path.join(scratch, "supervisor.py"))
         plist = {
             "Label": label,
             "ProgramArguments": [str(Path(sys.executable).resolve()), "-I", "-B", runner_copy, spec_path],
@@ -602,7 +886,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         result = _launchctl(launchctl, ["bootstrap", domain, plist_path], deadline)
         if result.returncode != 0:
             detail = (result.stderr + result.stdout).strip() or "launchctl bootstrap returned " + str(result.returncode)
-            if _darwin_cleanup(owner, launchctl, service, None, deadline, status_path, False):
+            if _darwin_cleanup(owner, launchctl, service, None, deadline, status_path, False, token=nonce, sequence=sequence):
                 owned_service = False
                 return no_verdict("setup", "temporary launchd job did not start: " + detail)
             custody = {
@@ -616,118 +900,168 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             )
             return no_verdict("cleanup", "launchd bootstrap did not prove allocation drain for " + service)
 
-        output_offset = 0
-        job_state = None
-        ready_validated = False
-        result_code = NO_VERDICT
-        reason = None
-        detail = None
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
-        while time.monotonic() < run_deadline:
-            output_offset = _stream_stdout(stdout_path, output_offset)
-            if interrupted.is_set():
-                reason, detail = "interrupted", "full gate was interrupted"
+        state, output_offset = _wait_job_phase(status_path, owner, None, nonce, ("ready",), 0, run_deadline,
+            interrupted, stdout_path, output_cursor)
+        if state is None:
+            reason = "interrupted" if interrupted.is_set() else "timeout"
+            raise OSError("guardian readiness did not complete")
+        owner.require_clock_contract(state.get("clock_contract"))
+        reported = state.get("identity")
+        if state.get("phase") != "ready" or not isinstance(reported, dict):
+            raise OSError("launchd guardian did not establish readiness")
+        identity = owner.joined_identity(int(reported["pid"]))
+        if not owner.same_process(reported, identity) or identity["coalition_id"] == controller["coalition_id"]:
+            raise OSError("launchd guardian identity changed")
+        counts = owner.task_counts(identity["coalition_id"])
+        service_state = _service_state(launchctl, service, deadline)
+        if counts[0] < 1 or counts[1] > counts[0] or not service_state["present"] or service_state["pid"] != identity["pid"] or service_state["state"] != "running":
+            raise OSError("launchd service identity did not match its ready guardian")
+        identity_verified = True
+        sequence += 1
+        _write_job_request(ack_path, nonce, owner, identity, sequence, "command", interrupted)
+        state, output_offset = _wait_job_phase(status_path, owner, identity, nonce, ("body-quiescent",), sequence,
+            run_deadline, interrupted, stdout_path, output_cursor)
+        if state is None:
+            reason = "interrupted" if interrupted.is_set() else "timeout"
+            raise OSError("body did not establish quiescence before relay")
+        if state["phase"] != "body-quiescent" or state["body_quiescent"] is not True:
+            reason = "cleanup"
+            raise OSError("body cleanup remains unresolved")
+        result_code = int(state["body_code"])
+        reason, detail = state.get("body_reason"), state.get("body_detail")
+        output_cursor["retain_output"] = True
+        while not interrupted.is_set() and clock_now() < run_deadline:
+            next_offset = _stream_stdout(stdout_path, output_cursor, final=True)
+            output_size = os.stat(stdout_path).st_size
+            if next_offset == output_size and output_cursor.get("pending_marker") is None:
+                output_cursor["retain_output"] = False
+                output_offset = next_offset
                 break
-            job_state = _read_job_state(status_path)
-            if job_state is not None:
-                if job_state["state"] == "ready" and not ready_validated:
-                    reported = job_state.get("identity")
-                    if not isinstance(reported, dict):
-                        reason, detail = "setup", "launchd guardian did not establish process identity"
-                        break
-                    identity = owner.joined_identity(int(reported["pid"]))
-                    if not owner.same_process(reported, identity):
-                        reason, detail = "setup", "launchd guardian identity changed"
-                        break
-                    if identity["coalition_id"] == controller["coalition_id"]:
-                        reason, detail = "setup", "launchd job shares the caller resource coalition"
-                        break
-                    counts = owner.task_counts(identity["coalition_id"])
-                    if counts[0] < 1 or counts[1] > counts[0]:
-                        reason, detail = "setup", "launchd guardian coalition counters are invalid"
-                        break
-                    service_state = _service_state(launchctl, service, deadline)
-                    if not service_state["present"] or service_state["pid"] != identity["pid"] or service_state["state"] != "running":
-                        reason, detail = "setup", "launchd service identity did not match its ready guardian"
-                        break
-                    identity_verified = True
-                    _write_private_file(ack_path, (nonce + "\n").encode("ascii"))
-                    ready_validated = True
-                elif job_state["state"] in ("running", "finished", "interrupted", "cleanup-failed") and not ready_validated:
-                    reason, detail = "setup", "launchd guardian skipped verified readiness"
-                    break
-                if job_state["state"] == "finished":
-                    result_code = int(job_state["code"])
-                    break
-                if job_state["state"] == "interrupted":
-                    reason, detail = "interrupted", str(job_state.get("reason", "launchd guardian was interrupted"))
-                    break
-                if job_state["state"] == "failed":
-                    reason, detail = "setup", str(job_state.get("detail", "launchd guardian could not start"))
-                    break
-                if job_state["state"] == "cleanup-failed":
-                    reason, detail = "cleanup", str(job_state.get("detail", "launchd guardian cleanup failed"))
-                    break
-            time.sleep(min(POLL_SECONDS, max(0, run_deadline - time.monotonic())))
+            if next_offset == output_offset:
+                time.sleep(min(POLL_SECONDS, max(0, run_deadline - clock_now())))
+            output_offset = next_offset
         else:
-            reason, detail = "timeout", "full gate exceeded the caller deadline"
-        if interrupted.is_set() and reason is None:
-            reason, detail = "interrupted", "full gate was interrupted"
-
-        if identity is not None:
-            state = _service_state(launchctl, service, deadline)
-            if reason is None and state["present"] and state["state"] not in ("exited", "not running"):
-                while time.monotonic() < deadline - 0.1:
-                    output_offset = _stream_stdout(stdout_path, output_offset)
-                    time.sleep(min(POLL_SECONDS, max(0, deadline - 0.1 - time.monotonic())))
-                    state = _service_state(launchctl, service, deadline)
-                    if not state["present"] or state["state"] in ("exited", "not running"):
-                        break
-                if state["present"] and state["state"] not in ("exited", "not running"):
-                    reason, detail = "cleanup", "launchd guardian did not exit after command completion"
-        if owned_service:
-            if not _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path, identity_verified):
-                reason, detail = "cleanup", "temporary launchd job or resource coalition did not drain"
-            else:
-                owned_service = False
-        output_offset = _stream_stdout(stdout_path, output_offset)
-
-        try:
-            after = capture_snapshot(root, environment, "after", deadline, interrupted)
-        except InterruptedError as error:
             if reason is None:
-                reason, detail = "interrupted", str(error)
-        except TimeoutError as error:
+                reason = "interrupted" if interrupted.is_set() else "timeout"
+                detail = "final stdout relay incomplete after body exit " + str(result_code)
+        sequence += 1
+        _write_job_request(ack_path, nonce, owner, identity, sequence, "normal-after", interrupted)
+        state, output_offset = _wait_job_phase(status_path, owner, identity, nonce, ("normal-after-complete",), sequence,
+            deadline, interrupted, stdout_path, output_cursor)
+        if state is None or state.get("phase") != "normal-after-complete":
+            raise OSError("source-after-unavailable: guardian did not complete normal verification")
+        after_failure = state.get("after_failure")
+        after = state.get("after")
+        if isinstance(after_failure, dict):
+            cause = after_failure.get("reason", "setup")
+            if cause == "cleanup" or reason is None:
+                reason, detail = cause, str(after_failure.get("detail", "source verification failed"))
+        elif not isinstance(after, dict) or "snapshot" not in after:
             if reason is None:
-                reason, detail = "timeout", str(error)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            if reason is None:
-                reason, detail = "stale", "unable to verify source after execution: " + str(error)
+                reason, detail = "stale", "source-after-unavailable: completed comparison data missing"
+        elif reason is None and before["snapshot"] != after["snapshot"]:
+            reason, detail = "stale", "source changed during supervised gate execution"
+        sequence += 1
+        _write_job_request(ack_path, nonce, owner, identity, sequence, "retire", interrupted,
+            result_code=NO_VERDICT if reason else result_code, reason=reason, detail=detail)
+        state, output_offset = _wait_job_phase(status_path, owner, identity, nonce, ("retired",), sequence,
+            deadline, interrupted, stdout_path, output_cursor)
+        if (state is None or state["phase"] != "retired" or state["sequence"] != sequence
+                or state["sealed"] is not True or state["quiescent"] is not True):
+            reason, detail = "cleanup", "guardian retains unresolved cleanup ownership"
+        elif state.get("code") == NO_VERDICT and state.get("reason") and (state["reason"] == "cleanup" or reason is None):
+            reason, detail = state["reason"], str(state.get("detail") or state["reason"])
+        elif state.get("code") == NO_VERDICT and result_code != NO_VERDICT and reason is None:
+            reason, detail = "cleanup", "guardian reported cleanup uncertainty"
+        released = _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path, identity_verified,
+            token=nonce, sequence=sequence, terminal_state=retirement)
+        if retirement.get("code") == NO_VERDICT and retirement.get("reason") and (retirement["reason"] == "cleanup" or reason is None):
+            reason, detail = retirement["reason"], str(retirement.get("detail") or retirement["reason"])
+        if not released:
+            detail = (detail + "; " if reason == "cleanup" and detail else "") + "guardian or allocation remains owned; evidence retained"
+            reason = "cleanup"
         else:
-            if before["snapshot"] != after["snapshot"] and reason is None:
-                reason, detail = "stale", "source changed during supervised gate execution"
-
-        if reason:
-            return no_verdict(reason, detail or reason)
-        _emit_job_stderr(stderr_path, stdout_path, result_code, True)
-        return result_code
+            owned_service = False
+        if not _emit_job_stderr(stderr_path, stdout_path, result_code, reason is None, output_cursor, deadline):
+            reason, detail = "timeout", "final stderr relay incomplete after body exit " + str(result_code)
+        return no_verdict(reason, detail or reason, stdout_cursor=output_cursor, stdout_deadline=deadline) if reason else result_code
     except (OSError, TimeoutError, ValueError, KeyError, TypeError) as error:
-        if owned_service and owner is not None:
-            if _darwin_cleanup(owner, launchctl, service, identity, deadline, locals().get("status_path"), identity_verified):
-                owned_service = False
-        if scratch:
+        detail = detail or str(error)
+        reason = reason or ("interrupted" if isinstance(error, InterruptedError) else "setup")
+        fallback_available = False
+        fallback_window = False
+        if interrupted.is_set() and identity_verified and not isinstance(error, JobRequestCancelled):
             try:
-                capture_snapshot(root, environment, "after", deadline, interrupted)
-            except Exception:
+                sequence += 1
+                _write_job_request(ack_path, nonce, owner, identity, sequence, "stop", interrupted,
+                    result_code=NO_VERDICT, reason="interrupted", detail="caller cancelled")
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
-        return no_verdict("cleanup" if owned_service else "setup", str(error))
+        if identity_verified and owner is not None and not interrupted.is_set():
+            try:
+                fallback_window = clock_now() < deadline - SNAPSHOT_STOP_RESERVE_SECONDS
+            except OSError as clock_error:
+                reason = "cleanup" if owned_service else reason
+                detail += "; source-after-unavailable: " + str(clock_error)
+        if fallback_window:
+            try:
+                state = _read_job_state(status_path, owner, nonce, identity)
+                if (state and state["sealed"] is False and state["sequence"] == sequence
+                        and state["phase"] in ("ready", "body-quiescent", "normal-after-complete")):
+                    sequence += 1
+                    _write_job_request(ack_path, nonce, owner, identity, sequence, "fallback", interrupted)
+                    state, output_offset = _wait_job_phase(status_path, owner, identity, nonce, ("fallback-complete",), sequence,
+                        deadline, interrupted, stdout_path, output_cursor)
+                    if state and state.get("phase") == "fallback-complete":
+                        fallback_available = True
+                        failure = state.get("after_failure")
+                        if isinstance(failure, dict) and failure.get("reason") == "cleanup":
+                            reason, detail = "cleanup", str(failure.get("detail", "source verifier cleanup uncertain"))
+                        sequence += 1
+                        _write_job_request(ack_path, nonce, owner, identity, sequence, "retire", interrupted,
+                            result_code=NO_VERDICT, reason=reason, detail=detail)
+            except (OSError, TimeoutError, ValueError, KeyError, TypeError):
+                fallback_available = False
+        if not fallback_available:
+            detail += "; source-after-unavailable: no safe guardian fallback"
+        if owned_service and owner is not None:
+            if _darwin_cleanup(owner, launchctl, service, identity, deadline, locals().get("status_path"), identity_verified, token=locals().get("nonce"), sequence=sequence, terminal_state=retirement):
+                owned_service = False
+            else:
+                reason = "cleanup"
+                detail += "; guardian/allocation custody retained"
+        if retirement.get("reason") == "cleanup":
+            reason = "cleanup"
+            detail = str(retirement.get("detail") or "guardian reported cleanup uncertainty") + "; " + detail
+        if not owned_service and retirement.get("sealed") is True and retirement.get("quiescent") is True:
+            relay_complete = False
+            try:
+                output_offset = output_cursor["offset"]
+                while clock_now() < deadline:
+                    next_offset = _stream_stdout(stdout_path, output_cursor, final=True)
+                    if next_offset == os.stat(stdout_path).st_size and output_cursor.get("pending_marker") is None:
+                        relay_complete = True
+                        break
+                    if next_offset == output_offset:
+                        time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
+                    output_offset = next_offset
+            except (OSError, ValueError, TypeError):
+                pass
+            output_cursor["retain_output"] = output_cursor.get("retain_output", False) or not relay_complete
+            if not relay_complete:
+                detail += "; final stdout relay incomplete; private evidence retained"
+        return no_verdict(reason, detail, stdout_cursor=output_cursor, stdout_deadline=deadline)
     finally:
-        if scratch and not owned_service:
+        if scratch and not owned_service and not output_cursor.get("retain_output"):
             shutil.rmtree(scratch, ignore_errors=True)
 
 
 def run(argv):
-    started = time.monotonic()
+    try:
+        started = clock_now()
+    except OSError as error:
+        return no_verdict("setup", str(error))
     interrupted = threading.Event()
     previous_handlers = {}
     receipt = None
@@ -769,6 +1103,8 @@ def run(argv):
         if sys.platform == "linux":
             return run_supervised(root, command, environment, started, receipt, interrupted)
         return run_darwin_supervised(root, command, environment, started, receipt, interrupted)
+    except OSError as error:
+        return no_verdict("setup", str(error))
     finally:
         if receipt is not None:
             receipt.close()

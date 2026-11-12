@@ -2,6 +2,7 @@
 
 import ctypes
 import errno
+import math
 import os
 import signal
 import struct
@@ -22,6 +23,7 @@ BSD_START_MICROSECONDS_OFFSET = 128
 RESOURCE_USAGE_SIZE = 512
 POLL_SECONDS = 0.025
 TERM_SECONDS = 1
+CLOCK_CONTRACT = "CLOCK_MONOTONIC_V1"
 
 
 class CapabilityError(OSError):
@@ -30,6 +32,21 @@ class CapabilityError(OSError):
 
 class CoalitionGone(CapabilityError):
     pass
+
+
+def clock_now():
+    try:
+        value = time.clock_gettime(time.CLOCK_MONOTONIC)
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as error:
+        raise CapabilityError("shared monotonic clock is unavailable") from error
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise CapabilityError("shared monotonic clock returned an invalid value")
+    return value
+
+
+def require_clock_contract(value):
+    if type(value) is not str or value != CLOCK_CONTRACT:
+        raise CapabilityError("shared gate clock contract does not match")
 
 
 def _apis():
@@ -149,15 +166,23 @@ def task_counts(resource_id):
     return started, exited
 
 
-def _coalition_members(resource_id, timeout, excluded=()):
-    result = subprocess.run(
-        ["ps", "-A", "-o", "pid="], capture_output=True, text=True,
-        check=False, timeout=max(0.01, timeout), env={**os.environ, "LC_ALL": "C"},
-    )
+def _coalition_members(resource_id, deadline, excluded=()):
+    remaining = deadline - clock_now()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline")
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid="], capture_output=True, text=True,
+            check=False, timeout=remaining, env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline") from error
     if result.returncode != 0:
         raise CapabilityError("process enumeration failed during coalition cleanup")
     members = []
     for field in result.stdout.split():
+        if not clock_now() < deadline:
+            raise CapabilityError("coalition enumeration exceeded the caller deadline")
         if not field.isdecimal():
             raise CapabilityError("process enumeration returned an invalid PID")
         pid = int(field)
@@ -169,10 +194,12 @@ def _coalition_members(resource_id, timeout, excluded=()):
             continue
         if identity is not None and identity["coalition_id"] == resource_id:
             members.append(identity)
+    if not clock_now() < deadline:
+        raise CapabilityError("coalition enumeration exceeded the caller deadline")
     return members
 
 
-def _signal(identity, signal_number):
+def _signal(identity, signal_number, deadline):
     _, _, signal_with_token = _apis()
     current = identity_if_present(identity["pid"])
     if current is None or not same_process(identity, current):
@@ -180,6 +207,8 @@ def _signal(identity, signal_number):
     token = (ctypes.c_uint32 * 8)()
     token[5] = identity["pid"]
     token[7] = identity["pid_version"]
+    if deadline is not None and not clock_now() < deadline:
+        raise CapabilityError("identity-safe signal exceeded the caller deadline")
     result = signal_with_token(ctypes.byref(token), signal_number)
     if result == 0:
         return True
@@ -194,14 +223,15 @@ def _signal(identity, signal_number):
     return False
 
 
-def signal_identity(identity, signal_number):
-    return _signal(identity, signal_number)
+# Standalone fixture callers retain their existing external timeout.
+def signal_identity(identity, signal_number, deadline=None):
+    return _signal(identity, signal_number, deadline)
 
 
 def _signal_members(resource_id, signal_number, deadline, excluded=()):
-    members = _coalition_members(resource_id, deadline - time.monotonic(), excluded)
+    members = _coalition_members(resource_id, deadline, excluded)
     for identity in members:
-        _signal(identity, signal_number)
+        _signal(identity, signal_number, deadline)
 
 
 def _drained(resource_id, preserve, allow_reaped):
@@ -224,18 +254,18 @@ def _drained(resource_id, preserve, allow_reaped):
 
 
 def drain(resource_id, deadline, preserve=None, allow_reaped=False):
-    term_deadline = min(deadline, time.monotonic() + TERM_SECONDS)
-    while time.monotonic() < term_deadline:
+    term_deadline = min(deadline, clock_now() + TERM_SECONDS)
+    while clock_now() < term_deadline:
         if _drained(resource_id, preserve, allow_reaped):
             return True
         excluded = (preserve["pid"],) if preserve else ()
         _signal_members(resource_id, signal.SIGTERM, deadline, excluded)
-        time.sleep(min(POLL_SECONDS, max(0, term_deadline - time.monotonic())))
+        time.sleep(min(POLL_SECONDS, max(0, term_deadline - clock_now())))
 
-    while time.monotonic() < deadline:
+    while clock_now() < deadline:
         if _drained(resource_id, preserve, allow_reaped):
             return True
         excluded = (preserve["pid"],) if preserve else ()
         _signal_members(resource_id, signal.SIGKILL, deadline, excluded)
-        time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+        time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
     return _drained(resource_id, preserve, allow_reaped)
