@@ -934,8 +934,8 @@ class SurfaceState {
     return intakeHandlers.listPendingOrdinaryHandoffChannels(this);
   }
 
-  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined) {
-    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata, expectedBoundary, expectedReadiness);
+  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined, guardedRecovery = null) {
+    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata, expectedBoundary, expectedReadiness, guardedRecovery);
   }
 
   pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {

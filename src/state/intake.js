@@ -181,6 +181,18 @@ function intakeBoundaryMatches(existing, expected, binding, expectedReadiness = 
   ].every(field => (existing[field] ?? null) === (expected[field] ?? null));
 }
 
+function sameIntakeExpectationRow(row, expected) {
+  return row != null && expected != null && Object.keys(row).length === Object.keys(expected).length &&
+    Object.keys(row).every(key => Object.hasOwn(expected, key) && row[key] === expected[key]);
+}
+
+function assertGuardedRecoveryTime(proof) {
+  if (!(Number.isSafeInteger(proof.deadlineMs) && Date.now() < proof.deadlineMs &&
+        Number.isFinite(proof.monotonicDeadline) && performance.now() < proof.monotonicDeadline)) {
+    throw Object.assign(new Error('guarded parent intake recovery expired'), { code: 'INTAKE_RECOVERY_EXPIRED' });
+  }
+}
+
 function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatchesExpected, compareDiscordIds, now }) {
   return {
     hasIntakeEvidence(state, discordId) {      assertText(discordId, 'discordId', 128);
@@ -267,7 +279,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       return state.getIntakeWatermark(channelId);
     },
 
-    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined) {
+    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined, guardedRecovery = null) {
       assertText(channelId, 'channelId', 128);
       if (!['pending', 'ready', 'gap', 'unavailable'].includes(boundaryState)) throw new BindingError('invalid intake watermark state');
       return state.transaction(() => {
@@ -275,6 +287,17 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         const existing = state.getIntakeWatermark(channelId);
         if (!bindingMatchesExpected(binding, expectedBinding)) return null;
         if (!intakeBoundaryMatches(existing, expectedBoundary, binding, expectedReadiness)) return null;
+        if (guardedRecovery) {
+          const savedBinding = state.db.prepare('SELECT * FROM bindings WHERE channel_id=?').get(channelId);
+          if (pauseMetadata || boundaryState !== READINESS.PENDING || detail !== 'explicit intake reconciliation requested' ||
+              typeof guardedRecovery.requestId !== 'string' || !guardedRecovery.requestId || !binding?.active ||
+              binding.readiness !== READINESS.UNAVAILABLE || existing?.state !== READINESS.UNAVAILABLE ||
+              existing.detail !== 'getaddrinfo ENOTFOUND discord.com' || savedBinding.guild_id !== existing.guild_id ||
+              gapFrom !== existing.gap_from || gapTo !== existing.gap_to ||
+              !sameIntakeExpectationRow(savedBinding, guardedRecovery.binding) ||
+              !sameIntakeExpectationRow(existing, guardedRecovery.watermark) ||
+              state.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(channelId)) return null;
+        }
         if (!intakePauseAllowsUpdate(state, channelId, pauseMetadata)) return null;
         if (pauseMetadata && Object.prototype.hasOwnProperty.call(pauseMetadata, 'expectedReadiness')
           && binding?.readiness !== pauseMetadata.expectedReadiness) return null;
@@ -288,6 +311,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         }
         if (boundaryState === 'ready') state.assertLegacyMigrationSafe(channelId);
         const guildId = existing?.guild_id || binding.guildId;
+        if (guardedRecovery) assertGuardedRecoveryTime(guardedRecovery);
         if (existing) {
           state.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE channel_id=?')
             .run(boundaryState, detail ? String(detail).slice(0, 1000) : null, gapFrom, gapTo, now(), channelId);
@@ -302,7 +326,18 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
           }
           state.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
         }
-        state.receipt(null, 'intake-boundary', { channelId, state: boundaryState, detail: detail || undefined, gapFrom: gapFrom || undefined, gapTo: gapTo || undefined });
+        state.receipt(null, 'intake-boundary', {
+          channelId, state: boundaryState, detail: detail || undefined, gapFrom: gapFrom || undefined, gapTo: gapTo || undefined,
+          ...(guardedRecovery ? { requestId: guardedRecovery.requestId } : {})
+        });
+        if (guardedRecovery) {
+          const saved = state.db.prepare('SELECT w.state, b.readiness FROM intake_watermarks w JOIN bindings b ON b.channel_id=w.channel_id WHERE w.channel_id=?').get(channelId);
+          if (saved?.state !== READINESS.PENDING || saved.readiness !== READINESS.PENDING) {
+            throw new BindingError('guarded intake recovery readback failed');
+          }
+          assertGuardedRecoveryTime(guardedRecovery);
+          return saved;
+        }
         if (pauseMetadata) state.receipt(null, 'ordinary-handoff-intake-paused', pauseMetadata);
         return state.getIntakeWatermark(channelId);
       });

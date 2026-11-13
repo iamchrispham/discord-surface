@@ -395,6 +395,16 @@ node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
   --intake-channel-id CHANNEL_ID
 ```
 
+For a parent held by a recorded `getaddrinfo ENOTFOUND discord.com`, add
+`--intake-expectation-file /absolute/private.json` to require an exact match before
+requesting reconciliation. The UTF-8 JSON file has four fields:
+
+- `requestId` is a 1–128 character identifier starting with a letter or digit and containing only letters, digits, periods, underscores or hyphens.
+- `deadlineMs` is the operator's absolute Unix deadline in milliseconds.
+- `binding` and `watermark` contain the complete current raw `bindings` and `intake_watermarks` rows for that channel, including all nulls, both update times and all cursors. Preserve database column names and scalar types. The binding must be active and both rows must say `unavailable`.
+
+Use a regular, owner-private, single-link file of at most 32 KiB. Verify the owner of the running Gateway separately. The command checks the current schema, reads a single parent under the write transaction, preserves the gap bounds, and records the request ID in its intake receipt. A `pending` response confirms the committed request. A changed row is refused. An interruption without a response leaves the outcome unknown. Inspect current parent metadata before taking further action. This mode sends no wake and makes no claim about delivery or child readiness.
+
 For an enrolled thread, the command also requests a wake from a compatible running Gateway. For a parent channel, it records pending reconciliation without waking the Gateway. Its owner can use the exported `requestGatewayRecovery(paths, { expectedPid })` helper in `src/cli.js` after verifying the installed Gateway's PID and wake capability. A supported wake keeps the same process and does not require a restart. If that capability is absent or the Gateway is stopped, coordinate recovery with its owner. Do not send an unchecked signal. A requested wake is not delivery proof: verify intake readiness, retained custody and the actual native pickup afterward.
 
 Delivery-only reconciliation never calls a native provider. Use `--resolution reply_not_sent` after evidence that no Discord message was created, or `--resolution reply_sent --part-index N --reply-message-id MESSAGE_ID` after finding the message. The adapter does not infer either outcome from a timeout.

@@ -1,3 +1,5 @@
+const { readIntakeRecoveryExpectation } = require('./intake-recovery-expectation');
+
 function createRecoveryCommands({ required, openState, print, gatewayProcessStatus, requestGatewayRecovery, GATEWAY_CAPABILITIES }) {
   function recoverCourier(args, dependencies = {}) {
     const messageId = required(args, 'courier-message-id');
@@ -37,9 +39,14 @@ function createRecoveryCommands({ required, openState, print, gatewayProcessStat
 
   function recover(args) {
     const mode = require('./flag-policy').recoverMode(args);
+    const hasExpectation = Object.hasOwn(args, 'intake-expectation-file');
+    if (hasExpectation && mode !== 'intake') throw new Error('a guarded recovery requires --intake-channel-id');
     // Courier mode is exclusive and owns its own Gateway preflight before mutation.
     if (mode === 'courier') return recoverCourier(args);
-    const { paths, state } = openState(args);
+    const expectation = hasExpectation
+      ? readIntakeRecoveryExpectation(required(args, 'intake-expectation-file'), required(args, 'intake-channel-id'))
+      : null;
+    const { paths, state } = expectation ? openState(args, { requireCurrentSchema: true }) : openState(args);
     try {
       if (mode === 'board') {
         const boardTarget = {
@@ -74,6 +81,19 @@ function createRecoveryCommands({ required, openState, print, gatewayProcessStat
         ));
       } else if (mode === 'intake') {
         const channelId = required(args, 'intake-channel-id');
+        if (expectation) {
+          const { watermark, requestId } = expectation;
+          let recovered;
+          try {
+            recovered = state.markIntakeBoundary(channelId, 'pending', 'explicit intake reconciliation requested',
+              watermark.gap_from, watermark.gap_to, null, null, watermark, 'unavailable', expectation);
+          } catch (error) {
+            if (error.code !== 'INTAKE_RECOVERY_EXPIRED') throw error;
+          }
+          print({ status: recovered ? 'pending' : 'refused', channelId, requestId });
+          if (!recovered) process.exitCode = 1;
+          return;
+        }
         const thread = state.getThreadEnrollment(channelId);
         const activeThread = thread?.active ? thread : null;
         const recovered = state.reconcileIntake(channelId);
