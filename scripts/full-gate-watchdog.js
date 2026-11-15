@@ -381,7 +381,12 @@ async function completeCleanup(code) {
     process.send({ kind: MESSAGES.CLEANUP_COMPLETE, code }, error => process.exit(error ? NO_VERDICT : code));
   } catch { process.exit(NO_VERDICT); }
 }
+let linuxFinishStopPending = false;
 async function finishStop() {
+  if (process.platform === 'linux') {
+    if (linuxFinishStopPending) return;
+    linuxFinishStopPending = true;
+  }
   await collector.whenClosed();
   setTimeout(async () => {
     const phase = beginObservation('orphan');
@@ -395,6 +400,13 @@ async function finishStop() {
     finally { finishObservation(phase); }
     await collector.whenClosed();
     const cleanupDeadline = observationDeadline('orphan');
+    if (!complete && process.platform === 'linux') {
+      setTimeout(() => {
+        linuxFinishStopPending = false;
+        finishStop();
+      }, 50);
+      return;
+    }
     if (complete && cleanupDeadline !== null && Date.now() < cleanupDeadline) await completeCleanup(NO_VERDICT);
     else process.exit(NO_VERDICT);
   }, 50);
