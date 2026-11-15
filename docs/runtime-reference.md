@@ -43,6 +43,24 @@ existing queue and native session.
 
 ## Conductor channels and handoff
 
+Bind an existing conductor channel to its exact conductor identity and current native session
+UUID. The conductor ID comes from the existing conductor claim, not a session UUID, PID,
+account, or display name. Repository metadata comes from that same claim. A Claude binding
+also needs the short absolute Unix socket path served by its existing opted-in listener.
+
+```sh
+node src/cli.js bind --state-dir "$HOME/.config/discord-surface" \
+  --channel-id CODEX_CHANNEL_ID --guild-id DISCORD_GUILD_ID \
+  --provider codex --native-id CODEX_SESSION_UUID --workspace /absolute/workspace \
+  --conductor-id CONDUCTOR_ID --repo-key CANONICAL_REPOSITORY_KEY
+
+node src/cli.js bind --state-dir "$HOME/.config/discord-surface" \
+  --channel-id CLAUDE_CHANNEL_ID --guild-id DISCORD_GUILD_ID \
+  --provider claude --native-id CLAUDE_SESSION_UUID \
+  --workspace /absolute/workspace --endpoint /absolute/private/probe.sock \
+  --conductor-id CONDUCTOR_ID --repo-key CANONICAL_REPOSITORY_KEY
+```
+
 `provision` creates or reuses one text channel for the stable conductor under its configured
 vendor category. Its topic is a fixed address marker. Local SQLite stores the provider,
 canonical repository key, native UUID, generation, readiness, history coverage, and custody. It

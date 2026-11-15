@@ -7,6 +7,7 @@ const { runFullGate, SCRATCH_ROOT } = require('./full-gate');
 
 const root = path.resolve(__dirname, '..');
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+const documentationFiles = packageJson.files.filter(entry => entry.endsWith('.md'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function run(command, args, options = {}) {
@@ -105,7 +106,7 @@ function main() {
     const env = isolatedEnvironment(home);
     const packRoot = path.join(scratch, 'pack');
     fs.mkdirSync(packRoot, { recursive: true });
-    for (const entry of ['README.md', 'package.json', 'package-lock.json', 'src', 'tsconfig.json', 'tsconfig.typecheck.json']) {
+    for (const entry of [...documentationFiles, 'package.json', 'package-lock.json', 'src', 'tsconfig.json', 'tsconfig.typecheck.json']) {
       fs.cpSync(path.join(root, entry), path.join(packRoot, entry), { recursive: true });
     }
     fs.symlinkSync(path.join(root, 'node_modules'), path.join(packRoot, 'node_modules'), 'junction');
@@ -117,7 +118,7 @@ function main() {
     const packagePath = path.join(scratch, pack.filename);
     const files = new Set(pack.files.map(file => file.path));
     assert(![...files].some(file => file.split('/').includes('__pycache__')), 'packed artifact contains Python bytecode cache');
-    for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
+    for (const required of [...documentationFiles, 'package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
       assert(files.has(required), `packed artifact is missing ${required}`);
     }
     for (const owner of ['state', 'discord']) {
@@ -126,6 +127,10 @@ function main() {
       }
     }
     run(npm, ['install', '--ignore-scripts', '--prefix', install, packagePath], { env });
+    for (const entry of documentationFiles) {
+      assert.equal(fs.readFileSync(path.join(install, 'node_modules', packageJson.name, entry), 'utf8'),
+        fs.readFileSync(path.join(root, entry), 'utf8'), `installed documentation differs: ${entry}`);
+    }
     runInstalledSmoke(path.join(install, 'node_modules', packageJson.name), env);
     process.stdout.write(JSON.stringify({ package: packageJson.name, version: packageJson.version, files: pack.files.length }));
     process.stdout.write('\n');

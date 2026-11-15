@@ -19,7 +19,7 @@ session or change native approval settings.
 | Exchange work between sessions | Send signed requests and correlated results through the CLI or peer MCP tools. |
 
 The [runtime
-reference](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md)
+reference](docs/runtime-reference.md)
 covers these commands, their required identities, and recovery after interrupted operations.
 
 ## Install and configure
@@ -81,7 +81,7 @@ session's identity into the environment.
 Standard Codex intake uses `codex queue --thread` to offer a follow-up turn. Delivery during an
 active turn needs a separately qualified courier route and a trusted native hook. Selecting a
 route or installing its guard does not establish that delivery works. See [Gateway and courier
-routes](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md#gateway-and-courier-routes).
+routes](docs/runtime-reference.md#gateway-and-courier-routes).
 
 ## Ordinary Claude session binding
 
@@ -105,7 +105,7 @@ same session's native **Monitor** tool. A session already launched with Channels
 `claude-channel` instead. Run one listener per socket.
 
 [Claude attachment
-details](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md#ordinary-claude-session-binding)
+details](docs/runtime-reference.md#ordinary-claude-session-binding)
 include the Monitor command, acknowledgment handling, and listener recovery.
 
 ## Verify delivery
@@ -128,7 +128,7 @@ These observations mean different things:
 If a route is pending, unavailable, or has a history gap, retain its session and saved messages.
 Inspect the reported boundary before using a scoped recovery command. Uncertain submissions or
 sends must not be replayed on the strength of a timeout. See [delivery and
-recovery](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md#delivery-and-recovery).
+recovery](docs/runtime-reference.md#delivery-and-recovery).
 
 ## Authenticated peer MCP
 
@@ -141,7 +141,7 @@ Results follow the request's recorded return route. A sent packet does not estab
 pickup or completion.
 
 See [peer MCP setup and tool
-arguments](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md#authenticated-peer-mcp).
+arguments](docs/runtime-reference.md#authenticated-peer-mcp).
 
 ## Development
 
@@ -178,6 +178,6 @@ shared Gateway out of test fixtures.
 | Document | Read it for |
 | --- | --- |
 | [Installation](INSTALL.md) | Release selection, host requirements, credentials, attachment, and live checks. |
-| [Runtime reference](https://github.com/iamchrispham/discord-surface/blob/main/docs/runtime-reference.md) | CLI examples, threads, handoff, files, decisions, peer tools, and recovery rules. |
+| [Runtime reference](docs/runtime-reference.md) | CLI examples, threads, handoff, files, decisions, peer tools, and recovery rules. |
 | [Conductor post proof](https://github.com/iamchrispham/discord-surface/blob/main/docs/conductor-post-proof.md) | The recorded milestone-publication proof and its limits. |
 | [Repository guidance](https://github.com/iamchrispham/discord-surface/blob/main/AGENTS.md) | Code ownership, validation, and contribution rules. |
