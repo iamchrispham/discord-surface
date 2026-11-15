@@ -1,5 +1,6 @@
 import type { Attachment } from '../attachments';
 import type { AgentMessage } from '../agent-message';
+import type { AgentPresentation } from '../agent-presentation';
 import type { WatcherNotice } from '../watcher-notice';
 import type { DecisionResult } from '../state/decision';
 import type { ENVELOPE_TYPE } from '../state/courier-route/constants';
@@ -57,6 +58,7 @@ export interface NativeMessage {
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
   agentRoute?: string | null;
+  agentPresentation?: AgentPresentation;
   watcherNotice?: WatcherNotice | null;
   watcherNoticeProvenance?: unknown;
   decisionResult?: DecisionResult | null;
@@ -273,4 +275,3 @@ export interface DispatchReport {
   message: NativeMessage | null | undefined;
   error?: unknown;
 }
-

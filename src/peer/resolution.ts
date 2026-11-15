@@ -16,6 +16,55 @@ interface PeerState {
   getBindingReadinessReceipt(channelId: string): Record<string, unknown> | null;
 }
 
+type PeerDestinationTarget = {
+  guildId: string;
+  channelId: string;
+  provider: PeerBinding['provider'];
+  nativeId: string;
+  generation: number;
+};
+
+export function canonicalNativeId(value: unknown): unknown {
+  return typeof value === 'string' ? value.toLowerCase() : value;
+}
+
+export function samePeerBinding(left: PeerBinding, right: PeerBinding): boolean {
+  return left.active && left.guildId === right.guildId && left.channelId === right.channelId &&
+    left.provider === right.provider && canonicalNativeId(left.nativeId) === canonicalNativeId(right.nativeId) &&
+    left.generation === right.generation && (left.conductorId ?? null) === (right.conductorId ?? null) &&
+    (left.repoKey ?? null) === (right.repoKey ?? null);
+}
+
+export function currentPeerDestination(
+  state: PeerState,
+  target: PeerDestinationTarget | null | undefined,
+  expectedBinding: PeerBinding | null = null,
+  expectedChildId: string | null = null,
+  allowUnreadyChild = false
+): boolean {
+  if (!target || typeof target !== 'object') return false;
+  const { guildId } = state.requireConfig();
+  const candidates = state.listBindings().filter(binding =>
+    binding.active && binding.guildId === guildId && binding.guildId === target.guildId &&
+    binding.provider === target.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(target.nativeId) &&
+    binding.generation === target.generation && (!expectedBinding || samePeerBinding(binding, expectedBinding))
+  );
+  const routes = candidates.filter(binding => {
+    const children = state.listThreadEnrollments(binding.channelId).filter(child =>
+      child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId
+    );
+    const watermark = state.getIntakeWatermark(binding.channelId);
+    const parentRoute = binding.channelId === target.channelId &&
+      (!expectedBinding || samePeerBinding(binding, expectedBinding));
+    const childRoute = children.some(child => (allowUnreadyChild || child.state === THREAD_STATES.READY) &&
+      child.threadId === target.channelId &&
+      (expectedChildId === null || expectedChildId === child.threadId));
+    return binding.readiness === READINESS.READY &&
+      (!watermark || watermark.state === READINESS.READY) && (parentRoute || childRoute);
+  });
+  return routes.length === 1;
+}
+
 export function validatePeerSelector(selector: PeerSelector): void {
   if (!selector || typeof selector !== 'object' || Array.isArray(selector)) throw new Error('peer selector must be an object');
   const entries = Object.entries(selector);

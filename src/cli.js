@@ -224,6 +224,14 @@ Consumes an acknowledged watcher notice without posting a Discord reply.
 
 const RECOVER_USAGE = `Usage: discord-surface recover [options]
 
+Reviewed, never-dispatched custody:
+  recover --message-id <id> --resolution not_executed \
+    --native-id <original UUID> --generation <original generation> \
+    --evidence-scope <why the instruction must not execute>
+
+Records a rejected disposition while preserving the original message and receipts.
+Refuses attempted or ambiguous native custody. This is not an execution acknowledgment.
+
 Courier recovery:
   recover --courier-message-id <id> --courier-attempt-id <id>
 

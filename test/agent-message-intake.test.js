@@ -5,11 +5,15 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
-const { encodeAgentMessage, KINDS } = require('../src/agent-message');
-const { SurfaceState } = require('../src/state');
+const { issueAgentAddress, encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
+const { SurfaceState, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
+const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
+const { currentPeerDestination } = require('../dist/peer/resolution');
 const { agentCompletionCommand, codexPrompt, claudeEvent, messageRequest } = require('../src/native');
+const { runDirectPost } = require('../src/direct-post');
 const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
+const { createSurfaceConsumer } = require('./agent-attachment-fixture');
 const { source, target, packet, token, enrollChild } = require('./agent-message-fixtures');
 
 test('durable agent intake survives reopen, preserves provenance and deduplicates replay', () => {
@@ -33,12 +37,280 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
     state = new SurfaceState(db);
     const restored = state.getMessage(event.id);
     assert.deepEqual(restored.agentMessage, addressed);
+    assert.equal(restored.agentPresentation, undefined);
     assert.equal(state.currentMessageBinding(restored).current, true);
     assert.match(codexPrompt(restored), /not as the operator/);
     assert.match(claudeEvent(restored).content, /not as the operator/);
     assert.ok(codexPrompt(restored).includes(packet.text));
     assert.equal(state.acceptDiscordMessage({ ...event, id: '1003', content: 'Ordinary bot milestone' }, { agentToken: token }).accepted, false);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('authenticated request freezes readable presentation for a local source through reopen and all native callers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-readable-request-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const requesterDb = path.join(dir, 'requester.sqlite');
+  const requesterState = new SurfaceState(requesterDb);
+  let requesterStateOpen = true;
+  let state = new SurfaceState(db);
+  let stateOpen = true;
+  const stdout = new EventEmitter();
+  const events = [];
+  stdout.write = (chunk, callback) => {
+    events.push(JSON.parse(String(chunk)));
+    callback?.();
+    return true;
+  };
+  try {
+    state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'receiver-conductor', repoKey: 'repo:target' }, { intakeCutoff: '100' });
+    const destination = enrollChild(state, target, '103', null);
+    state.bind({ ...source, workspace: dir, endpoint: '/tmp/agent-readable-request-source.sock', conductorId: 'requester-conductor', repoKey: 'repo:source' }, { intakeCutoff: '100' });
+    const sourceBinding = state.getBinding(source.channelId);
+    state.setBindingReadiness(source.channelId, READINESS.READY, 'local requester ready', sourceBinding);
+    const localSource = enrollChild(state, source, '203', null);
+    requesterState.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'requester-secret') });
+    requesterState.bind({ ...source, workspace: dir, endpoint: '/tmp/agent-readable-request-owner.sock', conductorId: 'requester-conductor', repoKey: 'repo:source' }, { intakeCutoff: '100' });
+    const requesterBinding = requesterState.getBinding(source.channelId);
+    requesterState.setBindingReadiness(source.channelId, READINESS.READY, 'local requester ready', requesterBinding);
+    const requesterSource = enrollChild(requesterState, source, '203', null);
+    assert.equal(state.acceptDiscordMessage({
+      id: '1090', guildId: sourceBinding.guildId, channelId: sourceBinding.channelId,
+      authorId: '900', isBot: false, attachments: [], content: 'Requester route is ready.'
+    }).accepted, true);
+    assert.deepEqual(localSource, requesterSource);
+    assert.equal(currentPeerDestination(state, localSource), true);
+
+    const requestTextFile = path.join(dir, 'request.txt');
+    fs.writeFileSync(requestTextFile, packet.text);
+    let requestWire;
+    let requestPostCount = 0;
+    const requestPublication = await runDirectPost({
+      state: requesterState,
+      token,
+      nativeId: requesterBinding.nativeId,
+      generation: requesterBinding.generation,
+      channelId: requesterBinding.channelId,
+      provider: requesterBinding.provider,
+      agentThreadId: requesterSource.channelId,
+      textFile: requestTextFile,
+      dedupeKey: packet.id,
+      agentTarget: issueAgentAddress(destination, token),
+      agentKind: KINDS.REQUEST,
+      agentPresentation: AGENT_PRESENTATIONS.LEGACY,
+      fetchImpl: async (_url, options) => {
+        if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: destination.channelId, guild_id: destination.guildId }) };
+        requestPostCount += 1;
+        requestWire = JSON.parse(options.body).content;
+        return { ok: true, status: 200, json: async () => ({ id: '1101' }) };
+      }
+    });
+    assert.equal(requestPublication.status, 'sent');
+    assert.equal(requestPostCount, 1);
+    const addressed = decodeAgentMessage(requestWire, token, destination);
+    assert.equal(addressed.kind, KINDS.REQUEST);
+    assert.deepEqual(addressed.source, localSource);
+    assert.deepEqual(addressed.target, destination);
+    const requestOutcome = requesterState.directPostRows(addressed.id).find(row => row.kind === 'direct-post-outcome');
+    assert.deepEqual(requestOutcome.detail.agentPacket, addressed);
+
+    const event = {
+      id: '1101', guildId: destination.guildId, channelId: destination.channelId,
+      authorId: '901', isBot: true, attachments: [], content: requestWire
+    };
+
+    assert.equal(state.acceptDiscordMessage(event, { agentToken: 'wrong' }).accepted, false);
+    state.failNextIntakeFlag = true;
+    assert.throws(() => state.acceptDiscordMessage({ ...event, id: '1100' }, { agentToken: token }), /injected intake transaction failure/);
+    assert.equal(state.getMessage('1100'), null);
+    assert.equal(state.getAgentMessage('1100'), null);
+    assert.equal(state.acceptDiscordMessage(event, { agentToken: token }).accepted, true);
+    const firstReceipt = state.getAgentMessage(event.id);
+    assert.equal(firstReceipt.agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+    assert.equal(firstReceipt.packet.agentPresentation, undefined);
+
+    state.setBindingReadiness(source.channelId, Object.values(READINESS).find(value => value !== READINESS.READY),
+      'requester route changed after acceptance', state.getBinding(source.channelId));
+    assert.equal(state.acceptDiscordMessage({ ...event, id: '1102' }, { agentToken: token }).reason, 'agent-message-duplicate');
+    assert.equal(state.getAgentMessage(event.id).agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+
+    state.close();
+    stateOpen = false;
+    state = new SurfaceState(db);
+    stateOpen = true;
+    const restored = state.getMessage(event.id);
+    assert.equal(restored.agentPresentation, AGENT_PRESENTATIONS.ATTACHMENT);
+    assert.equal(state.claimDispatch(event.id).claimed, true);
+    state.markSubmitted(event.id);
+    const completion = agentCompletionCommand(restored, db, path.resolve(path.join(__dirname, '../src/cli.js')), dir);
+
+    const codexText = codexPrompt(restored, null, completion);
+    const claudeText = claudeEvent(restored, completion).content;
+    for (const text of [codexText, claudeText]) {
+      assert.match(text, /agent-send --agent-presentation attachment-v1 --agent-reply-to/);
+      const argv = JSON.parse(text.match(/with exact argv (\[[^\n]*\])\./)[1]);
+      assert.equal(argv[argv.indexOf('--agent-presentation') + 1], AGENT_PRESENTATIONS.ATTACHMENT);
+    }
+
+    const monitor = createMonitorMcp({ state, stateDir: dir, dbPath: db, stdout });
+    try {
+      await monitor.notification({
+        method: 'notifications/claude/channel',
+        params: { content: 'ignored monitor content', meta: {
+          messageId: event.id, nativeId: restored.nativeId, generation: String(restored.generation)
+        } }
+      });
+    } finally { await monitor.close(); }
+    assert.equal(events.length, 1);
+    const monitorPayload = JSON.parse(fs.readFileSync(events[0].payloadPath, 'utf8'));
+    assert.equal(monitorPayload.content, messageRequest(restored, completion));
+    assert.match(monitorPayload.content, /agent-send --agent-presentation attachment-v1 --agent-reply-to/);
+    assert.doesNotMatch(monitorPayload.content, /ignored monitor content/);
+
+    state.setBindingReadiness(source.channelId, READINESS.READY, 'local requester route restored', state.getBinding(source.channelId));
+    const resultText = 'The analysis is ready.';
+    const resultTextFile = path.join(dir, 'result.txt');
+    fs.writeFileSync(resultTextFile, resultText);
+    const resultId = 'agent-result-work-1';
+    let resultPostCount = 0;
+    let postedResultBody;
+    let postedResultWire;
+    const resultPublication = await runDirectPost({
+      state,
+      token,
+      nativeId: destination.nativeId,
+      generation: destination.generation,
+      channelId: target.channelId,
+      provider: target.provider,
+      agentThreadId: destination.channelId,
+      textFile: resultTextFile,
+      dedupeKey: resultId,
+      agentTarget: issueAgentAddress(localSource, token),
+      agentKind: KINDS.RESULT,
+      agentReplyTo: addressed.id,
+      agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT,
+      agentDestinationCurrent: candidate => currentPeerDestination(state, candidate),
+      fetchImpl: async (_url, options) => {
+        if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: localSource.channelId, guild_id: localSource.guildId }) };
+        resultPostCount += 1;
+        assert.ok(options.body instanceof FormData);
+        const payload = JSON.parse(options.body.get('payload_json'));
+        postedResultBody = payload.content;
+        const file = options.body.get('files[0]');
+        postedResultWire = Buffer.from(await file.arrayBuffer());
+        return { ok: true, status: 200, json: async () => ({ id: '1201' }) };
+      }
+    });
+    assert.equal(resultPublication.status, 'sent');
+    assert.equal(resultPostCount, 1);
+    assert.equal(postedResultBody, 'Agent result from claude to codex: ' + resultText);
+    assert.doesNotMatch(postedResultBody, /discord-tether:agent:v1:|agent-result-work-1/);
+    const resultWire = postedResultWire.toString('utf8');
+    const resultPacket = decodeAgentMessage(resultWire, token, localSource);
+    assert.equal(resultPacket.id, resultId);
+    assert.equal(resultPacket.kind, KINDS.RESULT);
+    assert.deepEqual(resultPacket.source, destination);
+    assert.deepEqual(resultPacket.target, localSource);
+    assert.equal(resultPacket.replyTo, addressed.id);
+    assert.equal(resultPacket.text, resultText);
+    const resultOutcome = state.directPostRows(resultId).find(row => row.kind === 'direct-post-outcome');
+    assert.deepEqual(resultOutcome.detail.agentPacket, resultPacket);
+
+    const resultMessage = {
+      id: '1201',
+      guildId: localSource.guildId,
+      channelId: localSource.channelId,
+      author: { id: '901', bot: true },
+      content: postedResultBody,
+      attachments: [{
+        url: 'https://cdn.discordapp.com/attachments/' + localSource.guildId + '/' + localSource.channelId + '/agent-message.tether',
+        filename: 'agent-message.tether',
+        contentType: 'application/octet-stream',
+        size: postedResultWire.byteLength
+      }]
+    };
+    let resultFetchCount = 0;
+    const requester = createSurfaceConsumer({
+      state: requesterState,
+      providers: {},
+      agentCredential: () => token,
+      agentBotId: '901',
+      agentAttachmentFetch: async () => {
+        resultFetchCount += 1;
+        if (resultFetchCount > 1) throw new Error('duplicate result must not fetch the attachment');
+        return new Response(postedResultWire, { status: 200, headers: { 'content-length': String(postedResultWire.byteLength) } });
+      }
+    });
+    const resultIntake = await requester.intakeMessage(resultMessage, true, null, requesterBinding);
+    assert.equal(resultIntake.accepted, true);
+    const resultReceipt = requesterState.getAgentMessage(resultMessage.id);
+    assert.deepEqual(resultReceipt.packet, resultPacket);
+    assert.equal(resultReceipt.packet.replyTo, addressed.id);
+    assert.deepEqual(resultReceipt.packet.source, destination);
+    assert.deepEqual(resultReceipt.packet.target, localSource);
+    assert.equal(requesterState.getMessage(resultMessage.id).content, resultWire);
+    assert.deepEqual(requesterState.getMessage(resultMessage.id).attachments, []);
+    const duplicateResult = await requester.intakeMessage(resultMessage, true, null, requesterBinding);
+    assert.equal(duplicateResult.duplicate, true);
+    assert.equal(resultFetchCount, 1);
+    assert.equal(resultPostCount, 1);
+  } finally {
+    try { if (stateOpen) state.close(); }
+    finally {
+      try { if (requesterStateOpen) requesterState.close(); }
+      finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+  }
+});
+
+test('current peer destination accepts only a unique ready local route', () => {
+  const route = {
+    guildId: source.guildId,
+    channelId: source.channelId,
+    provider: source.provider,
+    nativeId: source.nativeId,
+    generation: source.generation
+  };
+  const binding = {
+    ...route, active: true, readiness: READINESS.READY, conductorId: null, repoKey: null
+  };
+  const unready = Object.values(READINESS).find(value => value !== READINESS.READY);
+  const makeState = ({ bindings = [binding], children = new Map(), watermarks = new Map() } = {}) => ({
+    requireConfig: () => ({ guildId: route.guildId }),
+    listBindings: () => bindings,
+    listThreadEnrollments: channelId => children.get(channelId) || [],
+    getIntakeWatermark: channelId => watermarks.get(channelId) || null,
+    getBindingReadinessReceipt: () => null
+  });
+
+  assert.equal(currentPeerDestination(makeState(), route), true);
+  assert.equal(currentPeerDestination(makeState({ bindings: [] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ bindings: [{ ...binding, generation: route.generation + 1 }] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ bindings: [{ ...binding, readiness: unready }] }), route), false);
+  assert.equal(currentPeerDestination(makeState({ watermarks: new Map([[route.channelId, { state: unready }]]) }), route), false);
+  assert.equal(currentPeerDestination(makeState(), { ...route, channelId: 'unmatched-channel' }), false);
+
+  const second = { ...binding, channelId: 'second-parent' };
+  const ambiguousChildren = new Map([['second-parent', [{
+    threadId: route.channelId, parentChannelId: 'second-parent', guildId: route.guildId,
+    active: true, state: THREAD_STATES.READY
+  }]]]);
+  assert.equal(currentPeerDestination(makeState({ bindings: [binding, second], children: ambiguousChildren }), route), false);
+});
+
+test('current peer destination keeps one source owner and the declared consumers', () => {
+  const root = path.join(__dirname, '..', 'src');
+  const counts = {};
+  for (const file of fs.readdirSync(root, { recursive: true }).filter(entry => /\.[cm]?[jt]sx?$/.test(entry))) {
+    const content = fs.readFileSync(path.join(root, file), 'utf8');
+    const count = [...content.matchAll(/\bcurrentPeerDestination\b/g)].length;
+    if (count) counts[file] = count;
+  }
+  assert.deepEqual(counts, {
+    'peer/resolution.ts': 1,
+    'peer/service.js': 2,
+    'state/message-intake.js': 2
+  });
 });
 
 test('agent packet dedupe compares the full source and target route', () => {
