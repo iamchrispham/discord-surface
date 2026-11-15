@@ -56,13 +56,27 @@ class JobRequestCancelled(InterruptedError):
 
 def _native_sigchld_flags():
     if sys.platform == "darwin":
-        sigset_size, no_cldwait = ctypes.sizeof(ctypes.c_uint32), 0x20
+        class NativeSigaction(ctypes.Structure):
+            _fields_ = [
+                ("sa_handler", ctypes.c_void_p),
+                ("sa_mask", ctypes.c_uint32),
+                ("sa_flags", ctypes.c_int),
+            ]
+
+        no_cldwait = 0x20
     elif sys.platform == "linux":
-        sigset_size, no_cldwait = 128, 0x2
+        class NativeSigaction(ctypes.Structure):
+            _fields_ = [
+                ("sa_handler", ctypes.c_void_p),
+                ("sa_mask", ctypes.c_ubyte * 128),
+                ("sa_flags", ctypes.c_int),
+                ("sa_restorer", ctypes.c_void_p),
+            ]
+
+        no_cldwait = 0x2
     else:
         raise OSError("waitable child status is unsupported on this platform")
-    flags_offset = ctypes.sizeof(ctypes.c_void_p) + sigset_size
-    action = ctypes.create_string_buffer(flags_offset + ctypes.sizeof(ctypes.c_int))
+    action = NativeSigaction()
     try:
         native_sigaction = ctypes.CDLL(None, use_errno=True).sigaction
     except AttributeError as error:
@@ -72,8 +86,7 @@ def _native_sigchld_flags():
     if native_sigaction(signal.SIGCHLD, None, ctypes.byref(action)) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    flags = ctypes.c_int.from_buffer(action, flags_offset).value
-    return flags, no_cldwait
+    return action.sa_flags, no_cldwait
 
 
 def establish_reaping_contract():
