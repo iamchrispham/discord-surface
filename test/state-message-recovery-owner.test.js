@@ -27,6 +27,7 @@ const DEPENDENCIES = [
   'TRANSPORT_RECEIPT_OUTCOME',
   'TRANSPORT_RECEIPT_ATTEMPT',
   'INTERACTION_TRANSPORT',
+  'INTERACTION_ORIGIN',
   'parseJson',
   'now',
   'BindingError'
@@ -222,10 +223,10 @@ test('message recovery handler ownership', () => {
   assert.equal(ownerDeclarations.length, 1, `expected exactly one ${FACTORY_NAME} declaration`);
   const factory = ownerDeclarations[0];
 
-  // (b) the factory destructures exactly the 13 dependencies, in order, without renames.
+  // (b) the factory destructures dependencies in order, without renames.
   assert.equal(factory.parameters.length, 1, `${FACTORY_NAME} must take exactly one parameter`);
   const factoryDependencies = bindingPatternNames(factory.parameters[0].name, ownerSource);
-  assert.deepEqual(factoryDependencies, DEPENDENCIES, `${FACTORY_NAME} dependency list must be exactly the 13 names`);
+  assert.deepEqual(factoryDependencies, DEPENDENCIES, `${FACTORY_NAME} dependency list must match its owner contract`);
 
   // (c) the factory returns an object literal with exactly the owned methods, in order.
   const factoryReturns = factory.body.statements.filter(statement => ts.isReturnStatement(statement));
@@ -244,10 +245,10 @@ test('message recovery handler ownership', () => {
       `${handler.name.text} must not contain a nested handler implementation`);
   }
 
-  // (d) state.js binds the factory with exactly the 13 dependencies, in order.
+  // (d) state.js binds the factory dependencies in order.
   const binding = recoveryBinding(stateSource);
   assert.deepEqual(propertyNames(binding), DEPENDENCIES,
-    `${BINDING_NAME} must be bound with exactly the 13 dependencies in order`);
+    `${BINDING_NAME} must be bound with its owner dependencies in order`);
 
   // (e) state.js wrappers survive with their parameter defaults and one-line bodies.
   const stateClass = surfaceStateClass(stateSource);

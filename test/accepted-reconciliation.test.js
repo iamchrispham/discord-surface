@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
-const { SurfaceState, MESSAGE_STATES } = require('../src/state');
+const { SurfaceState, MESSAGE_STATES, INTERACTION_ORIGIN } = require('../src/state');
 const { createOwnerAdmission } = require('../src/discord/owner-admission');
 const { createRecoveryCommands } = require('../src/cli/recovery-commands');
 const { GATEWAY_CAPABILITIES } = require('../src/ordinary-bind/constants');
@@ -53,6 +53,26 @@ test('identical reconciliation is idempotent and conflicting evidence is refused
   assert.equal(state.db.prepare('SELECT count(*) n FROM receipts').get().n, count);
   assert.throws(() => state.reconcileAcceptedNotExecuted({ ...request, evidenceScope: 'different evidence' }));
   assert.equal(state.db.prepare('SELECT count(*) n FROM receipts').get().n, count);
+});
+
+test('unattempted status interactions retain their original acceptance evidence', t => {
+  const { state, request } = accepted(t);
+  const intake = state.acceptInteraction({ id: '102', guildId: 'guild-1', channelId: 'channel-1',
+    userId: 'operator-1', content: '/cs', full: false }, state.getBinding('channel-1'));
+  assert.equal(intake.accepted, true);
+  const before = state.db.prepare('SELECT * FROM receipts WHERE discord_id=? ORDER BY id').all('102');
+  assert.deepEqual(before.map(receipt => receipt.kind), [INTERACTION_ORIGIN]);
+  const result = state.reconcileAcceptedNotExecuted({ ...request, messageId: '102' });
+  assert.equal(result.message.state, MESSAGE_STATES.REJECTED);
+  assert.equal(state.hasNativeAcknowledgment(result.message), false);
+  assert.deepEqual(state.db.prepare('SELECT * FROM receipts WHERE discord_id=? ORDER BY id').all('102').slice(0, -1), before);
+});
+
+test('an accepted row without intake provenance stays held', t => {
+  const { state, request } = accepted(t);
+  state.db.prepare('DELETE FROM receipts WHERE discord_id=?').run('101');
+  assert.throws(() => state.reconcileAcceptedNotExecuted(request));
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
 });
 
 test('reconciliation requires exact identity and a bounded evidence explanation', t => {

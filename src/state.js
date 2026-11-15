@@ -511,7 +511,7 @@ const bindingLifecycleHandlers = createBindingLifecycleHandlers({
   threadEnrollmentHandlers
 });
 
-const messageRecoveryHandlers = createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationHandlers, decisionHandlers, courierRouteHandlers, MESSAGE_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT, parseJson, now, BindingError });
+const messageRecoveryHandlers = createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationHandlers, decisionHandlers, courierRouteHandlers, MESSAGE_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT, INTERACTION_ORIGIN, parseJson, now, BindingError });
 const provisionIntentHandlers = createProvisionIntentHandlers({ assertProvider, assertUuid, assertConductorId, assertRepoKey, assertText, assertEndpoint, BindingError, now });
 
 class SurfaceState {

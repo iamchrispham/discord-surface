@@ -1,11 +1,11 @@
 const NOT_EXECUTED_RECEIPT = 'accepted-not-executed';
-const UNATTEMPTED_RECEIPTS = new Set([
-  'accepted', 'agent-message', 'watcher-notice', 'watcher-notice-publication',
-  'transport-receipt-attempt', 'transport-receipt-outcome', 'interaction-origin',
-  'intake-held-not-ready', 'dispatch-held-not-ready'
-]);
 
-function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationHandlers, decisionHandlers, courierRouteHandlers, MESSAGE_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT, parseJson, now, BindingError }) {
+function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationHandlers, decisionHandlers, courierRouteHandlers, MESSAGE_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT, INTERACTION_ORIGIN, parseJson, now, BindingError }) {
+  const UNATTEMPTED_RECEIPTS = new Set([
+    'accepted', 'agent-message', 'watcher-notice', 'watcher-notice-publication',
+    'transport-receipt-attempt', 'transport-receipt-outcome', INTERACTION_ORIGIN,
+    'intake-held-not-ready', 'dispatch-held-not-ready'
+  ]);
   return {
   recoverAfterRestart(ownerAlive = null) {
     return this.transaction(() => {
@@ -126,7 +126,7 @@ function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationH
       const hasReply = row.reply_text !== null || row.reply_nonce !== null || row.reply_message_id !== null || row.reply_next_part !== 0;
       const hasParts = this.db.prepare('SELECT 1 FROM reply_parts WHERE discord_id=? LIMIT 1').get(messageId);
       if (row.observer_cursor !== null || row.observer_marker !== null || row.error !== null || hasReply || hasParts ||
-          !receipts.some(receipt => receipt.kind === 'accepted') ||
+          !receipts.some(receipt => receipt.kind === 'accepted' || receipt.kind === INTERACTION_ORIGIN) ||
           receipts.some(receipt => !UNATTEMPTED_RECEIPTS.has(receipt.kind))) {
         throw new BindingError('not_executed refuses attempted or ambiguous custody');
       }
