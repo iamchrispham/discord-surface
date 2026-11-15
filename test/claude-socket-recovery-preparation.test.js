@@ -77,7 +77,7 @@ test('preparation preserves regular files and symlinks', async t => {
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
 });
 
-test('concurrent starts refuse an ambiguous orphaned incumbent', { timeout: 8000 }, async t => {
+test('concurrent re-arms retain exactly one listener', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   await orphan(socket);
   const { dir, state } = fixture();
@@ -92,9 +92,8 @@ test('concurrent starts refuse an ambiguous orphaned incumbent', { timeout: 8000
     }
   });
   const results = await Promise.allSettled(channels.map(channel => channel.start()));
-  assert.equal(results.filter(result => result.status === 'fulfilled').length, 0);
-  assert.equal(results.filter(result => result.status === 'rejected' && /incumbent ownership is ambiguous/.test(result.reason.message)).length, 2);
-  assert.equal(channels.filter(channel => channel.ready).length, 0);
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(channels.filter(channel => channel.ready).length, 1);
   assert.equal(fs.lstatSync(socket).isSocket(), true);
 });
 
@@ -292,16 +291,40 @@ test('socket probe timeout preserves custody after late refusal', { timeout: 800
   assert.doesNotThrow(() => release());
 });
 
-test('ambiguous orphan ownership refuses before listener startup', { timeout: 8000 }, async t => {
+test('stop during orphan probe prevents subsequent listener startup', { timeout: 8000 }, async t => {
   const socket = socketPath(t);
   await orphan(socket);
+  const probes = [];
+  let holdProbe = true;
+  const originalPrepareSocket = socketOwnership.prepareSocket;
+  t.mock.method(socketOwnership, 'prepareSocket', async (candidate, signal) => {
+    probes.push(candidate);
+    if (holdProbe) {
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(new Error('Claude channel stopped during socket preparation'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
+    }
+    return originalPrepareSocket(candidate, signal);
+  });
   const { dir, state } = fixture();
   t.after(() => state.close());
   state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   const starting = channel.start();
-  await assert.rejects(starting, /incumbent ownership is ambiguous/);
+  const rejected = assert.rejects(starting, /stopped during socket preparation/);
+  await waitForCondition(() => probes.length === 1, 'startup must enter the ordinary stale-socket probe');
   await channel.stop();
+  await rejected;
   assert.equal(channel.ready, false);
-  assert.equal(fs.lstatSync(socket).isSocket(), true);
+  holdProbe = false;
+  const restarting = channel.start();
+  await restarting;
+  assert.equal(channel.ready, true);
+  await channel.stop();
+  assert.equal(fs.existsSync(socket), false);
 });

@@ -1,7 +1,8 @@
 'use strict';
 
 const {
-  test, assert, fs, http, path, ClaudeChannel, fixture, CLAUDE_ID,
+  test, assert, fs, http, path, spawn, once, ClaudeChannel, SurfaceState, fixture, CLAUDE_ID,
+  SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT,
   socketPath, removeSocketDirectory, closeListeningServer, requestOverSocket, waitForCondition
 } = require('./claude-socket-recovery-fixture');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
@@ -26,14 +27,14 @@ function scheduler() {
 
 function bindFixture(t) {
   const socket = socketPath(t, { cleanup: false });
-  const { dir, state } = fixture();
+  const { dir, db, state } = fixture();
   state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   t.after(() => state.close());
   t.after(() => {
     removeSocketDirectory(socket);
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { socket, dir, state };
+  return { socket, dir, db, state };
 }
 
 function quietMcp() {
@@ -71,6 +72,62 @@ test('public start attaches after a same-process incumbent releases its listener
   await starting;
   assert.equal(waiter.ready, true);
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('public start reclaims a dead incumbent socket without a second start call', { timeout: 10000 }, async t => {
+  const f = bindFixture(t);
+  f.state.close();
+  const childScript = `
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const [channelPath, statePath, dbPath, nativeId, socketPath, workspace, homeRoot, tempRoot] = process.argv.slice(1);
+    const deadline = setTimeout(() => process.exit(124), 5000);
+    deadline.unref();
+    const originalUserInfo = os.userInfo;
+    os.userInfo = () => ({ ...originalUserInfo(), homedir: homeRoot });
+    const originalRealpath = fs.realpathSync;
+    fs.realpathSync = (target, ...args) => String(target) === '/tmp' ? tempRoot : originalRealpath(target, ...args);
+    const { ClaudeChannel } = require(channelPath);
+    const { SurfaceState } = require(statePath);
+    const state = new SurfaceState(dbPath);
+    const channel = new ClaudeChannel({ state, nativeId, socketPath, mcp: { notification: async () => {} } });
+    channel.start().then(() => {
+      process.stdout.write('ready');
+      process.stdin.resume();
+      process.stdin.once('end', () => process.exit(0));
+    }).catch(error => {
+      process.stderr.write(String(error));
+      process.exit(1);
+    });
+  `;
+  const child = spawn(process.execPath, ['-e', childScript, path.resolve('src/claude-channel.js'), path.resolve('src/state.js'), f.db, CLAUDE_ID, f.socket, f.dir, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const childErrors = [];
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => childErrors.push(chunk));
+  const childExit = once(child, 'exit');
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.stdin.end();
+    await childExit.catch(() => {});
+  });
+  await Promise.race([
+    once(child.stdout, 'data'),
+    childExit.then(([code, signal]) => { throw new Error(`holder exited before ready (${code}, ${signal}): ${childErrors.join('')}`); })
+  ]);
+  const resumedState = new SurfaceState(f.db);
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: resumedState, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp: quietMcp() });
+  const starting = waiter.start();
+  await waitForCondition(() => waitScheduler.pending > 0, 'waiter must pin the live child incumbent');
+  child.stdin.end();
+  const [code, signal] = await childExit;
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+  waitScheduler.release();
+  await starting;
+  assert.equal(waiter.ready, true);
+  await waiter.stop();
+  resumedState.close();
+  assert.equal(fs.existsSync(f.socket), false);
 });
 
 test('concurrent resumed starts yield one listener after incumbent release', { timeout: 8000 }, async t => {

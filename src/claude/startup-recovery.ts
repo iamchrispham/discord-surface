@@ -58,7 +58,7 @@ function assertBinding(options: StartupRecoveryOptions): void {
 function readSocketIdentity(socketPath: string): socketOwnership.SocketPathIdentity | undefined {
   try {
     const stats = fs.lstatSync(socketPath, { bigint: true });
-    if (!stats.isSocket()) throw new Error('Claude channel incumbent path is not a socket');
+    if (!stats.isSocket()) return undefined;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
@@ -117,18 +117,21 @@ export async function pinIncumbent(options: StartupRecoveryOptions): Promise<Inc
   const socketIdentity = readSocketIdentity(options.socketPath);
   if (!socketIdentity) return null;
   const lockPath = socketOwnership.lockPathForSocket(options.socketPath);
-  const lockOwner = readLock(lockPath);
-  if (!lockOwner || !lockOwner.owner.identity || !lockOwner.owner.generation || !socketOwnership.socketLockOwnerAlive(lockOwner.owner)) {
-    throw new Error('Claude channel incumbent ownership is ambiguous');
+  let lockOwner: socketOwnership.OwnerMarkerSnapshot | undefined;
+  try { lockOwner = readLock(lockPath); } catch { return null; }
+  if (!lockOwner || !lockOwner.owner.identity || !lockOwner.owner.generation || !socketOwnership.socketLockOwnerAlive(lockOwner.owner)) return null;
+  let listener: ClaudeChannelIdentity;
+  try { listener = await probe(options); }
+  catch (error) {
+    assertNotAborted(options);
+    return null;
   }
-  const listener = await probe(options);
   assertBinding(options);
-  if (!listener.listenerInstanceId) throw new Error('Claude channel incumbent listener identity is unavailable');
+  if (!listener.listenerInstanceId) return null;
   const currentSocket = readSocketIdentity(options.socketPath);
   const currentLock = readLock(lockPath);
-  if (!currentSocket || !sameSocketIdentity(socketIdentity, currentSocket) || !currentLock || !samePinnedLock({ binding: options.binding, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner }, currentLock)) {
-    throw new Error('Claude channel incumbent changed during startup recovery');
-  }
+  if (!currentSocket || !sameSocketIdentity(socketIdentity, currentSocket) || !currentLock ||
+    !samePinnedLock({ binding: options.binding, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner }, currentLock)) return null;
   return { binding: { ...options.binding }, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner };
 }
 
@@ -138,7 +141,8 @@ export async function waitForIncumbentVacancy(options: StartupRecoveryOptions, p
     const socketIdentity = readSocketIdentity(options.socketPath);
     const lockOwner = readLock(pin.lockPath);
     if (!socketIdentity) {
-      if (!lockOwner || !samePinnedLock(pin, lockOwner)) return;
+      if (!lockOwner) return;
+      if (!samePinnedLock(pin, lockOwner)) throw new Error('Claude channel incumbent lock was replaced during startup recovery');
       if (!socketOwnership.socketLockOwnerAlive(lockOwner.owner)) return;
       await waitForDelay(options);
       continue;
@@ -149,16 +153,14 @@ export async function waitForIncumbentVacancy(options: StartupRecoveryOptions, p
     if (lockOwner && !samePinnedLock(pin, lockOwner)) {
       throw new Error('Claude channel incumbent lock was replaced during startup recovery');
     }
-    if (lockOwner && !socketOwnership.socketLockOwnerAlive(lockOwner.owner)) {
-      throw new Error('Claude channel incumbent lock owner is no longer valid');
-    }
+    if (lockOwner && !socketOwnership.socketLockOwnerAlive(lockOwner.owner)) return;
     let listener: ClaudeChannelIdentity | undefined;
     try { listener = await probe(options); }
     catch (error) {
       assertNotAborted(options);
       if (!sameBinding(options.readBinding(), options.binding)) throw error;
     }
-    if (listener?.listenerInstanceId && listener.listenerInstanceId !== pin.listenerInstanceId) {
+    if (listener && listener.listenerInstanceId !== pin.listenerInstanceId) {
       throw new Error('Claude channel incumbent listener was replaced during startup recovery');
     }
     await waitForDelay(options);
