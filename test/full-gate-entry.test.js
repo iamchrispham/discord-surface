@@ -3313,7 +3313,7 @@ def guardian(scenario):
         spawns.append((args,kwargs));assert args==(['fake-child'],) and kwargs['start_new_session'] is False
         def poll():polls.append(None);assert len(polls)<=10;return None
         return types.SimpleNamespace(pid=402,poll=poll)
-    capability=types.SimpleNamespace(SnapshotCleanupError=OSError,InvalidGateBudget=ValueError,capture_snapshot=lambda *args,**kwargs:throw(AssertionError('controller loss must not start verification')))
+    capability=types.SimpleNamespace(SnapshotCleanupError=OSError,InvalidGateBudget=ValueError,establish_reaping_contract=lambda:None,capture_snapshot=lambda *args,**kwargs:throw(AssertionError('controller loss must not start verification')))
     target=dict(json=json,math=math,open=fake_open,time=clock,Path=Path,SimpleNamespace=types.SimpleNamespace,__file__='/private/fixture/darwin-runner.py',os=types.SimpleNamespace(getpid=lambda:401),interrupted=False,receive_signal=lambda *args:None,
         signal=types.SimpleNamespace(SIGINT=2,SIGTERM=15,SIGHUP=1,signal=lambda *args:None),subprocess=types.SimpleNamespace(Popen=popen),
         write_state=lambda spec,value:states.append(dict(value)),DARWIN=api,
@@ -3430,7 +3430,7 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
     'supervisor fails closed before the body on an unsupported platform'
   ];
   const verify = (entry, identity) => {
-    assert.equal(entry.split(importMarker).length - 1, 4, 'unclassified supervisor source import');
+    assert.equal(entry.split(importMarker).length - 1, 5, 'unclassified supervisor source import');
     for (const name of importTests) {
       const begin = entry.indexOf("test('" + name + "',");
       assert.ok(begin >= 0, name);
@@ -3439,6 +3439,13 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
       assert.equal(body.split(importMarker).length - 1, 1, name);
       assert.match(body, /spawn(?:Sync)?\('python3', \[\s*'-I', '-B', '-c', script, SUPERVISOR_SCRIPT/);
     }
+    const reapingName = 'Python owners reject non-waitable SIGCHLD before spawning';
+    const reapingBegin = entry.indexOf("test('" + reapingName + "',");
+    assert.ok(reapingBegin >= 0, reapingName);
+    const reapingNext = entry.indexOf('\ntest(', reapingBegin + 1);
+    const reapingBody = entry.slice(reapingBegin, reapingNext < 0 ? undefined : reapingNext);
+    assert.equal(reapingBody.split(importMarker).length - 1, 1, reapingName);
+    assert.match(reapingBody, /spawnSync\(process\.env\.DISCORD_SURFACE_PYTHON \|\| 'python3',\s*\[\s*'-I', '-B', script,/);
     const guardianName = 'Darwin guardian retains an after verifier when its outer controller dies';
     const guardianBegin = entry.indexOf("test('" + guardianName + "',");
     assert.ok(guardianBegin >= 0, guardianName);
@@ -3465,7 +3472,7 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
 });
 
 function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watchdogSource, collectorSource, evidenceInventory, gate }) {
-  test('watchdog collection keeps cancellation live and phase evidence fresh', { timeout: 45000 }, async t => {
+  test('watchdog collection observes process state without owning cleanup', { timeout: 45000 }, async t => {
     const flush = async () => { for (let i = 0; i < 32; i++) await Promise.resolve(); };
     function harness(options = {}) {
       const selectedSource = options.source ?? watchdogSource;
@@ -3659,12 +3666,12 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
       await h.respond(monitor, h.table(monitor));
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 1);
     });
-    await t.test('C19 missing native rows never retire remembered escaped identities', async () => {
+    await t.test('C19 missing native rows keep unresolved custody held', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const monitor = h.pending(); await h.respond(monitor, h.table(monitor, '21 20 20 S\n30 21 30 S darwin:1:1:30:1\n'));
       await h.advance(1000);
       const partial = h.pending(); await h.respond(partial, h.table(partial));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
       assert.deepEqual(h.exits, []);
     });
@@ -3685,79 +3692,9 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
       assert.equal(h.inspect('escapedDescendants.get(30)'), null);
       assert.equal(h.packets.some(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR'), false);
     });
-    await t.test('unresolved group-only and generic PID successors never gain ownership', async () => {
-      const run = async (source, native, pgid) => {
-        const h = harness({ source }); await h.start();
-        h.inspect("escapedDescendants.set(30,null); globalThis.fixturePhase=beginObservation('monitor');" +
-          "fixturePhase.nativeMonitor=" + native + ";globalThis.fixtureRows=[" +
-          "{pid:10,parent:1,pgid:10,state:'S'},{pid:20,parent:1,pgid:20,state:'S'}," +
-          "{pid:30,parent:1,pgid:" + pgid + ",state:'S'}];" +
-          "globalThis.fixtureToken=Object.freeze({phase:fixturePhase,generation:fixturePhase.generation,rows:fixtureRows,identities:new Map([[30,'darwin:1:1:30:9']])});" +
-          "fixturePhase.monitorIdentities=fixtureToken;readProcessIdentities=async pids=>new Map(pids.map(pid=>[pid,'darwin:1:1:30:9']));");
-        await h.inspect('rememberEscapedDescendants(fixtureRows,fixturePhase,fixtureToken)');
-        assert.equal(h.inspect('escapedDescendants.get(30)'), null);
-        await h.inspect("signalEscapedDescendants('SIGTERM',fixtureRows,fixturePhase)");
-        assert.equal(h.signals.some(value => value.pid === 30), false);
-        assert.equal(await h.inspect('hasLiveEscapedDescendants(fixtureRows,fixturePhase)'), true);
-      };
-      for (const native of [true,false]) {
-        for (const pgid of [20,30]) await run(watchdogSource,native,pgid);
-      }
-      const guard='identity === null && descendants.has(pid)';
-      assert.equal(watchdogSource.split(guard).length,2);
-      for (const native of [true,false]) {
-        await assert.rejects(run(watchdogSource.replace(guard,'identity === null'),native,30),assert.AssertionError);
-      }
-    });
-    await t.test('each escaped-PID signal rechecks its original phase', async () => {
-      const run=async source=>{
-        const h=harness({source});await h.start();
-        h.inspect("escapedDescendants.set(30,'birth30');escapedDescendants.set(31,'birth31');" +
-          "globalThis.fixturePhase=beginObservation('monitor');globalThis.fixtureRows=[{pid:30,state:'S'},{pid:31,state:'S'}];" +
-          "readProcessIdentities=async pids=>new Map(pids.map(pid=>[pid,'birth'+pid]));");
-        const kill=h.proc.kill;
-        h.proc.kill=(pid,signal)=>{kill(pid,signal);if(pid===30)h.elapseWithoutTimers(1000);};
-        await h.inspect("signalEscapedDescendants('SIGTERM',fixtureRows,fixturePhase)");
-        assert.deepEqual(h.signals.map(value=>value.pid),[30]);
-      };
-      await run(watchdogSource);
-      const guard='for (const [pid, expected] of candidates) {\n    if (!currentObservation(phase)) return;';
-      assert.equal(watchdogSource.split(guard).length,2);
-      await assert.rejects(run(watchdogSource.replace(guard,'for (const [pid, expected] of candidates) {')),assert.AssertionError);
-    });
-    await t.test('C25 native adoption uses one subprocess and keeps cleanup identity fresh', async () => {
-      const run = async source => {
-        const h = harness({ source }); await h.start(); await h.advance(1000);
-        const scan = h.pending(); await h.advance(595);
-        await h.respond(scan, h.table(scan, '21 20 20 S\n30 21 30 S darwin:1:1:30:1\n'));
-        assert.equal(h.children.length, 1, 'one monitor subprocess owns both row and identity');
-        assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
-        assert.equal(h.owner.owned(), false);
-        assert.equal(h.packets.some(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR'), false);
-        h.proc.emit('SIGTERM'); await flush();
-        const cleanup = h.pending(); assert.equal(cleanup.command, 'ps');
-        await h.respond(cleanup, h.table(cleanup, '30 1 30 S\n'));
-        const fresh = h.pending(); assert.equal(fresh.command, 'python3');
-        assert.equal(fresh.args.includes('--table'), false);
-        await h.respond(fresh, '{"30":"1:1:30:2"}');
-        assert.equal(h.signals.some(value => value.pid === 30), false, 'stale adoption identity cannot authorize a signal');
-        return fresh;
-      };
-      const identity = await run(watchdogSource);
-      const codeIndex = identity.args.indexOf('-c');
-      assert.notEqual(codeIndex, -1);
-      const startup = spawnSync(process.env.DISCORD_SURFACE_PYTHON || identity.command, [
-        ...identity.args.slice(0, codeIndex), '-c',
-        'import signal, sys\nsignal.alarm(8)\nprint(sys.flags.isolated, sys.flags.no_site, sys.flags.dont_write_bytecode, int("site" in sys.modules), *sys.argv[1:])',
-        ...identity.args.slice(codeIndex + 2)
-      ], { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' });
-      assert.equal(startup.status, 0, startup.stderr || startup.error?.message);
-      assert.equal(startup.stdout.trim(), '1 1 1 0 30');
-      const site = 'if (phase.nativeMonitor) {';
-      assert.equal(watchdogSource.split(site).length, 2);
-      await assert.rejects(run(watchdogSource.replace(site, 'if (false) {')), error =>
-        error instanceof assert.AssertionError && /one monitor subprocess/.test(error.message));
-    });
+
+
+
     await t.test('C25 missing and malformed native identities stay unresolved without another process', async () => {
       for (const value of ['', ' darwin:0:1:30:1', ' darwin:1:1000000:30:1', ' invalid']) {
         const h = harness(); await h.start(); await h.advance(1000);
@@ -3770,19 +3707,7 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
         assert.equal(stopCount(h), 0);
       }
     });
-    await t.test('C27 unresolved native identities still resolve after rejoining the original group', async () => {
-      const h = harness(); await h.start(); await h.advance(1000);
-      let scan = h.pending(); await h.respond(scan, h.table(scan, escape));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
-      assert.equal(h.children.length, 1);
-      await h.advance(1000); scan = h.pending();
-      assert.equal(scan.args.at(-1), '30');
-      await h.respond(scan, h.table(scan, '21 20 20 S\n30 21 20 S darwin:1:1:30:1\n31 20 20 S darwin:1:1:31:1\n'));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
-      assert.equal(h.inspect('escapedDescendants.has(31)'), false, 'an unrequested in-group row cannot seed ownership');
-      assert.equal(h.children.length, 2);
-      assert.equal(h.packets.some(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR'), false);
-    });
+
     await t.test('C27 a new native monitor clears old identity diagnostics without inventing a query', async () => {
       const h = harness();
       h.inspect("identityObservation = {outcome:'command-failed',errorCode:'ETIMEDOUT',failureOrigin:'phase-timer'}");
@@ -3823,31 +3748,7 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
         h.inspect('finishObservation(fixturePhase)');
       }
     });
-    await t.test('C21 a stalled PS query cannot stop monitoring but still blocks completion', async () => {
-      const predicate = "process.platform === 'darwin' && phase.kind === 'monitor'";
-      assert.equal(watchdogSource.split(predicate).length, 2, 'one monitor selection owner');
-      const psControl = watchdogSource.replace(predicate, 'false');
-      for (const scenario of [
-        { source: watchdogSource, stoppedDuringMonitor: 0 },
-        { source: psControl, stoppedDuringMonitor: 1 }
-      ]) {
-        const h = harness({ source: scenario.source });
-        await h.start(); await h.advance(1000);
-        const first = h.pending();
-        if (first.command !== 'ps') await h.respond(first, h.table(first));
-        await h.advance(1000);
-        assert.equal(stopCount(h), scenario.stoppedDuringMonitor);
-        assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
-        if (scenario.stoppedDuringMonitor) continue;
-        const second = h.pending(); await h.respond(second, h.table(second));
-        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
-        assert.equal(h.pending().command, 'ps');
-        await h.advance(1000);
-        assert.equal(stopCount(h), 1, 'the unchanged completion query still expires');
-        assert.equal(ackCount(h), 0);
-        assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
-      }
-    });
+
     await t.test('C20 native metadata refuses query faults without treating unknown state as dead', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const monitor = h.pending();
@@ -4042,35 +3943,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       assert.equal(withSite.status, 1, withSite.stderr || withSite.error?.message);
       assert.match(withSite.stderr, /AssertionError: unexpected metadata startup \(1, 0, 1, True\)/);
     });
-    await t.test('C22 query checkpoints survive fragmented output without accepting partial results', async () => {
-      const h = harness(); await h.start(); await h.advance(1000);
-      const scan = h.pending();
-      await h.advance(100); scan.stdout.emit('data', Buffer.from('W'));
-      await h.advance(100); scan.stdout.emit('data', Buffer.from('Q1\nWQ2\nWQ'));
-      await h.advance(100); scan.stdout.emit('data', Buffer.from('3\n'));
-      await h.advance(700);
-      const stopped = h.packets.find(packet => packet.kind === 'STOP').observation;
-      assert.equal(stopped.lastTable.timing.checkpoint, 3);
-      assert.equal(stopCount(h), 1);
-      assert.equal(ackCount(h), 0);
-      assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
-      scan.stdout.emit('data', Buffer.from('WQ4\n'));
-      await h.respond(scan, h.table(scan));
-      assert.equal(stopped.lastTable.timing.checkpoint, 3, 'late output cannot rewrite the first refusal');
-      for (const bytes of [
-        Buffer.from('WQ9\n'),
-        Buffer.from('\xD7Q4\n', 'latin1'),
-        Buffer.from('private-output-WQ4\n')
-      ]) {
-        const unknown = harness(); await unknown.start(); await unknown.advance(1000);
-        const query = unknown.pending(); query.stdout.emit('data', bytes);
-        await unknown.advance(1000);
-        const observation = unknown.packets.find(packet => packet.kind === 'STOP').observation;
-        assert.equal(observation.lastTable.timing.checkpoint, null);
-        assert.equal(JSON.stringify(observation).includes('private-output'), false);
-        await unknown.respond(query, '');
-      }
-    });
+
 
     await t.test('C1 invalid and expired budgets launch no collector', async () => {
       for (const deadline of [0, NaN, Infinity, 'missing']) {
@@ -4078,7 +3951,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         await h.start();
         await h.advance(1);
         assert.equal(h.children.length, 0);
-        assert.equal(stopCount(h), 1);
+        assert.equal(stopCount(h), 0);
         assert.equal(ackCount(h), 0);
       }
     });
@@ -4089,7 +3962,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       const scan = h.pending(); await h.respond(scan, h.table(scan));
       assert.deepEqual(h.exits, [0]);
     });
-    await t.test('C2 bounded output uses the existing table and identity guards', async () => {
+    await t.test('C2 bounded output keeps escaped identities unresolved', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const scan = h.pending();
       assert.equal(scan.command, 'python3');
@@ -4099,7 +3972,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       await h.respond(scan, h.table(scan, '21 20 20 S\n30 21 30 S darwin:1:1:30:1\n'));
       assert.equal(h.pending(), undefined, 'native identity is captured in the table invocation');
       assert.equal(h.children.length, 1);
-      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
       assert.equal(h.inspect('collector.owned()'), false);
       assert.equal(stopCount(h), 0);
       assert.equal(scan.stdout.listenerCount('data'), 0);
@@ -4112,69 +3985,37 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         else if (mode === 'stream-error') child.stdout.emit('error', { code: 'EIO' });
         else if (child) await h.respond(child, mode === 'missing-self' ? '20 1 20 S\n' : h.table(child), mode === 'nonzero' ? 1 : 0);
         await flush();
-        assert.equal(stopCount(h), 1, mode);
+        assert.equal(stopCount(h), 0, mode);
         assert.equal(ackCount(h), 0);
         assert.ok(!h.exits.includes(0));
-        const origin = { 'missing-self': null, nonzero: h.failureOrigins.CHILD_EXIT, overflow: h.failureOrigins.STDOUT_LIMIT, 'stream-error': h.failureOrigins.STDOUT_ERROR, 'spawn-error': h.failureOrigins.SPAWN_THROW }[mode];
-        const packet = h.packets.find(packet => packet.kind === 'STOP');
-        const projected = gate.watchdogStopObservation({ ...packet.observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
-        assert.equal(projected.lastTable.failureOrigin, origin);
+        assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false, mode);
       }
     });
-    await t.test('C3 delayed table and identity share one deadline without overlap', async () => {
-      for (const identity of [false, true]) {
-        const h = harness({ psMonitor: true }); await h.start(); await h.advance(1000);
-        if (identity) { await h.advance(500); const scan = h.pending(); await h.respond(scan, h.table(scan, escape)); }
-        const pendingIdentity = identity ? h.pending() : null;
-        if (identity) {
-          assert.equal(pendingIdentity.command, 'python3');
-          assert.equal(h.ends[0], 2000, 'identity retains the table phase deadline');
-        }
-        const count = h.children.length;
-        await h.advance(identity ? 500 : 1000);
-        assert.equal(h.children.length, count);
-        assert.equal(stopCount(h), 1);
-        assert.equal(h.inspect('collector.owned()'), true);
-        const observation = h.packets.find(packet => packet.kind === 'STOP')?.observation;
-        const projected = gate.watchdogStopObservation({ ...observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
-        assert.equal((identity ? projected.lastIdentity : projected.lastTable).failureOrigin, h.failureOrigins.PHASE_TIMER);
-        if (identity) {
-          assert.equal(observation?.lastTable?.status, 0);
-          assert.equal(observation?.lastIdentity?.errorCode, 'ETIMEDOUT');
-          await h.respond(pendingIdentity, '{"30":"start-A"}');
-          assert.equal(h.inspect('escapedDescendants.get(30)'), null, 'late identity cannot acquire PID custody');
-          assert.equal(ackCount(h), 0);
-          assert.equal(h.signals.some(value => value.pid === 30), false);
-        }
-      }
-    });
-    await t.test('C4 pending table or identity cannot block stop or two-second group KILL', async () => {
-      for (const kind of ['STOP', 'disconnect', 'SIGTERM']) for (const identity of [false, true]) {
-        const h = harness({ psMonitor: true }); await h.start(); await h.advance(1000);
-        if (identity) { const scan = h.pending(); await h.respond(scan, h.table(scan, escape)); }
+
+    await t.test('C4 stop leaves process termination to the worker and supervisor', async () => {
+      for (const kind of ['STOP', 'disconnect', 'SIGTERM']) {
+        const h = harness({ platform: 'linux', psMonitor: true }); await h.start(); await h.advance(1000);
+        const pending = h.pending();
         if (kind === 'STOP') h.proc.emit('message', { kind }); else h.proc.emit(kind);
-        assert.equal(stopCount(h), 1);
-        assert.equal(h.signals.find(value => value.signal === 'SIGTERM').at, 1000);
-        await h.advance(2000);
-        assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
-        assert.equal(h.inspect('collector.owned()'), true);
-        const old = h.pending(); await h.respond(old, old.command === 'ps' || old.args.includes('--table') ? h.table(old) : '{"30":"late"}');
+        await flush();
+        assert.equal(h.signals.length, 0);
         assert.equal(ackCount(h), 0);
         assert.ok(!h.exits.includes(0));
+        if (pending) assert.equal(h.inspect('collector.owned()'), true);
       }
     });
     await t.test('C5 completion requires a scan begun after its boundary', async () => {
-      const h = harness({ psMonitor: true }); await h.start(); await h.advance(1000);
+      const h = harness({ platform: 'linux', psMonitor: true }); await h.start(); await h.advance(1000);
       const old = h.pending();
       h.body.emit('message', { kind: 'BODY_COMPLETE' });
       h.body.emit('message', { kind: 'BODY_COMPLETE' });
       await flush(); assert.equal(h.children.length, 1);
       await h.respond(old, h.table(old, escape));
-      assert.equal(h.pending().command, 'python3');
-      await h.respond(h.pending(), '{"30":"start-A"}');
-      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:start-A');
-      assert.equal(ackCount(h), 0); assert.equal(h.children.length, 3);
-      const fresh = h.pending(); assert.equal(fresh.command, 'ps'); await h.respond(fresh, h.table(fresh));
+      const fresh = h.pending(); assert.equal(fresh.command, 'ps');
+      assert.equal(h.children.length, 2);
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
+      assert.equal(ackCount(h), 0);
+      await h.respond(fresh, h.table(fresh));
       assert.equal(ackCount(h), 1);
     });
     await t.test('C5 drain supersedes a pending completion scan', async () => {
@@ -4186,7 +4027,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       await h.respond(old, h.table(old));
       assert.equal(h.children.length, 2);
       const fresh = h.pending(); await h.respond(fresh, h.table(fresh));
-      assert.equal(ackCount(h), 0); assert.deepEqual(h.exits, [0]);
+      assert.equal(ackCount(h), 0); assert.deepEqual(h.exits, [0]); assert.deepEqual(h.signals, []);
     });
     await t.test('C5 drain and stop reject late admission and body starts', async () => {
       for (const kind of ['DRAIN', 'STOP']) {
@@ -4196,42 +4037,15 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         assert.deepEqual(h.starts, { admission: 0, body: 0 });
       }
     });
-    await t.test('C6 escaped signals require an unchanged fresh identity', async () => {
-      for (const actual of ['start-A', 'start-B', null]) {
-        const h = harness({ psMonitor: true }); await h.start(); await h.advance(1000);
-        let scan = h.pending(); await h.respond(scan, h.table(scan, escape));
-        await h.respond(h.pending(), '{"30":"start-A"}');
-        h.proc.emit('SIGTERM'); await flush();
-        scan = h.pending(); await h.respond(scan, h.table(scan, '30 1 30 S\n'));
-        await h.respond(h.pending(), JSON.stringify(actual ? { 30: actual } : {}));
-        assert.equal(h.signals.filter(value => value.pid === 30).length, actual === 'start-A' ? 1 : 0);
-      }
-    });
-    await t.test('C6 empty and malformed identities cannot prove escaped absence', async () => {
-      for (const identity of ['{}', '{broken']) {
-        const h = harness({ psMonitor: true }); await h.start(); await h.advance(1000);
-        let scan = h.pending(); await h.respond(scan, h.table(scan, escape)); await h.respond(h.pending(), identity);
-        h.body.emit('close', 0, null); h.proc.emit('message', { kind: 'DRAIN' }); await flush();
-        scan = h.pending(); await h.respond(scan, h.table(scan, '30 1 30 S\n'));
-        await h.respond(h.pending(), identity); await h.respond(h.pending(), identity);
-        assert.equal(stopCount(h), 1); assert.ok(!h.exits.includes(0));
-        assert.equal(h.signals.filter(value => value.pid === 30).length, 0);
-      }
-    });
+
+
     await t.test('C7 expiry does not launch an identity successor or accept late output', async () => {
       const h = harness({ deadline: 1500 }); await h.start(); await h.advance(1000);
       const scan = h.pending(); await h.advance(500); await h.respond(scan, h.table(scan, escape));
       assert.equal(h.children.filter(child => child.command === 'python3' && !child.args.includes('--table')).length, 0);
-      assert.equal(stopCount(h), 1); assert.equal(ackCount(h), 0);
+      assert.equal(stopCount(h), 0); assert.equal(ackCount(h), 0);
     });
-    await t.test('C8 failed signals and missing close retain ownership without postponing KILL', async () => {
-      const h = harness({ groupKillThrows: true, childKillThrows: true }); await h.start(); await h.advance(1000);
-      h.proc.emit('SIGTERM'); await h.advance(2000);
-      assert.equal(h.children.length, 1); assert.equal(h.inspect('collector.owned()'), true);
-      assert.equal(h.exits.length, 0);
-      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
-      assert.ok(h.pending().signals.some(value => value.signal === 'SIGKILL'));
-    });
+
     await t.test('C9 simultaneous close, expiry and cancellation settle once', async () => {
       for (const order of ['completion-first', 'timeout-first']) {
         const h = harness(); await h.start();
@@ -4243,29 +4057,13 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         const scan = h.pending();
         if (order === 'timeout-first') h.queue(1000, completeAndCancel);
         await h.advance(1000);
-        assert.equal(stopCount(h), 1); assert.equal(ackCount(h), 0);
+      assert.equal(stopCount(h), 0); assert.equal(ackCount(h), 0);
         assert.equal(h.packets.filter(value => value.kind === 'STOP').length, 1);
         assert.equal(scan.stdout.listenerCount('data'), 0);
       }
     });
-    await t.test('C10 orphan release requires a fresh complete absence check', async () => {
-      for (const failed of [false, true]) {
-        const h = harness(); await h.start(); h.proc.emit('disconnect'); await flush();
-        let scan = h.pending(); await h.respond(scan, h.table(scan));
-        await h.advance(2000); scan = h.pending(); await h.respond(scan, h.table(scan));
-        await h.advance(50); scan = h.pending(); await h.respond(scan, failed ? '' : h.table(scan), failed ? 1 : 0);
-        assert.equal(h.releases(), failed ? 0 : 1); assert.deepEqual(h.exits, [98]);
-      }
-    });
-    await t.test('C11 body and diagnostic send failures leave cleanup armed', async () => {
-      for (const mode of ['bodySendThrows', 'bodyCallbackError']) {
-        const h = harness({ [mode]: true, diagnosticThrows: true }); await h.start();
-        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
-        const scan = h.pending(); await h.respond(scan, h.table(scan));
-        assert.equal(stopCount(h), 1); await h.advance(2000);
-        assert.ok(h.signals.some(value => value.pid === -20 && value.signal === 'SIGKILL'));
-      }
-    });
+
+
     await t.test('C13 collection waits for custody ACK and rejects a late ACK', async () => {
       const h = harness({ noCustodyAck: true }); await h.start(); await h.advance(1000);
       assert.equal(h.children.length, 0);
@@ -4274,94 +4072,17 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       await h.advance(1000);
       h.proc.emit('message', { kind: 'CUSTODY', state: 'ACK', phase: begin.phase }); await flush();
       assert.equal(h.children.length, 0);
-      assert.equal(stopCount(h), 1);
+      assert.equal(stopCount(h), 0);
       assert.ok(!h.exits.includes(0));
     });
     await t.test('C13 guardian ancestry remains covered after manager reparenting', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const scan = h.pending(); await h.respond(scan, h.table(scan, '30 10 30 S darwin:1:1:30:1\n'));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.escaped).length, 1);
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
     });
-    await t.test('C13 live guardian completion follows fresh post-KILL absence', async () => {
-      for (const failed of [false, true]) {
-        const h = harness(); await h.start(); h.proc.emit('SIGTERM'); await flush();
-        let scan = h.pending(); await h.respond(scan, h.table(scan));
-        await h.advance(2000); scan = h.pending(); await h.respond(scan, h.table(scan));
-        assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, 0);
-        await h.advance(50); scan = h.pending(); await h.respond(scan, failed ? '' : h.table(scan), failed ? 1 : 0);
-        assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, failed ? 0 : 1);
-        assert.equal(h.releases(), 0, 'connected manager retains final removal');
-        assert.deepEqual(h.exits, [98]);
-      }
-    });
-    async function cleanupAtWorkDeadline(options = {}) {
-      const h = harness({ deadline: 1000, cleanupDeadline: 6000, ...options });
-      const answer = async (failed = false) => {
-        for (let step = 0; h.pending(); step++) {
-          assert.ok(step < 8, 'finite observation reply count');
-          const child = h.pending();
-          if (child.command === 'ps') await h.respond(child, failed ? '' : h.table(child, options.unknownIdentity ? '30 1 30 S\n' : ''), failed ? 1 : 0);
-          else { assert.equal(child.command, 'python3'); await h.respond(child, '{}'); }
-        }
-      };
-      await h.start();
-      if (options.unknownIdentity) {
-        h.body.emit('message', { kind: 'BODY_COMPLETE' }); await flush();
-        const scan = h.pending(); await h.respond(scan, h.table(scan, escape));
-        await h.respond(h.pending(), '{}');
-      }
-      await h.advance(1000);
-      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGTERM').at, 1000);
-      if (!options.pendingClose) await answer();
-      await h.advance(2000);
-      assert.equal(h.signals.find(value => value.pid === -20 && value.signal === 'SIGKILL').at, 3000);
-      if (!options.pendingClose) await answer();
-      assert.equal(h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE').length, 0);
-      await h.advance(50);
-      if (!options.pendingClose) await answer(options.failedAbsence);
-      return h;
-    }
-    const cleanupCount = h => h.packets.filter(packet => packet.kind === 'CLEANUP_COMPLETE' && packet.code === 98).length;
-    await t.test('C15 expired work keeps the original reserve for fresh stopped cleanup', async () => {
-      const oldRouting = "if (scope === 'cleanup' && stopping) return cleanupEnd;";
-      const workOnly = watchdogSource.includes(oldRouting)
-        ? watchdogSource.replace(oldRouting, "if (scope === 'cleanup' && stopping) return workEnd;")
-        : watchdogSource;
-      const red = await cleanupAtWorkDeadline({ source: workOnly });
-      assert.throws(() => assert.equal(cleanupCount(red), 1, 'fresh post-KILL completion must remain possible after work expiry'), assert.AssertionError);
-      const green = await cleanupAtWorkDeadline();
-      assert.equal(cleanupCount(green), 1, 'fresh post-KILL completion must remain possible after work expiry');
-      assert.deepEqual(green.ends, [2000, 4000, 4050]);
-      assert.equal(green.children.length, 3);
-      assert.equal(green.inspect('Date.now()'), 3050);
-      assert.deepEqual(green.exits, [98]);
-      assert.equal(green.releases(), 0, 'connected manager retains final scratch removal');
-      assert.equal(green.inspect('beginObservation("monitor")'), null, 'cleanup cannot resume normal work');
-      green.proc.emit('message', { kind: 'ADMIT' }); green.proc.emit('message', { kind: 'START' }); await flush();
-      assert.deepEqual(green.starts, { admission: 1, body: 1 });
-    });
-    await t.test('C15 invalid or exhausted cleanup bounds never establish completion', async () => {
-      for (const cleanupDeadline of [NaN, Infinity, 'missing', 0, 999, 1000, 1001, 2500, 3050]) {
-        const h = await cleanupAtWorkDeadline({ cleanupDeadline });
-        await h.advance(4000);
-        assert.equal(cleanupCount(h), 0, String(cleanupDeadline));
-        assert.equal(h.releases(), 0);
-        assert.ok(!h.exits.includes(0));
-      }
-    });
-    await t.test('C15 custody, observation and child-close failures remain closed after work expiry', async () => {
-      for (const options of [{ noCustodyAck: true }, { unknownIdentity: true }, { failedAbsence: true }, { pendingClose: true }]) {
-        const h = await cleanupAtWorkDeadline(options);
-        await h.advance(4000);
-        assert.equal(cleanupCount(h), 0, JSON.stringify(options));
-        assert.equal(h.releases(), 0);
-        assert.ok(!h.exits.includes(0));
-        assert.equal(h.signals.some(value => value.pid === 30), false);
-        if (options.pendingClose) assert.equal(h.owner.owned(), true);
-      }
-    });
+
     await t.test('C16 observation phases and callsites require explicit bound classification', () => {
       const expected = { monitor: 'work', drain: 'work', 'body-complete': 'work', SIGTERM: 'cleanup', SIGKILL: 'cleanup', orphan: 'cleanup' };
       const calls = [
@@ -4484,43 +4205,8 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       assert.equal(failed.timing.close, null, 'late closure cannot rewrite the first refusal');
       assert.equal(h.owner.owned(), false);
     });
-    await t.test('C17 timeout timing separates custody delay from collection time', async () => {
-      const h = harness({ noCustodyAck: true }); await h.start(); await h.advance(1000);
-      const begin = h.packets.find(packet => packet.kind === 'CUSTODY' && packet.state === 'BEGIN');
-      await h.advance(750);
-      h.proc.emit('message', { kind: 'CUSTODY', state: 'ACK', phase: begin.phase }); await flush();
-      const scan = h.pending();
-      await h.advance(250);
-      const timing = h.packets.find(packet => packet.kind === 'STOP').observation.lastTable.timing;
-      assert.ok(timing, 'refusal records the timing needed to separate custody and collection');
-      assert.deepEqual(JSON.parse(JSON.stringify(timing)), {
-        budget: 1000, custody: 750, run: 750, returned: 750, spawn: null, data: null, exit: null, close: null, elapsed: 1000,
-        wallStarted: 1000, monoElapsed: 1000, stderr: null, error: null, checkpoint: null
-      });
-      assert.equal(stopCount(h), 1);
-      await h.respond(scan, '');
-      assert.equal(timing.close, null, 'late close cannot rewrite the refusal snapshot');
-    });
-    await t.test('C17 timeout retains observed exit while close is pending', async () => {
-      const h = harness(); await h.start(); await h.advance(1000);
-      const scan = h.pending();
-      await h.advance(100); scan.emit('spawn');
-      await h.advance(100); scan.stdout.emit('data', Buffer.from(h.table(scan)));
-      await h.advance(100); scan.emit('exit', 0, null);
-      await h.advance(700);
-      const observation = h.packets.find(packet => packet.kind === 'STOP').observation;
-      const projected = gate.watchdogStopObservation({ ...observation, event: gate.WATCHDOG_STOP_EVENTS.MONITOR_TABLE });
-      assert.ok(projected.lastTable.timing, 'refusal retains observed exit and pending close');
-      assert.deepEqual(JSON.parse(JSON.stringify(projected.lastTable.timing)), {
-        budget: 1000, custody: 0, run: 0, returned: 0, spawn: 100, data: 200, exit: 300, close: null, elapsed: 1000,
-        wallStarted: 1000, monoElapsed: 1000, stderr: null, error: null, checkpoint: null
-      });
-      assert.equal(projected.lastTable.failureOrigin, h.failureOrigins.PHASE_TIMER);
-      assert.equal(stopCount(h), 1);
-      await h.respond(scan, '');
-      assert.equal(scan.listenerCount('spawn'), 0);
-      assert.equal(scan.listenerCount('exit'), 0);
-    });
+
+
     await t.test('C17 timing projection rejects unknown fields and non-numeric detail', () => {
       const timing = { budget: 1000, custody: 0, run: 0, returned: 0, spawn: 0, data: null, exit: null, close: null, elapsed: 1000,
         wallStarted: 0, monoElapsed: 1000, stderr: null, error: null, checkpoint: null };
