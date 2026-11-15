@@ -57,13 +57,12 @@ function createOwnerAdmission({ state, compareDiscordIds }) {
 
   function ownerMessageIsTerminal(message) {
     return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
-      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state));
+      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST, MESSAGE_STATES.REJECTED].includes(message.state));
   }
 
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
-    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
-      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state) ||
+    return !message || message.state === MESSAGE_STATES.ACCEPTED || ownerMessageIsTerminal(message) ||
       (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
   }
 
@@ -181,7 +180,7 @@ function createOwnerAdmission({ state, compareDiscordIds }) {
 
   function releaseHandledWithoutPostId(messageId) {
     const message = state.getMessage(messageId);
-    if (!message || message.state !== MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) return false;
+    if (!message || ![MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST, MESSAGE_STATES.REJECTED].includes(message.state)) return false;
     const queue = ownerQueues.get(nativeOwnerKey(message));
     if (!queue) return false;
     if (queue.active?.message.id === messageId) {

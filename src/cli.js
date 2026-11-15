@@ -229,6 +229,14 @@ Guarded parent intake recovery:
 
 Records pending reconciliation for the exact unavailable parent and DNS error in the expectation.
 
+Reviewed, never-dispatched custody:
+  recover --message-id <id> --resolution not_executed \
+    --native-id <original UUID> --generation <original generation> \
+    --evidence-scope <why the instruction must not execute>
+
+Records a rejected disposition while preserving the original message and receipts.
+Refuses attempted or ambiguous native custody. This is not an execution acknowledgment.
+
 Courier recovery:
   recover --courier-message-id <id> --courier-attempt-id <id>
 

@@ -122,6 +122,28 @@ function createRecoveryCommands({ required, openState, print, gatewayProcessStat
             nonce: args['direct-post-nonce']
           }
         ));
+      } else if (mode === 'accepted') {
+        const runtime = gatewayProcessStatus(paths);
+        const requiredCapability = GATEWAY_CAPABILITIES.acceptedCustodyReconciliation;
+        if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state) ||
+            (runtime.state === 'running' && (!Number.isSafeInteger(runtime.pid) || runtime.pid < 1 ||
+              !Array.isArray(runtime.capabilities)))) {
+          throw new Error('Gateway status is unknown; accepted custody was not changed');
+        }
+        const live = runtime.state === 'running';
+        if (live && !runtime.capabilities.includes(requiredCapability)) {
+          throw new Error('running Gateway does not support accepted custody reconciliation');
+        }
+        const result = state.reconcileAcceptedNotExecuted({
+          messageId: required(args, 'message-id'),
+          nativeId: required(args, 'native-id'),
+          generation: Number(required(args, 'generation')),
+          evidenceScope: required(args, 'evidence-scope')
+        });
+        const gatewayWake = requestGatewayRecovery(paths, {
+          ...(live ? { expectedPid: runtime.pid } : {}), requiredCapability
+        });
+        print({ messageId: result.message.id, state: result.message.state, duplicate: result.duplicate, gatewayWake });
       } else if (mode === 'message') print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
       else print(state.recoverAfterRestart());
     }

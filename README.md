@@ -388,6 +388,19 @@ node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
 
 `status` reports pending custody and labels live permission, native approval, quota, billing, and connection gates. Simulated tests do not prove those live gates. Completion evidence and live trials remain conductor-owned.
 
+For a reviewed instruction that must no longer execute, retire only its never-dispatched custody:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --message-id DISCORD_MESSAGE_ID --resolution not_executed \
+  --native-id ORIGINAL_SESSION_UUID --generation ORIGINAL_GENERATION \
+  --evidence-scope "Expired probe, reviewed during successor recovery"
+```
+
+This records `rejected` and an `accepted-not-executed` receipt. Content, attachments and original routing evidence remain unchanged. A prior dispatch, acknowledgment, observer, reply or unknown receipt kind refuses the operation. It never sends a reply or claims native pickup. Identical retries are idempotent. Keep actionable requests tracked until their actual work is complete.
+
+A running Gateway must advertise `accepted-custody-reconciliation-v1` before any message changes. Successful retirement requests a guarded wake so already queued successors can advance. A stopped Gateway retains the disposition for its next startup.
+
 To clear a recorded Discord intake gap after inspecting the attempted range, request explicit reconciliation:
 
 ```sh

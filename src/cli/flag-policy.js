@@ -22,6 +22,7 @@ const RECOVER_FLAGS = Object.freeze({
   directPost: ['direct-post-request-id', 'direct-post-attempt-id', 'direct-post-message-id', 'direct-post-nonce',
     'resolution', 'evidence-scope'],
   message: ['message-id', 'resolution'],
+  accepted: ['message-id', 'resolution', 'native-id', 'generation', 'evidence-scope'],
   courier: ['courier-message-id', 'courier-attempt-id'],
   restart: []
 });
@@ -40,6 +41,7 @@ function recoverMode(args = {}) {
   if (args['intake-channel-id']) return 'intake';
   if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) return 'reply';
   if (args['direct-post-request-id']) return 'directPost';
+  if (args['message-id'] && args.resolution === 'not_executed') return 'accepted';
   if (args['message-id'] && args.resolution) return 'message';
   return 'restart';
 }
