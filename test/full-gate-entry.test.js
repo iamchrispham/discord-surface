@@ -1834,7 +1834,9 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
     assert.notEqual(saved.extraHolders[1].coalition_id, first.identity.coalition_id, 'controller and launchd guardian shared a coalition');
     expected.push(first.identity, saved.extraHolders[1]);
   } else {
-    assert.equal(saved.extraHolders.length, 0);
+    assert.equal(saved.extraHolders.length, 1);
+    assert.ok(roleFixture.sameProcessIdentity(first.identity, saved.extraHolders[0]), 'wrong Linux supervisor holder');
+    expected.push(first.identity);
   }
   const lease = JSON.parse(fs.readFileSync(f.leaseFile, 'utf8'));
   assert.equal(lease.holders.length, expected.length);
@@ -5403,7 +5405,8 @@ def active_stop(mode):
                 raise InterruptedError('valid next-sequence stop interrupted active capture')
             return {'snapshot':'stable'}
         finally:active['capture']=False
-    capability=types.SimpleNamespace(capture_snapshot=capture,SnapshotCleanupError=Cleanup,InvalidGateBudget=Budget)
+    capability=types.SimpleNamespace(capture_snapshot=capture,SnapshotCleanupError=Cleanup,InvalidGateBudget=Budget,
+        establish_reaping_contract=lambda:None)
     def popen(argv,**kwargs):
         require(argv==['fixture-body'] and kwargs['start_new_session'] is False,'wrong active body launch')
         spawns.append(argv);require(len(spawns)==1,'active stop restarted body')

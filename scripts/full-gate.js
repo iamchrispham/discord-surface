@@ -71,8 +71,9 @@ function watchdogStopObservation(value) {
 const MESSAGES = Object.freeze({ READY: 'ready', ADMIT: 'admit', ADMISSION_EXIT: 'admission-exit', START: 'start', BODY_COMPLETE: 'body-complete', BODY_SCAN_COMPLETE: 'body-scan-complete', BODY_EXIT: 'body-exit', CLOSE: 'close', DRAIN: 'drain', STOP: 'stop', CUSTODY: 'custody', CLEANUP_COMPLETE: 'cleanup-complete' });
 const CUSTODY = Object.freeze({ BEGIN: 'begin', ACK: 'ack', CLEAR: 'clear' });
 const DARWIN_LAUNCHD = 'darwin-launchd-v1';
+const SUPERVISOR_PID_ENVIRONMENT = 'DISCORD_SURFACE_GATE_SUPERVISOR_PID';
 const SUPERVISOR_HOLDER_ENVIRONMENTS = Object.freeze([
-  'DISCORD_SURFACE_GATE_SUPERVISOR_PID',
+  SUPERVISOR_PID_ENVIRONMENT,
   'DISCORD_SURFACE_GATE_JOB_PID'
 ]);
 const SETTINGS = Object.freeze({ COMMAND: 'APERTURE_GATE_ADMISSION_COMMAND', BUDGET: 'APERTURE_GATE_TIME_LEFT_S', SLOWEST: 'APERTURE_GATE_SLOWEST_RUN_S' });
@@ -505,11 +506,19 @@ async function runFullGate(root, label, entry, args) {
       return;
     }
     const holders = [worker.pid, guardianPid];
-    if (supervisorKind === DARWIN_LAUNCHD) {
+    if (supervisorKind === SUPERVISOR.LINUX_SUBREAPER) {
+      const holder = Number(process.env[SUPERVISOR_PID_ENVIRONMENT]);
+      if (Number.isSafeInteger(holder) && holder > 1 && !holders.includes(holder)) holders.push(holder);
+    } else if (supervisorKind === DARWIN_LAUNCHD) {
       for (const name of SUPERVISOR_HOLDER_ENVIRONMENTS) {
         const holder = Number(process.env[name]);
         if (Number.isSafeInteger(holder) && holder > 1 && !holders.includes(holder)) holders.push(holder);
       }
+    }
+    if (supervisorKind === SUPERVISOR.LINUX_SUBREAPER && holders.length < 3) {
+      worker.removeListener('message', received);
+      resolve({ error: 'Linux supervisor holder is incomplete' });
+      return;
     }
     if (supervisorKind === DARWIN_LAUNCHD && holders.length < 4) {
       worker.removeListener('message', received);
