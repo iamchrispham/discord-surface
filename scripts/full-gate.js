@@ -586,6 +586,9 @@ async function runFullGate(root, label, entry, args) {
     guardian.on('message', message => {
       if (message.kind === MESSAGES.STOP) {
         try { observed.watchdogStop ||= watchdogStopObservation(message.observation); } catch {}
+        if (!stopped && message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS) {
+          stop(REASONS.INTERRUPTED, 'watchdog-stop');
+        }
       }
       if (message.kind === MESSAGES.CUSTODY && Number.isSafeInteger(message.phase) && message.phase > 0) {
         if (message.state === CUSTODY.BEGIN && message.phase > custodyPhase) {

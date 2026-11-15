@@ -29,6 +29,7 @@ function fixture(t) {
   const root = path.join(scratch, 'repo');
   fs.mkdirSync(root);
   const supervisor = createSupervisorReceipt(scratch);
+  const supervisorPidEnvironment = 'DISCORD_SURFACE_GATE_SUPERVISOR_PID';
   const env = { ...process.env };
   env.NODE_OPTIONS = '';
   env[SUPERVISOR.ENVIRONMENT] = SUPERVISOR.LINUX_SUBREAPER;
@@ -154,7 +155,7 @@ function fixture(t) {
     "  }",
     "  if (process.env.FIXTURE_ESCAPE_PIPE && !process.env.FIXTURE_ESCAPE_READY) startEscapePipe();",
     "  if (process.env.FIXTURE_READ_ONLY_SCRATCH) { const ro=require('node:path').join(process.env.DISCORD_SURFACE_GATE_SCRATCH,'ro');fs.mkdirSync(ro);fs.writeFileSync(require('node:path').join(ro,'f'),'x');fs.chmodSync(ro,0o500); }",
-    "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
+    "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'const fs=require(\"node:fs\");process.on(\"SIGTERM\",()=>{if(process.env.FIXTURE_LEFTOVER_STOPPED)fs.writeFileSync(process.env.FIXTURE_LEFTOVER_STOPPED,\"term\");process.exit(0)});setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
     "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH && !process.env.FIXTURE_ESCAPE_READY) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
     "}",
@@ -166,6 +167,12 @@ function fixture(t) {
   ].join('\n'));
   const processes = [];
   const boundedCustodies = [];
+  const inheritedSupervisorPid = Number(env[supervisorPidEnvironment]);
+  const externalSupervisorPid = Number.isSafeInteger(inheritedSupervisorPid)
+      && inheritedSupervisorPid > 1 && inheritedSupervisorPid !== process.pid
+    ? inheritedSupervisorPid
+    : null;
+  const externalSupervisorIdentity = roleFixture.captureIdentity(externalSupervisorPid ?? process.pid);
   t.after(async () => {
     const unresolved = [];
     const identities = new Map();
@@ -213,14 +220,14 @@ function fixture(t) {
         for (const item of value) remember(item);
       } else if (value && typeof value === 'object') {
         if (value.kind === 'present' && Number.isSafeInteger(value.pid)) {
+          if (externalSupervisorIdentity.kind === 'present'
+              && roleFixture.sameProcessIdentity(value, externalSupervisorIdentity)) return;
           const start = value.platform === 'darwin'
             ? value.start_sec + ':' + value.start_usec + ':' + value.unique_id
             : value.boot_id + ':' + value.start;
           identities.set(value.pid + ':' + start, value);
         } else {
-          for (const [key, item] of Object.entries(value)) {
-            if (key !== 'extraHolders') remember(item);
-          }
+          for (const item of Object.values(value)) remember(item);
         }
       }
     };
@@ -336,6 +343,21 @@ function fixture(t) {
       FIXTURE_ROOT: root, FIXTURE_MARKER: marker, FIXTURE_PROTOCOL: protocol,
       FIXTURE_LEASE_FILE: leaseFile, FIXTURE_ROLE_FILE: roleFile, ...extra
     };
+    if (!supervised) {
+      if (extra.FIXTURE_KILL_WORKER && externalSupervisorPid === null) {
+        const simulatedSupervisor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+        simulatedSupervisor.once('error', () => {});
+        const identity = roleFixture.captureIdentity(simulatedSupervisor.pid);
+        if (identity.kind !== 'present') {
+          simulatedSupervisor.kill('SIGKILL');
+          throw new Error('simulated supervisor identity could not be established');
+        }
+        processes.push({ child: simulatedSupervisor, identity });
+        launchEnv[supervisorPidEnvironment] = String(simulatedSupervisor.pid);
+      } else {
+        launchEnv[supervisorPidEnvironment] = String(externalSupervisorPid ?? process.pid);
+      }
+    }
     if (supervised) {
       delete launchEnv[SUPERVISOR.ENVIRONMENT];
       delete launchEnv[SUPERVISOR.RECEIPT];
@@ -2192,9 +2214,18 @@ test('scratch cleanup subprocess is bounded by the gate deadline', () => {
 
 test('leftover owned child produces exactly one no-verdict line', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const result = await f.launch({ FIXTURE_LEFTOVER: '1' }).done;
+  const leftoverStopped = path.join(f.scratch, 'leftover-stopped');
+  const started = Date.now();
+  const result = await f.launch({
+    FIXTURE_LEFTOVER: '1', FIXTURE_LEFTOVER_STOPPED: leftoverStopped,
+    APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '1'
+  }).done;
   assert.equal(result.code, 98, result.output);
   assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+  if (process.platform === 'linux') {
+    assert.equal(fs.readFileSync(leftoverStopped, 'utf8'), 'term');
+    assert.ok(Date.now() - started < 12000, 'worker cleanup waited for the caller deadline');
+  }
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(fs.existsSync(body.scratch), false);
 });
