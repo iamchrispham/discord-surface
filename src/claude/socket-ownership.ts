@@ -12,28 +12,51 @@ import {
   unlinkSocketIfOwned as unlinkSocketIfOwnedQuarantine,
   type QuarantineDependencies
 } from './socket-ownership/quarantine';
-import { acquireSocketLock as acquireSocketLockImpl, lockPathForSocket } from './socket-ownership/lock';
+import {
+  acquireSocketLock as acquireSocketLockImpl,
+  lockPathForSocket,
+  readSocketLockOwnerSnapshotAt
+} from './socket-ownership/lock';
 import {
   effectiveUserId,
   isSocketLockOwnerAlive,
   ownerIdentity,
   parseSocketLockOwner,
   sameFile,
+  sameOwnerMarker,
   writeOwnerMarker
 } from './socket-ownership/lock-owner';
-import type { SocketIdentity } from './socket-ownership/types';
+import type { OwnerMarkerSnapshot, OwnerRecord, SocketIdentity } from './socket-ownership/types';
 
 export type { SocketIdentity } from './socket-ownership/types';
+export type { OwnerMarkerSnapshot, OwnerRecord } from './socket-ownership/types';
 
 export type SocketPathIdentity = SocketIdentity;
 
 export type SocketLockRelease = () => void;
+
+export { lockPathForSocket };
 
 // Re-exported at the existing public path. Local binding form (rather than a
 // `export ... from` specifier) keeps the emitted CommonJS export a writable
 // data property, matching the baseline public surface for test mocking.
 const acquireSocketLock = acquireSocketLockImpl;
 export { acquireSocketLock };
+
+export function readSocketLockOwnerSnapshot(lockPath: string): OwnerMarkerSnapshot | undefined {
+  try { return readSocketLockOwnerSnapshotAt(lockPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+export function sameSocketLockOwnerSnapshot(left: OwnerMarkerSnapshot, right: OwnerMarkerSnapshot): boolean {
+  return sameOwnerMarker(left, right);
+}
+
+export function socketLockOwnerAlive(owner: OwnerRecord): boolean {
+  return isSocketLockOwnerAlive(owner);
+}
 
 function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
   return sameFile(left, right) && left.ctimeNs === right.ctimeNs && left.birthtimeNs === right.birthtimeNs;

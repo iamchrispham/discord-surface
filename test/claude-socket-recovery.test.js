@@ -11,7 +11,7 @@ const {
   isCaseInsensitiveDirectory, orphan
 } = require('./claude-socket-recovery-fixture');
 
-test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 8000 }, async t => {
+test('abrupt listener expiry refuses an ambiguous incumbent', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   const { dir, db, state } = fixture();
   state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket, generation: 7 }, { intakeCutoff: '100' });
@@ -44,10 +44,10 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
       }
     }
   });
-  await channel.start();
-  assert.equal(channel.ready, true, 'public start must re-arm a real listener');
+  await assert.rejects(channel.start(), /incumbent ownership is ambiguous/);
+  assert.equal(channel.ready, false, 'ambiguous incumbent must not publish readiness');
   const socketStats = fs.lstatSync(socket);
-  assert.equal(socketStats.isSocket(), true, 're-armed path must be a real unix socket');
+  assert.equal(socketStats.isSocket(), true, 'ambiguous incumbent path must remain untouched');
 
   const afterBinding = recoveredState.getBinding('claude');
   assert.equal(afterBinding.nativeId, beforeBinding.nativeId, 'native UUID must survive recovery');

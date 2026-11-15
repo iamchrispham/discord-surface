@@ -77,7 +77,7 @@ test('preparation preserves regular files and symlinks', async t => {
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
 });
 
-test('concurrent re-arms retain exactly one listener', { timeout: 8000 }, async t => {
+test('concurrent starts refuse an ambiguous orphaned incumbent', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   await orphan(socket);
   const { dir, state } = fixture();
@@ -92,8 +92,9 @@ test('concurrent re-arms retain exactly one listener', { timeout: 8000 }, async 
     }
   });
   const results = await Promise.allSettled(channels.map(channel => channel.start()));
-  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
-  assert.equal(channels.filter(channel => channel.ready).length, 1);
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 0);
+  assert.equal(results.filter(result => result.status === 'rejected' && /incumbent ownership is ambiguous/.test(result.reason.message)).length, 2);
+  assert.equal(channels.filter(channel => channel.ready).length, 0);
   assert.equal(fs.lstatSync(socket).isSocket(), true);
 });
 
@@ -291,33 +292,16 @@ test('socket probe timeout preserves custody after late refusal', { timeout: 800
   assert.doesNotThrow(() => release());
 });
 
-test('stop during orphan probe prevents subsequent listener startup', { timeout: 8000 }, async t => {
+test('ambiguous orphan ownership refuses before listener startup', { timeout: 8000 }, async t => {
   const socket = socketPath(t);
   await orphan(socket);
-  const { EventEmitter } = require('node:events');
-  const probes = [];
-  const originalCreateConnection = net.createConnection;
-  t.mock.method(net, 'createConnection', (...args) => {
-    if (probes.length >= 2) return originalCreateConnection.apply(net, args);
-    const probe = new EventEmitter();
-    probe.destroy = () => {};
-    probes.push(probe);
-    return probe;
-  });
   const { dir, state } = fixture();
   t.after(() => state.close());
   state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   const starting = channel.start();
-  const rejected = assert.rejects(starting, /stopped during socket preparation/);
+  await assert.rejects(starting, /incumbent ownership is ambiguous/);
   await channel.stop();
-  probes[0].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
-  await rejected;
   assert.equal(channel.ready, false);
-  const restarting = channel.start();
-  probes[1].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
-  await restarting;
-  assert.equal(channel.ready, true);
-  await channel.stop();
-  assert.equal(fs.existsSync(socket), false);
+  assert.equal(fs.lstatSync(socket).isSocket(), true);
 });

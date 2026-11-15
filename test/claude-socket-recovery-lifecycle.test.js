@@ -11,7 +11,7 @@ const {
   isCaseInsensitiveDirectory, orphan
 } = require('./claude-socket-recovery-fixture');
 
-test('stop aborts a pending MCP connection and releases startup', { timeout: 8000 }, async t => {
+test('stop aborts an early MCP connection and releases startup', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
@@ -42,7 +42,8 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
   await connected;
   const stopping = channel.stop();
   await new Promise(resolve => setImmediate(resolve));
-  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  const availableDuringMcpConnection = acquireSocketLock(socket);
+  availableDuringMcpConnection();
   settleConnection();
   await stopping;
   await assert.rejects(starting, /stopped during MCP connection/);

@@ -37,6 +37,7 @@
     "src/claude-channel.ts",
     "src/claude/channel-contracts.ts",
     "src/claude/default-mcp.ts",
+    "src/claude/startup-recovery.ts",
     "src/claude/socket-ownership.ts",
     "src/claude/socket-ownership/bound-identity.ts",
     "src/claude/socket-ownership/lock.ts",
