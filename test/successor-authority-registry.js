@@ -209,3 +209,52 @@ test('worker proof treats unavailable canonical ancestor symlinks as unknown', (
     }
   }
 });
+
+test('isolated successor wrapper leaves a fresh source copy free of bytecode', () => {
+  const { spawnSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const helper = path.join(__dirname, 'helpers', 'successor-authority.py');
+  const probe = String.raw`import importlib.util, json, os, pathlib, shutil, subprocess, sys, tempfile
+helper_path = pathlib.Path(sys.argv[1]).resolve()
+spec = importlib.util.spec_from_file_location('successor_authority_fixture', helper_path)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+root = helper_path.parents[2]
+with tempfile.TemporaryDirectory(prefix='successor-wrapper-bytecode-') as temporary:
+    temporary = pathlib.Path(temporary)
+    source = temporary / 'source-copy'
+    shutil.copytree(root / 'src', source, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    wrapper = temporary / 'gate-wrapper.py'
+    wrapper.write_text(fixture.WRAPPER, encoding='utf-8')
+    gate = temporary / 'gate.py'
+    gate.write_text(chr(10).join([
+        'import os',
+        'from pathlib import Path',
+        "Path(os.environ['FIXTURE_WRAPPER_MARKER']).write_text('ran', encoding='utf-8')",
+    ]) + chr(10), encoding='utf-8')
+    mocks = temporary / 'mocks.json'
+    mocks.write_text(json.dumps({'argv': [str(gate)], 'gate': str(gate)}), encoding='utf-8')
+    environment = dict(os.environ)
+    environment.update({
+        'DISCORD_SURFACE_FIXTURE_SRC': str(source),
+        'DISCORD_SURFACE_FIXTURE_MOCKS': str(mocks),
+        'FIXTURE_WRAPPER_MARKER': str(temporary / 'wrapper-ran'),
+        'PYTHONDONTWRITEBYTECODE': '1',
+    })
+    result = subprocess.run([sys.executable, '-I', str(wrapper)], env=environment,
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert pathlib.Path(environment['FIXTURE_WRAPPER_MARKER']).read_text(encoding='utf-8') == 'ran'
+    caches = list(source.rglob('__pycache__'))
+    assert not caches, caches
+    print(json.dumps({'wrapper': 'completed', 'sourceBytecodeDirectories': len(caches)}))`;
+  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-B', '-c', probe, helper], {
+    encoding: 'utf8', timeout: 15000
+  });
+  assert.equal(result.status, 0, result.stdout + '\n' + result.stderr);
+  const report = JSON.parse(result.stdout.trim());
+  assert.equal(report.wrapper, 'completed');
+  assert.equal(report.sourceBytecodeDirectories, 0);
+});

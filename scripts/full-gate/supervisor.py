@@ -20,6 +20,7 @@ SUPERVISOR_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR"
 LINUX_SUBREAPER = "linux-subreaper-v1"
 DARWIN_LAUNCHD = "darwin-launchd-v1"
 _DARWIN_OWNER = None
+_REAPING_OWNER = None
 SUPERVISOR_RECEIPT_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR_RECEIPT"
 SUPERVISOR_TOKEN_ENVIRONMENT = "DISCORD_SURFACE_GATE_SUPERVISOR_TOKEN"
 NO_VERDICT = 98
@@ -51,6 +52,43 @@ class SnapshotCleanupError(OSError):
 
 class JobRequestCancelled(InterruptedError):
     pass
+
+
+def _native_sigchld_flags():
+    if sys.platform == "darwin":
+        sigset_size, no_cldwait = ctypes.sizeof(ctypes.c_uint32), 0x20
+    elif sys.platform == "linux":
+        sigset_size, no_cldwait = 128, 0x2
+    else:
+        raise OSError("waitable child status is unsupported on this platform")
+    flags_offset = ctypes.sizeof(ctypes.c_void_p) + sigset_size
+    action = ctypes.create_string_buffer(flags_offset + ctypes.sizeof(ctypes.c_int))
+    try:
+        native_sigaction = ctypes.CDLL(None, use_errno=True).sigaction
+    except AttributeError as error:
+        raise OSError("native SIGCHLD action inspection is unavailable") from error
+    native_sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    native_sigaction.restype = ctypes.c_int
+    if native_sigaction(signal.SIGCHLD, None, ctypes.byref(action)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    flags = ctypes.c_int.from_buffer(action, flags_offset).value
+    return flags, no_cldwait
+
+
+def establish_reaping_contract():
+    global _REAPING_OWNER
+    owner = (os.getpid(), threading.get_ident())
+    if threading.active_count() != 1:
+        raise OSError("exclusive child reaping cannot be established with multiple threads")
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise OSError("SIGCHLD disposition does not preserve waitable children")
+    flags, no_cldwait = _native_sigchld_flags()
+    if flags & no_cldwait:
+        raise OSError("SA_NOCLDWAIT prevents owned child reaping")
+    if _REAPING_OWNER is not None and _REAPING_OWNER != owner:
+        raise OSError("child reaping ownership changed after setup")
+    _REAPING_OWNER = owner
 
 
 def _write_job_output(descriptor, payload, deadline=None):
@@ -205,11 +243,14 @@ def wait_for_group_exit(process, deadline):
 
 
 def stop_owned_processes(process, deadline):
+    try:
+        establish_reaping_contract()
+    except OSError:
+        return False
     if sys.platform == "darwin":
         if process is None:
             return True
         if process.returncode is None:
-            # The verifier leads its own group. Until it is reaped, its pid keeps the group id from naming another group.
             signal_group(process.pid, signal.SIGTERM)
             term_deadline = min(deadline, clock_now() + TERMINATION_GRACE_SECONDS)
             while True:
@@ -237,10 +278,7 @@ def stop_owned_processes(process, deadline):
         time.sleep(min(POLL_SECONDS, max(0, term_deadline - clock_now())))
 
     if process is not None and process.poll() is None:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+        signal_owned_child(process.pid, signal.SIGKILL)
     while clock_now() < deadline:
         process_live = process is not None and process.poll() is None
         excluded = {process.pid} if process_live else set()
@@ -254,6 +292,7 @@ def stop_owned_processes(process, deadline):
 
 
 def capture_snapshot(root, environment, phase, deadline, interrupted, *, stop_deadline):
+    establish_reaping_contract()
     # Leave the stop TERM grace plus time to see KILL land before stop_deadline.
     window = min(deadline, stop_deadline - SNAPSHOT_STOP_RESERVE_SECONDS)
     if interrupted is not None and interrupted.is_set():
@@ -1088,6 +1127,7 @@ def run(argv):
             return no_verdict("setup", "unset NODE_OPTIONS before starting the full gate")
         try:
             caller_budget(environment)
+            establish_reaping_contract()
             if sys.platform == "linux":
                 enable_subreaper()
             elif sys.platform == "darwin":

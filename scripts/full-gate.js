@@ -666,8 +666,14 @@ async function runFullGate(root, label, entry, args) {
         try { observed.initialGroupProbe = { ok: false, count: null, errorCode: gateErrorCode(error?.code) }; } catch {}
       }
       const hadPeers = peers.length > 0;
+      if (!observed.initialGroupProbe.ok) {
+        worker.stdout.destroy(); worker.stderr.destroy();
+        const code = decline(REASONS.CLEANUP, 'owned process group could not be inspected');
+        clearTimeout(timer);
+        removeInterruptHandlers();
+        return code;
+      }
       if (peers.length) {
-        try { process.kill(-worker.pid, 'SIGKILL'); } catch {}
         await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, callerDeadline - Date.now()))));
         try {
           peers = groupPeers(worker.pid, callerDeadline);

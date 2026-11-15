@@ -1954,6 +1954,125 @@ test('manager process-group inspection uses its remaining deadline', () => {
   assert.ok(inspections[0].options.timeout > 0 && inspections[0].options.timeout <= 5000);
 });
 
+test('Python owners reject non-waitable SIGCHLD before spawning', { skip: process.platform === 'win32', timeout: 30000 }, () => {
+  const probe = String.raw`import ctypes, importlib.util, json, os, pathlib, signal, subprocess, sys, tempfile, time
+mode, owner_name, supervisor_path, runner_path = sys.argv[1:]
+if os.environ.get('REAPING_PROBE_STAGE') != 'child':
+    if mode == 'inherited-ignore':
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    os.environ['REAPING_PROBE_STAGE'] = 'child'
+    os.execv(sys.executable, [sys.executable, '-I', '-B', __file__, mode, owner_name, supervisor_path, runner_path])
+
+def set_no_cldwait():
+    if sys.platform == 'darwin':
+        sigset_size, no_cldwait = ctypes.sizeof(ctypes.c_uint32), 0x20
+    elif sys.platform.startswith('linux'):
+        sigset_size, no_cldwait = 128, 0x2
+    else:
+        raise RuntimeError('unsupported SIGCHLD action layout')
+    libc = ctypes.CDLL(None, use_errno=True)
+    sigaction = libc.sigaction
+    sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    sigaction.restype = ctypes.c_int
+    action = ctypes.create_string_buffer(256)
+    if sigaction(signal.SIGCHLD, None, ctypes.byref(action)) != 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    flags_offset = ctypes.sizeof(ctypes.c_void_p) + sigset_size
+    flags = ctypes.c_int.from_buffer(action, flags_offset)
+    flags.value |= no_cldwait
+    if sigaction(signal.SIGCHLD, ctypes.byref(action), None) != 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+
+if mode == 'no-cldwait':
+    set_no_cldwait()
+elif signal.getsignal(signal.SIGCHLD) != signal.SIG_IGN:
+    raise AssertionError('SIGCHLD ignore did not survive exec')
+
+attempts = []
+def forbidden_spawn(*args, **kwargs):
+    attempts.append(args)
+    raise AssertionError('owner spawned before refusing unsafe reaping')
+subprocess.Popen = forbidden_spawn
+
+def load(name, file):
+    spec = importlib.util.spec_from_file_location(name, file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+if owner_name == 'supervisor':
+    os.environ.pop('NODE_OPTIONS', None)
+    os.environ['APERTURE_GATE_TIME_LEFT_S'] = '20'
+    os.environ['APERTURE_GATE_SLOWEST_RUN_S'] = '5'
+    supervisor = load('full_gate_supervisor_probe', supervisor_path)
+    refusals = []
+    original_no_verdict = supervisor.no_verdict
+    def capture_no_verdict(*args, **kwargs):
+        refusals.append(args)
+        return original_no_verdict(*args, **kwargs)
+    supervisor.no_verdict = capture_no_verdict
+    result = supervisor.run(['--', sys.executable, '-c', 'raise SystemExit(0)'])
+    assert result == 98, result
+    detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else 'SA_NOCLDWAIT'
+    assert any(detail in str(refusal) for refusal in refusals), refusals
+    assert supervisor.stop_owned_processes(None, time.monotonic() + 1) is False
+    assert not attempts
+    print(json.dumps({'owner': owner_name, 'mode': mode, 'result': result, 'detail': detail}))
+elif owner_name == 'darwin-runner':
+    runner_directory = str(pathlib.Path(runner_path).resolve().parent)
+    sys.path.insert(0, runner_directory)
+    import darwin
+    runner = load('full_gate_darwin_runner_probe', runner_path)
+    with tempfile.TemporaryDirectory(prefix='gate-reaping-probe-') as temporary:
+        temporary = pathlib.Path(temporary)
+        state = temporary / 'state.json'
+        spec_path = temporary / 'spec.json'
+        spec = {
+            'state_path': str(state),
+            'clock_contract': darwin.CLOCK_CONTRACT,
+            'deadline': time.monotonic() + 20,
+            'run_deadline': time.monotonic() + 10,
+            'controller': {'pid': os.getppid(), 'coalition_id': 999999},
+            'ack_path': str(temporary / 'ack.json'),
+            'launch_token': 'reaping-probe',
+            'environment': {'APERTURE_GATE_TIME_LEFT_S': '10'},
+            'command': [sys.executable, '-c', 'raise SystemExit(0)'],
+            'cwd': temporary.as_posix(),
+            'snapshot_program': 'unused before ownership refusal',
+        }
+        spec_path.write_text(json.dumps(spec), encoding='utf-8')
+        result = runner.run(str(spec_path))
+        assert result == 98, result
+        assert state.exists(), 'Darwin runner must record its bounded refusal'
+        state_text = state.read_text(encoding='utf-8')
+        detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else 'SA_NOCLDWAIT'
+        assert detail in state_text, state_text
+        supervisor = load('full_gate_supervisor_cleanup_probe', supervisor_path)
+        assert supervisor.stop_owned_processes(None, time.monotonic() + 1) is False
+        assert not attempts
+        print(json.dumps({'owner': owner_name, 'mode': mode, 'result': result, 'detail': detail}))
+else:
+    raise AssertionError('unknown owner ' + owner_name)`;
+  const script = path.join(os.tmpdir(), 'gate-reaping-contract-' + process.pid + '.py');
+  fs.writeFileSync(script, probe);
+  try {
+    for (const mode of ['inherited-ignore', 'no-cldwait']) {
+      for (const owner of ['supervisor', 'darwin-runner']) {
+        const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3',
+          ['-I', '-B', script, mode, owner, SUPERVISOR_SCRIPT, path.join(PROJECT, 'scripts/full-gate/darwin-runner.py')],
+          { encoding: 'utf8', timeout: 8000, env: { ...process.env, NODE_OPTIONS: '' } });
+        assert.equal(result.status, 0, result.stdout + '\\n' + result.stderr);
+        const report = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.equal(report.owner, owner);
+        assert.equal(report.mode, mode);
+        assert.equal(report.result, 98);
+      }
+    }
+  } finally {
+    fs.rmSync(script, { force: true });
+  }
+});
+
 test('worker keeps body and admission in its group and excludes body control forgery', () => {
   const { EventEmitter } = require('node:events');
   const vm = require('node:vm');
@@ -2199,7 +2318,7 @@ test('worker loss during admission is interruption, never capacity', { timeout: 
 });
 
 
-test('gate cleanup terminates a detached descendant before accepting a verdict', { timeout: 180000 }, async t => {
+test('gate retains scratch when escaped writer ownership is unresolved', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1', APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5' });
   let escaped;
@@ -2209,9 +2328,9 @@ test('gate cleanup terminates a detached descendant before accepting a verdict',
     assert.equal(result.code, 98, result.output);
     assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
     assert.match(result.output, /reason=(?:interrupted|cleanup)/);
-    assert.equal(roleFixture.identityGone(escaped.escapeIdentity, roleFixture.captureIdentity(escaped.escapePid)), true, 'the owned detached child is terminated');
-    assert.equal(fs.existsSync(f.marker + '.escape-signalled'), true);
-    assert.equal(fs.existsSync(escaped.scratch), false);
+    assert.equal(roleFixture.identityGone(escaped.escapeIdentity, roleFixture.captureIdentity(escaped.escapePid)), false, 'unproved escaped ownership is not signalled');
+    assert.equal(fs.existsSync(f.marker + '.escape-signalled'), false);
+    assert.equal(fs.existsSync(escaped.scratch), true, 'unknown escaped ownership keeps scratch in custody');
   } finally {
     if (!escaped && fs.existsSync(f.marker)) escaped = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
     if (escaped?.escapePid) {
@@ -2222,7 +2341,12 @@ test('gate cleanup terminates a detached descendant before accepting a verdict',
           throw new Error('escaped fixture cleanup is unresolved; custody retained at ' + f.scratch);
         }
         if (!await waitForIdentityGone(escaped.escapeIdentity, Date.now() + 8000)) {
-          throw new Error('escaped fixture did not drain; custody retained at ' + f.scratch);
+          const afterTerm = roleFixture.captureIdentity(escaped.escapePid);
+          if (!roleFixture.sameProcessIdentity(escaped.escapeIdentity, afterTerm)
+              || !roleFixture.signalOwned(escaped.escapeIdentity, 'SIGKILL')
+              || !await waitForIdentityGone(escaped.escapeIdentity, Date.now() + 8000)) {
+            throw new Error('escaped fixture did not drain; custody retained at ' + f.scratch);
+          }
         }
       }
     }
@@ -2257,7 +2381,7 @@ test('manager joins real guardian completion before final scratch removal', { sk
     }
     const entry = path.join(f.scratch, 'entry.js');
     fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace(JSON.stringify(GATE), JSON.stringify(gate)));
-    const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1', FIXTURE_COMPLETION_BARRIER: barrier, FIXTURE_COMPLETION_RELEASE: release });
+    const run = f.launch({ FIXTURE_COMPLETION_BARRIER: barrier, FIXTURE_COMPLETION_RELEASE: release });
     let finished = false;
     run.done.then(() => { finished = true; });
     try {
@@ -2265,18 +2389,16 @@ test('manager joins real guardian completion before final scratch removal', { sk
       while (!fs.existsSync(barrier) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10));
       assert.equal(fs.existsSync(barrier), true, 'actual fresh cleanup completion was not reached');
       const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
-      assert.equal(roleFixture.identityGone(body.escapeIdentity, roleFixture.captureIdentity(body.escapePid)), true);
-      assert.equal(fs.existsSync(f.marker + '.escape-signalled'), true);
+      assert.equal(fs.existsSync(body.scratch), true, 'scratch remains while guardian completion is pending');
       if (control) {
         const result = await run.done;
         assert.equal(result.code, 98, result.output);
-        assert.throws(() => assert.equal(fs.existsSync(body.scratch), false), assert.AssertionError, 'removing the join must violate final removal');
+        assert.equal(fs.existsSync(body.scratch), true, 'unconfirmed guardian completion keeps scratch in custody');
       } else {
         assert.equal(finished, false, 'manager finished before actual guardian completion');
         fs.writeFileSync(release, 'release');
         const result = await run.done;
-        assert.equal(result.code, 98, result.output);
-        assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
+        assert.equal(result.code, 0, result.output);
         assert.equal(fs.existsSync(body.scratch), false);
       }
     } finally { fs.writeFileSync(release, 'release'); }
@@ -2333,23 +2455,20 @@ test('admitted test body revalidates its registered suite list', async () => {
   assert.equal(await runBody([]), 4);
 });
 
-test('watchdog has one identity-checked escaped PID signal site and a bounded host scan interval', () => {
-  const vm = require('node:vm');
+test('watchdog cannot signal escaped IDs after stale acquisition or recheck', () => {
   const source = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate-watchdog.js'), 'utf8');
-  const pidSignalSites = source.match(/process\.kill\(pid, signal\)/g) || [];
-  const ownerStart = source.indexOf('function signalEscapedDescendants');
-  const ownerEnd = source.indexOf('\nasync function hasLiveEscapedDescendants', ownerStart);
-  const signalOwner = source.slice(ownerStart, ownerEnd);
-  const identitySource = source.match(/function sameProcessIdentity[\s\S]*?\n}/)?.[0];
-  const sameProcessIdentity = vm.runInNewContext(identitySource + '\nsameProcessIdentity');
-  assert.equal(pidSignalSites.length, 1, 'new PID signal sites must go through the identity owner');
-  assert.match(signalOwner, /sameProcessIdentity\(expected, identities\.get\(pid\)\)/);
-  assert.equal(sameProcessIdentity('darwin:1791712345:100001:900001:7', 'darwin:1791712345:900002:900001:7'), false);
-  assert.equal(sameProcessIdentity('darwin:1791712345:100001:900001:7', 'darwin:1791712345:100001:900002:7'), false);
-  assert.equal(sameProcessIdentity('darwin:1791712345:100001:900001:7', 'darwin:1791712345:100001:900001:7'), true);
-  assert.equal(sameProcessIdentity('linux:78123456', 'linux:78123456'), true);
+  const manager = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate.js'), 'utf8');
+  const remember = source.match(/async function rememberEscapedDescendants[\s\S]*?\n}/)?.[0];
+  assert.ok(remember, 'escaped ancestry owner must remain inventoried');
+  assert.match(remember, /escapedDescendants\.set\(row\.pid, null\)/);
+  assert.doesNotMatch(remember, /readProcessIdentities/);
+  assert.doesNotMatch(source, /process\.kill\s*\(/);
+  assert.doesNotMatch(source, /signalEscapedDescendants/);
+  assert.match(source, /return row && !row\.state\.startsWith\('Z'\)/);
   assert.match(source, /const PROCESS_MONITOR_INTERVAL_MS = 1000/);
   assert.match(source, /setInterval\(monitorDescendants, PROCESS_MONITOR_INTERVAL_MS\)/);
+  assert.doesNotMatch(manager, /process\.kill\s*\(\s*-worker\.pid/);
+  assert.match(manager, /if \(!observed\.initialGroupProbe\.ok\)/);
 });
 
 for (const { escape, mode } of [
@@ -2544,7 +2663,7 @@ def clock_owner(clock):
 def case(name,action):
     action();results.append(name)
 def run_case(cap='95',delay=15,change=None,ack_change=None,clock_failure=False,live=False,start_clock_failure=False,oracle_fault=None):
-    clock=Clock(-7000);clock.fail=start_clock_failure;ns=clock_owner(clock);states=[];spawns=[];drains=[];sleep_count=[0];first=[True]
+    clock=Clock(-7000);clock.fail=start_clock_failure;ns=clock_owner(clock);ns['establish_reaping_contract']=lambda:None;states=[];spawns=[];drains=[];sleep_count=[0];first=[True]
     controller={'pid':301,'coalition_id':300};identity={'pid':401,'coalition_id':400}
     api=types.SimpleNamespace(**ns)
     api.joined_identity=lambda pid:dict(identity)
@@ -2564,7 +2683,7 @@ def run_case(cap='95',delay=15,change=None,ack_change=None,clock_failure=False,l
     before=wire(spec);phase=['command'];sequence=[1]
     class Cleanup(OSError):pass
     class Budget(Exception):pass
-    capability=types.SimpleNamespace(SnapshotCleanupError=Cleanup,InvalidGateBudget=Budget,capture_snapshot=lambda *args,**kwargs:{'snapshot':'stable'})
+    capability=types.SimpleNamespace(SnapshotCleanupError=Cleanup,InvalidGateBudget=Budget,establish_reaping_contract=lambda:None,capture_snapshot=lambda *args,**kwargs:{'snapshot':'stable'})
     def published(record,value):
         if oracle_fault=='wrong-spec':record={**record,'cwd':'wrong-root'}
         oracle(wire(record)==before,'state writer changed immutable spec');states.append(dict(value))
@@ -2714,14 +2833,14 @@ def darwin_group_stop():
         def clock_now():
             if clock_fails:raise OSError('fake clock failure')
             return now[0]
-        ns=dict(sys=types.SimpleNamespace(platform='darwin'),os=types.SimpleNamespace(killpg=killpg),signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9),clock_now=clock_now,time=types.SimpleNamespace(sleep=sleep),TERMINATION_GRACE_SECONDS=1,POLL_SECONDS=.025)
+        ns=dict(sys=types.SimpleNamespace(platform='darwin'),os=types.SimpleNamespace(killpg=killpg),signal=types.SimpleNamespace(SIGTERM=15,SIGKILL=9),clock_now=clock_now,time=types.SimpleNamespace(sleep=sleep),establish_reaping_contract=lambda:None,_DARWIN_OWNER=None,TERMINATION_GRACE_SECONDS=1,POLL_SECONDS=.025)
         declarations(supervisor,{'stop_owned_processes','signal_group','wait_for_group_exit'},ns)
         before=len(oracle_failures)
         try:result=ns['stop_owned_processes'](Leader(),deadline)
         finally:oracle(len(oracle_failures)==before,'Darwin stop absorbed a fixture oracle')
         return result,sent,state['reaped'],now[0]
     result,sent,reaped,ended=stop()
-    assert result is True and reaped and sent[0]==15 and 9 not in sent and sent[-1]==0
+    assert result is True and reaped and sent[0]==15 and 9 not in sent and sent[-1]==0,(result,sent,reaped,ended)
     for member in ('leader','child'):
         result,sent,reaped,ended=stop(ignores={member:{15}})
         assert result is True and reaped and sent.index(9)>sent.index(15)
@@ -2806,7 +2925,7 @@ def snapshot_case(mode,cleanup='ok',platform='darwin',stop_deadline=1105,now_aft
         if cleanup=='false' or seen[0]>=deadline:return False
         if process.returncode is None:process.returncode=-15
         return True
-    target=dict(clock_now=clock_now,subprocess=types.SimpleNamespace(Popen=popen,PIPE=-1,TimeoutExpired=TimeoutError),SNAPSHOT_PROGRAM='snapshot-program',POLL_SECONDS=.025,CLEANUP_RESERVE_SECONDS=5,
+    target=dict(clock_now=clock_now,establish_reaping_contract=lambda:None,subprocess=types.SimpleNamespace(Popen=popen,PIPE=-1,TimeoutExpired=TimeoutError),SNAPSHOT_PROGRAM='snapshot-program',POLL_SECONDS=.025,CLEANUP_RESERVE_SECONDS=5,
         stop_owned_processes=stop,wait_for_owned_children=lambda deadline:oracle(platform=='linux','Linux child wait ran on Darwin') or waits.append(deadline) or mode!='descendants',
         wait_for_group_exit=lambda owned,deadline:oracle(platform=='darwin' and owned is process,'Darwin group wait ran on Linux or for another process') or waits.append(deadline) or mode!='descendants',sys=types.SimpleNamespace(platform=platform),json=json,
         NO_VERDICT=literal(supervisor,'NO_VERDICT'),SNAPSHOT_STOP_RESERVE_SECONDS=literal(supervisor,'SNAPSHOT_STOP_RESERVE_SECONDS'))
@@ -4450,8 +4569,8 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       };
       const expectedCalls = { [watchdog]: [0, 0, 0], [collector]: [1, 0, 0], [manager]: [0, 4, 2], [worker]: [1, 0, 1], [body]: [0, 0, 0] };
       const expectedSignals = {
-        [watchdog]: ["-group,'SIGKILL'", "-group,'SIGTERM'", 'pid,signal'].sort(),
-        [manager]: ["-worker.pid,'SIGKILL'"],
+        [watchdog]: [],
+        [manager]: [],
         [worker]: ["-process.pid,'SIGKILL'", "-process.pid,'SIGTERM'"].sort(),
         [collector]: [], [body]: []
       };
@@ -4469,11 +4588,9 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
           assert.equal(references.length, calls.length, 'aliased PID signal in ' + name);
           assert.deepEqual(calls.map(value => value[1].replace(/\s/g, '').replace(/"/g, "'")).sort(), expectedSignals[name], 'direct PID signal bypass in ' + name);
         }
-        const owner = inventory.sources[watchdog].match(/async function signalEscapedDescendants[\s\S]*?\n}/)?.[0];
-        assert.ok(owner);
-        assert.equal((owner.match(/process\.kill\(pid, signal\)/g) || []).length, 1);
-        assert.match(owner, /sameProcessIdentity\(expected, identities\.get\(pid\)\)/);
-        assert.match(owner, /currentObservation\(phase\)/);
+        assert.doesNotMatch(inventory.sources[watchdog], /process\.kill\s*\(/);
+        assert.doesNotMatch(inventory.sources[watchdog], /signalEscapedDescendants/);
+        assert.match(inventory.sources[watchdog], /escapedDescendants\.set\(row\.pid, null\)/);
         assert.doesNotMatch(inventory.sources[watchdog], /spawnSync/);
         assert.match(inventory.sources[worker], /admission = spawn\(message\.command, message\.args, \{ stdio: 'inherit' \}\)/);
         assert.match(inventory.sources[watchdog], /const \{ spawn \} = require\('node:child_process'\)/);

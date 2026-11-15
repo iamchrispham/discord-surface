@@ -223,6 +223,7 @@ def snapshot(spec, identity, owner, sequence, body_code=98):
 def run(spec_path):
     with open(spec_path, "r", encoding="utf-8") as handle:
         spec = json.load(handle)
+    owner = None
     identity = None
     sequence = 0
     code = 98
@@ -232,6 +233,13 @@ def run(spec_path):
     fallback_done = False
     failed = False
     try:
+        owner_spec = importlib.util.spec_from_file_location("full_gate_snapshot_owner", Path(__file__).resolve().with_name("supervisor.py"))
+        if owner_spec is None or owner_spec.loader is None:
+            raise OSError("source snapshot owner could not load")
+        owner = importlib.util.module_from_spec(owner_spec)
+        owner_spec.loader.exec_module(owner)
+        owner.establish_reaping_contract()
+        owner._DARWIN_OWNER = DARWIN
         DARWIN.require_clock_contract(spec.get("clock_contract"))
         deadline = float(spec["deadline"])
         run_deadline = float(spec["run_deadline"])
@@ -243,12 +251,6 @@ def run(spec_path):
         if candidate_identity["coalition_id"] == spec["controller"]["coalition_id"]:
             raise DARWIN.CapabilityError("launchd did not isolate the job resource coalition")
         identity = candidate_identity
-        owner_spec = importlib.util.spec_from_file_location("full_gate_snapshot_owner", Path(__file__).resolve().with_name("supervisor.py"))
-        if owner_spec is None or owner_spec.loader is None:
-            raise OSError("source snapshot owner could not load")
-        owner = importlib.util.module_from_spec(owner_spec)
-        owner_spec.loader.exec_module(owner)
-        owner._DARWIN_OWNER = DARWIN
         owner.SNAPSHOT_PROGRAM = spec["snapshot_program"]
         write_state(spec, {"state": "ready", "phase": "ready", "sequence": 0,
             "identity": identity, "clock_contract": DARWIN.CLOCK_CONTRACT, "sealed": False})

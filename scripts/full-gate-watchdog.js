@@ -309,7 +309,7 @@ async function readProcessTable(phase) {
   phase.monitorIdentities = monitorIdentities;
   return { rows, scannerPid: result.pid, monitorIdentities };
 }
-async function rememberEscapedDescendants(rows, phase, monitorIdentities) {
+async function rememberEscapedDescendants(rows, phase) {
   const descendants = new Set([group, process.pid]);
   let changed = true;
   while (changed) {
@@ -325,46 +325,15 @@ async function rememberEscapedDescendants(rows, phase, monitorIdentities) {
       }
     }
   }
-  const unresolved = [...escapedDescendants]
-    .filter(([pid, identity]) => identity === null && descendants.has(pid)
-      && rows.some(row => row.pid === pid && !row.state.startsWith('Z')))
-    .map(([pid]) => pid);
-  let identities;
-  if (phase.nativeMonitor) {
-    identities = new Map();
-    if (monitorIdentities === phase.monitorIdentities && monitorIdentities?.phase === phase
-        && monitorIdentities.generation === phase.generation && monitorIdentities.rows === rows && currentObservation(phase)) {
-      for (const pid of unresolved) {
-        const identity = monitorIdentities.identities.get(pid);
-        if (identity) identities.set(pid, identity);
-      }
-    }
-  } else identities = await readProcessIdentities(unresolved, phase);
   if (!currentObservation(phase)) return;
-  for (const [pid, identity] of identities) escapedDescendants.set(pid, identity);
-}
-async function signalEscapedDescendants(signal, rows, phase) {
-  if (!rows) return;
-  const byPid = new Map(rows.map(row => [row.pid, row]));
-  const candidates = [...escapedDescendants].filter(([pid, identity]) => identity && byPid.has(pid));
-  const identities = await readProcessIdentities(candidates.map(([pid]) => pid), phase);
-  if (!currentObservation(phase)) return;
-  for (const [pid, expected] of candidates) {
-    if (!currentObservation(phase)) return;
-    const row = byPid.get(pid);
-    if (!row || row.state.startsWith('Z') || !sameProcessIdentity(expected, identities.get(pid))) continue;
-    try { process.kill(pid, signal); } catch {}
-  }
 }
 async function hasLiveEscapedDescendants(rows, phase) {
   const byPid = new Map(rows.map(row => [row.pid, row]));
   const candidates = [...escapedDescendants].filter(([pid]) => byPid.has(pid));
-  const identities = await readProcessIdentities(candidates.map(([pid]) => pid), phase);
   if (!currentObservation(phase)) return true;
-  return candidates.some(([pid, expected]) => {
+  return candidates.some(([pid]) => {
     const row = byPid.get(pid);
-    if (!row || row.state.startsWith('Z')) return false;
-    return !expected || !identities.has(pid) || sameProcessIdentity(expected, identities.get(pid));
+    return row && !row.state.startsWith('Z');
   });
 }
 async function hasOwnedProcesses(table, phase) {
@@ -380,7 +349,7 @@ async function monitorDescendants() {
     const snapshot = await readProcessTable(phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!snapshot) return stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
-    await rememberEscapedDescendants(snapshot.rows, phase, snapshot.monitorIdentities);
+      await rememberEscapedDescendants(snapshot.rows, phase);
     if (!stopping && phase.generation === observationGeneration && !currentObservation(phase)) stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
   } catch (error) { stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE, error); }
   finally { finishObservation(phase); }
@@ -393,7 +362,6 @@ async function stopObservation(signal, phaseDeadline) {
     const snapshot = phase ? await readProcessTable(phase) : null;
     if (snapshot) {
       await rememberEscapedDescendants(snapshot.rows, phase);
-      await signalEscapedDescendants(signal, snapshot.rows, phase);
     }
   } catch {}
   finally { finishObservation(phase); }
@@ -443,12 +411,10 @@ function stop(event, error) {
   process.on('SIGTERM', () => {});
   collector.cancel();
   terminationStage = 'SIGTERM';
-  try { process.kill(-group, 'SIGTERM'); } catch {}
   setTimeout(() => {
     ++observationGeneration;
     collector.cancel();
     terminationStage = 'SIGKILL';
-    try { process.kill(-group, 'SIGKILL'); } catch {}
     collector.signal('SIGKILL');
     stopObservation('SIGKILL');
   }, Math.max(0, killAt - Date.now()));
