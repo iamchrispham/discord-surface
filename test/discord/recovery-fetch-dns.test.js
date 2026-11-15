@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const { fixture: intakeFixture } = require('../helpers/intake-recovery-fixture');
 const { fixture: threadFixture } = require('../issue-thread-fixture');
+const { CODEX_VALIDATION_KINDS } = require('../../src/native');
 const {
   RECOVERY_DNS_MARKER_PREFIX,
   classifyRecoveryFailure,
@@ -64,6 +65,33 @@ test('DNS classification stays narrow and keeps existing precedence', async () =
     }),
     'Discord recovery retry pending: channel recovery after DNS failure'
   );
+});
+
+test('DNS provenance never overrides auth or recovery control metadata', async () => {
+  const authDirect = Object.assign(dnsError(), { status: 401 });
+  const authFetch = Object.assign(fetchFailedDnsError(), { status: 401 });
+  const authCause = fetchFailedDnsError();
+  authCause.cause.status = 401;
+  for (const transportError of [authDirect, authFetch, authCause]) {
+    await assert.rejects(
+      recoveryFetch(async () => { throw transportError; }),
+      error => error === transportError
+    );
+  }
+
+  for (const recoveryKind of [CODEX_VALIDATION_KINDS.DEADLINE, CODEX_VALIDATION_KINDS.STOPPED, 'stale', 'cancelled']) {
+    const direct = Object.assign(dnsError(), { recoveryKind });
+    const fetchFailed = fetchFailedDnsError();
+    fetchFailed.recoveryKind = recoveryKind;
+    const cause = fetchFailedDnsError();
+    cause.cause.recoveryKind = recoveryKind;
+    for (const transportError of [direct, fetchFailed, cause]) {
+      await assert.rejects(
+        recoveryFetch(async () => { throw transportError; }),
+        error => error === transportError
+      );
+    }
+  }
 });
 
 for (const { id, kind, label } of [

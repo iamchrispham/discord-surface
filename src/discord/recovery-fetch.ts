@@ -145,7 +145,7 @@ export async function recoveryFetch<T>(fetch: () => Promise<T>): Promise<T> {
   try {
     return await fetch();
   } catch (error) {
-    if (error && typeof error === 'object' && 'status' in error && error.status === 503) {
+    if (!hasRecoveryControlMetadata(error) && error && typeof error === 'object' && 'status' in error && error.status === 503) {
       throw new Error(`${RETRYABLE_FETCH_PREFIX}${error instanceof Error ? error.message : 'Service Unavailable'}`, { cause: error });
     }
     const dnsCause = supportedDnsCause(error);
@@ -165,13 +165,22 @@ interface StructuredDnsError extends Error {
   hostname: 'discord.com';
 }
 
+function hasTransportControlMetadata(error: unknown): boolean {
+  return hasRecoveryControlMetadata(error) || error instanceof Error && ('status' in error || 'statusCode' in error);
+}
+
+function hasRecoveryControlMetadata(error: unknown): boolean {
+  return error instanceof Error && 'recoveryKind' in error;
+}
+
 function isStructuredDnsError(error: unknown): error is StructuredDnsError {
-  if (!(error instanceof Error)) return false;
+  if (!(error instanceof Error) || hasTransportControlMetadata(error)) return false;
   const candidate = error as Partial<StructuredDnsError>;
   return candidate.code === 'ENOTFOUND' && candidate.syscall === 'getaddrinfo' && candidate.hostname === 'discord.com';
 }
 
 function supportedDnsCause(error: unknown): StructuredDnsError | null {
+  if (hasTransportControlMetadata(error)) return null;
   if (isStructuredDnsError(error)) return error;
   if (error instanceof TypeError && error.message === 'fetch failed' && isStructuredDnsError(error.cause)) {
     return error.cause;
