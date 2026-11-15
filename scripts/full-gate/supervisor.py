@@ -42,21 +42,21 @@ SNAPSHOT_PROGRAM = (
 )
 
 
-# Only Node 22 Linux combinations with the verified generic layout are admitted.
+_LINUX_GENERIC_SIGACTION_ABI_LIBCS = frozenset({"glibc", "musl"})
 _LINUX_SIGACTION_ABI_LIBCS = {
-    "x86_64": frozenset({"glibc", "musl"}),
-    "amd64": frozenset({"glibc", "musl"}),
-    "i386": frozenset({"glibc"}),
-    "i486": frozenset({"glibc"}),
-    "i586": frozenset({"glibc"}),
-    "i686": frozenset({"glibc"}),
-    "aarch64": frozenset({"glibc"}),
-    "armv6l": frozenset({"glibc"}),
-    "armv7l": frozenset({"glibc"}),
-    "armv8l": frozenset({"glibc"}),
-    "ppc64le": frozenset({"glibc"}),
-    "s390x": frozenset({"glibc"}),
-    "loongarch64": frozenset({"glibc"}),
+    "x86_64": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "amd64": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "i386": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "i486": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "i586": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "i686": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "aarch64": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "armv6l": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "armv7l": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "armv8l": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "ppc64le": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "s390x": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
+    "loongarch64": _LINUX_GENERIC_SIGACTION_ABI_LIBCS,
 }
 _LINUX_SIGSET_SIZE = 128
 _LINUX_SA_NOCLDWAIT = 0x2

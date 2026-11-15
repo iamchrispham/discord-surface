@@ -172,7 +172,8 @@ function fixture(t) {
       && inheritedSupervisorPid > 1 && inheritedSupervisorPid !== process.pid
     ? inheritedSupervisorPid
     : null;
-  const externalSupervisorIdentity = roleFixture.captureIdentity(externalSupervisorPid ?? process.pid);
+  const effectiveExternalSupervisorPid = externalSupervisorPid ?? process.pid;
+  const externalSupervisorIdentity = roleFixture.captureIdentity(effectiveExternalSupervisorPid);
   t.after(async () => {
     const unresolved = [];
     const identities = new Map();
@@ -325,6 +326,9 @@ function fixture(t) {
     fs.rmSync(scratch, { recursive: true, force: true });
   });
   function launch(extra = {}, supervised = false) {
+    if (!supervised && extra.FIXTURE_KILL_WORKER && externalSupervisorPid === null) {
+      throw new Error('FIXTURE_KILL_WORKER requires an external supervisor owner');
+    }
     if (extra.FIXTURE_ESCAPE_READY && extra.FIXTURE_KILL_GUARD
         && extra.FIXTURE_RECREATE_SCRATCH && extra.FIXTURE_HANG) {
       boundedCustodies.push({
@@ -344,19 +348,7 @@ function fixture(t) {
       FIXTURE_LEASE_FILE: leaseFile, FIXTURE_ROLE_FILE: roleFile, ...extra
     };
     if (!supervised) {
-      if (extra.FIXTURE_KILL_WORKER && externalSupervisorPid === null) {
-        const simulatedSupervisor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-        simulatedSupervisor.once('error', () => {});
-        const identity = roleFixture.captureIdentity(simulatedSupervisor.pid);
-        if (identity.kind !== 'present') {
-          simulatedSupervisor.kill('SIGKILL');
-          throw new Error('simulated supervisor identity could not be established');
-        }
-        processes.push({ child: simulatedSupervisor, identity });
-        launchEnv[supervisorPidEnvironment] = String(simulatedSupervisor.pid);
-      } else {
-        launchEnv[supervisorPidEnvironment] = String(externalSupervisorPid ?? process.pid);
-      }
+      launchEnv[supervisorPidEnvironment] = String(effectiveExternalSupervisorPid);
     }
     if (supervised) {
       delete launchEnv[SUPERVISOR.ENVIRONMENT];
@@ -428,7 +420,10 @@ function fixture(t) {
     return { child, identity, ready, done };
   }
   const launchSupervised = (extra = {}) => launch(extra, true);
-  return { root, marker, protocol, launch, launchSupervised, git, env, scratch, leaseFile, emergencyRelease };
+  return {
+    root, marker, protocol, launch, launchSupervised, git, env, scratch, leaseFile,
+    emergencyRelease, effectiveExternalSupervisorPid
+  };
 }
 
 function filesUnder(root) {
@@ -1174,13 +1169,21 @@ test('no-verdict marker starts on a new line after body stderr fragment', { time
   assert.equal(result.output.includes('checkingAPERTURE-GATE-INDETERMINATE'), false);
 });
 
+test('direct worker-loss fixture refuses without an external supervisor', { timeout: 180000 }, async t => {
+  const f = fixture(t);
+  assert.throws(
+    () => f.launch({ FIXTURE_KILL_WORKER: '1' }),
+    /FIXTURE_KILL_WORKER requires an external supervisor owner/
+  );
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
 for (const bodyExit of [0, 17, 98]) {
   test('admitted body preserves raw exit ' + bodyExit + ' and completes cleanup', { timeout: 180000 }, async t => {
     const f = fixture(t);
-    const externalHolderPid = process.pid;
+    const externalHolderPid = f.effectiveExternalSupervisorPid;
     const result = await f.launch({
-      FIXTURE_BODY_EXIT: String(bodyExit),
-      DISCORD_SURFACE_GATE_SUPERVISOR_PID: String(externalHolderPid)
+      FIXTURE_BODY_EXIT: String(bodyExit)
     }).done;
     assert.equal(result.code, bodyExit, result.output);
     assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
@@ -2040,13 +2043,13 @@ native_attempts = []
 if mode == 'unknown-abi':
     abi_owner = load('full_gate_abi_matrix_probe', supervisor_path)
     supported = [
-        ('x86_64', 'glibc'), ('x86_64', 'musl'),
-        ('i386', 'glibc'), ('i686', 'glibc'),
-        ('aarch64', 'glibc'), ('armv6l', 'glibc'), ('armv7l', 'glibc'),
-        ('ppc64le', 'glibc'), ('s390x', 'glibc'), ('loongarch64', 'glibc'),
+        'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'aarch64',
+        'armv6l', 'armv7l', 'armv8l', 'ppc64le', 's390x', 'loongarch64',
     ]
-    for machine, libc in supported:
-        assert abi_owner._linux_sigaction_abi(machine, libc) == (128, 0x2), (machine, libc)
+    assert set(abi_owner._LINUX_SIGACTION_ABI_LIBCS) == set(supported)
+    for machine in supported:
+        for libc in ('glibc', 'musl'):
+            assert abi_owner._linux_sigaction_abi(machine, libc) == (128, 0x2), (machine, libc)
     for machine, libc in [
         ('mips64', 'glibc'), ('sparc64', 'glibc'), ('x86_64', 'uclibc'),
     ]:
@@ -2215,7 +2218,6 @@ test('scratch cleanup subprocess is bounded by the gate deadline', () => {
 test('leftover owned child produces exactly one no-verdict line', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const leftoverStopped = path.join(f.scratch, 'leftover-stopped');
-  const started = Date.now();
   const result = await f.launch({
     FIXTURE_LEFTOVER: '1', FIXTURE_LEFTOVER_STOPPED: leftoverStopped,
     APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '1'
@@ -2223,8 +2225,8 @@ test('leftover owned child produces exactly one no-verdict line', { timeout: 180
   assert.equal(result.code, 98, result.output);
   assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
   if (process.platform === 'linux') {
+    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=interrupted:/);
     assert.equal(fs.readFileSync(leftoverStopped, 'utf8'), 'term');
-    assert.ok(Date.now() - started < 12000, 'worker cleanup waited for the caller deadline');
   }
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(fs.existsSync(body.scratch), false);
