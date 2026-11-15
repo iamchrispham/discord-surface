@@ -17,7 +17,7 @@ const RECOVER_FLAGS = Object.freeze({
   board: ['board-attempt-id', 'board-channel-id', 'board-evidence-scope', 'board-guild-id', 'board-message-id',
     'board-no-hidden-retry', 'board-readback', 'board-readback-at', 'board-resolution', 'board-single-attempt', 'board-sole-writer'],
   topic: ['topic-channel-id', 'topic-request-id', 'resolution', 'evidence-scope', 'topic-readback', 'topic-readback-at'],
-  intake: ['intake-channel-id'],
+  intake: ['intake-channel-id', 'intake-expectation-file'],
   reply: ['message-id', 'resolution', 'part-index', 'reply-message-id'],
   directPost: ['direct-post-request-id', 'direct-post-attempt-id', 'direct-post-message-id', 'direct-post-nonce',
     'resolution', 'evidence-scope'],

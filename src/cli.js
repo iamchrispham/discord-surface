@@ -224,6 +224,11 @@ Consumes an acknowledged watcher notice without posting a Discord reply.
 
 const RECOVER_USAGE = `Usage: discord-surface recover [options]
 
+Guarded parent intake recovery:
+  recover --intake-channel-id <parent-id> --intake-expectation-file <absolute-private-json>
+
+Records pending reconciliation for the exact unavailable parent and DNS error in the expectation.
+
 Reviewed, never-dispatched custody:
   recover --message-id <id> --resolution not_executed \
     --native-id <original UUID> --generation <original generation> \
