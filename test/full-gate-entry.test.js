@@ -1252,23 +1252,26 @@ test('a late descendant source write is checked after the owned group drains', {
   assert.equal(fs.readFileSync(path.join(f.root, 'input'), 'utf8'), 'changed by late descendant');
 });
 
-test('a detached descendant cannot write source after gate completion', { timeout: 180000 }, async t => {
+test('a detached descendant cannot write source after gate completion', { skip: process.platform !== 'linux', timeout: 180000 }, async t => {
   const f = fixture(t);
   const armed = path.join(f.scratch, 'detached-armed');
   const done = path.join(f.scratch, 'detached-done');
   const pidFile = path.join(f.scratch, 'detached-pid');
   let child;
   try {
-    const result = await f.launch({
+    const result = await f.launchSupervised({
       FIXTURE_DETACHED_LATE_WRITE: '1',
       FIXTURE_DETACHED_ARMED: armed,
       FIXTURE_DETACHED_DONE: done,
-      FIXTURE_DETACHED_PID: pidFile
+      FIXTURE_DETACHED_PID: pidFile,
+      APERTURE_GATE_TIME_LEFT_S: '40',
+      APERTURE_GATE_SLOWEST_RUN_S: '1'
     }).done;
-    child = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
-    await new Promise(resolve => setTimeout(resolve, 1200));
     assert.equal(result.code, 98, result.output);
     assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=(?:interrupted|cleanup|stale)/);
+    assert.equal(fs.existsSync(pidFile), true, result.output);
+    child = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+    await new Promise(resolve => setTimeout(resolve, 1200));
     assert.equal(fs.existsSync(done), false);
     assert.equal(fs.readFileSync(path.join(f.root, 'input'), 'utf8'), 'source\n');
     assert.equal(roleFixture.identityGone(child.identity, roleFixture.captureIdentity(child.pid)), true, 'owned detached child remained after cleanup');
@@ -1285,6 +1288,92 @@ test('a detached descendant cannot write source after gate completion', { timeou
           throw new Error('detached child did not drain; custody retained at ' + f.scratch);
         }
       }
+    }
+  }
+});
+
+test('stale numeric ancestry cannot grant Linux signal ownership', { skip: process.platform !== 'linux', timeout: 90000 }, async t => {
+  const normal = fixture(t);
+  const bypassed = fixture(t);
+  const actor = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 60000); setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const actorIdentity = roleFixture.captureIdentity(actor.pid);
+  assert.equal(actorIdentity.kind, 'present', 'disposable ancestry actor was not captured');
+  const directChildrenLine = '    return [int(value) for value in child_list().read_text(encoding="ascii").split()]';
+  const injectedChildrenLine = '    return [int(value) for value in child_list().read_text(encoding="ascii").split()] + [int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"])]';
+  const signalLine = '        signal.pidfd_send_signal(descriptor, signal_number)';
+  const interceptedSignal = [
+    '        if pid == int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"]):',
+    '            with open(os.environ["FIXTURE_SIGNAL_LOG"], "a", encoding="ascii") as handle:',
+    '                handle.write(str(pid) + ",")',
+    '        else:',
+    '            signal.pidfd_send_signal(descriptor, signal_number)'
+  ].join('\n');
+  const ownershipGuard = [
+    '    try:',
+    '        waited, _ = os.waitpid(pid, os.WNOHANG)',
+    '    except ChildProcessError:',
+    '        return',
+    '    if waited == pid:',
+    '        return',
+    '    descriptor = os.pidfd_open(pid)'
+  ].join('\n');
+  const bypassedOwnershipGuard = '    descriptor = os.pidfd_open(pid)';
+  const liveChildGuard = '        except ChildProcessError:\n            continue\n        if waited == 0:';
+  const bypassedLiveChildGuard = '        except ChildProcessError:\n            waited = 0\n        if waited == 0:';
+  const supervisorSource = fs.readFileSync(SUPERVISOR_SCRIPT, 'utf8');
+  assert.ok(supervisorSource.includes(directChildrenLine));
+  assert.ok(supervisorSource.includes(signalLine));
+  assert.ok(supervisorSource.includes(ownershipGuard));
+  assert.ok(supervisorSource.includes(liveChildGuard));
+  const instrument = source => source
+    .replace(directChildrenLine, injectedChildrenLine)
+    .replace(signalLine, interceptedSignal);
+  const writeSupervisor = (root, name, source) => {
+    const directory = path.join(root.scratch, 'private-owner');
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, name + '.py');
+    fs.writeFileSync(file, source, { mode: 0o600 });
+    return file;
+  };
+  const normalSupervisor = writeSupervisor(normal, 'supervisor', instrument(supervisorSource));
+  let bypassSource = instrument(supervisorSource)
+    .replace(ownershipGuard, bypassedOwnershipGuard)
+    .replace(liveChildGuard, bypassedLiveChildGuard);
+  assert.notEqual(bypassSource, instrument(supervisorSource), 'counterfactual did not bypass child-handle ownership');
+  const bypassSupervisor = writeSupervisor(bypassed, 'supervisor', bypassSource);
+  const marker = path.join(normal.scratch, 'body.json');
+  const signalLog = path.join(normal.scratch, 'signals.log');
+  try {
+    const result = await normal.launchSupervised({
+      FIXTURE_SUPERVISOR_SCRIPT: normalSupervisor,
+      FIXTURE_REUSED_ROOT_CHILD_PID: String(actor.pid),
+      FIXTURE_SIGNAL_LOG: signalLog,
+      FIXTURE_MARKER: marker,
+      APERTURE_GATE_TIME_LEFT_S: '40',
+      APERTURE_GATE_SLOWEST_RUN_S: '1'
+    }).done;
+    assert.equal(result.code, 0, result.output);
+    assert.equal(fs.existsSync(marker), true, 'public command did not reach its body');
+    assert.equal(fs.existsSync(signalLog), false, 'stale ancestry reached the native signal boundary');
+    assert.equal(roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid)), false, 'the stale ancestry actor was signaled');
+
+    const bypassLog = path.join(bypassed.scratch, 'signals.log');
+    const bypassResult = await bypassed.launchSupervised({
+      FIXTURE_SUPERVISOR_SCRIPT: bypassSupervisor,
+      FIXTURE_REUSED_ROOT_CHILD_PID: String(actor.pid),
+      FIXTURE_SIGNAL_LOG: bypassLog,
+      FIXTURE_MARKER: path.join(bypassed.scratch, 'body.json'),
+      APERTURE_GATE_TIME_LEFT_S: '40',
+      APERTURE_GATE_SLOWEST_RUN_S: '1'
+    }).done;
+    assert.equal(bypassResult.code, 98, bypassResult.output);
+    assert.ok(fs.readFileSync(bypassLog, 'utf8').split(',').includes(String(actor.pid)), 'bypassed ownership did not reach the intercepted signal boundary');
+    assert.equal(roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid)), false, 'the intercepted signal reached the disposable actor');
+  } finally {
+    if (!roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid))) {
+      assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'disposable actor identity changed before cleanup');
+      assert.equal(roleFixture.signalOwned(actorIdentity, 'SIGTERM'), true, 'disposable actor could not be stopped by its test owner');
+      assert.equal(await waitForIdentityGone(actorIdentity, Date.now() + 5000), true, 'disposable actor remained after bounded cleanup');
     }
   }
 });
@@ -5281,6 +5370,187 @@ test('Darwin phase ownership keeps relay, retirement and failed verdicts ordered
   assert.equal(report.realStateFileWrites, 0);
 });
 
+
+test('public supervisor refuses a shared controller coalition before dispatch', { skip: process.platform !== 'darwin', timeout: 90000 }, async t => {
+  async function runCase(bypassGuard) {
+    const f = fixture(t);
+    const directory = path.join(f.scratch, 'private-owner', 'scripts', 'full-gate');
+    fs.mkdirSync(directory, { recursive: true });
+    const stopMarker = path.join(f.scratch, 'fixture-stop');
+    const eventLog = path.join(f.scratch, 'native-boundary-events.jsonl');
+    const runnerExit = path.join(f.scratch, 'runner-exit');
+    const runnerAlarm = path.join(f.scratch, 'runner-alarm');
+    const bodyMarker = path.join(f.scratch, 'body-started.json');
+    const databasePath = path.join(f.scratch, 'fake-launchd.json');
+    const bin = path.join(f.scratch, 'fake-bin');
+    fs.mkdirSync(bin);
+    const ownerBoundary = [
+      'import json as _fixture_json, os as _fixture_os, sys as _fixture_sys',
+      '_FIXTURE_STOP = ' + JSON.stringify(stopMarker),
+      '_FIXTURE_EVENTS = ' + JSON.stringify(eventLog),
+      'def _fixture_log(kind, pid=None, coalition=None):',
+      '    with open(_FIXTURE_EVENTS, "a", encoding="utf-8") as handle:',
+      '        handle.write(_fixture_json.dumps({"kind":kind,"pid":pid,"coalition":coalition,"role":_fixture_os.path.basename(_fixture_sys.argv[0])}) + chr(10))',
+      'def joined_identity(pid):',
+      '    role = _fixture_os.path.basename(_fixture_sys.argv[0])',
+      '    if role == "darwin-runner.py" and _fixture_os.path.exists(_FIXTURE_STOP): raise SystemExit(0)',
+      '    coalition = 400 if role == "darwin-runner.py" and int(pid) == _fixture_os.getpid() else 300',
+      '    identity = {"pid":int(pid),"unique_id":int(pid),"pid_version":1,"start_sec":1,"start_usec":1,"coalition_id":coalition}',
+      '    if role == "supervisor.py" and int(pid) != _fixture_os.getpid(): _fixture_log("identity", int(pid), coalition)',
+      '    return identity',
+      'def identity_if_present(pid):',
+      '    if _fixture_os.path.exists(_FIXTURE_STOP):',
+      '        if _fixture_os.path.basename(_fixture_sys.argv[0]) == "darwin-runner.py": raise SystemExit(0)',
+      '        return None',
+      '    return joined_identity(pid)',
+      'def same_process(expected, actual): return bool(expected and actual and expected.get("pid") == actual.get("pid"))',
+      'def task_counts(resource): return (1, 0)',
+      'def _drained(*args): return True',
+      'def signal_identity(identity, signum, deadline):',
+      '    _fixture_log("signal", int(identity["pid"]))',
+      '    with open(_FIXTURE_STOP, "w", encoding="ascii") as handle: handle.write("stop")',
+      '    return True',
+      'def drain(resource, deadline, preserve=None, allow_reaped=False):',
+      '    _fixture_log("drain", None, int(resource))',
+      '    if _fixture_os.path.basename(_fixture_sys.argv[0]) == "supervisor.py":',
+      '        with open(_FIXTURE_STOP, "w", encoding="ascii") as handle: handle.write("stop")',
+      '    return True'
+    ].join('\n');
+    const runnerPrefix = [
+      'import atexit as _fixture_atexit, os as _fixture_os, signal as _fixture_signal',
+      '_FIXTURE_RUNNER_EXIT = ' + JSON.stringify(runnerExit),
+      '_FIXTURE_RUNNER_ALARM = ' + JSON.stringify(runnerAlarm),
+      'def _fixture_runner_alarm(*args):',
+      '    with open(_FIXTURE_RUNNER_ALARM, "w", encoding="ascii") as handle: handle.write("expired")',
+      '    _fixture_os._exit(94)',
+      '_fixture_signal.signal(_fixture_signal.SIGALRM, _fixture_runner_alarm)',
+      '_fixture_signal.alarm(45)',
+      '_fixture_atexit.register(lambda: open(_FIXTURE_RUNNER_EXIT, "w", encoding="ascii").write("exited"))',
+      ''
+    ].join('\n');
+    for (const file of ['supervisor.py', 'darwin-runner.py', 'darwin.py']) {
+      let source = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate', file), 'utf8');
+      if (file === 'supervisor.py' && bypassGuard) {
+        const coalitionGuard = 'if not owner.same_process(reported, identity) or identity["coalition_id"] == controller["coalition_id"]:';
+        assert.ok(source.includes(coalitionGuard), 'public supervisor coalition guard was not found');
+        source = source.replace(coalitionGuard, 'if not owner.same_process(reported, identity):');
+      }
+      if (file === 'darwin-runner.py') source = runnerPrefix + source;
+      if (file === 'darwin.py') source += '\n' + ownerBoundary + '\n';
+      fs.writeFileSync(path.join(directory, file), source, { mode: 0o600 });
+    }
+    fs.symlinkSync(GATE, path.join(directory, '..', 'full-gate.js'));
+    const launchctl = path.join(bin, 'launchctl');
+    const unrelatedService = 'gui/' + process.getuid() + '/com.discordsurface.fixture.unrelated';
+    const unrelated = { service: unrelatedService, pid: 424242, active: true, sentinel: 'preserve' };
+    fs.writeFileSync(databasePath, JSON.stringify({ services: { [unrelatedService]: unrelated } }));
+    const launchctlSource = [
+      '#!/usr/bin/env python3',
+      'import json, os, plistlib, subprocess, sys',
+      '_DATABASE = ' + JSON.stringify(databasePath),
+      'def read_db():',
+      '    with open(_DATABASE, encoding="utf-8") as handle: return json.load(handle)',
+      'def write_db(value):',
+      '    with open(_DATABASE, "w", encoding="utf-8") as handle: json.dump(value, handle)',
+      'action = sys.argv[1]',
+      'if action == "print":',
+      '    service = sys.argv[2]',
+      '    record = read_db()["services"].get(service)',
+      '    if record and record.get("active"):',
+      '        print("pid = " + str(record["pid"]))',
+      '        print("state = running")',
+      '        raise SystemExit(0)',
+      '    label = service.rsplit("/", 1)[-1]',
+      '    print(\'Could not find service "\' + label + \'" in domain for user gui: \' + str(os.getuid()), file=sys.stderr)',
+      '    raise SystemExit(113)',
+      'if action == "bootstrap":',
+      '    domain, plist_path = sys.argv[2], sys.argv[3]',
+      '    with open(plist_path, "rb") as handle: plist = plistlib.load(handle)',
+      '    args = plist["ProgramArguments"]',
+      '    with open(args[-1], encoding="utf-8") as handle: spec = json.load(handle)',
+      '    environment = os.environ.copy(); environment.update(plist.get("EnvironmentVariables", {}))',
+      '    with open(plist["StandardOutPath"], "ab") as stdout, open(plist["StandardErrorPath"], "ab") as stderr:',
+      '        process = subprocess.Popen(args, cwd=spec["cwd"], env=environment, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)',
+      '    service = domain + "/" + plist["Label"]',
+      '    database = read_db()',
+      '    database["services"][service] = {"service":service,"pid":process.pid,"active":True,"scratch":os.path.dirname(plist_path),"spec_path":args[-1]}',
+      '    write_db(database)',
+      '    raise SystemExit(0)',
+      'if action == "bootout":',
+      '    service = sys.argv[-1]',
+      '    database = read_db()',
+      '    if service in database["services"]: database["services"][service]["active"] = False',
+      '    write_db(database)',
+      '    raise SystemExit(0)',
+      'raise SystemExit(2)',
+      ''
+    ].join('\n');
+    fs.writeFileSync(launchctl, launchctlSource, { mode: 0o700 });
+    const supervised = f.launchSupervised({
+      FIXTURE_SUPERVISOR_SCRIPT: path.join(directory, 'supervisor.py'),
+      FIXTURE_LAUNCHD_DB: databasePath,
+      FIXTURE_MARKER: bodyMarker,
+      PATH: bin + path.delimiter + process.env.PATH,
+      APERTURE_GATE_TIME_LEFT_S: '30',
+      APERTURE_GATE_SLOWEST_RUN_S: '1'
+    });
+    let serviceRecord;
+    let runnerIdentity;
+    let spec;
+    try {
+      const launchDeadline = Date.now() + 10000;
+      while (!serviceRecord && Date.now() < launchDeadline) {
+        const database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+        serviceRecord = Object.values(database.services).find(record => record.service !== unrelatedService);
+        if (!serviceRecord) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(serviceRecord, 'public supervisor did not create the disposable platform job');
+      spec = JSON.parse(fs.readFileSync(serviceRecord.spec_path, 'utf8'));
+      runnerIdentity = roleFixture.captureIdentity(serviceRecord.pid);
+      assert.equal(runnerIdentity.kind, 'present', 'disposable runner identity was not captured');
+      const result = await supervised.done;
+      const database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+      const events = fs.existsSync(eventLog)
+        ? fs.readFileSync(eventLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+        : [];
+      assert.ok(events.some(event => event.kind === 'identity' && event.role === 'supervisor.py' && event.pid === serviceRecord.pid && event.coalition === 300), 'same-coalition observation did not reach the public supervisor guard');
+      assert.deepEqual(database.services[unrelatedService], unrelated, 'public cleanup changed the unrelated job');
+      if (!bypassGuard) {
+        assert.equal(result.code, 98, result.output);
+        assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.output);
+        assert.equal(fs.existsSync(bodyMarker), false, 'shared coalition reached command dispatch');
+        assert.equal(fs.existsSync(spec.ack_path), false, 'shared coalition wrote a command acknowledgment');
+        assert.equal(fs.existsSync(eventLog) && fs.readFileSync(eventLog, 'utf8').includes('"kind": "drain"'), false, 'shared coalition reached drain');
+        const signals = events.filter(event => event.kind === 'signal');
+        assert.ok(signals.every(event => event.pid === serviceRecord.pid), 'cleanup signal escaped the disposable runner');
+      } else {
+        assert.equal(fs.existsSync(bodyMarker), true, 'bypassing the public guard did not make the body start');
+        assert.ok(events.some(event => event.kind === 'drain'), 'bypassing the public guard did not reach coalition drain');
+      }
+    } finally {
+      let database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+      serviceRecord ||= Object.values(database.services).find(record => record.service !== unrelatedService);
+      if (serviceRecord) {
+        fs.writeFileSync(stopMarker, 'stop');
+        if (runnerIdentity?.kind === 'present' && !roleFixture.identityGone(runnerIdentity, roleFixture.captureIdentity(runnerIdentity.pid))) {
+          let gone = await waitForIdentityGone(runnerIdentity, Date.now() + 3000);
+          if (!gone && roleFixture.sameProcessIdentity(runnerIdentity, roleFixture.captureIdentity(runnerIdentity.pid))) {
+            assert.equal(roleFixture.signalOwned(runnerIdentity, 'SIGTERM'), true, 'test owner could not stop its disposable runner');
+            gone = await waitForIdentityGone(runnerIdentity, Date.now() + 5000);
+          }
+          assert.equal(gone, true, 'disposable runner remained after bounded cleanup');
+        }
+        const bootout = spawnSync('python3', [launchctl, 'bootout', serviceRecord.service], { encoding: 'utf8', timeout: 5000 });
+        assert.equal(bootout.status, 0, bootout.stderr);
+        fs.rmSync(serviceRecord.scratch, { recursive: true, force: true });
+      }
+      database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
+      assert.deepEqual(database.services[unrelatedService], unrelated, 'test cleanup changed the unrelated job');
+    }
+  }
+  await runCase(false);
+  await runCase(true);
+});
 
 test('Darwin guardian retains an after verifier when its outer controller dies', { skip: process.platform !== 'darwin', timeout: 120000 }, async t => {
   const f = fixture(t);
