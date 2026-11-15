@@ -15,7 +15,7 @@ const OWNER_RELATIVE = path.join('src', 'state', 'message-recovery.js');
 
 const FACTORY_NAME = 'createMessageRecoveryHandlers';
 const BINDING_NAME = 'messageRecoveryHandlers';
-const HANDLER_NAMES = ['recoverAfterRestart', 'recoveryCandidates', 'reconcileUncertain'];
+const HANDLER_NAMES = ['recoverAfterRestart', 'recoveryCandidates', 'reconcileAcceptedNotExecuted', 'reconcileUncertain'];
 const DEPENDENCIES = [
   'boardRefreshHandlers',
   'topicPublicationHandlers',
@@ -227,15 +227,15 @@ test('message recovery handler ownership', () => {
   const factoryDependencies = bindingPatternNames(factory.parameters[0].name, ownerSource);
   assert.deepEqual(factoryDependencies, DEPENDENCIES, `${FACTORY_NAME} dependency list must be exactly the 13 names`);
 
-  // (c) the factory returns an object literal with exactly the three methods, in order.
+  // (c) the factory returns an object literal with exactly the owned methods, in order.
   const factoryReturns = factory.body.statements.filter(statement => ts.isReturnStatement(statement));
   assert.equal(factoryReturns.length, 1, `${FACTORY_NAME} must have exactly one top-level return`);
   const returned = factoryReturns[0].expression;
   assert.ok(ts.isObjectLiteralExpression(returned), `${FACTORY_NAME} must return an object literal`);
   const returnedHandlers = methodImplementationsNamed(returned, new Set(HANDLER_NAMES));
-  assert.equal(returnedHandlers.length, 3, `${FACTORY_NAME} return must nest exactly three handlers`);
+  assert.equal(returnedHandlers.length, HANDLER_NAMES.length, `${FACTORY_NAME} return must nest exactly its owned handlers`);
   assert.deepEqual(returnedHandlers.map(method => method.name.text), HANDLER_NAMES,
-    `${FACTORY_NAME} return must list exactly the three handlers in order`);
+    `${FACTORY_NAME} return must list exactly the owned handlers in order`);
   assert.deepEqual(returned.properties.map(property => property.name && property.name.text), HANDLER_NAMES,
     `${FACTORY_NAME} return object must contain only the three handler properties`);
   for (const handler of returnedHandlers) {
@@ -253,14 +253,14 @@ test('message recovery handler ownership', () => {
   const stateClass = surfaceStateClass(stateSource);
   const stateImplementations = methodImplementationsNamed(stateClass, new Set(HANDLER_NAMES));
   assert.deepEqual(stateImplementations.map(method => method.name.text), HANDLER_NAMES,
-    'SurfaceState must contain exactly the three wrappers in order');
+    'SurfaceState must contain exactly the owned wrappers in order');
   assertWrapper(wrapperMethod(stateClass, 'recoverAfterRestart'), 'recoverAfterRestart', ['ownerAlive'], stateSource);
   assertWrapper(wrapperMethod(stateClass, 'recoveryCandidates'), 'recoveryCandidates', ['before'], stateSource);
   assertWrapper(wrapperMethod(stateClass, 'reconcileUncertain'), 'reconcileUncertain', ['messageId', 'resolution'], stateSource);
 
   // (f) census every git-tracked src .js/.ts file (plus the untracked-in-progress
   // owner module and any other untracked src file, so a new sibling cannot hide):
-  // each handler is implemented exactly three times in state.js and three times
+  // each handler is implemented once per owned handler in state.js and once per owned handler
   // in the owner module, and nowhere else.
   const gitList = args => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' })
     .split('\n').filter(Boolean);
@@ -275,10 +275,10 @@ test('message recovery handler ownership', () => {
     if (counts.length > 0) census.set(relativePath, counts.map(method => method.name.text));
   }
   assert.deepEqual([...census.keys()].sort(), ['src/state.js', OWNER_RELATIVE.split(path.sep).join('/')].sort(),
-    'the three handlers must be implemented only in src/state.js and the owner module');
-  assert.equal(census.get('src/state.js').length, 3, 'src/state.js must implement the three handlers exactly three times');
-  assert.equal(census.get('src/state/message-recovery.js').length, 3,
-    'src/state/message-recovery.js must implement the three handlers exactly three times');
+    'the owned handlers must be implemented only in src/state.js and the owner module');
+  assert.equal(census.get('src/state.js').length, HANDLER_NAMES.length, 'src/state.js must implement the owned handlers once per owned handler');
+  assert.equal(census.get('src/state/message-recovery.js').length, HANDLER_NAMES.length,
+    'src/state/message-recovery.js must implement the owned handlers once per owned handler');
   for (const name of HANDLER_NAMES) {
     assert.equal(census.get('src/state.js').filter(entry => entry === name).length, 1,
       `src/state.js must implement ${name} exactly once (the wrapper)`);

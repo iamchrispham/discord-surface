@@ -17,7 +17,8 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
     GATEWAY_CAPABILITIES.agentHandledWithoutPost,
     GATEWAY_CAPABILITIES.agentRequestWithdrawal,
     GATEWAY_CAPABILITIES.watcherNoticeIngress,
-    GATEWAY_CAPABILITIES.courierRecovery
+    GATEWAY_CAPABILITIES.courierRecovery,
+    GATEWAY_CAPABILITIES.acceptedCustodyReconciliation
   ];
   if (typeof courierRouteId === 'string' && courierRouteId.length > 0) {
     capabilities.push(GATEWAY_CAPABILITIES.codexWatcherNoticeIngress);

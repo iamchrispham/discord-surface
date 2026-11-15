@@ -1360,6 +1360,8 @@ class SurfaceState {
     return directPostHandlers.excludeDirectPost(this, event);
   }
   recoveryCandidates(before = null) { return messageRecoveryHandlers.recoveryCandidates.apply(this, arguments); }
+  reconcileAcceptedNotExecuted(input) { return messageRecoveryHandlers.reconcileAcceptedNotExecuted.apply(this, arguments); }
+
   reconcileUncertain(messageId, resolution) { return messageRecoveryHandlers.reconcileUncertain.apply(this, arguments); }
 
   beginProvisionIntent(intent) {

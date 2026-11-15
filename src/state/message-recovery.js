@@ -1,3 +1,10 @@
+const NOT_EXECUTED_RECEIPT = 'accepted-not-executed';
+const UNATTEMPTED_RECEIPTS = new Set([
+  'accepted', 'agent-message', 'watcher-notice', 'watcher-notice-publication',
+  'transport-receipt-attempt', 'transport-receipt-outcome', 'interaction-origin',
+  'intake-held-not-ready', 'dispatch-held-not-ready'
+]);
+
 function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationHandlers, decisionHandlers, courierRouteHandlers, MESSAGE_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT, parseJson, now, BindingError }) {
   return {
   recoverAfterRestart(ownerAlive = null) {
@@ -88,6 +95,46 @@ function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationH
       ? this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) AND created_at<=? ORDER BY created_at, rowid`).all(...states, before)
       : this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) ORDER BY created_at, rowid`).all(...states);
     return rows.map(row => this.getMessage(row.discord_id));
+  },
+  reconcileAcceptedNotExecuted({ messageId, nativeId, generation, evidenceScope }) {
+    if (typeof evidenceScope !== 'string' || !evidenceScope.trim() || evidenceScope.length > 2048 || evidenceScope.includes('\0')) {
+      throw new BindingError('not_executed requires a nonempty evidence scope of at most 2048 characters');
+    }
+    if (!Number.isSafeInteger(generation) || generation < 1 || typeof nativeId !== 'string') {
+      throw new BindingError('not_executed requires the original native owner and generation');
+    }
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message || message.nativeId !== nativeId || message.generation !== generation) {
+        throw new BindingError('not_executed message identity is stale');
+      }
+      const receipts = this.db.prepare('SELECT kind, detail FROM receipts WHERE discord_id=? ORDER BY id').all(messageId);
+      const previous = receipts.find(row => row.kind === NOT_EXECUTED_RECEIPT);
+      if (previous) {
+        const detail = parseJson(previous.detail, {});
+        if (message.state !== MESSAGE_STATES.REJECTED || detail.nativeId !== nativeId ||
+            detail.generation !== generation || detail.evidenceScope !== evidenceScope) {
+          throw new BindingError('not_executed conflicts with the recorded disposition');
+        }
+        return { message, duplicate: true };
+      }
+      if (message.state !== MESSAGE_STATES.ACCEPTED || !this.currentMessageBinding(message).current) {
+        throw new BindingError('not_executed requires accepted custody under the current binding');
+      }
+      const row = this.db.prepare(`SELECT observer_cursor, observer_marker, reply_text, reply_nonce,
+        reply_message_id, reply_next_part, error FROM messages WHERE discord_id=?`).get(messageId);
+      const hasReply = row.reply_text !== null || row.reply_nonce !== null || row.reply_message_id !== null || row.reply_next_part !== 0;
+      const hasParts = this.db.prepare('SELECT 1 FROM reply_parts WHERE discord_id=? LIMIT 1').get(messageId);
+      if (row.observer_cursor !== null || row.observer_marker !== null || row.error !== null || hasReply || hasParts ||
+          !receipts.some(receipt => receipt.kind === 'accepted') ||
+          receipts.some(receipt => !UNATTEMPTED_RECEIPTS.has(receipt.kind))) {
+        throw new BindingError('not_executed refuses attempted or ambiguous custody');
+      }
+      this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
+        .run(MESSAGE_STATES.REJECTED, now(), messageId, MESSAGE_STATES.ACCEPTED);
+      this.receipt(messageId, NOT_EXECUTED_RECEIPT, { nativeId, generation, evidenceScope });
+      return { message: this.getMessage(messageId), duplicate: false };
+    });
   },
   reconcileUncertain(messageId, resolution) {
     if (!['submitted', 'not_submitted'].includes(resolution)) throw new BindingError('resolution must be submitted or not_submitted');

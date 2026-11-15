@@ -7,7 +7,8 @@ const GATEWAY_CAPABILITIES = Object.freeze({
   agentRequestWithdrawal: 'agent-request-withdrawal-v1',
   watcherNoticeIngress: 'watcher-notice-ingress-v1',
   codexWatcherNoticeIngress: 'codex-watcher-notice-ingress-v1',
-  courierRecovery: 'courier-recovery-v1'
+  courierRecovery: 'courier-recovery-v1',
+  acceptedCustodyReconciliation: 'accepted-custody-reconciliation-v1'
 });
 
 module.exports = { GATEWAY_CAPABILITIES };
