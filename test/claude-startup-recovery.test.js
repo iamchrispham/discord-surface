@@ -1,13 +1,17 @@
 'use strict';
 
 const {
-  test, assert, fs, http, path, spawn, once, ClaudeChannel, SurfaceState, fixture, CLAUDE_ID,
+  test, assert, fs, http, path, spawn, once, EventEmitter, ClaudeChannel, SurfaceState, fixture, CLAUDE_ID,
+  socketOwnership,
   SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT,
   socketPath, removeSocketDirectory, closeListeningServer, requestOverSocket, waitForCondition
 } = require('./claude-socket-recovery-fixture');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+const { createClaudeMonitor } = require('../src/claude-monitor');
+const { createDefaultMcp } = require('../src/claude-channel');
+const { MESSAGE_STATES, READINESS } = require('../src/state');
 
 function scheduler() {
   const pending = [];
@@ -71,6 +75,33 @@ test('public start attaches after a same-process incumbent releases its listener
   waitScheduler.release();
   await starting;
   assert.equal(waiter.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('initial socket replacement during pin is refused before ordinary preparation', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const originalLstat = fs.lstatSync;
+  let socketReads = 0;
+  let injectReplacement = true;
+  t.mock.method(fs, 'lstatSync', (candidate, options) => {
+    const observed = originalLstat(candidate, options);
+    if (!injectReplacement || candidate !== f.socket || !observed.isSocket()) return observed;
+    socketReads += 1;
+    if (socketReads !== 2) return observed;
+    const replacement = Object.create(Object.getPrototypeOf(observed));
+    Object.assign(replacement, observed, { ino: observed.ino + 1n });
+    return replacement;
+  });
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  t.after(async () => {
+    injectReplacement = false;
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await assert.rejects(waiter.start(), /incumbent socket was replaced during startup recovery/);
+  assert.equal(incumbent.ready, true);
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
@@ -176,6 +207,46 @@ test('replacement during vacancy is refused and preserved', { timeout: 8000 }, a
   assert.equal((await requestOverSocket(f.socket, { requestPath: '/other' })).body, 'replacement');
 });
 
+test('expected incumbent shutdown response keeps the waiter cancellably waiting', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp: quietMcp() });
+  t.after(async () => {
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  const starting = waiter.start();
+  await waitForCondition(() => waitScheduler.pending > 0, 'waiter must pin the incumbent');
+  incumbent.ready = false;
+  waitScheduler.release();
+  await waitForCondition(() => waitScheduler.pending > 0, '503 identity response must preserve the wait');
+  assert.equal(waiter.ready, false);
+  await waiter.stop();
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(incumbent.ready, false);
+});
+
+test('confirmed foreign identity failure refuses the pinned wait', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp: quietMcp() });
+  t.after(async () => {
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  const starting = waiter.start();
+  await waitForCondition(() => waitScheduler.pending > 0, 'waiter must pin the incumbent');
+  incumbent.bindingIdentity.nativeId = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
+  waitScheduler.release();
+  await assert.rejects(starting, /identity endpoint returned HTTP 409/);
+  assert.equal(waiter.ready, false);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 409);
+});
+
 test('binding handoff cancels the waiter before a new bind', { timeout: 8000 }, async t => {
   const f = bindFixture(t);
   const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
@@ -218,6 +289,223 @@ test('SDK initialization completes while waiting and close cancels startup', { t
   waitScheduler.release();
   await channelStarting;
   assert.equal(waiter.ready, true);
+  await waiter.stop();
+});
+
+test('SDK transport closes when a successor wins during acquisition', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const mcp = new Server({ name: 'acquisition-cleanup-test', version: '1.0.0' });
+  mcp.transportFactory = () => serverTransport;
+  const client = new Client({ name: 'acquisition-cleanup-client', version: '1.0.0' });
+  const clientStarting = client.connect(clientTransport);
+  let closeCalls = 0;
+  const originalClose = mcp.close.bind(mcp);
+  mcp.close = async () => { closeCalls += 1; return originalClose(); };
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const replacement = http.createServer((request, response) => {
+    response.writeHead(200);
+    response.end('successor');
+  });
+  let replacementStarted = false;
+  let injectReplacement = false;
+  let successorRelease;
+  const originalLstat = fs.lstatSync;
+  const originalAcquire = socketOwnership.acquireSocketLock;
+  t.mock.method(fs, 'lstatSync', (candidate, options) => {
+    try {
+      return originalLstat(candidate, options);
+    } catch (error) {
+      if (candidate === f.socket && injectReplacement && error.code === 'ENOENT' && !replacementStarted) {
+        replacementStarted = true;
+        replacement.listen(f.socket);
+        throw error;
+      }
+      throw error;
+    }
+  });
+  t.mock.method(socketOwnership, 'acquireSocketLock', candidate => {
+    if (candidate === f.socket && !successorRelease) {
+      successorRelease = originalAcquire(candidate);
+      throw new Error('Claude channel socket preparation is already in progress');
+    }
+    return originalAcquire(candidate);
+  });
+  const starting = waiter.start();
+  t.after(async () => {
+    successorRelease?.();
+    await client.close().catch(() => {});
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+    await closeListeningServer(replacement);
+  });
+  await clientStarting;
+  await waitForCondition(() => waitScheduler.pending > 0, 'SDK waiter must pin the incumbent');
+  await incumbent.stop();
+  injectReplacement = true;
+  waitScheduler.release();
+  await assert.rejects(starting, /Claude channel socket already exists; stop its owner first/);
+  assert.ok(closeCalls >= 1, 'acquisition refusal must close the connected MCP transport');
+  assert.equal(waiter.startupAbort, null, 'acquisition refusal must clear startup cancellation');
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('stopping during identity probe destroys the request before stop returns', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  let startRequest;
+  const started = new Promise(resolve => { startRequest = resolve; });
+  const server = http.createServer((request, response) => {
+    if (request.url !== '/identity') {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    startRequest();
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(f.socket, resolve); });
+  t.after(() => closeListeningServer(server));
+  const release = socketOwnership.acquireSocketLock(f.socket);
+  const originalDestroy = http.ClientRequest.prototype.destroy;
+  let destroyed = false;
+  t.mock.method(http.ClientRequest.prototype, 'destroy', function (...args) {
+    destroyed = true;
+    return originalDestroy.apply(this, args);
+  });
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  t.after(async () => {
+    release();
+    await waiter.stop().catch(() => {});
+  });
+  const starting = waiter.start();
+  const rejected = assert.rejects(starting, /stopped during incumbent wait/);
+  await started;
+  await waiter.stop();
+  assert.equal(destroyed, true, 'stop must destroy the identity request before returning');
+  await rejected;
+  assert.equal(waiter.ready, false);
+});
+
+test('SDK close cancels a waiter while it remains detached', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const mcp = new Server({ name: 'wait-cancel-test', version: '1.0.0' });
+  mcp.transportFactory = () => serverTransport;
+  const client = new Client({ name: 'wait-cancel-client', version: '1.0.0' });
+  const clientStarting = client.connect(clientTransport);
+  let closeCalls = 0;
+  const originalClose = mcp.close.bind(mcp);
+  mcp.close = async () => { closeCalls += 1; return originalClose(); };
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const starting = waiter.start();
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await clientStarting;
+  await waitForCondition(() => waitScheduler.pending > 0, 'SDK waiter must enter incumbent wait');
+  const stopping = waiter.stop();
+  await stopping;
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(waiter.ready, false);
+  assert.ok(closeCalls >= 1, 'SDK close must propagate through waiter cancellation');
+  assert.equal(incumbent.ready, true);
+});
+
+test('Monitor stdout close cancels a waiter while incumbent stays ready', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const stdout = new EventEmitter();
+  stdout.write = (_chunk, callback) => { callback?.(); return true; };
+  const waitScheduler = scheduler();
+  const monitor = createClaudeMonitor({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, stateDir: f.dir, dbPath: f.db, stdout, startupScheduler: waitScheduler });
+  const starting = monitor.start();
+  t.after(async () => {
+    await monitor.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await waitForCondition(() => waitScheduler.pending > 0, 'Monitor must enter incumbent wait');
+  stdout.emit('close');
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(monitor.ready, false);
+  assert.equal(incumbent.ready, true);
+});
+
+test('cleanup failure during waiting retains incumbent ownership', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({
+    state: f.state,
+    nativeId: CLAUDE_ID,
+    socketPath: f.socket,
+    startupScheduler: waitScheduler,
+    mcp: { notification: async () => {}, close: async () => { throw new Error('simulated MCP cleanup failure'); } }
+  });
+  const starting = waiter.start();
+  t.after(async () => {
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await waitForCondition(() => waitScheduler.pending > 0, 'waiter must enter incumbent wait');
+  await assert.rejects(waiter.stop(), /Claude channel stop failed/);
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('detached valid native completion remains authorized while stale identity is rejected', { timeout: 10000 }, async t => {
+  const f = bindFixture(t);
+  const currentBinding = f.state.getBinding('claude');
+  f.state.setBindingReadiness('claude', READINESS.READY, 'detached authorization fixture', currentBinding);
+  const accepted = f.state.acceptDiscordMessage({
+    id: '102', guildId: 'guild-1', channelId: 'claude', authorId: 'operator-1', isBot: false,
+    content: 'complete while listener waits'
+  }, { ready: true });
+  assert.equal(accepted.accepted, true);
+  assert.equal(f.state.claimDispatch('102').claimed, true);
+  f.state.markSubmitted('102');
+  const message = f.state.getMessage('102');
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const mcp = createDefaultMcp({ nativeId: CLAUDE_ID, state: f.state });
+  mcp.transportFactory = () => serverTransport;
+  const client = new Client({ name: 'detached-authorization-client', version: '1.0.0' });
+  const clientStarting = client.connect(clientTransport);
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const starting = waiter.start();
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await clientStarting;
+  await waitForCondition(() => waitScheduler.pending > 0, 'default MCP must initialize before detached authorization');
+  assert.equal(waiter.ready, false);
+  assert.equal(incumbent.ready, true);
+  const acknowledgment = await client.callTool({ name: 'acknowledge', arguments: { messageId: message.id, generation: message.generation } });
+  assert.equal(acknowledgment.isError, undefined);
+  const reply = await client.callTool({ name: 'reply', arguments: { messageId: message.id, generation: message.generation, text: 'detached completion' } });
+  assert.equal(reply.isError, undefined);
+  assert.equal(f.state.getMessage(message.id).state, MESSAGE_STATES.REPLY_READY);
+  assert.equal(f.state.getMessage(message.id).replyText, 'detached completion');
+  await assert.rejects(
+    client.callTool({ name: 'reply', arguments: { messageId: message.id, generation: message.generation + 1, text: 'stale completion' } }),
+    /native reply is stale/
+  );
+  await incumbent.stop();
+  waitScheduler.release();
+  await starting;
   await waiter.stop();
 });
 

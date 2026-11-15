@@ -292,6 +292,10 @@ export class ClaudeChannel<
       startupController.abort();
       rejectStartup?.(new Error(`Claude channel stopped during ${startupPhase}`));
     };
+    const closeStartupTransport = async (): Promise<void> => {
+      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+      if (this.startupAbort === abortStartup) this.startupAbort = null;
+    };
     this.startupAbort = abortStartup;
     const retainedRelease = this.socketLockRelease;
     if (retainedRelease) {
@@ -340,8 +344,7 @@ export class ClaudeChannel<
         }, incumbent);
       }
     } catch (error) {
-      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
-      if (this.startupAbort === abortStartup) this.startupAbort = null;
+      await closeStartupTransport();
       if (this.startupPhase === startupPhase) this.startupPhase = null;
       throw error;
     }
@@ -351,25 +354,21 @@ export class ClaudeChannel<
     try {
       releaseSocketLock = socketOwnership.acquireSocketLock(this.socketPath);
     } catch (error) {
+      let acquisitionError: unknown = error;
       if (errorMessage(error) === 'Claude channel socket preparation is already in progress') {
         let socketExists = false;
         try {
           socketExists = fs.lstatSync(this.socketPath).isSocket();
         } catch (pathError) {
           if ((pathError as NodeJS.ErrnoException).code !== 'ENOENT') {
-            this.startupPhase = null;
-            throw pathError;
+            acquisitionError = pathError;
           }
         }
-        if (socketExists) {
-          this.startupPhase = null;
-          throw new Error('Claude channel socket already exists; stop its owner first');
-        }
+        if (socketExists) acquisitionError = new Error('Claude channel socket already exists; stop its owner first');
       }
       this.startupPhase = null;
-      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
-      if (this.startupAbort === abortStartup) this.startupAbort = null;
-      throw error;
+      await closeStartupTransport();
+      throw acquisitionError;
     }
     this.socketLockRelease = releaseSocketLock;
     try {

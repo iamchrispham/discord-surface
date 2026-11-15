@@ -59,11 +59,11 @@ function readSocketIdentity(socketPath: string): socketOwnership.SocketPathIdent
   try {
     const stats = fs.lstatSync(socketPath, { bigint: true });
     if (!stats.isSocket()) return undefined;
+    return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs, birthtimeNs: stats.birthtimeNs };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  return socketOwnership.socketPathIdentity(socketPath);
 }
 
 function readLock(lockPath: string): socketOwnership.OwnerMarkerSnapshot | undefined {
@@ -77,8 +77,19 @@ async function probe(options: StartupRecoveryOptions): Promise<ClaudeChannelIden
     workspace: options.binding.workspace,
     endpoint: options.socketPath
   };
-  const pending = probeClaudeChannel(options.socketPath, expected, { timeoutMs: 1000 });
-  return Promise.race([pending, options.startupCancellation]);
+  const pending = probeClaudeChannel(options.socketPath, expected, { timeoutMs: 1000, signal: options.signal });
+  try {
+    return await Promise.race([pending, options.startupCancellation]);
+  } catch (error) {
+    if (options.signal.aborted) return await options.startupCancellation;
+    throw error;
+  }
+}
+
+function expectedProbeFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code;
+  if (['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOENT', 'ETIMEDOUT'].includes(String(code))) return true;
+  return /Claude channel identity probe timed out|Claude channel identity endpoint returned HTTP 503/.test(String((error as { message?: unknown }).message));
 }
 
 function samePinnedLock(pin: IncumbentPin, lock: socketOwnership.OwnerMarkerSnapshot): boolean {
@@ -123,15 +134,21 @@ export async function pinIncumbent(options: StartupRecoveryOptions): Promise<Inc
   let listener: ClaudeChannelIdentity;
   try { listener = await probe(options); }
   catch (error) {
-    assertNotAborted(options);
-    return null;
+    if (options.signal.aborted) throw error;
+    if (expectedProbeFailure(error)) return null;
+    throw error;
   }
   assertBinding(options);
   if (!listener.listenerInstanceId) return null;
   const currentSocket = readSocketIdentity(options.socketPath);
   const currentLock = readLock(lockPath);
-  if (!currentSocket || !sameSocketIdentity(socketIdentity, currentSocket) || !currentLock ||
-    !samePinnedLock({ binding: options.binding, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner }, currentLock)) return null;
+  if (!currentSocket || !sameSocketIdentity(socketIdentity, currentSocket)) {
+    throw new Error('Claude channel incumbent socket was replaced during startup recovery');
+  }
+  if (!currentLock || !samePinnedLock({ binding: options.binding, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner }, currentLock)) {
+    throw new Error('Claude channel incumbent lock was replaced during startup recovery');
+  }
+  if (!socketOwnership.socketLockOwnerAlive(currentLock.owner)) return null;
   return { binding: { ...options.binding }, listenerInstanceId: listener.listenerInstanceId, socketIdentity, lockPath, lockOwner };
 }
 
@@ -157,8 +174,8 @@ export async function waitForIncumbentVacancy(options: StartupRecoveryOptions, p
     let listener: ClaudeChannelIdentity | undefined;
     try { listener = await probe(options); }
     catch (error) {
-      assertNotAborted(options);
-      if (!sameBinding(options.readBinding(), options.binding)) throw error;
+      if (options.signal.aborted) throw error;
+      if (!sameBinding(options.readBinding(), options.binding) || !expectedProbeFailure(error)) throw error;
     }
     if (listener && listener.listenerInstanceId !== pin.listenerInstanceId) {
       throw new Error('Claude channel incumbent listener was replaced during startup recovery');
