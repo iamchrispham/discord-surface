@@ -42,6 +42,67 @@ SNAPSHOT_PROGRAM = (
 )
 
 
+# Only Node 22 Linux combinations with the verified generic layout are admitted.
+_LINUX_SIGACTION_ABI_LIBCS = {
+    "x86_64": frozenset({"glibc", "musl"}),
+    "amd64": frozenset({"glibc", "musl"}),
+    "i386": frozenset({"glibc"}),
+    "i486": frozenset({"glibc"}),
+    "i586": frozenset({"glibc"}),
+    "i686": frozenset({"glibc"}),
+    "aarch64": frozenset({"glibc"}),
+    "armv6l": frozenset({"glibc"}),
+    "armv7l": frozenset({"glibc"}),
+    "armv8l": frozenset({"glibc"}),
+    "ppc64le": frozenset({"glibc"}),
+    "s390x": frozenset({"glibc"}),
+    "loongarch64": frozenset({"glibc"}),
+}
+_LINUX_SIGSET_SIZE = 128
+_LINUX_SA_NOCLDWAIT = 0x2
+
+
+def _linux_libc_family():
+    try:
+        version = os.confstr("CS_GNU_LIBC_VERSION")
+    except (AttributeError, OSError, ValueError):
+        version = None
+    if isinstance(version, str) and version.startswith("glibc "):
+        return "glibc"
+
+    try:
+        with open("/proc/self/maps", encoding="ascii") as mappings:
+            mapped_libraries = mappings.read()
+    except (OSError, UnicodeError) as error:
+        raise OSError("Linux C library ABI could not be verified") from error
+
+    has_musl = "ld-musl-" in mapped_libraries
+    has_glibc = "libc.so.6" in mapped_libraries or "/libc-" in mapped_libraries
+    if has_musl == has_glibc:
+        return None
+    return "musl" if has_musl else "glibc"
+
+
+def _linux_sigaction_abi(machine=None, libc=None):
+    if machine is None:
+        try:
+            machine = os.uname().machine
+        except (AttributeError, OSError) as error:
+            raise OSError("Linux machine ABI could not be verified") from error
+    if not isinstance(machine, str) or not machine:
+        raise OSError("Linux machine ABI could not be verified")
+    machine = machine.lower()
+    supported_libcs = _LINUX_SIGACTION_ABI_LIBCS.get(machine)
+    if supported_libcs is None:
+        raise OSError("Linux SIGCHLD ABI is unsupported")
+
+    if libc is None:
+        libc = _linux_libc_family()
+    if not isinstance(libc, str) or libc.lower() not in supported_libcs:
+        raise OSError("Linux SIGCHLD ABI is unsupported")
+    return _LINUX_SIGSET_SIZE, _LINUX_SA_NOCLDWAIT
+
+
 class InvalidGateBudget(Exception):
     pass
 
@@ -65,15 +126,16 @@ def _native_sigchld_flags():
 
         no_cldwait = 0x20
     elif sys.platform == "linux":
+        mask_size, no_cldwait = _linux_sigaction_abi()
+        mask_type = ctypes.c_ubyte * mask_size
+
         class NativeSigaction(ctypes.Structure):
             _fields_ = [
                 ("sa_handler", ctypes.c_void_p),
-                ("sa_mask", ctypes.c_ubyte * 128),
+                ("sa_mask", mask_type),
                 ("sa_flags", ctypes.c_int),
                 ("sa_restorer", ctypes.c_void_p),
             ]
-
-        no_cldwait = 0x2
     else:
         raise OSError("waitable child status is unsupported on this platform")
     action = NativeSigaction()

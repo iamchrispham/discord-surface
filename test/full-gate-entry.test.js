@@ -218,7 +218,9 @@ function fixture(t) {
             : value.boot_id + ':' + value.start;
           identities.set(value.pid + ':' + start, value);
         } else {
-          for (const item of Object.values(value)) remember(item);
+          for (const [key, item] of Object.entries(value)) {
+            if (key !== 'extraHolders') remember(item);
+          }
         }
       }
     };
@@ -1153,7 +1155,11 @@ test('no-verdict marker starts on a new line after body stderr fragment', { time
 for (const bodyExit of [0, 17, 98]) {
   test('admitted body preserves raw exit ' + bodyExit + ' and completes cleanup', { timeout: 180000 }, async t => {
     const f = fixture(t);
-    const result = await f.launch({ FIXTURE_BODY_EXIT: String(bodyExit) }).done;
+    const externalHolderPid = process.pid;
+    const result = await f.launch({
+      FIXTURE_BODY_EXIT: String(bodyExit),
+      DISCORD_SURFACE_GATE_SUPERVISOR_PID: String(externalHolderPid)
+    }).done;
     assert.equal(result.code, bodyExit, result.output);
     assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
     const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
@@ -1166,6 +1172,12 @@ for (const bodyExit of [0, 17, 98]) {
     assert.equal(holder, admittedRoles.worker.pid, 'the recorded worker is the admitted holder');
     assert.match(args[args.indexOf('--ticket') + 1], /^[A-Za-z0-9._:-]{1,128}$/);
     assert.equal(roleFixture.identityGone(admittedRoles.worker, roleFixture.captureIdentity(holder)), true, 'admission worker remained after cleanup');
+    const externalHolder = admittedRoles.extraHolders.find(identity => identity.pid === externalHolderPid);
+    assert.ok(externalHolder, 'the enclosing supervisor must remain an external admission holder');
+    assert.equal(roleFixture.identityGone(
+      externalHolder,
+      roleFixture.captureIdentity(externalHolderPid)
+    ), false, 'the enclosing supervisor must remain alive during fixture cleanup');
   });
 }
 
@@ -1987,7 +1999,7 @@ def set_no_cldwait():
 
 if mode == 'no-cldwait':
     set_no_cldwait()
-elif signal.getsignal(signal.SIGCHLD) != signal.SIG_IGN:
+elif mode == 'inherited-ignore' and signal.getsignal(signal.SIGCHLD) != signal.SIG_IGN:
     raise AssertionError('SIGCHLD ignore did not survive exec')
 
 attempts = []
@@ -2002,6 +2014,35 @@ def load(name, file):
     spec.loader.exec_module(module)
     return module
 
+native_attempts = []
+if mode == 'unknown-abi':
+    abi_owner = load('full_gate_abi_matrix_probe', supervisor_path)
+    supported = [
+        ('x86_64', 'glibc'), ('x86_64', 'musl'),
+        ('i386', 'glibc'), ('i686', 'glibc'),
+        ('aarch64', 'glibc'), ('armv6l', 'glibc'), ('armv7l', 'glibc'),
+        ('ppc64le', 'glibc'), ('s390x', 'glibc'), ('loongarch64', 'glibc'),
+    ]
+    for machine, libc in supported:
+        assert abi_owner._linux_sigaction_abi(machine, libc) == (128, 0x2), (machine, libc)
+    for machine, libc in [
+        ('mips64', 'glibc'), ('sparc64', 'glibc'), ('x86_64', 'uclibc'),
+    ]:
+        try:
+            abi_owner._linux_sigaction_abi(machine, libc)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('unsupported Linux SIGCHLD ABI was accepted: ' + machine + '/' + libc)
+    sys.platform = 'linux'
+    os.uname = lambda: type('Uname', (), {'machine': 'mips64'})()
+
+    def forbidden_native(*args, **kwargs):
+        native_attempts.append(args)
+        raise AssertionError('native SIGCHLD inspection ran before ABI verification')
+
+    ctypes.CDLL = forbidden_native
+
 if owner_name == 'supervisor':
     os.environ.pop('NODE_OPTIONS', None)
     os.environ['APERTURE_GATE_TIME_LEFT_S'] = '20'
@@ -2015,10 +2056,12 @@ if owner_name == 'supervisor':
     supervisor.no_verdict = capture_no_verdict
     result = supervisor.run(['--', sys.executable, '-c', 'raise SystemExit(0)'])
     assert result == 98, result
-    detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else 'SA_NOCLDWAIT'
+    detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else (
+        'SA_NOCLDWAIT' if mode == 'no-cldwait' else 'Linux SIGCHLD ABI')
     assert any(detail in str(refusal) for refusal in refusals), refusals
     assert supervisor.stop_owned_processes(None, time.monotonic() + 1) is False
     assert not attempts
+    assert not native_attempts
     print(json.dumps({'owner': owner_name, 'mode': mode, 'result': result, 'detail': detail}))
 elif owner_name == 'darwin-runner':
     runner_directory = str(pathlib.Path(runner_path).resolve().parent)
@@ -2047,18 +2090,20 @@ elif owner_name == 'darwin-runner':
         assert result == 98, result
         assert state.exists(), 'Darwin runner must record its bounded refusal'
         state_text = state.read_text(encoding='utf-8')
-        detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else 'SA_NOCLDWAIT'
+        detail = 'SIGCHLD disposition' if mode == 'inherited-ignore' else (
+            'SA_NOCLDWAIT' if mode == 'no-cldwait' else 'Linux SIGCHLD ABI')
         assert detail in state_text, state_text
         supervisor = load('full_gate_supervisor_cleanup_probe', supervisor_path)
         assert supervisor.stop_owned_processes(None, time.monotonic() + 1) is False
         assert not attempts
+        assert not native_attempts
         print(json.dumps({'owner': owner_name, 'mode': mode, 'result': result, 'detail': detail}))
 else:
     raise AssertionError('unknown owner ' + owner_name)`;
   const script = path.join(os.tmpdir(), 'gate-reaping-contract-' + process.pid + '.py');
   fs.writeFileSync(script, probe);
   try {
-    for (const mode of ['inherited-ignore', 'no-cldwait']) {
+    for (const mode of ['inherited-ignore', 'no-cldwait', 'unknown-abi']) {
       for (const owner of ['supervisor', 'darwin-runner']) {
         const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3',
           ['-I', '-B', script, mode, owner, SUPERVISOR_SCRIPT, path.join(PROJECT, 'scripts/full-gate/darwin-runner.py')],
