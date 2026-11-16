@@ -586,8 +586,10 @@ async function runFullGate(root, label, entry, args) {
     guardian.on('message', message => {
       if (message.kind === MESSAGES.STOP) {
         try { observed.watchdogStop ||= watchdogStopObservation(message.observation); } catch {}
-        if (!stopped && message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS) {
-          stop(REASONS.INTERRUPTED, 'watchdog-stop');
+        const escapedWriterHandoff = process.platform === 'linux' &&
+          message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
+        if (!stopped && (escapedWriterHandoff || message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS)) {
+          stop(escapedWriterHandoff ? REASONS.CLEANUP : REASONS.INTERRUPTED, 'watchdog-stop');
         }
       }
       if (message.kind === MESSAGES.CUSTODY && Number.isSafeInteger(message.phase) && message.phase > 0) {
@@ -711,8 +713,12 @@ async function runFullGate(root, label, entry, args) {
       }
       if (closed.code !== 0 || hadPeers || guardianClosed.code !== 0) {
         worker.stdout.destroy(); worker.stderr.destroy();
-        const code = decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
-        releaseOwnedScratch();
+        const escapedWriterHandoff = process.platform === 'linux' &&
+          observed.watchdogStop?.event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
+        const code = escapedWriterHandoff
+          ? decline(REASONS.CLEANUP, 'escaped writer cleanup was handed to the Linux supervisor; scratch custody retained')
+          : decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
+        if (!escapedWriterHandoff) releaseOwnedScratch();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;

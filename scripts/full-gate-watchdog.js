@@ -394,8 +394,13 @@ async function finishStop() {
     try {
       const table = phase ? await readProcessTable(phase) : null;
       if (table) await rememberEscapedDescendants(table.rows, phase);
-      const owned = await hasOwnedProcesses(table, phase);
-      complete = !owned && currentObservation(phase);
+      const groupHasLiveProcesses = !table || table.rows.some(row =>
+        row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
+      const escapedWriterIsLive = table ? await hasLiveEscapedDescendants(table.rows, phase) : false;
+      const observationIsCurrent = currentObservation(phase);
+      const canHandOffToLinuxOwner = process.platform === 'linux' && process.connected &&
+        !groupHasLiveProcesses && escapedWriterIsLive && observationIsCurrent;
+      complete = observationIsCurrent && ((!groupHasLiveProcesses && !escapedWriterIsLive) || canHandOffToLinuxOwner);
     } catch {}
     finally { finishObservation(phase); }
     await collector.whenClosed();
