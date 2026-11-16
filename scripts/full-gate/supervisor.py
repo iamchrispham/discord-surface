@@ -534,11 +534,8 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 reason, detail = "cleanup", "supervised process tree did not stop before the caller deadline"
         else:
             result = process.wait()
-            if live_owned_children():
-                if not stop_owned_processes(None, deadline):
-                    reason, detail = "cleanup", "detached descendants did not stop before the caller deadline"
-                else:
-                    reason, detail = "cleanup", "detached descendants remained after gate completion"
+            if not wait_for_owned_children(run_deadline):
+                reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
 
         try:
             after = capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)

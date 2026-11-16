@@ -98,7 +98,7 @@ function fixture(t) {
   fs.writeFileSync(entry, [
     "const fs = require('node:fs');",
     "const roles = require(" + JSON.stringify(ROLE_FIXTURE) + ");",
-    "const { runFullGate } = require(" + JSON.stringify(GATE) + ");",
+    "const { runFullGate } = require(process.env.FIXTURE_GATE_MODULE || " + JSON.stringify(GATE) + ");",
     "if(process.env.FIXTURE_SIGNAL_RECEIVED)process.on('SIGTERM',()=>fs.writeFileSync(process.env.FIXTURE_SIGNAL_RECEIVED,String(process.pid)));",
     "async function runBody() {",
     "  const watchdogEnvironment = process.platform === 'linux' ? fs.readFileSync('/proc/' + process.ppid + '/environ') : Buffer.alloc(0);",
@@ -145,6 +145,16 @@ function fixture(t) {
     "    const until=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_DETACHED_ARMED)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_DETACHED_ARMED))throw new Error('detached descendant did not start');",
     "    const identity=roles.captureIdentity(child.pid);if(identity.kind!=='present')throw new Error('detached child identity could not be established');fs.writeFileSync(process.env.FIXTURE_DETACHED_PID,JSON.stringify({pid:child.pid,identity}));",
     "  }",
+    "  if (process.env.FIXTURE_CLEANUP_CUSTODY) {",
+    "    const cp=require('node:child_process');",
+    "    const writerProgram=\"const fs=require('node:fs');const roles=require(\" + JSON.stringify(ROLE_FIXTURE) + \");const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;let finished=false;const end=Date.now()+12000;let poll;const observe=()=>{if(finished)return;if(!fs.existsSync(scratch)&&!fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE)){const identity=roles.captureIdentity(process.pid);fs.writeFileSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE,JSON.stringify({identity}));}if(fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASE)){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'released');process.exit(0);}if(Date.now()>=end){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'self-destruct');process.exit(0);}};fs.writeFileSync(process.env.FIXTURE_CLEANUP_ARMED,'armed');poll=setInterval(observe,5);observe();setTimeout(()=>{if(!finished){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'hard-timeout');process.exit(0);}},12000);\";",
+    "    const writer=cp.spawn(process.execPath,['-e',writerProgram],{detached:true,stdio:'ignore'});writer.unref();",
+    "    const armedDeadline=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_CLEANUP_ARMED)&&Date.now()<armedDeadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_CLEANUP_ARMED))throw new Error('cleanup writer did not arm');",
+    "    const identity=roles.captureIdentity(writer.pid);if(identity.kind!=='present')throw new Error('cleanup writer identity could not be established');fs.writeFileSync(process.env.FIXTURE_CLEANUP_PID,JSON.stringify({pid:writer.pid,identity}));fs.writeFileSync(process.env.FIXTURE_CLEANUP_SCRATCH_PATH,process.env.DISCORD_SURFACE_GATE_SCRATCH);",
+    "    const peerProgram=\"const fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_STOPPED,'stopped');process.exit(0);});fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_ARMED,'armed');setTimeout(()=>process.exit(0),12000).unref();\";",
+    "    const peer=cp.spawn(process.execPath,['-e',peerProgram],{stdio:'ignore'});peer.unref();",
+    "    const peerDeadline=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_CLEANUP_PEER_ARMED)&&Date.now()<peerDeadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_CLEANUP_PEER_ARMED))throw new Error('cleanup peer did not arm');",
+    "  }",
     "  if (process.env.FIXTURE_REPARENTED_DESCENDANT) {",
     "    fs.writeFileSync(process.env.FIXTURE_REPARENTED_BODY_READY, 'body-ready');",
     "    const releaseDeadline=Date.now()+10000;while(!fs.existsSync(process.env.FIXTURE_REPARENTED_RELEASE)&&Date.now()<releaseDeadline)await new Promise(resolve=>setTimeout(resolve,10));",
@@ -157,11 +167,13 @@ function fixture(t) {
     "  if (process.env.FIXTURE_READ_ONLY_SCRATCH) { const ro=require('node:path').join(process.env.DISCORD_SURFACE_GATE_SCRATCH,'ro');fs.mkdirSync(ro);fs.writeFileSync(require('node:path').join(ro,'f'),'x');fs.chmodSync(ro,0o500); }",
     "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'const fs=require(\"node:fs\");process.on(\"SIGTERM\",()=>{if(process.env.FIXTURE_LEFTOVER_STOPPED)fs.writeFileSync(process.env.FIXTURE_LEFTOVER_STOPPED,\"term\");process.exit(0)});setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
     "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH && !process.env.FIXTURE_ESCAPE_READY) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
+    "  if(process.env.FIXTURE_TABLE_FAILURE_ARM)fs.writeFileSync(process.env.FIXTURE_TABLE_FAILURE_ARM,'armed');",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
     "}",
     "setTimeout(() => process.exit(98), 120000).unref();",
     "module.exports = { runBody };",
     "if (require.main === module) {",
+    "  if(process.env.FIXTURE_MANAGER_IDENTITY)fs.writeFileSync(process.env.FIXTURE_MANAGER_IDENTITY,JSON.stringify(roles.captureIdentity(process.pid)));",
     "  runFullGate(process.env.FIXTURE_ROOT, 'fixture', __filename, []).then(code => { process.exitCode = code; });",
     "}"
   ].join('\n'));
@@ -1252,44 +1264,137 @@ test('a late descendant source write is checked after the owned group drains', {
   assert.equal(fs.readFileSync(path.join(f.root, 'input'), 'utf8'), 'changed by late descendant');
 });
 
-test('a detached descendant cannot write source after gate completion', { skip: process.platform !== 'linux', timeout: 180000 }, async t => {
+test('cleanup keeps scratch until an escaped writer and guardian are done', { skip: process.platform !== 'linux', timeout: 30000 }, async t => {
   const f = fixture(t);
-  const armed = path.join(f.scratch, 'detached-armed');
-  const done = path.join(f.scratch, 'detached-done');
-  const pidFile = path.join(f.scratch, 'detached-pid');
-  let child;
-  try {
-    const result = await f.launchSupervised({
-      FIXTURE_DETACHED_LATE_WRITE: '1',
-      FIXTURE_DETACHED_ARMED: armed,
-      FIXTURE_DETACHED_DONE: done,
-      FIXTURE_DETACHED_PID: pidFile,
-      APERTURE_GATE_TIME_LEFT_S: '40',
-      APERTURE_GATE_SLOWEST_RUN_S: '1'
-    }).done;
-    assert.equal(result.code, 98, result.output);
-    assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=(?:interrupted|cleanup|stale)/);
-    assert.equal(fs.existsSync(pidFile), true, result.output);
-    child = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    assert.equal(fs.existsSync(done), false);
-    assert.equal(fs.readFileSync(path.join(f.root, 'input'), 'utf8'), 'source\n');
-    assert.equal(roleFixture.identityGone(child.identity, roleFixture.captureIdentity(child.pid)), true, 'owned detached child remained after cleanup');
-  } finally {
-    if (!child && fs.existsSync(pidFile)) child = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
-    if (child) {
-      const current = roleFixture.captureIdentity(child.pid);
-      if (!roleFixture.identityGone(child.identity, current)) {
-        if (!roleFixture.sameProcessIdentity(child.identity, current)
-            || !roleFixture.signalOwned(child.identity, 'SIGTERM')) {
-          throw new Error('detached child cleanup is unresolved; custody retained at ' + f.scratch);
-        }
-        if (!await waitForIdentityGone(child.identity, Date.now() + 5000)) {
-          throw new Error('detached child did not drain; custody retained at ' + f.scratch);
-        }
-      }
+  const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  const waitFor = async (predicate, milliseconds) => {
+    const deadline = Date.now() + milliseconds;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await sleep(10);
     }
+    return predicate();
+  };
+  const start = (label, gateModule) => {
+    const files = Object.fromEntries([
+      'armed', 'writer', 'scratchPath', 'releasedWhileLive', 'writerDone', 'peerArmed', 'peerStopped', 'manager'
+    ].map(name => [name, path.join(f.scratch, label + '-' + name)]));
+    const launched = f.launchSupervised({
+      FIXTURE_CLEANUP_CUSTODY: '1',
+      FIXTURE_CLEANUP_ARMED: files.armed,
+      FIXTURE_CLEANUP_PID: files.writer,
+      FIXTURE_CLEANUP_SCRATCH_PATH: files.scratchPath,
+      FIXTURE_CLEANUP_RELEASED_WHILE_LIVE: files.releasedWhileLive,
+      FIXTURE_CLEANUP_WRITER_DONE: files.writerDone,
+      FIXTURE_CLEANUP_PEER_ARMED: files.peerArmed,
+      FIXTURE_CLEANUP_PEER_STOPPED: files.peerStopped,
+      FIXTURE_CLEANUP_RELEASE: path.join(f.scratch, label + '-release'),
+      FIXTURE_MANAGER_IDENTITY: files.manager,
+      APERTURE_GATE_TIME_LEFT_S: '30',
+      APERTURE_GATE_SLOWEST_RUN_S: '5',
+      ...(gateModule ? { FIXTURE_GATE_MODULE: gateModule } : {})
+    });
+    const run = { ...launched, files, release: () => fs.writeFileSync(path.join(f.scratch, label + '-release'), 'release'), outcome: null };
+    run.done = launched.done.then(value => { run.outcome = value; return value; });
+    return run;
+  };
+  const isLive = actor => !roleFixture.identityGone(actor.identity, roleFixture.captureIdentity(actor.pid));
+  const waitForStart = async run => {
+    assert.equal(await waitFor(() => fs.existsSync(run.files.armed) || run.outcome, 8000), true, run.outcome?.output || 'fixture actors did not start');
+    assert.equal(fs.existsSync(run.files.armed), true, run.outcome?.output || 'escaped writer did not arm');
+    assert.equal(fs.existsSync(run.files.peerArmed), true);
+    return {
+      writer: JSON.parse(fs.readFileSync(run.files.writer, 'utf8')),
+      scratch: fs.readFileSync(run.files.scratchPath, 'utf8'),
+      manager: JSON.parse(fs.readFileSync(run.files.manager, 'utf8'))
+    };
+  };
+  const releaseAndDrain = async run => {
+    run.release();
+    await Promise.race([run.done, sleep(9000)]);
+  };
+
+  const normal = start('guarded');
+  let normalActors;
+  try {
+    normalActors = await waitForStart(normal);
+    assert.equal(await waitFor(() => fs.existsSync(normal.files.peerStopped) || normal.outcome, 7000), true, normal.outcome?.output || 'peer was not stopped');
+    assert.equal(fs.existsSync(normal.files.peerStopped), true, normal.outcome?.output || 'watchdog did not stop the owned peer');
+    await sleep(1000);
+    assert.equal(normal.outcome, null, 'public supervisor closed while the escaped writer was live');
+    assert.equal(isLive(normalActors.writer), true, 'escaped writer exited before release');
+    assert.equal(isLive(normalActors.manager), true, 'manager closed before guardian completion');
+    assert.equal(fs.existsSync(normalActors.scratch), true, 'private scratch was released while the escaped writer was live');
+    assert.equal(fs.existsSync(normal.files.releasedWhileLive), false);
+  } finally {
+    await releaseAndDrain(normal);
   }
+  const normalResult = normal.outcome;
+  assert.equal(normalResult?.code, 98, normalResult?.output);
+  assert.match(normalResult.output, /drain-peers/);
+  assert.equal(fs.readFileSync(normal.files.writerDone, 'utf8'), 'released');
+  assert.equal(fs.existsSync(normal.files.releasedWhileLive), false, 'writer observed scratch removal before it exited');
+  assert.equal(roleFixture.identityGone(normalActors.writer.identity, roleFixture.captureIdentity(normalActors.writer.pid)), true);
+  assert.equal(roleFixture.identityGone(normalActors.manager.identity, roleFixture.captureIdentity(normalActors.manager.pid)), true, 'manager remained open after verified writer cleanup');
+  assert.equal(fs.existsSync(normalActors.scratch), false, 'verified cleanup did not release private scratch');
+
+  const bypassScripts = path.join(f.scratch, 'bypass-scripts');
+  fs.mkdirSync(bypassScripts);
+  for (const file of ['full-gate.js', 'full-gate-worker.js', 'full-gate-watchdog.js']) {
+    fs.copyFileSync(path.join(PROJECT, 'scripts', file), path.join(bypassScripts, file));
+  }
+  fs.cpSync(path.join(PROJECT, 'scripts', 'full-gate'), path.join(bypassScripts, 'full-gate'), { recursive: true });
+  const bypassWatchdog = path.join(bypassScripts, 'full-gate-watchdog.js');
+  const fixedWatchdog = fs.readFileSync(bypassWatchdog, 'utf8');
+  const completionGuard = 'complete = observationIsCurrent && !groupHasLiveProcesses && !escapedWriterIsLive;';
+  assert.equal(fixedWatchdog.split(completionGuard).length - 1, 1, 'disposable control must bypass only the escaped-writer completion guard');
+  fs.writeFileSync(bypassWatchdog, fixedWatchdog.replace(completionGuard, 'complete = observationIsCurrent && !groupHasLiveProcesses;'));
+
+  const bypassed = start('bypassed', path.join(bypassScripts, 'full-gate.js'));
+  let bypassActors;
+  try {
+    bypassActors = await waitForStart(bypassed);
+    assert.equal(await waitFor(() => fs.existsSync(bypassed.files.peerStopped) || bypassed.outcome, 7000), true, bypassed.outcome?.output || 'peer was not stopped');
+    assert.equal(fs.existsSync(bypassed.files.peerStopped), true, bypassed.outcome?.output || 'watchdog did not stop the owned peer');
+    assert.equal(await waitFor(() => fs.existsSync(bypassed.files.releasedWhileLive), 3000), true, 'guard bypass did not expose scratch release during live writer custody');
+    const releaseEvidence = JSON.parse(fs.readFileSync(bypassed.files.releasedWhileLive, 'utf8'));
+    assert.equal(roleFixture.identityGone(releaseEvidence.identity, roleFixture.captureIdentity(releaseEvidence.identity.pid)), false);
+    assert.equal(isLive(bypassActors.writer), true, 'writer exited before the bypass release was observed');
+    assert.equal(fs.existsSync(bypassActors.scratch), false, 'guard bypass did not release scratch while the writer was live');
+    assert.equal(await waitFor(() => roleFixture.identityGone(bypassActors.manager, roleFixture.captureIdentity(bypassActors.manager.pid)), 3000), true, 'bypassed public manager did not close');
+  } finally {
+    await releaseAndDrain(bypassed);
+  }
+  assert.equal(bypassed.outcome?.code, 98, bypassed.outcome?.output);
+});
+
+test('watchdog table failure interrupts the worker through the manager', { skip: process.platform !== 'linux', timeout: 30000 }, async t => {
+  const f = fixture(t);
+  const bin = path.join(f.scratch, 'watchdog-ps');
+  fs.mkdirSync(bin);
+  const realPs = ['/bin/ps', '/usr/bin/ps'].find(file => fs.existsSync(file));
+  assert.ok(realPs, 'Linux test host must provide ps');
+  const failOnce = path.join(f.scratch, 'watchdog-ps-failed');
+  fs.writeFileSync(path.join(bin, 'ps'), '#!' + process.execPath + '\n' + [
+    "const fs=require('node:fs');const cp=require('node:child_process');",
+    "const args=process.argv.slice(2);",
+    "if(args.join(' ').includes('ppid')&&fs.existsSync(process.env.FIXTURE_TABLE_FAILURE_ARM)&&!fs.existsSync(process.env.FIXTURE_TABLE_FAILURE_ONCE)){fs.writeFileSync(process.env.FIXTURE_TABLE_FAILURE_ONCE,'failed');process.exit(1);}",
+    "const result=cp.spawnSync(" + JSON.stringify(realPs) + ",args,{stdio:'inherit'});process.exit(result.status===null?1:result.status);"
+  ].join('\n'), { mode: 0o700 });
+  const started = Date.now();
+  const result = await f.launchSupervised({
+    PATH: bin + path.delimiter + process.env.PATH,
+    FIXTURE_TABLE_FAILURE_ARM: path.join(f.scratch, 'body-complete'),
+    FIXTURE_TABLE_FAILURE_ONCE: failOnce,
+    APERTURE_GATE_TIME_LEFT_S: '18',
+    APERTURE_GATE_SLOWEST_RUN_S: '5'
+  }).done;
+  assert.equal(result.code, 98, result.output);
+  assert.equal(fs.existsSync(failOnce), true, result.output);
+  assert.match(result.output, /body-table-unavailable/);
+  assert.match(result.output, /firstStop[^\n]*watchdog-stop/);
+  assert.match(result.output, /workerStop[^\n]*parent-stop/);
+  assert.ok(Date.now() - started < 8000, 'watchdog observation failure waited for the execution deadline');
 });
 
 test('stale numeric ancestry cannot grant Linux signal ownership', { skip: process.platform !== 'linux', timeout: 90000 }, async t => {

@@ -3,7 +3,7 @@
 const { spawn } = require('node:child_process');
 const { createWatchdogCollector, COLLECTOR_CHECKPOINTS, COLLECTOR_CHECKPOINT_PREFIX } = require('./full-gate/watchdog-collector');
 const fs = require('node:fs');
-const { MESSAGES, CUSTODY, WATCHDOG_STOP_EVENTS, gateSyscallObservation, watchdogStopObservation, REASONS, NO_VERDICT, canFinish, releaseScratch, NO_VERDICT_SECRET, SCRATCH_ROOT } = require('./full-gate');
+const { MESSAGES, CUSTODY, WATCHDOG_STOP_EVENTS, gateSyscallObservation, watchdogStopObservation, REASONS, NO_VERDICT, canFinish, NO_VERDICT_SECRET } = require('./full-gate');
 const [deadline, callerDeadline, leader, entry, ...args] = process.argv.slice(2);
 const group = Number(leader);
 const PROCESS_MONITOR_INTERVAL_MS = 1000;
@@ -373,10 +373,7 @@ async function completeCleanup(code) {
   const completionDeadline = observationDeadline(code === 0 ? 'drain' : 'orphan');
   if (completionDeadline === null || Date.now() >= completionDeadline) return process.exit(NO_VERDICT);
   completionSent = true;
-  if (orphan || !process.connected) {
-    releaseScratch(process.env[SCRATCH_ROOT], completionDeadline);
-    return process.exit(NO_VERDICT);
-  }
+  if (orphan || !process.connected) return process.exit(NO_VERDICT);
   try {
     process.send({ kind: MESSAGES.CLEANUP_COMPLETE, code }, error => process.exit(error ? NO_VERDICT : code));
   } catch { process.exit(NO_VERDICT); }
@@ -398,13 +395,12 @@ async function finishStop() {
         row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
       const escapedWriterIsLive = table ? await hasLiveEscapedDescendants(table.rows, phase) : false;
       const observationIsCurrent = currentObservation(phase);
-      const canHandOffToLinuxOwner = process.platform === 'linux' && process.connected &&
-        !groupHasLiveProcesses && escapedWriterIsLive && observationIsCurrent;
-      complete = observationIsCurrent && ((!groupHasLiveProcesses && !escapedWriterIsLive) || canHandOffToLinuxOwner);
+      complete = observationIsCurrent && !groupHasLiveProcesses && !escapedWriterIsLive;
     } catch {}
     finally { finishObservation(phase); }
     await collector.whenClosed();
     const cleanupDeadline = observationDeadline('orphan');
+    if (cleanupDeadline === null || Date.now() >= cleanupDeadline) return process.exit(NO_VERDICT);
     if (!complete && process.platform === 'linux') {
       setTimeout(() => {
         linuxFinishStopPending = false;
@@ -412,7 +408,7 @@ async function finishStop() {
       }, 50);
       return;
     }
-    if (complete && cleanupDeadline !== null && Date.now() < cleanupDeadline) await completeCleanup(NO_VERDICT);
+    if (complete) await completeCleanup(NO_VERDICT);
     else process.exit(NO_VERDICT);
   }, 50);
 }

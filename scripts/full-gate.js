@@ -25,6 +25,11 @@ const WATCHDOG_STOP_EVENTS = Object.freeze({
   BODY_SCAN_UNAVAILABLE: 'body-scan-unavailable', BODY_SCAN_SEND: 'body-scan-send-error',
   PARENT_STOP: 'parent-stop', PARENT_DISCONNECT: 'parent-disconnect', SIGTERM: 'SIGTERM', TIMER: 'deadline'
 });
+const WATCHDOG_OBSERVATION_FAILURE_EVENTS = new Set([
+  WATCHDOG_STOP_EVENTS.MONITOR_TABLE, WATCHDOG_STOP_EVENTS.DRAIN_TABLE,
+  WATCHDOG_STOP_EVENTS.BODY_TABLE, WATCHDOG_STOP_EVENTS.BODY_SCAN_UNAVAILABLE,
+  WATCHDOG_STOP_EVENTS.BODY_SCAN_SEND
+]);
 const WORKER_STOP_EVENTS = Object.freeze({
   PARENT_STOP: 'parent-stop', SIGTERM: 'SIGTERM', PARENT_DISCONNECT: 'parent-disconnect',
   GUARD_EXIT: 'guard-exit', GUARD_ERROR: 'guard-error'
@@ -586,10 +591,10 @@ async function runFullGate(root, label, entry, args) {
     guardian.on('message', message => {
       if (message.kind === MESSAGES.STOP) {
         try { observed.watchdogStop ||= watchdogStopObservation(message.observation); } catch {}
-        const escapedWriterHandoff = process.platform === 'linux' &&
-          message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
-        if (!stopped && (escapedWriterHandoff || message.observation?.event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS)) {
-          stop(escapedWriterHandoff ? REASONS.CLEANUP : REASONS.INTERRUPTED, 'watchdog-stop');
+        const event = message.observation?.event;
+        const escapedWriterDetected = process.platform === 'linux' && event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
+        if (!stopped && (escapedWriterDetected || event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS || WATCHDOG_OBSERVATION_FAILURE_EVENTS.has(event))) {
+          stop(escapedWriterDetected ? REASONS.CLEANUP : REASONS.INTERRUPTED, 'watchdog-stop');
         }
       }
       if (message.kind === MESSAGES.CUSTODY && Number.isSafeInteger(message.phase) && message.phase > 0) {
@@ -713,12 +718,12 @@ async function runFullGate(root, label, entry, args) {
       }
       if (closed.code !== 0 || hadPeers || guardianClosed.code !== 0) {
         worker.stdout.destroy(); worker.stderr.destroy();
-        const escapedWriterHandoff = process.platform === 'linux' &&
-          observed.watchdogStop?.event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
-        const code = escapedWriterHandoff
-          ? decline(REASONS.CLEANUP, 'escaped writer cleanup was handed to the Linux supervisor; scratch custody retained')
-          : decline(REASONS.INTERRUPTED, 'owned process group was drained after interruption');
-        if (!escapedWriterHandoff) releaseOwnedScratch();
+        const cleanupReason = stopped === REASONS.CLEANUP;
+        const code = decline(
+          cleanupReason ? REASONS.CLEANUP : REASONS.INTERRUPTED,
+          cleanupReason ? 'owned writer cleanup completed without a successful gate result' : 'owned process group was drained after interruption'
+        );
+        releaseOwnedScratch();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
