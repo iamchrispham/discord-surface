@@ -3,9 +3,37 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { attachOrdinaryListener, detachOrdinaryListener, servedOrdinaryBinding } = require('../../src/cli');
+const { ClaudeChannel } = require('../../dist/claude-channel.js');
 const { READINESS, SurfaceState } = require('../../src/state');
 const { CLAUDE, CLI_PATH, fixture } = require('./fixture.cjs');
 const { expectWithin, readinessReceipts, spawnChannel, spawnGateway } = require('./channel-fixture.cjs');
+
+test('public ClaudeChannel.start preserves a transport close failure after connect fails', async t => {
+  const f = fixture(t);
+  const startupError = new Error('MCP connect failed');
+  const cleanupError = new Error('MCP close failed');
+  let closeCalls = 0;
+  const mcp = {
+    transportFactory() { return {}; },
+    async connect() { throw startupError; },
+    async close() {
+      closeCalls += 1;
+      if (closeCalls === 1) throw cleanupError;
+    }
+  };
+  const channel = new ClaudeChannel({ state: f.state, nativeId: CLAUDE, socketPath: f.socketPath, mcp });
+
+  await assert.rejects(channel.start(), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, 'Claude channel startup cleanup failed');
+    assert.deepEqual(error.errors.map(item => item.message), [startupError.message, cleanupError.message]);
+    return true;
+  });
+  await assert.rejects(channel.start(), /Claude channel startup cleanup is pending; stop the channel first/);
+
+  await channel.stop();
+  assert.equal(closeCalls, 2);
+});
 
 test('ordinary Claude channel startup reopens an endpoint-unavailable watermark, wakes the Gateway, and revokes readiness on stop', async t => {
   const f = fixture(t);
