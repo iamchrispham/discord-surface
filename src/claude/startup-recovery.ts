@@ -83,7 +83,6 @@ async function probe(options: StartupRecoveryOptions): Promise<ClaudeChannelIden
   } catch (error) {
     if (options.signal.aborted) {
       try { await pending; } catch {}
-      return await options.startupCancellation;
     }
     throw error;
   }

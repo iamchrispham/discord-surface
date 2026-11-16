@@ -124,6 +124,7 @@ export function probeUnixSocket(socketPath: string, { timeoutMs = 1000 }: { time
   });
 }
 
+
 export function probeClaudeChannel(
   socketPath: string,
   expected: ClaudeBindingExpectation,
@@ -138,6 +139,8 @@ export function probeClaudeChannel(
   return new Promise<ClaudeChannelIdentity>((resolve, reject) => {
     let settled = false;
     let abortRequested = false;
+    let requestClosed = false;
+    let cancellationError: Error | undefined;
     let request: http.ClientRequest | undefined;
     const deadlineMs = Math.max(1, Number(timeoutMs));
     let deadlineTimer: NodeJS.Timeout;
@@ -149,27 +152,21 @@ export function probeClaudeChannel(
       if (error) reject(error);
       else if (proof) resolve(proof);
     };
+    const onRequestClose = (): void => {
+      requestClosed = true;
+      if (abortRequested && cancellationError) finish(cancellationError);
+    };
     const onAbort = (): void => {
       abortRequested = true;
       const error = new Error('Claude channel identity probe was cancelled');
+      cancellationError = error;
       clearTimeout(deadlineTimer);
       signal?.removeEventListener('abort', onAbort);
-      if (!request) {
+      if (!request || requestClosed) {
         finish(error);
         return;
       }
-      let quiesced = false;
-      const complete = (): void => {
-        if (quiesced) return;
-        quiesced = true;
-        request?.removeListener('close', complete);
-        request?.removeListener('error', complete);
-        finish(error);
-      };
-      request.once('close', complete);
-      request.once('error', complete);
       request.destroy(error);
-      if (request.destroyed) queueMicrotask(complete);
     };
     deadlineTimer = setTimeout(() => {
       const error = new Error('Claude channel identity probe timed out');
@@ -235,6 +232,7 @@ export function probeClaudeChannel(
           finish(null, proof);
         });
       });
+      request.once('close', onRequestClose);
       request.once('error', (error: Error) => { if (!abortRequested) finish(error); });
       request.end();
     } catch (error) {
@@ -242,4 +240,3 @@ export function probeClaudeChannel(
     }
   });
 }
-

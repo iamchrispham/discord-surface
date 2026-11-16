@@ -525,12 +525,15 @@ export class ClaudeChannel<
     } catch (error) {
       this.ready = false;
       this.listenerInstanceId = null;
+      let startupError: unknown = error;
       if (listenerStartup) {
         try { await listenerStartup; } catch {}
         listenerStartup = null;
       }
       if (!this.stopping) {
-        try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+        try { await closeStartupTransport(); } catch (cleanupError) {
+          startupError = new AggregateError([error, cleanupError], 'Claude channel startup cleanup failed');
+        }
       }
       if (!this.startupCleanupPending) {
         try { await closeServer(this.server); } catch {}
@@ -541,7 +544,7 @@ export class ClaudeChannel<
           this.socketIdentity = null;
         }
       }
-      throw error;
+      throw startupError;
     } finally {
       if (this.startupAbort === abortStartup) this.startupAbort = null;
       if (this.startupPhase === startupPhase) this.startupPhase = null;

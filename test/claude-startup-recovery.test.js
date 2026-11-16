@@ -382,7 +382,7 @@ test('SDK transport closes when a successor wins during acquisition', { timeout:
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
-test('stopping during identity probe joins the delayed request close before stop returns', { timeout: 8000 }, async t => {
+test('public stop joins a real identity request close before returning', { timeout: 8000 }, async t => {
   const f = bindFixture(t);
   let startRequest;
   const started = new Promise(resolve => { startRequest = resolve; });
@@ -397,30 +397,23 @@ test('stopping during identity probe joins the delayed request close before stop
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(f.socket, resolve); });
   t.after(() => closeListeningServer(server));
   const release = socketOwnership.acquireSocketLock(f.socket);
-  const originalDestroy = http.ClientRequest.prototype.destroy;
-  const originalEmit = http.ClientRequest.prototype.emit;
-  let destroyRequested = false;
-  let closeObserved = false;
-  let releaseClose;
-  let requestToClose;
-  const closeGate = new Promise(resolve => { releaseClose = resolve; });
-  t.mock.method(http.ClientRequest.prototype, 'destroy', function (...args) {
-    if (!destroyRequested) {
-      destroyRequested = true;
-      const request = this;
-      requestToClose = () => originalDestroy.call(request, ...args);
-      void closeGate.then(() => requestToClose());
-      return this;
-    }
-    return originalDestroy.apply(this, args);
-  });
-  t.mock.method(http.ClientRequest.prototype, 'emit', function (event, ...args) {
-    if (event === 'close') closeObserved = true;
-    return originalEmit.call(this, event, ...args);
+  const originalRequest = http.request.bind(http);
+  let identityRequest;
+  let requestErrorObserved = false;
+  let requestCloseObserved = false;
+  let resolveRequestError;
+  const requestError = new Promise(resolve => { resolveRequestError = resolve; });
+  t.mock.method(http, 'request', (...args) => {
+    identityRequest = originalRequest(...args);
+    identityRequest.once('error', () => {
+      requestErrorObserved = true;
+      resolveRequestError();
+    });
+    identityRequest.once('close', () => { requestCloseObserved = true; });
+    return identityRequest;
   });
   const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
   t.after(async () => {
-    releaseClose();
     release();
     await waiter.stop().catch(() => {});
   });
@@ -428,14 +421,19 @@ test('stopping during identity probe joins the delayed request close before stop
   const rejected = assert.rejects(starting, /stopped during incumbent wait/);
   await started;
   let stopReturned = false;
-  const stopping = waiter.stop().finally(() => { stopReturned = true; });
-  await waitForCondition(() => destroyRequested && requestToClose, 'stop must request identity teardown');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(stopReturned, false, 'stop must wait for the identity request close');
-  releaseClose();
+  let closeObservedAtStopReturn = false;
+  const stopping = waiter.stop().finally(() => {
+    stopReturned = true;
+    closeObservedAtStopReturn = requestCloseObserved;
+  });
+  await requestError;
+  assert.equal(requestErrorObserved, true, 'the real request must report its cancellation error');
+  assert.equal(requestCloseObserved, false, 'the request error must precede actual close');
+  assert.equal(stopReturned, false, 'stop must remain pending after request error');
   await stopping;
   await rejected;
-  assert.equal(closeObserved, true, 'the request close must finish before stop returns');
+  assert.ok(identityRequest, 'the public startup must create a real ClientRequest');
+  assert.equal(closeObservedAtStopReturn, true, 'the real request close must finish before stop returns');
   assert.equal(waiter.ready, false);
 });
 
