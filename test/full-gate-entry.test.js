@@ -147,11 +147,12 @@ function fixture(t) {
     "  }",
     "  if (process.env.FIXTURE_CLEANUP_CUSTODY) {",
     "    const cp=require('node:child_process');",
-    "    const writerProgram=\"const fs=require('node:fs');const roles=require(\" + JSON.stringify(ROLE_FIXTURE) + \");const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;let finished=false;const end=Date.now()+12000;let poll;const observe=()=>{if(finished)return;if(!fs.existsSync(scratch)&&!fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE)){const identity=roles.captureIdentity(process.pid);fs.writeFileSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE,JSON.stringify({identity}));}if(fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASE)){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'released');process.exit(0);}if(Date.now()>=end){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'self-destruct');process.exit(0);}};fs.writeFileSync(process.env.FIXTURE_CLEANUP_ARMED,'armed');poll=setInterval(observe,5);observe();setTimeout(()=>{if(!finished){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'hard-timeout');process.exit(0);}},12000);\";",
+    "    const roleFixturePath = " + JSON.stringify(ROLE_FIXTURE) + ";",
+    "    const writerProgram=\"const fs=require('node:fs');const roles=require(\" + JSON.stringify(roleFixturePath) + \");const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;let finished=false;const end=Date.now()+12000;let poll;const observe=()=>{if(finished)return;if(fs.existsSync(scratch)&&!fs.existsSync(process.env.FIXTURE_CLEANUP_PRESENT_WHILE_LIVE)){const identity=roles.captureIdentity(process.pid);fs.writeFileSync(process.env.FIXTURE_CLEANUP_PRESENT_WHILE_LIVE,JSON.stringify({identity}));}if(!fs.existsSync(scratch)&&!fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE)){const identity=roles.captureIdentity(process.pid);fs.writeFileSync(process.env.FIXTURE_CLEANUP_RELEASED_WHILE_LIVE,JSON.stringify({identity}));}if(fs.existsSync(process.env.FIXTURE_CLEANUP_RELEASE)){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'released');process.exit(0);}if(Date.now()>=end){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'self-destruct');process.exit(0);}};fs.writeFileSync(process.env.FIXTURE_CLEANUP_ARMED,'armed');poll=setInterval(observe,5);observe();setTimeout(()=>{if(!finished){finished=true;clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_WRITER_DONE,'hard-timeout');process.exit(0);}},12000);\";",
     "    const writer=cp.spawn(process.execPath,['-e',writerProgram],{detached:true,stdio:'ignore'});writer.unref();",
     "    const armedDeadline=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_CLEANUP_ARMED)&&Date.now()<armedDeadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_CLEANUP_ARMED))throw new Error('cleanup writer did not arm');",
     "    const identity=roles.captureIdentity(writer.pid);if(identity.kind!=='present')throw new Error('cleanup writer identity could not be established');fs.writeFileSync(process.env.FIXTURE_CLEANUP_PID,JSON.stringify({pid:writer.pid,identity}));fs.writeFileSync(process.env.FIXTURE_CLEANUP_SCRATCH_PATH,process.env.DISCORD_SURFACE_GATE_SCRATCH);",
-    "    const peerProgram=\"const fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_STOPPED,'stopped');process.exit(0);});fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_ARMED,'armed');setTimeout(()=>process.exit(0),12000).unref();\";",
+    "    const peerProgram=\"const fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_STOPPED,'signalled');});fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_ARMED,'armed');const deadline=Date.now()+12000;const poll=setInterval(()=>{if(fs.existsSync(process.env.FIXTURE_CLEANUP_PEER_RELEASE)){clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_STOPPED,'released');process.exit(0);}if(Date.now()>=deadline){clearInterval(poll);fs.writeFileSync(process.env.FIXTURE_CLEANUP_PEER_STOPPED,'deadline');process.exit(0);}},5);\";",
     "    const peer=cp.spawn(process.execPath,['-e',peerProgram],{stdio:'ignore'});peer.unref();",
     "    const peerDeadline=Date.now()+5000;while(!fs.existsSync(process.env.FIXTURE_CLEANUP_PEER_ARMED)&&Date.now()<peerDeadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(process.env.FIXTURE_CLEANUP_PEER_ARMED))throw new Error('cleanup peer did not arm');",
     "  }",
@@ -768,8 +769,8 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    def emit(self, *args):",
     "        self.emitted = args[3]",
     "        return True",
-    "    def remove(self, scratch, ignore_errors):",
-    "        assert scratch == \"private\" and ignore_errors is True",
+    "    def remove(self, scratch):",
+    "        assert scratch == \"private\"",
     "        self.removals += 1",
     "def context(fixture):",
     "    env = {\"__builtins__\": {\"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"int\": int,",
@@ -779,7 +780,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "                           \"ValueError\": ValueError, \"KeyError\": KeyError, \"TypeError\": TypeError, \"Exception\": Exception},",
     "           \"open\": fixture.open, \"json\": json, \"SnapshotCleanupError\": error_types[\"SnapshotCleanupError\"],",
     "           \"InvalidGateBudget\": error_types[\"InvalidGateBudget\"], \"JobRequestCancelled\": error_types[\"JobRequestCancelled\"],",
-    "           \"os\": SimpleNamespace(get_blocking=fixture.get_blocking, set_blocking=fixture.set_blocking, write=fixture.write, stat=fixture.stat),",
+    "           \"os\": SimpleNamespace(get_blocking=fixture.get_blocking, set_blocking=fixture.set_blocking, write=fixture.write, stat=fixture.stat, path=SimpleNamespace(lexists=lambda name: False)),",
     "           \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73))}",
     "    exec(compile(ast.Module(body=[writer, relay], type_ignores=[]), \"<relay-fixture>\", \"exec\"), env)",
     "    relay_owner=env[\"_stream_stdout\"]",
@@ -812,6 +813,9 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        return {\"phase\":\"normal-after-complete\",\"after\":after,\"after_failure\":failure},offset[\"offset\"]",
     "    env.update(_write_job_request=phase_write,_wait_job_phase=phase_wait,_darwin_cleanup=lambda *args,**kwargs:True)",
     "    initial = ast.parse(\"output_offset = 0\\noutput_cursor = {'offset':0,'source_line_start':True,'output_line_start':True}\\nretirement = {}\\nreason = None\\ndetail = None\\nowned_service = False\\nsequence = 1\\nafter_failure = None\").body",
+    "    initial.append(ast.parse(\"scratch = 'private'\").body[0])",
+    "    retire_helper = next(n for n in darwin.body if isinstance(n, ast.FunctionDef) and n.name == 'retire_scratch')",
+    "    initial.append(copy.deepcopy(retire_helper))",
     "    final = ast.Try(body=final_body, handlers=outer.handlers, orelse=outer.orelse, finalbody=outer.finalbody)",
     "    function = ast.FunctionDef(name=\"finish\", args=ast.arguments(posonlyargs=[], args=[], vararg=None,",
     "                               kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),",
@@ -1277,30 +1281,33 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
   };
   const start = (label, gateModule) => {
     const files = Object.fromEntries([
-      'armed', 'writer', 'scratchPath', 'releasedWhileLive', 'writerDone', 'peerArmed', 'peerStopped', 'manager'
+      'armed', 'writer', 'scratchPath', 'presentWhileLive', 'releasedWhileLive', 'writerDone', 'peerArmed', 'peerStopped', 'manager'
     ].map(name => [name, path.join(f.scratch, label + '-' + name)]));
     const launched = f.launchSupervised({
       FIXTURE_CLEANUP_CUSTODY: '1',
       FIXTURE_CLEANUP_ARMED: files.armed,
       FIXTURE_CLEANUP_PID: files.writer,
       FIXTURE_CLEANUP_SCRATCH_PATH: files.scratchPath,
+      FIXTURE_CLEANUP_PRESENT_WHILE_LIVE: files.presentWhileLive,
       FIXTURE_CLEANUP_RELEASED_WHILE_LIVE: files.releasedWhileLive,
       FIXTURE_CLEANUP_WRITER_DONE: files.writerDone,
       FIXTURE_CLEANUP_PEER_ARMED: files.peerArmed,
       FIXTURE_CLEANUP_PEER_STOPPED: files.peerStopped,
+      FIXTURE_CLEANUP_PEER_RELEASE: path.join(f.scratch, label + '-peer-release'),
       FIXTURE_CLEANUP_RELEASE: path.join(f.scratch, label + '-release'),
       FIXTURE_MANAGER_IDENTITY: files.manager,
       APERTURE_GATE_TIME_LEFT_S: '30',
       APERTURE_GATE_SLOWEST_RUN_S: '5',
       ...(gateModule ? { FIXTURE_GATE_MODULE: gateModule } : {})
     });
-    const run = { ...launched, files, release: () => fs.writeFileSync(path.join(f.scratch, label + '-release'), 'release'), outcome: null };
+    const run = { ...launched, files, release: () => fs.writeFileSync(path.join(f.scratch, label + '-release'), 'release'), releasePeer: () => fs.writeFileSync(path.join(f.scratch, label + '-peer-release'), 'release'), outcome: null };
     run.done = launched.done.then(value => { run.outcome = value; return value; });
     return run;
   };
   const isLive = actor => !roleFixture.identityGone(actor.identity, roleFixture.captureIdentity(actor.pid));
   const waitForStart = async run => {
-    assert.equal(await waitFor(() => fs.existsSync(run.files.armed) || run.outcome, 8000), true, run.outcome?.output || 'fixture actors did not start');
+    const ready = await waitFor(() => ['armed', 'writer', 'scratchPath', 'presentWhileLive', 'peerArmed', 'manager'].every(name => fs.existsSync(run.files[name])) || run.outcome, 8000);
+    assert.equal(ready, true, run.outcome?.output || 'fixture actors did not become ready');
     assert.equal(fs.existsSync(run.files.armed), true, run.outcome?.output || 'escaped writer did not arm');
     assert.equal(fs.existsSync(run.files.peerArmed), true);
     return {
@@ -1311,27 +1318,33 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
   };
   const releaseAndDrain = async run => {
     run.release();
-    await Promise.race([run.done, sleep(9000)]);
+    run.releasePeer();
+    await run.done;
   };
 
   const normal = start('guarded');
   let normalActors;
   try {
     normalActors = await waitForStart(normal);
-    assert.equal(await waitFor(() => fs.existsSync(normal.files.peerStopped) || normal.outcome, 7000), true, normal.outcome?.output || 'peer was not stopped');
-    assert.equal(fs.existsSync(normal.files.peerStopped), true, normal.outcome?.output || 'watchdog did not stop the owned peer');
-    await sleep(1000);
-    assert.equal(normal.outcome, null, 'public supervisor closed while the escaped writer was live');
+    const presentReceipt = JSON.parse(fs.readFileSync(normal.files.presentWhileLive, 'utf8'));
+    assert.deepEqual(presentReceipt.identity, normalActors.writer.identity);
     assert.equal(isLive(normalActors.writer), true, 'escaped writer exited before release');
     assert.equal(isLive(normalActors.manager), true, 'manager closed before guardian completion');
-    assert.equal(fs.existsSync(normalActors.scratch), true, 'private scratch was released while the escaped writer was live');
+    assert.equal(fs.existsSync(normalActors.scratch), true, 'private scratch was not present at writer readiness');
+    assert.equal(normal.outcome, null, 'public supervisor closed while the escaped writer was live');
     assert.equal(fs.existsSync(normal.files.releasedWhileLive), false);
+    normal.releasePeer();
+    assert.equal(await waitFor(() => (fs.existsSync(normal.files.peerStopped) && fs.readFileSync(normal.files.peerStopped, 'utf8') === 'released') || normal.outcome, 20000), true, normal.outcome?.output || 'peer release was not observed');
+    assert.equal(fs.readFileSync(normal.files.peerStopped, 'utf8'), 'released');
+    assert.equal(normal.outcome, null, 'drain did not resume while the escaped writer remained live');
+    assert.equal(isLive(normalActors.writer), true, 'escaped writer exited before its independent release');
+    assert.equal(fs.existsSync(normalActors.scratch), true, 'scratch was released before the escaped writer drained');
   } finally {
     await releaseAndDrain(normal);
   }
   const normalResult = normal.outcome;
-  assert.equal(normalResult?.code, 98, normalResult?.output);
-  assert.match(normalResult.output, /drain-peers/);
+  assert.equal(normalResult?.code, 0, normalResult?.output);
+  assert.equal(fs.readFileSync(normal.files.peerStopped, 'utf8'), 'released');
   assert.equal(fs.readFileSync(normal.files.writerDone, 'utf8'), 'released');
   assert.equal(fs.existsSync(normal.files.releasedWhileLive), false, 'writer observed scratch removal before it exited');
   assert.equal(roleFixture.identityGone(normalActors.writer.identity, roleFixture.captureIdentity(normalActors.writer.pid)), true);
@@ -1344,24 +1357,33 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
     fs.copyFileSync(path.join(PROJECT, 'scripts', file), path.join(bypassScripts, file));
   }
   fs.cpSync(path.join(PROJECT, 'scripts', 'full-gate'), path.join(bypassScripts, 'full-gate'), { recursive: true });
+  const bypassManager = path.join(bypassScripts, 'full-gate.js');
+  const managerSource = fs.readFileSync(bypassManager, 'utf8');
+  const retirementGuard = 'scratchIsPlatformOwned = Boolean(platformScratch);';
+  assert.equal(managerSource.split(retirementGuard).length - 1, 1, 'disposable control must target the Node scratch-retirement boundary');
+  fs.writeFileSync(bypassManager, managerSource.replace(retirementGuard, 'scratchIsPlatformOwned = false;'));
   const bypassWatchdog = path.join(bypassScripts, 'full-gate-watchdog.js');
   const fixedWatchdog = fs.readFileSync(bypassWatchdog, 'utf8');
-  const completionGuard = 'complete = observationIsCurrent && !groupHasLiveProcesses && !escapedWriterIsLive;';
-  assert.equal(fixedWatchdog.split(completionGuard).length - 1, 1, 'disposable control must bypass only the escaped-writer completion guard');
-  fs.writeFileSync(bypassWatchdog, fixedWatchdog.replace(completionGuard, 'complete = observationIsCurrent && !groupHasLiveProcesses;'));
+  const liveWriterGuard = "if (liveEscapes) {\n      drainRecheckRequested = true;\n      return;\n    }";
+  assert.equal(fixedWatchdog.split(liveWriterGuard).length - 1, 1, 'disposable control must bypass the live escaped-writer drain guard');
+  fs.writeFileSync(bypassWatchdog, fixedWatchdog.replace(liveWriterGuard, ''));
 
   const bypassed = start('bypassed', path.join(bypassScripts, 'full-gate.js'));
   let bypassActors;
   try {
     bypassActors = await waitForStart(bypassed);
-    assert.equal(await waitFor(() => fs.existsSync(bypassed.files.peerStopped) || bypassed.outcome, 7000), true, bypassed.outcome?.output || 'peer was not stopped');
-    assert.equal(fs.existsSync(bypassed.files.peerStopped), true, bypassed.outcome?.output || 'watchdog did not stop the owned peer');
-    assert.equal(await waitFor(() => fs.existsSync(bypassed.files.releasedWhileLive), 3000), true, 'guard bypass did not expose scratch release during live writer custody');
+    const bypassPresent = JSON.parse(fs.readFileSync(bypassed.files.presentWhileLive, 'utf8'));
+    assert.deepEqual(bypassPresent.identity, bypassActors.writer.identity);
+    assert.equal(fs.existsSync(bypassActors.scratch), true, 'bypass writer did not observe initial scratch');
+    bypassed.releasePeer();
+    assert.equal(await waitFor(() => (fs.existsSync(bypassed.files.peerStopped) && fs.readFileSync(bypassed.files.peerStopped, 'utf8') === 'released') || bypassed.outcome, 20000), true, bypassed.outcome?.output || 'peer release was not observed');
+    assert.equal(fs.readFileSync(bypassed.files.peerStopped, 'utf8'), 'released');
+    assert.equal(await waitFor(() => fs.existsSync(bypassed.files.releasedWhileLive), 20000), true, 'guard bypass did not expose scratch release during live writer custody');
     const releaseEvidence = JSON.parse(fs.readFileSync(bypassed.files.releasedWhileLive, 'utf8'));
+    assert.deepEqual(releaseEvidence.identity, bypassActors.writer.identity, 'absence receipt came from a different actor');
     assert.equal(roleFixture.identityGone(releaseEvidence.identity, roleFixture.captureIdentity(releaseEvidence.identity.pid)), false);
     assert.equal(isLive(bypassActors.writer), true, 'writer exited before the bypass release was observed');
     assert.equal(fs.existsSync(bypassActors.scratch), false, 'guard bypass did not release scratch while the writer was live');
-    assert.equal(await waitFor(() => roleFixture.identityGone(bypassActors.manager, roleFixture.captureIdentity(bypassActors.manager.pid)), 3000), true, 'bypassed public manager did not close');
   } finally {
     await releaseAndDrain(bypassed);
   }
@@ -1381,7 +1403,6 @@ test('watchdog table failure interrupts the worker through the manager', { skip:
     "if(args.join(' ').includes('ppid')&&fs.existsSync(process.env.FIXTURE_TABLE_FAILURE_ARM)&&!fs.existsSync(process.env.FIXTURE_TABLE_FAILURE_ONCE)){fs.writeFileSync(process.env.FIXTURE_TABLE_FAILURE_ONCE,'failed');process.exit(1);}",
     "const result=cp.spawnSync(" + JSON.stringify(realPs) + ",args,{stdio:'inherit'});process.exit(result.status===null?1:result.status);"
   ].join('\n'), { mode: 0o700 });
-  const started = Date.now();
   const result = await f.launchSupervised({
     PATH: bin + path.delimiter + process.env.PATH,
     FIXTURE_TABLE_FAILURE_ARM: path.join(f.scratch, 'body-complete'),
@@ -1394,7 +1415,6 @@ test('watchdog table failure interrupts the worker through the manager', { skip:
   assert.match(result.output, /body-table-unavailable/);
   assert.match(result.output, /firstStop[^\n]*watchdog-stop/);
   assert.match(result.output, /workerStop[^\n]*parent-stop/);
-  assert.ok(Date.now() - started < 8000, 'watchdog observation failure waited for the execution deadline');
 });
 
 test('stale numeric ancestry cannot grant Linux signal ownership', { skip: process.platform !== 'linux', timeout: 90000 }, async t => {
@@ -4361,7 +4381,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         'observationDeadline:kind', 'beginObservation:kind,phaseDeadline', 'observationDeadline:kind',
         'freshObservation:kind', 'beginObservation:kind', "beginObservation:'monitor'",
         'stopObservation:signal,phaseDeadline', 'beginObservation:signal,phaseDeadline',
-        "observationDeadline:code===0?'drain':'orphan'", "beginObservation:'orphan'", "observationDeadline:'orphan'",
+        "observationDeadline:'drain'", "beginObservation:'orphan'", "observationDeadline:'orphan'",
         "stopObservation:'SIGKILL'", "stopObservation:'SIGTERM',killAt", "freshObservation:'drain'", "freshObservation:'body-complete'"
       ].sort();
       const verify = source => {

@@ -373,6 +373,8 @@ async function completeCleanup() {
   const completionDeadline = observationDeadline('drain');
   if (completionDeadline === null || Date.now() >= completionDeadline) return process.exit(NO_VERDICT);
   completionSent = true;
+  clearTimeout(drainRecheckTimer);
+  drainRecheckTimer = undefined;
   if (orphan || !process.connected) return process.exit(NO_VERDICT);
   try {
     process.send({ kind: MESSAGES.CLEANUP_COMPLETE, code: 0 }, error => process.exit(error ? NO_VERDICT : 0));
@@ -414,6 +416,9 @@ async function finishStop() {
 function stop(event, error) {
   if (stopping) return;
   stopping = true;
+  clearTimeout(drainRecheckTimer);
+  drainRecheckTimer = undefined;
+  drainRecheckRequested = false;
   const killAt = Date.now() + 2000;
   ++observationGeneration;
   boundaryPending = false;
@@ -433,28 +438,66 @@ function stop(event, error) {
   stopObservation('SIGTERM', killAt);
   try { if (process.connected && observation) process.send({ kind: MESSAGES.STOP, observation }, () => {}); } catch {}
 }
+let drainRecheckTimer;
+let drainCheckInFlight = false;
+let drainRecheckRequested = false;
+function scheduleDrainCheck(generation) {
+  if (stopping || completionSent || !draining || generation !== observationGeneration) return;
+  if (drainCheckInFlight) {
+    drainRecheckRequested = true;
+    return;
+  }
+  if (drainRecheckTimer) return;
+  const remaining = Number(deadline) - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) return;
+  drainRecheckTimer = setTimeout(() => {
+    drainRecheckTimer = undefined;
+    if (stopping || completionSent || !draining || generation !== observationGeneration) return;
+    void check();
+  }, Math.min(PROCESS_MONITOR_INTERVAL_MS, remaining));
+}
 async function check() {
   if (!canFinish(stopping)) return;
   if (Date.now() >= Number(deadline)) return stop(WATCHDOG_STOP_EVENTS.CHECK_DEADLINE);
   if (!draining) return;
-  const phase = await freshObservation('drain');
-  if (stopping) return;
-  if (!phase) return stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE);
+  if (drainCheckInFlight) {
+    drainRecheckRequested = true;
+    return;
+  }
+  drainCheckInFlight = true;
+  let phase;
   try {
+    phase = await freshObservation('drain');
+    if (stopping) return;
+    if (!phase) return stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE);
     const table = await readProcessTable(phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!table) return stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE);
     await rememberEscapedDescendants(table.rows, phase);
     const peers = table.rows.filter(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
-    if (peers.length) return;
+    if (peers.length) {
+      drainRecheckRequested = true;
+      return;
+    }
     const liveEscapes = await hasLiveEscapedDescendants(table.rows, phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!currentObservation(phase)) return stop(WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES);
-    if (liveEscapes) return;
+    if (liveEscapes) {
+      drainRecheckRequested = true;
+      return;
+    }
     finishObservation(phase);
+    phase = undefined;
     await completeCleanup();
   } catch (error) { stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE, error); }
-  finally { finishObservation(phase); }
+  finally {
+    if (phase) finishObservation(phase);
+    drainCheckInFlight = false;
+    if (drainRecheckRequested) {
+      drainRecheckRequested = false;
+      scheduleDrainCheck(observationGeneration);
+    }
+  }
 }
 async function scanBody() {
   if (bodyScanned || bodyScanRequested || stopping || draining || !body) return;

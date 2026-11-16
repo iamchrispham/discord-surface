@@ -515,11 +515,39 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
     result = NO_VERDICT
     reason = None
     detail = None
+    scratch = None
+    process_started = False
+    writers_drained = False
+
+    def finish(code=None, *, failure=None, failure_detail=None):
+        nonlocal scratch
+        if scratch is not None:
+            if process_started and not writers_drained:
+                return no_verdict("cleanup", "gate scratch retained because descendant drainage is unverified")
+            if not clock_now() < deadline:
+                return no_verdict("cleanup", "gate scratch retirement exceeded the caller deadline; allocation retained")
+            try:
+                shutil.rmtree(scratch)
+            except OSError as error:
+                return no_verdict("cleanup", "gate scratch removal failed: " + str(error))
+            if not clock_now() < deadline or os.path.lexists(scratch):
+                return no_verdict("cleanup", "gate scratch removal did not complete before the caller deadline")
+            scratch = None
+        if failure is not None:
+            return no_verdict(failure, failure_detail or failure)
+        if code is not None and code < 0:
+            return no_verdict("interrupted", "full gate ended from signal " + str(-code))
+        return code
+
     try:
+        scratch = tempfile.mkdtemp(prefix="discord-gate-")
+        os.chmod(scratch, 0o700)
+        environment["DISCORD_SURFACE_GATE_SCRATCH"] = scratch
         process = subprocess.Popen(
             command, cwd=str(root), env=environment, start_new_session=True,
             stdout=None, stderr=stderr_capture,
         )
+        process_started = True
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
         while process.poll() is None:
             if interrupted.is_set():
@@ -530,11 +558,13 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 break
             time.sleep(min(POLL_SECONDS, max(0, run_deadline - clock_now())))
         if reason:
-            if not stop_owned_processes(process, deadline):
+            writers_drained = stop_owned_processes(process, deadline)
+            if not writers_drained:
                 reason, detail = "cleanup", "supervised process tree did not stop before the caller deadline"
         else:
             result = process.wait()
-            if not wait_for_owned_children(run_deadline):
+            writers_drained = wait_for_owned_children(run_deadline)
+            if not writers_drained:
                 reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
 
         try:
@@ -558,22 +588,24 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 reason, detail = "stale", "source changed during supervised gate execution"
 
         if reason:
-            return no_verdict(reason, detail or reason)
-        if result < 0:
-            return no_verdict("interrupted", "full gate ended from signal " + str(-result))
+            return finish(failure=reason, failure_detail=detail)
         emit_child_stderr(stderr_capture, result)
-        return result
+        return finish(code=result)
     except OSError as error:
-        if process is not None and process.poll() is None:
-            if not stop_owned_processes(process, deadline):
-                return no_verdict("cleanup", "supervised process tree did not stop before the caller deadline")
+        if process_started and not writers_drained:
+            if process is not None and process.poll() is None:
+                writers_drained = stop_owned_processes(process, deadline)
+            else:
+                writers_drained = wait_for_owned_children(deadline)
+            if not writers_drained:
+                return finish(failure="cleanup", failure_detail="supervised process tree did not stop before the caller deadline")
         try:
             capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
         except SnapshotCleanupError as snapshot_error:
-            return no_verdict("cleanup", str(snapshot_error))
+            return finish(failure="cleanup", failure_detail=str(snapshot_error))
         except Exception:
-            return no_verdict("stale", "unable to verify source after setup failure")
-        return no_verdict("setup", "full gate command could not start: " + str(error))
+            return finish(failure="stale", failure_detail="unable to verify source after setup failure")
+        return finish(failure="setup", failure_detail="full gate command could not start: " + str(error))
     finally:
         stderr_capture.close()
 
@@ -935,6 +967,24 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
     owned_service = False
     identity = None
     identity_verified = False
+
+    def retire_scratch():
+        nonlocal scratch
+        if scratch is None:
+            return True
+        if owned_service or output_cursor.get("retain_output"):
+            return False
+        if not clock_now() < deadline:
+            return False
+        try:
+            shutil.rmtree(scratch)
+        except OSError:
+            return False
+        if not clock_now() < deadline or os.path.lexists(scratch):
+            return False
+        scratch = None
+        return True
+
     launchctl = shutil.which("launchctl")
     if not launchctl:
         return no_verdict("setup", "launchctl is unavailable")
@@ -943,6 +993,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         controller = owner.joined_identity(os.getpid())
         scratch = tempfile.mkdtemp(prefix="dsg-darwin-", dir="/private/tmp")
         os.chmod(scratch, 0o700)
+        environment["DISCORD_SURFACE_GATE_SCRATCH"] = scratch
         nonce = secrets.token_hex(16)
         label = "com.discordsurface.fullgate." + nonce
         domain = "gui/" + str(os.getuid())
@@ -958,6 +1009,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             os.close(descriptor)
         present = _service_state(launchctl, service, deadline)["present"]
         if present:
+            if not retire_scratch():
+                return no_verdict("cleanup", "private allocation could not be retired before the caller deadline")
             return no_verdict("setup", "the unique launchd label was already occupied")
         spec_payload = json.dumps({
             "state_path": status_path,
@@ -1096,6 +1149,12 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             owned_service = False
         if not _emit_job_stderr(stderr_path, stdout_path, result_code, reason is None, output_cursor, deadline):
             reason, detail = "timeout", "final stderr relay incomplete after body exit " + str(result_code)
+        if scratch is not None:
+            if owned_service or output_cursor.get("retain_output"):
+                if reason is None:
+                    reason, detail = "cleanup", "platform-owned scratch remains under active custody"
+            elif not retire_scratch():
+                reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
         return no_verdict(reason, detail or reason, stdout_cursor=output_cursor, stdout_deadline=deadline) if reason else result_code
     except (OSError, TimeoutError, ValueError, KeyError, TypeError) as error:
         detail = detail or str(error)
@@ -1162,10 +1221,10 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             output_cursor["retain_output"] = output_cursor.get("retain_output", False) or not relay_complete
             if not relay_complete:
                 detail += "; final stdout relay incomplete; private evidence retained"
+        if scratch is not None and not owned_service and not output_cursor.get("retain_output") and not retire_scratch():
+            reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
         return no_verdict(reason, detail, stdout_cursor=output_cursor, stdout_deadline=deadline)
-    finally:
-        if scratch and not owned_service and not output_cursor.get("retain_output"):
-            shutil.rmtree(scratch, ignore_errors=True)
+
 
 
 def run(argv):

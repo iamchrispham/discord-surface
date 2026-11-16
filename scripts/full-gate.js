@@ -454,7 +454,9 @@ async function runFullGate(root, label, entry, args) {
   let guardianCompletion;
   let custodyPhase = 0;
   let cleanupVerified = false;
-  const releaseOwnedScratch = () => (!worker || cleanupVerified) && releaseScratch(scratch, callerDeadline);
+  let scratchIsPlatformOwned = false;
+  const finishScratchCustody = () => (!worker || cleanupVerified)
+    && (scratchIsPlatformOwned || releaseScratch(scratch, callerDeadline));
   const send = (child, message) => {
     try { if (child?.connected) child.send(message, () => {}); } catch {}
   };
@@ -556,7 +558,10 @@ async function runFullGate(root, label, entry, args) {
       : snapshot.branch === null ? 'detached' : 'branch:' + snapshot.branch;
     ticket = 'discord:' + label + ':' + crypto.createHash('sha256').update(snapshot.repository + '\0' + branchIdentity + '\0' + (snapshot.head || snapshot.files)).digest('hex').slice(0, 32);
     sentinelSecret = crypto.randomBytes(32).toString('hex');
-    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
+    const platformScratch = process.env[SCRATCH_ROOT];
+    if (platformScratch) delete process.env[SCRATCH_ROOT];
+    scratchIsPlatformOwned = Boolean(platformScratch);
+    scratch = platformScratch || fs.mkdtempSync(path.join(os.tmpdir(), 'discord-gate-'));
     const workerEnvironment = repositoryEnvironment(deadline);
     delete workerEnvironment[NO_VERDICT_SECRET];
     delete workerEnvironment[SUPERVISOR.RECEIPT];
@@ -723,12 +728,12 @@ async function runFullGate(root, label, entry, args) {
           cleanupReason ? REASONS.CLEANUP : REASONS.INTERRUPTED,
           cleanupReason ? 'owned writer cleanup completed without a successful gate result' : 'owned process group was drained after interruption'
         );
-        releaseOwnedScratch();
+        finishScratchCustody();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
       }
-      if (!releaseOwnedScratch()) {
+      if (!finishScratchCustody()) {
         worker.stdout.destroy(); worker.stderr.destroy();
         clearTimeout(timer);
         removeInterruptHandlers();
@@ -744,13 +749,13 @@ async function runFullGate(root, label, entry, args) {
         worker.stdout.destroy(); worker.stderr.destroy();
         const reason = stopped && stopped !== REASONS.TIMEOUT ? REASONS.INTERRUPTED : REASONS.TIMEOUT;
         const code = decline(reason, 'owned output did not finish within the gate deadline');
-        releaseOwnedScratch();
+        finishScratchCustody();
         clearTimeout(timer);
         removeInterruptHandlers();
         return code;
       }
     }
-    const released = releaseOwnedScratch();
+    const released = finishScratchCustody();
     if (!released) {
       clearTimeout(timer);
       removeInterruptHandlers();
