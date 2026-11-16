@@ -603,7 +603,7 @@ async function runFullGate(root, label, entry, args) {
           send(guardian, { kind: MESSAGES.CUSTODY, state: CUSTODY.ACK, phase: message.phase });
         }
       }
-      if (message.kind === MESSAGES.CLEANUP_COMPLETE && !guardianEnded && !guardianCompletion && [0, NO_VERDICT].includes(message.code) && Date.now() < callerDeadline) {
+      if (message.kind === MESSAGES.CLEANUP_COMPLETE && !guardianEnded && !guardianCompletion && message.code === 0 && Date.now() < callerDeadline) {
         guardianCompletion = { code: message.code };
       }
       if (message.kind === MESSAGES.START && bodyStarted && !stopped) send(worker, { kind: MESSAGES.START });

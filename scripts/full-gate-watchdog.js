@@ -367,15 +367,15 @@ async function stopObservation(signal, phaseDeadline) {
   finally { finishObservation(phase); }
   if (signal === 'SIGKILL') finishStop();
 }
-async function completeCleanup(code) {
+async function completeCleanup() {
   await collector.whenClosed();
-  if (completionSent || (code === 0 && stopping)) return;
-  const completionDeadline = observationDeadline(code === 0 ? 'drain' : 'orphan');
+  if (completionSent || stopping) return;
+  const completionDeadline = observationDeadline('drain');
   if (completionDeadline === null || Date.now() >= completionDeadline) return process.exit(NO_VERDICT);
   completionSent = true;
   if (orphan || !process.connected) return process.exit(NO_VERDICT);
   try {
-    process.send({ kind: MESSAGES.CLEANUP_COMPLETE, code }, error => process.exit(error ? NO_VERDICT : code));
+    process.send({ kind: MESSAGES.CLEANUP_COMPLETE, code: 0 }, error => process.exit(error ? NO_VERDICT : 0));
   } catch { process.exit(NO_VERDICT); }
 }
 let linuxFinishStopPending = false;
@@ -408,8 +408,7 @@ async function finishStop() {
       }, 50);
       return;
     }
-    if (complete) await completeCleanup(NO_VERDICT);
-    else process.exit(NO_VERDICT);
+    process.exit(NO_VERDICT);
   }, 50);
 }
 function stop(event, error) {
@@ -447,12 +446,13 @@ async function check() {
     if (!table) return stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE);
     await rememberEscapedDescendants(table.rows, phase);
     const peers = table.rows.filter(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
-    if (peers.length) return stop(WATCHDOG_STOP_EVENTS.DRAIN_PEERS);
+    if (peers.length) return;
     const liveEscapes = await hasLiveEscapedDescendants(table.rows, phase);
     if (stopping || phase.generation !== observationGeneration) return;
-    if (liveEscapes || !currentObservation(phase)) return stop(WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES);
+    if (!currentObservation(phase)) return stop(WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES);
+    if (liveEscapes) return;
     finishObservation(phase);
-    await completeCleanup(0);
+    await completeCleanup();
   } catch (error) { stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE, error); }
   finally { finishObservation(phase); }
 }
