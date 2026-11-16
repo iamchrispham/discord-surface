@@ -293,8 +293,14 @@ export class ClaudeChannel<
       rejectStartup?.(new Error(`Claude channel stopped during ${startupPhase}`));
     };
     const closeStartupTransport = async (): Promise<void> => {
-      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
-      if (this.startupAbort === abortStartup) this.startupAbort = null;
+      try {
+        await (this.mcp as unknown as ClaudeRuntimeMcp).close?.();
+      } catch (error) {
+        this.startupCleanupPending = true;
+        throw error;
+      } finally {
+        if (this.startupAbort === abortStartup) this.startupAbort = null;
+      }
     };
     this.startupAbort = abortStartup;
     const retainedRelease = this.socketLockRelease;
@@ -344,9 +350,12 @@ export class ClaudeChannel<
         }, incumbent);
       }
     } catch (error) {
-      await closeStartupTransport();
+      let startupError: unknown = error;
+      try { await closeStartupTransport(); } catch (cleanupError) {
+        startupError = new AggregateError([error, cleanupError], 'Claude channel startup cleanup failed');
+      }
       if (this.startupPhase === startupPhase) this.startupPhase = null;
-      throw error;
+      throw startupError;
     }
     startupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
     this.startupPhase = startupPhase;
@@ -367,7 +376,9 @@ export class ClaudeChannel<
         if (socketExists) acquisitionError = new Error('Claude channel socket already exists; stop its owner first');
       }
       this.startupPhase = null;
-      await closeStartupTransport();
+      try { await closeStartupTransport(); } catch (cleanupError) {
+        acquisitionError = new AggregateError([acquisitionError, cleanupError], 'Claude channel startup cleanup failed');
+      }
       throw acquisitionError;
     }
     this.socketLockRelease = releaseSocketLock;

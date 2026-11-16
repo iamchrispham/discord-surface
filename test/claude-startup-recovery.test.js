@@ -9,8 +9,12 @@ const {
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const { PassThrough } = require('node:stream');
 const { createClaudeMonitor } = require('../src/claude-monitor');
 const { createDefaultMcp } = require('../src/claude-channel');
+const createClaudeListeners = require('../src/cli/claude-listeners');
+const claudeIdentity = require('../dist/native/claude-identity');
 const { MESSAGE_STATES, READINESS } = require('../src/state');
 
 function scheduler() {
@@ -102,6 +106,31 @@ test('initial socket replacement during pin is refused before ordinary preparati
   });
   await assert.rejects(waiter.start(), /incumbent socket was replaced during startup recovery/);
   assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('public start proceeds when the incumbent releases socket and lock after serving identity', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const originalProbe = claudeIdentity.probeClaudeChannel;
+  let incumbentStopped = false;
+  t.mock.method(claudeIdentity, 'probeClaudeChannel', async (...args) => {
+    const identity = await originalProbe(...args);
+    await incumbent.stop();
+    incumbentStopped = true;
+    return identity;
+  });
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  t.after(async () => {
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+
+  await waiter.start();
+
+  assert.equal(incumbentStopped, true);
+  assert.equal(waiter.ready, true);
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
@@ -353,7 +382,7 @@ test('SDK transport closes when a successor wins during acquisition', { timeout:
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
-test('stopping during identity probe destroys the request before stop returns', { timeout: 8000 }, async t => {
+test('stopping during identity probe joins the delayed request close before stop returns', { timeout: 8000 }, async t => {
   const f = bindFixture(t);
   let startRequest;
   const started = new Promise(resolve => { startRequest = resolve; });
@@ -369,23 +398,81 @@ test('stopping during identity probe destroys the request before stop returns', 
   t.after(() => closeListeningServer(server));
   const release = socketOwnership.acquireSocketLock(f.socket);
   const originalDestroy = http.ClientRequest.prototype.destroy;
-  let destroyed = false;
+  const originalEmit = http.ClientRequest.prototype.emit;
+  let destroyRequested = false;
+  let closeObserved = false;
+  let releaseClose;
+  let requestToClose;
+  const closeGate = new Promise(resolve => { releaseClose = resolve; });
   t.mock.method(http.ClientRequest.prototype, 'destroy', function (...args) {
-    destroyed = true;
+    if (!destroyRequested) {
+      destroyRequested = true;
+      const request = this;
+      requestToClose = () => originalDestroy.call(request, ...args);
+      void closeGate.then(() => requestToClose());
+      return this;
+    }
     return originalDestroy.apply(this, args);
+  });
+  t.mock.method(http.ClientRequest.prototype, 'emit', function (event, ...args) {
+    if (event === 'close') closeObserved = true;
+    return originalEmit.call(this, event, ...args);
   });
   const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
   t.after(async () => {
+    releaseClose();
     release();
     await waiter.stop().catch(() => {});
   });
   const starting = waiter.start();
   const rejected = assert.rejects(starting, /stopped during incumbent wait/);
   await started;
-  await waiter.stop();
-  assert.equal(destroyed, true, 'stop must destroy the identity request before returning');
+  let stopReturned = false;
+  const stopping = waiter.stop().finally(() => { stopReturned = true; });
+  await waitForCondition(() => destroyRequested && requestToClose, 'stop must request identity teardown');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopReturned, false, 'stop must wait for the identity request close');
+  releaseClose();
+  await stopping;
   await rejected;
+  assert.equal(closeObserved, true, 'the request close must finish before stop returns');
   assert.equal(waiter.ready, false);
+});
+
+test('startup cleanup failure is preserved and blocks another start until stop succeeds', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  let closeCalls = 0;
+  const waiter = new ClaudeChannel({
+    state: f.state,
+    nativeId: CLAUDE_ID,
+    socketPath: f.socket,
+    mcp: {
+      notification: async () => {},
+      transportFactory: () => ({}),
+      connect: async () => {},
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw new Error('simulated startup close failure');
+      }
+    }
+  });
+  t.mock.method(socketOwnership, 'acquireSocketLock', () => {
+    throw new Error('Claude channel socket preparation is already in progress');
+  });
+  t.after(async () => { await waiter.stop().catch(() => {}); });
+
+  await assert.rejects(waiter.start(), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(error.message, /startup cleanup failed/);
+    assert.match(error.errors[0].message, /already in progress/);
+    assert.match(error.errors[1].message, /simulated startup close failure/);
+    return true;
+  });
+  assert.equal(waiter.startupCleanupPending, true);
+  await assert.rejects(waiter.start(), /startup cleanup is pending/);
+  await waiter.stop();
+  assert.equal(waiter.startupCleanupPending, false);
+  assert.equal(closeCalls, 2);
 });
 
 test('SDK close cancels a waiter while it remains detached', { timeout: 8000 }, async t => {
@@ -416,6 +503,144 @@ test('SDK close cancels a waiter while it remains detached', { timeout: 8000 }, 
   assert.equal(waiter.ready, false);
   assert.ok(closeCalls >= 1, 'SDK close must propagate through waiter cancellation');
   assert.equal(incumbent.ready, true);
+});
+
+test('buffered MCP initialization followed by EOF cancels startup while detached', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const transport = new StdioServerTransport(input, output);
+  const mcp = new Server({ name: 'buffered-init-test', version: '1.0.0' });
+  mcp.transportFactory = () => transport;
+  const frame = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'buffered-init-test', version: '1.0.0' }
+    }
+  };
+  input.write(`${JSON.stringify(frame)}\n`);
+  let responseText = '';
+  let resolveInitialized;
+  const initialized = new Promise(resolve => { resolveInitialized = resolve; });
+  output.on('data', chunk => {
+    responseText += chunk.toString();
+    if (/"id":1/.test(responseText)) resolveInitialized();
+  });
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const starting = waiter.start();
+  t.after(async () => {
+    input.destroy();
+    output.destroy();
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+
+  await initialized;
+  await waitForCondition(() => waitScheduler.pending > 0, 'buffered SDK initialization must finish before EOF');
+  input.end();
+  await transport.close();
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(waiter.ready, false);
+  assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('MCP transport error cancels startup while detached', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const mcp = new Server({ name: 'wait-error-test', version: '1.0.0' });
+  mcp.transportFactory = () => serverTransport;
+  const client = new Client({ name: 'wait-error-client', version: '1.0.0' });
+  const clientStarting = client.connect(clientTransport);
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const starting = waiter.start();
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await waiter.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+
+  await clientStarting;
+  await waitForCondition(() => waitScheduler.pending > 0, 'SDK waiter must enter incumbent wait');
+  assert.equal(typeof serverTransport.onerror, 'function');
+  serverTransport.onerror(new Error('simulated MCP transport failure'));
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(waiter.ready, false);
+  assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('Monitor stdout error cancels a waiter while incumbent stays ready', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const stdout = new EventEmitter();
+  stdout.write = (_chunk, callback) => { callback?.(); return true; };
+  const waitScheduler = scheduler();
+  const monitor = createClaudeMonitor({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, stateDir: f.dir, dbPath: f.db, stdout, startupScheduler: waitScheduler });
+  const starting = monitor.start();
+  t.after(async () => {
+    await monitor.stop().catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await waitForCondition(() => waitScheduler.pending > 0, 'Monitor must enter incumbent wait');
+  stdout.emit('error', new Error('simulated Monitor stdout failure'));
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(monitor.ready, false);
+  assert.equal(incumbent.ready, true);
+});
+
+test('Monitor SIGTERM cancels public startup while incumbent stays ready', { timeout: 8000 }, async t => {
+  const f = bindFixture(t);
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const signals = new Map();
+  const originalOnce = process.once;
+  t.mock.method(process, 'once', function (event, listener) {
+    if (event === 'SIGINT' || event === 'SIGTERM') {
+      signals.set(event, listener);
+      return this;
+    }
+    return originalOnce.call(this, event, listener);
+  });
+  const previousExitCode = process.exitCode;
+  const monitorState = new SurfaceState(f.db);
+  let resolveRequest;
+  const requestStarted = new Promise(resolve => { resolveRequest = resolve; });
+  incumbent.server.once('request', request => {
+    if (request.url === '/identity') resolveRequest();
+  });
+  const commands = createClaudeListeners({
+    openState: () => ({ paths: { stateDir: f.dir, db: f.db }, state: monitorState }),
+    required: (args, key) => args[key],
+    requestGatewayRecovery: async () => {},
+    cliPath: path.resolve(__dirname, '../src/cli.js')
+  });
+  const starting = commands.claudeMonitor({ 'native-id': CLAUDE_ID, socket: f.socket, 'state-dir': f.dir, db: f.db });
+  t.after(async () => {
+    signals.get('SIGTERM')?.('SIGTERM');
+    await starting.catch(() => {});
+    try { monitorState.close(); } catch {}
+    await incumbent.stop().catch(() => {});
+    process.exitCode = previousExitCode;
+  });
+
+  await requestStarted;
+  assert.equal(typeof signals.get('SIGTERM'), 'function');
+  signals.get('SIGTERM')('SIGTERM');
+  await assert.rejects(starting, /stopped during incumbent wait/);
+  assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
 test('Monitor stdout close cancels a waiter while incumbent stays ready', { timeout: 8000 }, async t => {
@@ -457,12 +682,58 @@ test('cleanup failure during waiting retains incumbent ownership', { timeout: 80
   });
   await waitForCondition(() => waitScheduler.pending > 0, 'waiter must enter incumbent wait');
   await assert.rejects(waiter.stop(), /Claude channel stop failed/);
-  await assert.rejects(starting, /stopped during incumbent wait/);
+  await assert.rejects(starting, error => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(error.message, /startup cleanup failed/);
+    assert.match(error.errors[0].message, /stopped during incumbent wait/);
+    assert.match(error.errors[1].message, /simulated MCP cleanup failure/);
+    return true;
+  });
   assert.equal(incumbent.ready, true);
   assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
 });
 
-test('detached valid native completion remains authorized while stale identity is rejected', { timeout: 10000 }, async t => {
+test('detached stale native identity remains unauthorized while waiter is detached', { timeout: 10000 }, async t => {
+  const f = bindFixture(t);
+  const currentBinding = f.state.getBinding('claude');
+  f.state.setBindingReadiness('claude', READINESS.READY, 'detached stale identity fixture', currentBinding);
+  const accepted = f.state.acceptDiscordMessage({
+    id: '103', guildId: 'guild-1', channelId: 'claude', authorId: 'operator-1', isBot: false,
+    content: 'stale native identity must not complete this message'
+  }, { ready: true });
+  assert.equal(accepted.accepted, true);
+  assert.equal(f.state.claimDispatch('103').claimed, true);
+  f.state.markSubmitted('103');
+  const message = f.state.getMessage('103');
+  const incumbent = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, mcp: quietMcp() });
+  await incumbent.start();
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const mcp = createDefaultMcp({ nativeId: '00000000-0000-4000-8000-000000000001', state: f.state });
+  mcp.transportFactory = () => serverTransport;
+  const client = new Client({ name: 'stale-native-id-client', version: '1.0.0' });
+  const clientStarting = client.connect(clientTransport);
+  const waitScheduler = scheduler();
+  const waiter = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.socket, startupScheduler: waitScheduler, mcp });
+  const starting = waiter.start();
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await waiter.stop().catch(() => {});
+    await starting.catch(() => {});
+    await incumbent.stop().catch(() => {});
+  });
+  await clientStarting;
+  await waitForCondition(() => waitScheduler.pending > 0, 'stale native client must initialize while waiter is detached');
+  assert.equal(waiter.ready, false);
+  await assert.rejects(
+    client.callTool({ name: 'acknowledge', arguments: { messageId: message.id, generation: message.generation } }),
+    /native acknowledgment owner or generation is stale/
+  );
+  assert.equal(f.state.getMessage(message.id).state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(incumbent.ready, true);
+  assert.equal((await requestOverSocket(f.socket)).statusCode, 200);
+});
+
+test('detached valid native completion remains authorized while stale generation is rejected', { timeout: 10000 }, async t => {
   const f = bindFixture(t);
   const currentBinding = f.state.getBinding('claude');
   f.state.setBindingReadiness('claude', READINESS.READY, 'detached authorization fixture', currentBinding);
@@ -508,4 +779,3 @@ test('detached valid native completion remains authorized while stale identity i
   await starting;
   await waiter.stop();
 });
-

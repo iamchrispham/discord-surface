@@ -81,7 +81,10 @@ async function probe(options: StartupRecoveryOptions): Promise<ClaudeChannelIden
   try {
     return await Promise.race([pending, options.startupCancellation]);
   } catch (error) {
-    if (options.signal.aborted) return await options.startupCancellation;
+    if (options.signal.aborted) {
+      try { await pending; } catch {}
+      return await options.startupCancellation;
+    }
     throw error;
   }
 }
@@ -142,6 +145,7 @@ export async function pinIncumbent(options: StartupRecoveryOptions): Promise<Inc
   if (!listener.listenerInstanceId) return null;
   const currentSocket = readSocketIdentity(options.socketPath);
   const currentLock = readLock(lockPath);
+  if (!currentSocket && !currentLock) return null;
   if (!currentSocket || !sameSocketIdentity(socketIdentity, currentSocket)) {
     throw new Error('Claude channel incumbent socket was replaced during startup recovery');
   }
