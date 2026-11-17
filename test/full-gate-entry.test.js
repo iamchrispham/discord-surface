@@ -1971,8 +1971,9 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
     .replace(directChildrenLine, injectedChildrenLine)
     .replace(signalLine, interceptedSignal);
   const writeSupervisor = (root, name, source) => {
-    const directory = path.join(root.scratch, 'private-owner');
+    const directory = path.join(root.scratch, 'private-owner', 'scripts', 'full-gate');
     fs.mkdirSync(directory, { recursive: true });
+    fs.symlinkSync(GATE, path.join(directory, '..', 'full-gate.js'));
     const file = path.join(directory, name + '.py');
     fs.writeFileSync(file, source, { mode: 0o600 });
     return file;
