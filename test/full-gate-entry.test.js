@@ -16,6 +16,20 @@ const PROJECT = path.resolve(__dirname, '..');
 const GATE = path.join(PROJECT, 'scripts/full-gate.js');
 const SUPERVISOR_SCRIPT = path.join(PROJECT, 'scripts/full-gate/supervisor.py');
 const ROLE_FIXTURE = path.join(PROJECT, 'test/successor-authority/process-identity.js');
+const SUPERVISOR_PID_ENVIRONMENT = 'DISCORD_SURFACE_GATE_SUPERVISOR_PID';
+const PLATFORM_SCRATCH_ENVIRONMENT = 'DISCORD_SURFACE_GATE_SCRATCH';
+
+function fakeSupervisionEnvironment(source, overrides = {}, { absentSupervisor = false } = {}) {
+  const env = { ...source };
+  delete env[PLATFORM_SCRATCH_ENVIRONMENT];
+  const inheritedPid = Number(env[SUPERVISOR_PID_ENVIRONMENT]);
+  if (!Number.isSafeInteger(inheritedPid) || inheritedPid <= 1) {
+    env[SUPERVISOR_PID_ENVIRONMENT] = String(process.pid);
+  }
+  Object.assign(env, overrides);
+  if (absentSupervisor) delete env[SUPERVISOR_PID_ENVIRONMENT];
+  return env;
+}
 
 function createSupervisorReceipt(directory) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -24,13 +38,13 @@ function createSupervisorReceipt(directory) {
   return { receipt, token };
 }
 
-function fixture(t) {
+function fixture(t, { absentSupervisor = false } = {}) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-entry-fixture-'));
   const root = path.join(scratch, 'repo');
   fs.mkdirSync(root);
   const supervisor = createSupervisorReceipt(scratch);
-  const supervisorPidEnvironment = 'DISCORD_SURFACE_GATE_SUPERVISOR_PID';
-  const env = { ...process.env };
+  const supervisorPidEnvironment = SUPERVISOR_PID_ENVIRONMENT;
+  const env = fakeSupervisionEnvironment(process.env, {}, { absentSupervisor });
   env.NODE_OPTIONS = '';
   env[SUPERVISOR.ENVIRONMENT] = SUPERVISOR.LINUX_SUBREAPER;
   env[SUPERVISOR.RECEIPT] = supervisor.receipt;
@@ -354,14 +368,15 @@ function fixture(t) {
         deletion: extra.FIXTURE_SCRATCH_REMOVED
       });
     }
-    const launchEnv = {
-      ...env, APERTURE_GATE_ADMISSION_COMMAND: admit,
+    const launchEnv = fakeSupervisionEnvironment(env, {
+      APERTURE_GATE_ADMISSION_COMMAND: admit,
       APERTURE_GATE_TIME_LEFT_S: '120', APERTURE_GATE_SLOWEST_RUN_S: '60',
       FIXTURE_ROOT: root, FIXTURE_MARKER: marker, FIXTURE_PROTOCOL: protocol,
       FIXTURE_LEASE_FILE: leaseFile, FIXTURE_ROLE_FILE: roleFile, ...extra
-    };
+    }, { absentSupervisor });
     if (!supervised) {
-      launchEnv[supervisorPidEnvironment] = String(effectiveExternalSupervisorPid);
+      if (absentSupervisor) delete launchEnv[supervisorPidEnvironment];
+      else launchEnv[supervisorPidEnvironment] = String(effectiveExternalSupervisorPid);
     }
     if (supervised) {
       delete launchEnv[SUPERVISOR.ENVIRONMENT];
@@ -1186,7 +1201,7 @@ test('no-verdict marker starts on a new line after body stderr fragment', { time
 });
 
 test('direct worker-loss fixture refuses without an external supervisor', { timeout: 180000 }, async t => {
-  const f = fixture(t);
+  const f = fixture(t, { absentSupervisor: true });
   assert.throws(
     () => f.launch({ FIXTURE_KILL_WORKER: '1' }),
     /FIXTURE_KILL_WORKER requires an external supervisor owner/
@@ -1221,6 +1236,63 @@ for (const bodyExit of [0, 17, 98]) {
     ), false, 'the enclosing supervisor must remain alive during fixture cleanup');
   });
 }
+
+test('Linux supervisor selects one terminal record after scratch retirement fails', { skip: process.platform !== 'linux', timeout: 45000 }, async t => {
+  const f = fixture(t);
+  let outputScratch;
+  t.after(() => {
+    if (!outputScratch || !fs.existsSync(outputScratch)) return;
+    try { fs.chmodSync(path.join(outputScratch, 'blocked'), 0o700); } catch {}
+    fs.rmSync(outputScratch, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(f.scratch, 'entry.js'), [
+    "const fs=require('node:fs');const path=require('node:path');",
+    "const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;const blocked=path.join(scratch,'blocked');",
+    "fs.mkdirSync(blocked);fs.writeFileSync(path.join(blocked,'writer'),'held');fs.chmodSync(blocked,0o500);",
+    "fs.writeFileSync(process.env.FIXTURE_MARKER+'.scratch',scratch);",
+    "process.stdout.write('ordinary stdout\\nAPERTURE-GATE-INDETERMINATE reason=capacity: child stdout\\n');",
+    "process.stderr.write('ordinary stderr\\nAPERTURE-GATE-INDETERMINATE reason=setup: child stderr\\n');process.exitCode=98;"
+  ].join(''));
+  const result = await f.launch({}, true).done;
+  assert.equal(fs.existsSync(f.marker + '.scratch'), true, result.output);
+  outputScratch = fs.readFileSync(f.marker + '.scratch', 'utf8');
+  assert.equal(result.code, 98, result.output);
+  assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=cleanup/);
+  assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.output);
+  assert.match(result.output, /ordinary stdout/);
+  assert.match(result.output, /ordinary stderr/);
+  assert.equal(fs.existsSync(outputScratch), true, 'writer scratch remains until required output custody is resolved');
+});
+
+test('unreadable required supervisor stderr selects bounded uncertainty', { timeout: 30000 }, t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-output-custody-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const stderrPath = path.join(scratch, 'stderr.log');
+  const stdoutPath = path.join(scratch, 'stdout.log');
+  fs.mkdirSync(stderrPath);
+  fs.writeFileSync(stdoutPath, '');
+  const program = [
+    'import importlib.util, json, pathlib, sys',
+    'spec = importlib.util.spec_from_file_location("supervisor", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(module)',
+    'terminal = module.TerminalOutput()',
+    'module._ACTIVE_TERMINAL_OUTPUT = terminal',
+    'cursor = {"retain_output": False, "output_line_start": True}',
+    'staged = module._emit_job_stderr(sys.argv[2], sys.argv[3], 0, True, cursor, None)',
+    'code = terminal.publish(0)',
+    'print(json.dumps({"staged": staged, "code": code, "reason": terminal.reason, "retain": cursor["retain_output"], "source_exists": pathlib.Path(sys.argv[2]).exists()}))'
+  ].join('\n');
+  const result = spawnSync('python3', ['-I', '-B', '-c', program, SUPERVISOR_SCRIPT, stderrPath, stdoutPath], {
+    encoding: 'utf8', timeout: 10000
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((result.stdout.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.stdout);
+  const outcome = JSON.parse(result.stdout.trim().split('\n').at(-1));
+  assert.deepEqual(outcome, {
+    staged: false, code: 98, reason: 'cleanup', retain: true, source_exists: true
+  });
+});
 
 test('queued source change refuses the old premise without running the body', { timeout: 180000 }, async t => {
   const f = fixture(t);
@@ -1752,7 +1824,7 @@ for (const scenario of pipelineScenarios) test('public pipeline ' + scenario.nam
   const admitMarker = path.join(scratch, 'admission-started');
   const admit = path.join(bin,'admit'); fs.writeFileSync(admit,'#!'+process.execPath+'\nrequire(\"node:fs\").writeFileSync('+JSON.stringify(admitMarker)+',\"started\");process.exit(0);\n',{mode:0o700});
   fs.writeFileSync(path.join(root,'test','selected.test.js'), "const test=require('node:test');const fs=require('node:fs');const assert=require('node:assert/strict');setTimeout(()=>process.exit(98),120000).unref();test('actual selected test executes',()=>{fs.appendFileSync(process.env.PIPELINE_LOG,'test\\n');assert.notEqual(process.env.PIPELINE_FAIL,'test');});\n");
-  const env={...process.env,PATH:bin+path.delimiter+process.env.PATH,APERTURE_GATE_ADMISSION_COMMAND:admit,APERTURE_GATE_TIME_LEFT_S:'120',APERTURE_GATE_SLOWEST_RUN_S:'60',PIPELINE_LOG:log,PIPELINE_FAIL:scenario.fail||'',PIPELINE_EXIT:String(scenario.value||0)};
+  const env=fakeSupervisionEnvironment(process.env,{PATH:bin+path.delimiter+process.env.PATH,APERTURE_GATE_ADMISSION_COMMAND:admit,APERTURE_GATE_TIME_LEFT_S:'120',APERTURE_GATE_SLOWEST_RUN_S:'60',PIPELINE_LOG:log,PIPELINE_FAIL:scenario.fail||'',PIPELINE_EXIT:String(scenario.value||0)});
   env[SUPERVISOR.ENVIRONMENT] = SUPERVISOR.LINUX_SUBREAPER;
   env[SUPERVISOR.RECEIPT] = supervisor.receipt;
   env[SUPERVISOR.TOKEN] = supervisor.token;
@@ -1806,7 +1878,7 @@ for (const scenario of [
       + ',module);owner.filename=' + JSON.stringify(GATE)
       + ';owner.paths=Module._nodeModulePaths(require("node:path").dirname(owner.filename));owner._compile('
       + JSON.stringify(control) + ',owner.filename);return owner.exports;})()';
-    const ownerImport = 'require(' + JSON.stringify(GATE) + ')';
+    const ownerImport = 'require(process.env.FIXTURE_GATE_MODULE || ' + JSON.stringify(GATE) + ')';
     assert.equal(entrySource.split(ownerImport).length, 2);
     entrySource = entrySource.replace(ownerImport, load);
   }
@@ -1827,9 +1899,12 @@ for (const scenario of [
     FIXTURE_FINAL_RELEASE: f.emergencyRelease,
     FIXTURE_IPC: '1'
   });
+  let launchOutput = '';
+  run.child.stdout.on('data', chunk => { launchOutput += chunk.toString(); });
+  run.child.stderr.on('data', chunk => { launchOutput += chunk.toString(); });
   const signalDeadline = Date.now() + 10000;
   while (!fs.existsSync(signalMarker) && Date.now() < signalDeadline) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(fs.existsSync(signalMarker), true, 'final source verification did not start');
+  assert.equal(fs.existsSync(signalMarker), true, launchOutput);
   const signal = JSON.parse(fs.readFileSync(signalMarker, 'utf8'));
   assert.equal(signal.manager, run.child.pid);
   assert.equal(run.child.connected, true);

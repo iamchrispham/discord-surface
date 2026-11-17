@@ -205,17 +205,240 @@ def _write_job_output(descriptor, payload, deadline=None):
     return offset
 
 
+_TERMINAL_MARKER = b"APERTURE-GATE-INDETERMINATE reason="
+_ACTIVE_TERMINAL_OUTPUT = None
+
+
+def split_terminal_output(payload, result):
+    if result != NO_VERDICT:
+        return payload, None, True
+    ordinary = []
+    candidate = None
+    for line in payload.splitlines(keepends=True):
+        if not line.startswith(_TERMINAL_MARKER):
+            ordinary.append(line)
+            continue
+        if not line.endswith(b"\n"):
+            return b"".join(ordinary), candidate, False
+        if candidate is None:
+            candidate = line
+    return b"".join(ordinary), candidate, True
+
+
+def select_terminal_outcome(result, reason, detail, output_complete, retirement_complete, candidate):
+    if not output_complete or not retirement_complete:
+        return NO_VERDICT, "cleanup", detail or "gate output or cleanup custody is incomplete", None
+    if reason is not None:
+        return NO_VERDICT, reason, detail or reason, None
+    if result == NO_VERDICT and candidate is not None:
+        return NO_VERDICT, None, None, candidate
+    return result, None, None, None
+
+
+class TerminalOutput:
+    def __init__(self):
+        self.outputs = []
+        self.capture_handles = []
+        self.accepted_offsets = {}
+        self.reason = None
+        self.detail = None
+        self.candidate = None
+        self.deadline = None
+        self.cursor = None
+        self.output_complete = True
+        self.retirement_complete = True
+        self.output_failure = None
+        self.marker_attempted = False
+
+    @property
+    def evidence_paths(self):
+        return [output["path"] for output in self.outputs]
+
+    def set_deadline(self, deadline):
+        if deadline is None:
+            return
+        self.deadline = deadline if self.deadline is None else min(self.deadline, deadline)
+
+    def request(self, reason, detail, *, stdout_cursor=None, stdout_deadline=None):
+        if stdout_cursor is not None:
+            self.cursor = stdout_cursor
+        self.set_deadline(stdout_deadline)
+        if reason is None:
+            return
+        if self.reason is None or reason == "cleanup":
+            if self.reason == "cleanup" and reason == "cleanup" and self.detail and detail:
+                if detail not in self.detail:
+                    self.detail += "; " + detail
+            else:
+                self.reason, self.detail = reason, detail
+
+    def fail_output(self, detail):
+        self.output_complete = False
+        self.output_failure = detail
+        self.request("cleanup", detail)
+
+    def fail_retirement(self, detail):
+        self.retirement_complete = False
+        self.request("cleanup", detail)
+
+    def add_capture(self, name):
+        handle = tempfile.NamedTemporaryFile(mode="w+b", prefix="dsg-output-", delete=False)
+        self.outputs.append({"name": name, "path": handle.name, "replay": True, "candidate": False})
+        self.capture_handles.append(handle)
+        return handle
+
+    def close_captures(self):
+        complete = True
+        for handle in self.capture_handles:
+            if handle.closed:
+                continue
+            try:
+                handle.close()
+            except OSError as error:
+                complete = False
+                self.fail_output("gate output capture close failed: " + str(error))
+        self.capture_handles.clear()
+        return complete
+
+    def add_payload(self, name, payload, *, replay, candidate=False):
+        descriptor = None
+        path = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="dsg-output-")
+            record = {"name": name, "path": path, "replay": replay, "candidate": candidate}
+            self.outputs.append(record)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                written = handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+                if written != len(payload):
+                    raise OSError("private gate output staging was incomplete")
+            return True
+        except OSError as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.fail_output("gate output could not be staged: " + str(error))
+            return False
+
+    def _failure_detail(self):
+        detail = self.output_failure or self.detail or "gate output custody is incomplete"
+        if self.evidence_paths:
+            detail += "; output evidence retained at " + ", ".join(self.evidence_paths)
+        return detail
+
+    def publish(self, result):
+        stream_payloads = []
+        candidates = []
+        if self.output_complete:
+            loaded = []
+            for output in self.outputs:
+                try:
+                    with open(output["path"], "rb") as handle:
+                        payload = handle.read()
+                except OSError as error:
+                    self.fail_output("required gate output could not be read: " + str(error))
+                    break
+                loaded.append((output, payload))
+            if self.output_complete:
+                for output, payload in loaded:
+                    if output["candidate"]:
+                        if not payload.startswith(_TERMINAL_MARKER) or not payload.endswith(b"\n"):
+                            self.fail_output("saved gate verdict marker was incomplete")
+                            break
+                        candidates.append(payload)
+                        continue
+                    ordinary, candidate, complete = split_terminal_output(payload, result)
+                    if not complete:
+                        self.fail_output("required gate output ended inside a verdict marker")
+                        break
+                    if candidate is not None:
+                        candidates.append(candidate)
+                    if output["replay"]:
+                        stream_payloads.append((output["name"], ordinary))
+
+        output_line_start = self.cursor.get("output_line_start", True) if self.cursor is not None else True
+        if self.output_complete:
+            for name, payload in stream_payloads:
+                if not payload:
+                    continue
+                descriptor = sys.stderr.fileno() if name == "stderr" else sys.stdout.fileno()
+                try:
+                    written = _write_job_output(descriptor, payload, self.deadline)
+                except (OSError, ValueError) as error:
+                    self.fail_output("final " + name + " relay failed: " + str(error))
+                    break
+                self.accepted_offsets[name] = written
+                if name == "stdout" and written:
+                    output_line_start = payload[written - 1:written] == b"\n"
+                if written != len(payload):
+                    self.fail_output("final " + name + " relay was incomplete")
+                    break
+
+        candidate = self.candidate or (candidates[0] if candidates else None)
+        detail = self._failure_detail() if not self.output_complete or not self.retirement_complete else self.detail
+        code, reason, detail, selected_candidate = select_terminal_outcome(
+            result, self.reason, detail, self.output_complete, self.retirement_complete, candidate
+        )
+        marker = None
+        if reason is not None:
+            marker = ("APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + str(detail or reason) + "\n").encode(
+                "utf-8", errors="replace"
+            )
+        elif selected_candidate is not None:
+            marker = selected_candidate
+        if marker is not None and not self.marker_attempted:
+            self.marker_attempted = True
+            if not output_line_start:
+                marker = b"\n" + marker
+            try:
+                written = _write_job_output(sys.stdout.fileno(), marker, self.deadline)
+                self.accepted_offsets["verdict"] = written
+                delivered = written == len(marker)
+            except (OSError, ValueError):
+                self.accepted_offsets["verdict"] = 0
+                delivered = False
+            if self.cursor is not None:
+                self.cursor["verdict_delivery_complete"] = delivered
+            if not delivered:
+                self.output_complete = False
+                self.output_failure = "final gate verdict delivery was incomplete"
+                if self.cursor is not None:
+                    self.cursor["retain_output"] = True
+                return NO_VERDICT
+        elif self.cursor is not None and marker is None:
+            self.cursor["verdict_delivery_complete"] = True
+
+        complete = self.output_complete and self.retirement_complete
+        if self.cursor is not None:
+            self.cursor["retain_output"] = self.cursor.get("retain_output", False) or not complete
+        if complete:
+            for path in self.evidence_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        return code
+
+
 def no_verdict(reason, detail, *, stdout_cursor=None, stdout_deadline=None):
+    if _ACTIVE_TERMINAL_OUTPUT is not None:
+        _ACTIVE_TERMINAL_OUTPUT.request(
+            reason, detail, stdout_cursor=stdout_cursor, stdout_deadline=stdout_deadline
+        )
+        return NO_VERDICT
     prefix = "\n" if stdout_cursor and not stdout_cursor["output_line_start"] else ""
     line = prefix + "APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + detail + "\n"
     try:
         payload = line.encode("utf-8", errors="replace")
-        if stdout_cursor is None:
-            os.write(sys.stdout.fileno(), payload)
-        else:
-            stdout_cursor["verdict_delivery_complete"] = _write_job_output(sys.stdout.fileno(), payload, stdout_deadline) == len(payload)
-            stdout_cursor["retain_output"] = stdout_cursor.get("retain_output", False) or not stdout_cursor["verdict_delivery_complete"]
-    except OSError:
+        delivered = _write_job_output(sys.stdout.fileno(), payload, stdout_deadline) == len(payload)
+        if stdout_cursor is not None:
+            stdout_cursor["verdict_delivery_complete"] = delivered
+            stdout_cursor["retain_output"] = stdout_cursor.get("retain_output", False) or not delivered
+    except (OSError, ValueError):
         pass
     return NO_VERDICT
 
@@ -281,10 +504,8 @@ def signal_owned_child(pid, signal_number):
         os.close(descriptor)
 
 
-def wait_for_owned_children(deadline, *, cleanup_requested=None):
+def wait_for_owned_children(deadline):
     while True:
-        if cleanup_requested is not None and cleanup_requested():
-            return False
         if not live_owned_children():
             return True
         remaining = deadline - clock_now()
@@ -463,21 +684,7 @@ def caller_budget(environment):
     return int(raw)
 
 
-def emit_child_stderr(capture, result):
-    capture.seek(0)
-    output = capture.read()
-    marker = b"APERTURE-GATE-INDETERMINATE"
-    if result == NO_VERDICT:
-        for line in output.splitlines(keepends=True):
-            if marker in line:
-                os.write(sys.stderr.fileno(), line)
-                return
-        return
-    if output:
-        os.write(sys.stderr.fileno(), output)
-
-
-def run_supervised(root, command, environment, started, receipt, interrupted, *, cleanup_requested=None):
+def run_supervised(root, command, environment, started, receipt, interrupted):
     environment.pop("NODE_OPTIONS", None)
     environment[SUPERVISOR_ENVIRONMENT] = LINUX_SUBREAPER
     environment[SUPERVISOR_RECEIPT_ENVIRONMENT] = receipt.path
@@ -489,6 +696,10 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
         print(str(error), file=sys.stderr)
         return 4
     deadline = started + budget
+    terminal = _ACTIVE_TERMINAL_OUTPUT
+    if terminal is None:
+        raise OSError("terminal output owner is unavailable")
+    terminal.set_deadline(deadline)
     preflight_deadline = deadline - CLEANUP_RESERVE_SECONDS
     if preflight_deadline <= clock_now():
         return no_verdict("capacity", "caller budget leaves no time for source verification and cleanup")
@@ -512,7 +723,12 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
         return no_verdict("capacity", "caller budget leaves no time for admission plus execution")
     environment["APERTURE_GATE_TIME_LEFT_S"] = str(remaining)
 
-    stderr_capture = tempfile.TemporaryFile(mode="w+b")
+    terminal = _ACTIVE_TERMINAL_OUTPUT
+    if terminal is None:
+        raise OSError("terminal output owner is unavailable")
+    terminal.set_deadline(deadline)
+    stdout_capture = terminal.add_capture("stdout")
+    stderr_capture = terminal.add_capture("stderr")
     process = None
     result = NO_VERDICT
     reason = None
@@ -525,15 +741,24 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
         nonlocal scratch
         if scratch is not None:
             if process_started and not writers_drained:
-                return no_verdict("cleanup", "gate scratch retained because descendant drainage is unverified")
+                detail = "gate scratch retained because descendant drainage is unverified"
+                terminal.fail_retirement(detail)
+                terminal.fail_output("gate output remains live because descendant drainage is unverified")
+                return no_verdict("cleanup", detail)
             if not clock_now() < deadline:
-                return no_verdict("cleanup", "gate scratch retirement exceeded the caller deadline; allocation retained")
+                detail = "gate scratch retirement exceeded the caller deadline; allocation retained"
+                terminal.fail_retirement(detail)
+                return no_verdict("cleanup", detail)
             try:
                 shutil.rmtree(scratch)
             except OSError as error:
-                return no_verdict("cleanup", "gate scratch removal failed: " + str(error))
+                detail = "gate scratch removal failed: " + str(error)
+                terminal.fail_retirement(detail)
+                return no_verdict("cleanup", detail)
             if not clock_now() < deadline or os.path.lexists(scratch):
-                return no_verdict("cleanup", "gate scratch removal did not complete before the caller deadline")
+                detail = "gate scratch removal did not complete before the caller deadline"
+                terminal.fail_retirement(detail)
+                return no_verdict("cleanup", detail)
             scratch = None
         if failure is not None:
             return no_verdict(failure, failure_detail or failure)
@@ -547,14 +772,11 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
         environment["DISCORD_SURFACE_GATE_SCRATCH"] = scratch
         process = subprocess.Popen(
             command, cwd=str(root), env=environment, start_new_session=True,
-            stdout=None, stderr=stderr_capture,
+            stdout=stdout_capture, stderr=stderr_capture,
         )
         process_started = True
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
         while process.poll() is None:
-            if cleanup_requested is not None and cleanup_requested():
-                reason, detail = "cleanup", "gate reported an escaped descendant"
-                break
             if interrupted.is_set():
                 reason, detail = "interrupted", "full gate was interrupted"
                 break
@@ -568,11 +790,8 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
                 reason, detail = "cleanup", "supervised process tree did not stop before the caller deadline"
         else:
             result = process.wait()
-            writers_drained = wait_for_owned_children(run_deadline, cleanup_requested=cleanup_requested)
-            if cleanup_requested is not None and cleanup_requested():
-                reason, detail = "cleanup", "gate reported an escaped descendant"
-                writers_drained = stop_owned_processes(process, deadline)
-            elif not writers_drained:
+            writers_drained = wait_for_owned_children(run_deadline)
+            if not writers_drained:
                 reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
 
         try:
@@ -597,7 +816,6 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
 
         if reason:
             return finish(failure=reason, failure_detail=detail)
-        emit_child_stderr(stderr_capture, result)
         return finish(code=result)
     except OSError as error:
         if process_started and not writers_drained:
@@ -615,7 +833,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted, *,
             return finish(failure="stale", failure_detail="unable to verify source after setup failure")
         return finish(failure="setup", failure_detail="full gate command could not start: " + str(error))
     finally:
-        stderr_capture.close()
+        terminal.close_captures()
 
 
 def load_darwin_owner():
@@ -831,30 +1049,45 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
         return True
     try:
         output = Path(path).read_bytes()
-    except OSError:
-        output = b""
-    marker = b"APERTURE-GATE-INDETERMINATE reason="
-    if result == NO_VERDICT:
-        saved = cursor.get("verdict")
-        verdict = None
-        if saved is not None:
+    except OSError as error:
+        cursor["retain_output"] = True
+        if _ACTIVE_TERMINAL_OUTPUT is not None:
+            _ACTIVE_TERMINAL_OUTPUT.set_deadline(deadline)
+            _ACTIVE_TERMINAL_OUTPUT.fail_output("required gate stderr could not be read from " + path + ": " + str(error))
+        return False
+
+    terminal = _ACTIVE_TERMINAL_OUTPUT
+    if terminal is None:
+        cursor["retain_output"] = True
+        return False
+    terminal.set_deadline(deadline)
+    saved = cursor.get("verdict")
+    if saved is not None:
+        try:
             with open(stdout_path, "rb") as handle:
                 handle.seek(saved[0])
                 verdict = handle.read(saved[1] - saved[0])
+        except OSError as error:
+            cursor["retain_output"] = True
+            terminal.fail_output("saved gate verdict marker could not be read from " + stdout_path + ": " + str(error))
+            return False
+        if len(verdict) != saved[1] - saved[0] or not verdict.startswith(_TERMINAL_MARKER) or not verdict.endswith(b"\n"):
+            cursor["retain_output"] = True
+            terminal.fail_output("saved gate verdict marker was short or incomplete in " + stdout_path)
+            return False
+        if result == NO_VERDICT:
+            replay, candidate = False, True
+            name = "candidate"
         else:
-            verdict = next((line for line in output.splitlines(keepends=True)
-                if line.startswith(marker) and line.endswith(b"\n")), None)
-        if verdict is not None:
-            prefix = b"\n" if not cursor["output_line_start"] else b""
-            cursor["verdict_delivery_complete"] = _write_job_output(sys.stdout.fileno(), prefix + verdict, deadline) == len(prefix + verdict)
-            cursor["retain_output"] = cursor.get("retain_output", False) or not cursor["verdict_delivery_complete"]
-            return True
-    # Terminal selection has already rejected any earlier child verdict.
-    output = b"".join(line for line in output.splitlines(keepends=True)
-        if not (line.startswith(marker) and line.endswith(b"\n")))
-    complete = _write_job_output(sys.stderr.fileno(), output, deadline) == len(output)
-    cursor["retain_output"] = cursor.get("retain_output", False) or not complete
-    return complete
+            replay, candidate = True, False
+            name = "stdout"
+        if not terminal.add_payload(name, verdict, replay=replay, candidate=candidate):
+            cursor["retain_output"] = True
+            return False
+    if not terminal.add_payload("stderr", output, replay=True):
+        cursor["retain_output"] = True
+        return False
+    return True
 
 
 def _write_job_request(path, token, owner, identity, sequence, phase, interrupted, **values):
@@ -930,21 +1163,6 @@ def _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path=N
         return False
 
 
-def run_supervised_with_cleanup_request(root, command, environment, started, receipt, interrupted):
-    requested = False
-
-    def request_cleanup(_signum, _frame):
-        nonlocal requested
-        requested = True
-
-    previous = signal.signal(signal.SIGUSR1, request_cleanup)
-    try:
-        return run_supervised(root, command, environment, started, receipt, interrupted,
-            cleanup_requested=lambda: requested)
-    finally:
-        signal.signal(signal.SIGUSR1, previous)
-
-
 def run_darwin_supervised(root, command, environment, started, receipt, interrupted):
     environment.pop("NODE_OPTIONS", None)
     environment[SUPERVISOR_ENVIRONMENT] = DARWIN_LAUNCHD
@@ -995,15 +1213,22 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         nonlocal scratch
         if scratch is None:
             return True
-        if owned_service or output_cursor.get("retain_output"):
+        if owned_service:
+            terminal.fail_retirement("platform-owned scratch remains under active guardian custody")
+            return False
+        if output_cursor.get("retain_output"):
+            terminal.fail_retirement("platform-owned scratch retains required output evidence")
             return False
         if not clock_now() < deadline:
+            terminal.fail_retirement("platform-owned scratch retirement exceeded the caller deadline")
             return False
         try:
             shutil.rmtree(scratch)
-        except OSError:
+        except OSError as error:
+            terminal.fail_retirement("platform-owned scratch removal failed: " + str(error))
             return False
         if not clock_now() < deadline or os.path.lexists(scratch):
+            terminal.fail_retirement("platform-owned scratch removal did not complete before the caller deadline")
             return False
         scratch = None
         return True
@@ -1168,14 +1393,16 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         if not released:
             detail = (detail + "; " if reason == "cleanup" and detail else "") + "guardian or allocation remains owned; evidence retained"
             reason = "cleanup"
+            terminal.fail_retirement("guardian or platform allocation remains under active custody")
         else:
             owned_service = False
         if not _emit_job_stderr(stderr_path, stdout_path, result_code, reason is None, output_cursor, deadline):
-            reason, detail = "timeout", "final stderr relay incomplete after body exit " + str(result_code)
+            reason, detail = "cleanup", "required output staging was incomplete after body exit " + str(result_code)
         if scratch is not None:
             if owned_service or output_cursor.get("retain_output"):
                 if reason is None:
                     reason, detail = "cleanup", "platform-owned scratch remains under active custody"
+                terminal.fail_retirement(detail)
             elif not retire_scratch():
                 reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
         return no_verdict(reason, detail or reason, stdout_cursor=output_cursor, stdout_deadline=deadline) if reason else result_code
@@ -1250,7 +1477,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
 
 
 
-def run(argv):
+def _run(argv):
     try:
         started = clock_now()
     except OSError as error:
@@ -1295,15 +1522,40 @@ def run(argv):
             return no_verdict("interrupted", "full gate was interrupted before launch")
         root = Path.cwd().resolve()
         if sys.platform == "linux":
-            return run_supervised_with_cleanup_request(root, command, environment, started, receipt, interrupted)
+            return run_supervised(root, command, environment, started, receipt, interrupted)
         return run_darwin_supervised(root, command, environment, started, receipt, interrupted)
     except OSError as error:
         return no_verdict("setup", str(error))
     finally:
         if receipt is not None:
-            receipt.close()
+            try:
+                receipt.close()
+            except OSError as error:
+                no_verdict("cleanup", "supervisor receipt removal failed: " + str(error))
         for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError) as error:
+                no_verdict("cleanup", "supervisor signal handler restoration failed: " + str(error))
+
+
+def run(argv):
+    global _ACTIVE_TERMINAL_OUTPUT
+    terminal = TerminalOutput()
+    previous = _ACTIVE_TERMINAL_OUTPUT
+    _ACTIVE_TERMINAL_OUTPUT = terminal
+    result = NO_VERDICT
+    try:
+        result = _run(argv)
+    except OSError as error:
+        terminal.request("setup", str(error))
+    finally:
+        terminal.close_captures()
+        _ACTIVE_TERMINAL_OUTPUT = previous
+    try:
+        return terminal.publish(result)
+    except Exception:
+        return NO_VERDICT
 
 
 if __name__ == "__main__":
