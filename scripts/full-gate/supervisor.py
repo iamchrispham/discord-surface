@@ -1083,12 +1083,22 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
 
     def finish(code=None, *, failure=None, failure_detail=None):
         nonlocal scratch, output_staged
+        if scratch is not None and process_started and not writers_drained:
+            detail = "gate scratch retained because descendant drainage is unverified"
+            terminal.fail_retirement(detail)
+            terminal.fail_output("gate output remains live because descendant drainage is unverified")
+            return no_verdict("cleanup", detail)
+        if not output_staged:
+            output_staged = True
+            output_result = NO_VERDICT if failure is not None or reason is not None or (code is not None and code < 0) else result
+            if not _emit_job_stderr(
+                stderr_capture.name, stdout_capture.name, output_result, True, stdout_cursor, deadline
+            ):
+                terminal.fail_output("required gate output staging was incomplete after process exit")
+                if failure is None and reason is None:
+                    failure = "cleanup"
+                    failure_detail = "required gate output staging was incomplete after process exit"
         if scratch is not None:
-            if process_started and not writers_drained:
-                detail = "gate scratch retained because descendant drainage is unverified"
-                terminal.fail_retirement(detail)
-                terminal.fail_output("gate output remains live because descendant drainage is unverified")
-                return no_verdict("cleanup", detail)
             if not clock_now() < deadline:
                 detail = "gate scratch retirement exceeded the caller deadline; allocation retained"
                 terminal.fail_retirement(detail)
@@ -1104,16 +1114,6 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 terminal.fail_retirement(detail)
                 return no_verdict("cleanup", detail)
             scratch = None
-        if not output_staged:
-            output_staged = True
-            output_result = NO_VERDICT if failure is not None or reason is not None or (code is not None and code < 0) else result
-            if not _emit_job_stderr(
-                stderr_capture.name, stdout_capture.name, output_result, True, stdout_cursor, deadline
-            ):
-                terminal.fail_output("required gate output staging was incomplete after process exit")
-                if failure is None and reason is None:
-                    failure = "cleanup"
-                    failure_detail = "required gate output staging was incomplete after process exit"
         if failure is not None:
             return no_verdict(failure, failure_detail or failure)
         if code is not None and code < 0:
