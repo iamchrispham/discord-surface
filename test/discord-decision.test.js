@@ -65,7 +65,10 @@ async function fixture(t, { callback = null } = {}) {
   const dispatches = [];
   const question = {
     id: presentation.messageId,
-    async edit(payload) { edits.push(payload); return { id: presentation.messageId, ...payload }; }
+    content: posts[0].content,
+    components: posts[0].components,
+    embeds: [],
+    async edit(payload) { edits.push(payload); Object.assign(this, payload); return this; }
   };
   const channel = {
     id: 'channel',
@@ -99,7 +102,7 @@ async function fixture(t, { callback = null } = {}) {
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, db, state, request, presentation, posts, edits, callbacks, dispatches, gateway, listeners };
+  return { dir, db, state, request, presentation, posts, question, edits, callbacks, dispatches, gateway, listeners };
 }
 
 function component(presentation, id, selectedIndex, overrides = {}) {
@@ -130,8 +133,11 @@ async function waitForCondition(predicate, message, timeoutMs = 3000) {
   }
 }
 
-test('Gateway settles competing component clicks once and imports the canonical winner', { timeout: 30000 }, async t => {
+test('Gateway preserves the full prompt while settling competing clicks once', { timeout: 30000 }, async t => {
   const f = await fixture(t);
+  f.question.content = f.question.content.padEnd(2000, '?');
+  const originalPrompt = f.question.content;
+  assert.equal(originalPrompt.length, 2000);
   f.gateway.started = true;
   f.gateway.transportReady = true;
   f.gateway.ready = true;
@@ -144,7 +150,10 @@ test('Gateway settles competing component clicks once and imports the canonical 
   assert.deepEqual(f.callbacks.map(item => item.body), [{ type: 6 }, { type: 6 }]);
   assert.equal(f.dispatches.length, 1);
   assert.equal(f.edits.length, 2);
-  assert.deepEqual(f.edits.map(item => item.content), ['approve', 'approve']);
+  assert.equal(f.question.content, originalPrompt);
+  assert.deepEqual(f.question.embeds, [{ description: 'approve' }]);
+  assert.deepEqual(f.question.components, []);
+  assert.deepEqual(f.edits.map(item => item.embeds), [[{ description: 'approve' }], [{ description: 'approve' }]]);
   assert.equal(decisionMessages(f.state).length, 1);
   const row = decisionMessages(f.state)[0];
   assert.equal(row.decisionResult.answer, 'approve');
@@ -178,7 +187,7 @@ test('bound component ingress keeps callback custody before readiness and gates 
   f.gateway.resolveInteractionRecovery(true);
   await waitForCondition(() => f.edits.length === 1 && f.dispatches.length === 1,
     'decision continuation did not resume after readiness barrier');
-  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.deepEqual(f.edits.map(item => item.embeds), [[{ description: 'approve' }]]);
   assert.equal(decisionMessages(f.state).length, 1);
 
   const aborted = await fixture(t);
@@ -225,7 +234,7 @@ test('decision native return is held before startup and proceeds once after a he
 
   assert.equal(f.dispatches.length, 1);
   assert.equal(f.edits.length, 1);
-  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.deepEqual(f.edits.map(item => item.embeds), [[{ description: 'approve' }]]);
   assert.equal(decisionMessages(f.state).length, 1);
   assert.equal(f.state.getDecisionClick('native-after-start').nativeReturn.outcome, 'submitted');
   assert.equal(f.state.getDecisionClick('held-before-start').nativeReturn, null);
