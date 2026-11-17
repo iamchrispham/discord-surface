@@ -1142,7 +1142,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        def get_blocking(self, fd): return fixture.get_blocking(fd)",
     "        def set_blocking(self, fd, value): return fixture.set_blocking(fd, value)",
     "        def write(self, fd, payload): return fixture.write(fd, payload)",
-    "        def stat(self, name): return fixture.stat(name)",
+    "        def stat(self, name): return fixture.stat(name) if name in ('memory', 'stderr') else os.stat(name)",
     "        def __getattr__(self, name): return getattr(os, name)",
     "    class FixtureOpen:",
     "        def __call__(self, name, mode='r', *args, **kwargs):",
