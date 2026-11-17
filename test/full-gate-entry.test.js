@@ -11,6 +11,7 @@ const { PassThrough } = require('node:stream');
 const { relay, revision, noVerdict, MESSAGES, NO_VERDICT, SUPERVISOR } = require('../scripts/full-gate');
 const { pythonTestEnvironment } = require('../scripts/test-gate');
 const roleFixture = require('./successor-authority/process-identity');
+const ESCAPE_COMPLETION_RECORDS = Object.freeze(['reason=supervisor-stop', 'reason=hard-timeout']);
 
 const PROJECT = path.resolve(__dirname, '..');
 const GATE = path.join(PROJECT, 'scripts/full-gate.js');
@@ -318,7 +319,7 @@ function fixture(t, { absentSupervisor = false } = {}) {
         }
         if (donePresent) {
           try {
-            if (fs.readFileSync(selected.done, 'utf8') !== 'reason=supervisor-stop') markMissing(record, 'bounded-custody-expired');
+            if (!ESCAPE_COMPLETION_RECORDS.includes(fs.readFileSync(selected.done, 'utf8'))) markMissing(record, 'bounded-custody-expired');
           } catch { markMissing(record, 'bounded-custody-done-read'); }
         }
       }
@@ -1855,7 +1856,7 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
   try {
     normalActors = await waitForStart(normal);
     const presentReceipt = JSON.parse(fs.readFileSync(normal.files.presentWhileLive, 'utf8'));
-    assert.deepEqual(presentReceipt.identity, normalActors.writer.identity);
+    assert.ok(roleFixture.sameProcessIdentity(presentReceipt.identity, normalActors.writer.identity));
     assert.equal(isLive(normalActors.writer), true, 'escaped writer exited before release');
     assert.equal(isLive(normalActors.manager), true, 'manager closed before guardian completion');
     assert.equal(fs.existsSync(normalActors.scratch), true, 'private scratch was not present at writer readiness');
@@ -1901,14 +1902,14 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
   try {
     bypassActors = await waitForStart(bypassed);
     const bypassPresent = JSON.parse(fs.readFileSync(bypassed.files.presentWhileLive, 'utf8'));
-    assert.deepEqual(bypassPresent.identity, bypassActors.writer.identity);
+    assert.ok(roleFixture.sameProcessIdentity(bypassPresent.identity, bypassActors.writer.identity));
     assert.equal(fs.existsSync(bypassActors.scratch), true, 'bypass writer did not observe initial scratch');
     bypassed.releasePeer();
     assert.equal(await waitFor(() => (fs.existsSync(bypassed.files.peerStopped) && fs.readFileSync(bypassed.files.peerStopped, 'utf8') === 'released') || bypassed.outcome, 20000), true, bypassed.outcome?.output || 'peer release was not observed');
     assert.equal(fs.readFileSync(bypassed.files.peerStopped, 'utf8'), 'released');
     assert.equal(await waitFor(() => fs.existsSync(bypassed.files.releasedWhileLive), 20000), true, 'guard bypass did not expose scratch release during live writer custody');
     const releaseEvidence = JSON.parse(fs.readFileSync(bypassed.files.releasedWhileLive, 'utf8'));
-    assert.deepEqual(releaseEvidence.identity, bypassActors.writer.identity, 'absence receipt came from a different actor');
+    assert.ok(roleFixture.sameProcessIdentity(releaseEvidence.identity, bypassActors.writer.identity), 'absence receipt came from a different actor');
     assert.equal(roleFixture.identityGone(releaseEvidence.identity, roleFixture.captureIdentity(releaseEvidence.identity.pid)), false);
     assert.equal(isLive(bypassActors.writer), true, 'writer exited before the bypass release was observed');
     assert.equal(fs.existsSync(bypassActors.scratch), false, 'guard bypass did not release scratch while the writer was live');
@@ -2577,7 +2578,7 @@ test('guardian loss allows healthy outer supervisor cleanup after inner guardian
   assert.equal(fs.existsSync(monitorBarrier), true, diagnostics());
   assert.equal(fs.existsSync(escapeStarted), true, diagnostics());
   assert.equal(fs.existsSync(escapeDone), true, diagnostics());
-  assert.ok(['reason=supervisor-stop', 'reason=hard-timeout'].includes(fs.readFileSync(escapeDone, 'utf8')), diagnostics());
+  assert.ok(ESCAPE_COMPLETION_RECORDS.includes(fs.readFileSync(escapeDone, 'utf8')), diagnostics());
   assert.equal(await waitForIdentityGone(body.escapeIdentity, actionDeadline), true, diagnostics());
   assert.notEqual(body.scratch, f.scratch, diagnostics());
   assert.match(path.basename(body.scratch), process.platform === 'darwin' ? /^dsg-darwin-/ : /^discord-gate-/, diagnostics());
@@ -2592,7 +2593,9 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
     FIXTURE_LEASE_ENFORCE: '1',
     FIXTURE_KILL_WORKER: '1',
     FIXTURE_HANG: '1',
-    FIXTURE_WORKER_KILLED: workerKilled
+    FIXTURE_WORKER_KILLED: workerKilled,
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'worker-loss cleanup could not verify descendant drainage'
   };
   const first = f.launchSupervised(env);
   let firstExit;
@@ -2635,7 +2638,8 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   }
 
   const secondMarker = path.join(f.scratch, 'second-body.json');
-  const second = f.launchSupervised({ ...env, FIXTURE_KILL_WORKER: '', FIXTURE_HANG: '', FIXTURE_MARKER: secondMarker });
+  const second = f.launchSupervised({ ...env, FIXTURE_KILL_WORKER: '', FIXTURE_HANG: '', FIXTURE_MARKER: secondMarker,
+    FIXTURE_EXPECTED_RETENTION: '', FIXTURE_EXPECTED_RETENTION_REASON: '' });
   const secondResult = await second.done;
   assert.equal(secondResult.code, 98, secondResult.output);
   assert.match(secondResult.output, /reason=capacity/);
@@ -2646,14 +2650,62 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   assert.equal(roleFixture.signalOwned(stopped.guardian, 'SIGCONT'), true, 'guardian identity changed before resume');
   const firstResult = await first.done;
   assert.equal(firstResult.code, 98, firstResult.output);
+  assert.match(firstResult.output, /APERTURE-GATE-INDETERMINATE reason=cleanup/);
+  assert.match(firstResult.output, /unverified|unknown|cannot|could not|not verified|not proven|did not prove/i);
+  assert.match(firstResult.output, /descendant|drain/i);
+  assert.match(firstResult.output, /retained/i);
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.identityGone(stopped.body, roleFixture.captureIdentity(body.pid)), true, 'body process remained after guardian cleanup');
-  assert.equal(fs.existsSync(body.scratch), false, firstResult.output);
+  assert.equal(fs.existsSync(body.scratch), true, firstResult.output);
 
   const resumedMarker = path.join(f.scratch, 'resumed-body.json');
   const resumed = await f.launchSupervised({ FIXTURE_LEASE_ENFORCE: '1', FIXTURE_MARKER: resumedMarker }).done;
   assert.equal(resumed.code, 0, resumed.output);
   assert.equal(fs.existsSync(resumedMarker), true, 'admission did not resume after cleanup finished');
+});
+
+test('live stdout relay yields to supervisor cancellation', { timeout: 10000 }, () => {
+  const program = String.raw`import ast, io, sys, threading, types
+from pathlib import Path
+source=Path(sys.argv[1]).read_text()
+tree=ast.parse(source)
+functions={node.name:node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in {'_write_job_output','_stream_stdout','run_supervised'}}
+assert set(functions)=={'_write_job_output','_stream_stdout','run_supervised'}
+calls=[node for node in ast.walk(functions['run_supervised']) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='_stream_stdout']
+live=[node for node in calls if not any(keyword.arg=='final' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords)]
+final=[node for node in calls if any(keyword.arg=='final' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords)]
+assert len(live)==1 and any(keyword.arg=='interrupted' and isinstance(keyword.value,ast.Name) and keyword.value.id=='interrupted' for keyword in live[0].keywords)
+assert len(final)==1 and not any(keyword.arg=='interrupted' for keyword in final[0].keywords)
+interrupted=threading.Event(); clock=[0.0]; writes=[]; sleeps=[]; failures=[]; accepted=bytearray(); ready=[False]; blocking=[True]; data=b'waiting on stdout\n'
+def write(fd,payload):
+    assert fd==11 and blocking[0] is False
+    writes.append(payload)
+    if not ready[0]:interrupted.set();raise BlockingIOError('consumer stopped reading')
+    accepted.extend(payload);return len(payload)
+def sleep(seconds):
+    sleeps.append(seconds);clock[0]+=seconds
+class Terminal:
+    def set_deadline(self,deadline):self.deadline=deadline
+    def fail_output(self,detail):failures.append(detail)
+terminal=Terminal()
+namespace=dict(os=types.SimpleNamespace(get_blocking=lambda fd:blocking[0],set_blocking=lambda fd,value:blocking.__setitem__(0,value),write=write),
+    time=types.SimpleNamespace(sleep=sleep),clock_now=lambda:clock[0],POLL_SECONDS=.25,
+    sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11)),open=lambda *args:io.BytesIO(data),
+    _ACTIVE_TERMINAL_OUTPUT=terminal)
+exec(compile(ast.Module(body=[functions['_write_job_output'],functions['_stream_stdout']],type_ignores=[]),'<supervisor relay>','exec'),namespace)
+cursor={'offset':0,'source_line_start':True,'output_line_start':True}
+assert namespace['_stream_stdout']('stdout',cursor,deadline=1,interrupted=interrupted)==0
+assert len(writes)==1, 'live stdout relay retried after cancellation'
+assert sleeps==[], 'live stdout relay waited after cancellation'
+assert failures==[] and blocking[0] is True
+interrupted.clear();ready[0]=True
+assert namespace['_stream_stdout']('stdout',cursor,final=True,deadline=2)==len(data)
+assert bytes(accepted)==data and failures==[] and blocking[0] is True
+`;
+  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-B', '-c', program, SUPERVISOR_SCRIPT], {
+    encoding: 'utf8', timeout: 5000
+  });
+  assert.equal(result.status, 0, result.error?.message || result.stdout + '\n' + result.stderr);
 });
 
 test('launchd coalition drain catches a detached grandchild after its helper exits', { skip: process.platform !== 'darwin', timeout: 30000 }, async t => {

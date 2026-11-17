@@ -166,11 +166,13 @@ def establish_reaping_contract():
     _REAPING_OWNER = owner
 
 
-def _write_job_output(descriptor, payload, deadline=None, logical_state=None):
+def _write_job_output(descriptor, payload, deadline=None, logical_state=None, interrupted=None):
     offset = 0
     state = logical_state if logical_state is not None else {}
     attempted = bool(state.get("attempted"))
     while offset < len(payload):
+        if interrupted is not None and interrupted.is_set():
+            break
         if attempted and deadline is not None:
             try:
                 if not clock_now() < deadline:
@@ -194,6 +196,8 @@ def _write_job_output(descriptor, payload, deadline=None, logical_state=None):
                 except OSError:
                     pass
         offset += written
+        if interrupted is not None and interrupted.is_set():
+            break
         if deadline is None or offset == len(payload):
             break
         try:
@@ -1131,7 +1135,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         process_started = True
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
         while process.poll() is None:
-            _stream_stdout(stdout_capture.name, stdout_cursor, deadline=run_deadline)
+            _stream_stdout(stdout_capture.name, stdout_cursor, deadline=run_deadline, interrupted=interrupted)
             if interrupted.is_set():
                 reason, detail = "interrupted", "full gate was interrupted"
                 break
@@ -1353,7 +1357,7 @@ def _read_job_state(path, owner, token, identity=None):
     return state
 
 
-def _stream_stdout(path, cursor, final=False, deadline=None):
+def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
     try:
         terminal = _ACTIVE_TERMINAL_OUTPUT
     except NameError:
@@ -1413,7 +1417,10 @@ def _stream_stdout(path, cursor, final=False, deadline=None):
     if not payload:
         return offset
     try:
-        written = _write_job_output(sys.stdout.fileno(), payload, deadline)
+        if interrupted is None:
+            written = _write_job_output(sys.stdout.fileno(), payload, deadline)
+        else:
+            written = _write_job_output(sys.stdout.fileno(), payload, deadline, interrupted=interrupted)
     except (OSError, ValueError) as error:
         if terminal is not None:
             terminal.fail_output("live stdout relay failed: " + str(error))
@@ -1421,7 +1428,7 @@ def _stream_stdout(path, cursor, final=False, deadline=None):
     if written:
         cursor["source_line_start"] = cursor["output_line_start"] = payload[written - 1:written] == b"\n"
         cursor["offset"] += written
-    if written != len(payload):
+    if written != len(payload) and (interrupted is None or not interrupted.is_set()):
         if terminal is not None:
             terminal.fail_output("live stdout relay was incomplete")
     return cursor["offset"]
