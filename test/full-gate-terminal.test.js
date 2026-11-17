@@ -1,0 +1,26 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const test = require('node:test');
+const { pythonTestEnvironment } = require('../scripts/test-gate');
+
+const root = path.resolve(__dirname, '..');
+for (const scenario of [
+  'reason-order', 'required-hold', 'replacement-failure', 'blocked-delivery', 'phase-reserve',
+  'finalizer-receipt', 'finalizer-handler', 'finalizer-creation', 'finalizer-clock',
+  'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'darwin-bootstrap', 'darwin-exception'
+]) {
+  test('terminal output owner: ' + scenario, { timeout: 30000 }, () => {
+    const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', [
+      '-I', '-B', path.join(__dirname, 'helpers/full-gate-terminal.py'),
+      path.join(root, 'scripts/full-gate/supervisor.py'), scenario
+    ], {
+      cwd: root, env: pythonTestEnvironment({ PATH: process.env.PATH }),
+      encoding: 'utf8', timeout: 25000
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  });
+}

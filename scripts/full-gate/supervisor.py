@@ -225,11 +225,32 @@ def split_terminal_output(payload, result):
     return b"".join(ordinary), candidate, True
 
 
-def select_terminal_outcome(result, reason, detail, output_complete, retirement_complete, candidate):
-    if not output_complete or not retirement_complete:
-        return NO_VERDICT, "cleanup", detail or "gate output or cleanup custody is incomplete", None
+def _join_detail(*details):
+    result = None
+    for detail in details:
+        if not detail:
+            continue
+        detail = str(detail)
+        if result is None:
+            result = detail
+        elif detail not in result:
+            result += "; " + detail
+    return result
+
+
+def select_terminal_outcome(result, reason, detail, output_complete, retirement_complete, candidate,
+                            output_failure=None, retirement_failure=None):
+    if not retirement_complete:
+        return NO_VERDICT, "cleanup", _join_detail(
+            detail, "prior reason=" + reason if reason and reason != "cleanup" else None,
+            retirement_failure or "gate cleanup custody is incomplete", output_failure
+        ), None
     if reason is not None:
-        return NO_VERDICT, reason, detail or reason, None
+        return NO_VERDICT, reason, _join_detail(detail or reason, output_failure), None
+    if not output_complete:
+        return NO_VERDICT, "cleanup", _join_detail(
+            detail, output_failure or "gate output custody is incomplete"
+        ), None
     if result == NO_VERDICT and candidate is not None:
         return NO_VERDICT, None, None, candidate
     return result, None, None, None
@@ -248,11 +269,69 @@ class TerminalOutput:
         self.output_complete = True
         self.retirement_complete = True
         self.output_failure = None
+        self.retirement_failure = None
         self.marker_attempted = False
+        self.recovery_path = None
+        self.recovery_prepared = None
+        self.recovery_staged = False
 
     @property
     def evidence_paths(self):
-        return [output["path"] for output in self.outputs]
+        paths = [output["path"] for output in self.outputs]
+        if self.recovery_path is not None:
+            paths.append(self.recovery_path)
+        return paths
+
+    def prepare_recovery(self):
+        if self.recovery_prepared is not None:
+            return self.recovery_prepared
+        self.recovery_prepared = False
+        descriptor = None
+        try:
+            descriptor, self.recovery_path = tempfile.mkstemp(prefix="dsg-recovery-")
+            selected = descriptor
+            descriptor = None
+            os.close(selected)
+            self.recovery_prepared = True
+            return True
+        except OSError as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.fail_output("gate recovery custody could not be created: " + str(error))
+            return False
+
+    def stage_recovery(self, payload):
+        self.recovery_staged = False
+        if not self.prepare_recovery():
+            return False
+        descriptor = None
+        record = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="dsg-recovery-", dir=os.path.dirname(self.recovery_path))
+            record = {"name": "recovery", "path": path, "replay": False, "candidate": False}
+            self.outputs.append(record)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                written = handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+                if written != len(payload):
+                    raise OSError("gate recovery custody was incomplete")
+            os.replace(path, self.recovery_path)
+            self.outputs.remove(record)
+            self.recovery_staged = True
+            return True
+        except OSError as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.fail_output("gate recovery custody could not be staged: " + str(error))
+            return False
 
     def set_deadline(self, deadline):
         if deadline is None:
@@ -265,25 +344,22 @@ class TerminalOutput:
         self.set_deadline(stdout_deadline)
         if reason is None:
             return
-        if self.reason is None or reason == "cleanup":
-            if self.reason == "cleanup" and reason == "cleanup" and self.detail and detail:
-                if detail not in self.detail:
-                    self.detail += "; " + detail
-            else:
-                self.reason, self.detail = reason, detail
+        if self.reason is None:
+            self.reason, self.detail = reason, detail
+        elif self.reason == reason:
+            self.detail = _join_detail(self.detail, detail)
 
     def fail_output(self, detail):
         self.output_complete = False
-        self.output_failure = detail
-        self.request("cleanup", detail)
+        self.output_failure = _join_detail(self.output_failure, detail)
 
     def fail_retirement(self, detail):
         self.retirement_complete = False
-        self.request("cleanup", detail)
+        self.retirement_failure = _join_detail(self.retirement_failure, detail)
 
-    def add_capture(self, name):
+    def add_capture(self, name, *, replay=True):
         handle = tempfile.NamedTemporaryFile(mode="w+b", prefix="dsg-output-", delete=False)
-        self.outputs.append({"name": name, "path": handle.name, "replay": True, "candidate": False})
+        self.outputs.append({"name": name, "path": handle.name, "replay": replay, "candidate": False})
         self.capture_handles.append(handle)
         return handle
 
@@ -324,13 +400,16 @@ class TerminalOutput:
             self.fail_output("gate output could not be staged: " + str(error))
             return False
 
-    def _failure_detail(self):
-        detail = self.output_failure or self.detail or "gate output custody is incomplete"
+    def _failure_detail(self, detail):
+        detail = detail or "gate output custody is incomplete"
         if self.evidence_paths:
             detail += "; output evidence retained at " + ", ".join(self.evidence_paths)
         return detail
 
     def publish(self, result):
+        self.prepare_recovery()
+        if self.cursor is not None and self.cursor.get("retain_output"):
+            self.fail_output("required gate output remains under retained custody")
         stream_payloads = []
         candidates = []
         if self.output_complete:
@@ -379,17 +458,23 @@ class TerminalOutput:
                     break
 
         candidate = self.candidate or (candidates[0] if candidates else None)
-        detail = self._failure_detail() if not self.output_complete or not self.retirement_complete else self.detail
-        code, reason, detail, selected_candidate = select_terminal_outcome(
-            result, self.reason, detail, self.output_complete, self.retirement_complete, candidate
-        )
-        marker = None
-        if reason is not None:
-            marker = ("APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + str(detail or reason) + "\n").encode(
-                "utf-8", errors="replace"
+        def selected_record():
+            code, reason, detail, selected_candidate = select_terminal_outcome(
+                result, self.reason, self.detail, self.output_complete, self.retirement_complete, candidate,
+                output_failure=self.output_failure, retirement_failure=self.retirement_failure
             )
-        elif selected_candidate is not None:
-            marker = selected_candidate
+            if reason is not None:
+                if not self.output_complete or not self.retirement_complete:
+                    detail = self._failure_detail(detail)
+                marker = ("APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + str(detail or reason) + "\n").encode(
+                    "utf-8", errors="replace"
+                )
+                return code, marker
+            return code, selected_candidate
+
+        code, marker = selected_record()
+        if marker is not None and not self.stage_recovery(marker):
+            code, marker = selected_record()
         if marker is not None and not self.marker_attempted:
             self.marker_attempted = True
             if not output_line_start:
@@ -425,8 +510,9 @@ class TerminalOutput:
 
 
 def no_verdict(reason, detail, *, stdout_cursor=None, stdout_deadline=None):
-    if _ACTIVE_TERMINAL_OUTPUT is not None:
-        _ACTIVE_TERMINAL_OUTPUT.request(
+    terminal = _ACTIVE_TERMINAL_OUTPUT
+    if terminal is not None:
+        terminal.request(
             reason, detail, stdout_cursor=stdout_cursor, stdout_deadline=stdout_deadline
         )
         return NO_VERDICT
@@ -696,10 +782,9 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         print(str(error), file=sys.stderr)
         return 4
     deadline = started + budget
-    terminal = _ACTIVE_TERMINAL_OUTPUT
-    if terminal is None:
-        raise OSError("terminal output owner is unavailable")
-    terminal.set_deadline(deadline)
+    terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
+    if terminal is not None:
+        terminal.set_deadline(deadline)
     preflight_deadline = deadline - CLEANUP_RESERVE_SECONDS
     if preflight_deadline <= clock_now():
         return no_verdict("capacity", "caller budget leaves no time for source verification and cleanup")
@@ -723,12 +808,14 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         return no_verdict("capacity", "caller budget leaves no time for admission plus execution")
     environment["APERTURE_GATE_TIME_LEFT_S"] = str(remaining)
 
-    terminal = _ACTIVE_TERMINAL_OUTPUT
+    terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
     if terminal is None:
         raise OSError("terminal output owner is unavailable")
     terminal.set_deadline(deadline)
-    stdout_capture = terminal.add_capture("stdout")
-    stderr_capture = terminal.add_capture("stderr")
+    stdout_cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    terminal.request(None, None, stdout_cursor=stdout_cursor, stdout_deadline=deadline)
+    stdout_capture = terminal.add_capture("stdout", replay=False)
+    stderr_capture = terminal.add_capture("stderr", replay=False)
     process = None
     result = NO_VERDICT
     reason = None
@@ -736,9 +823,10 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
     scratch = None
     process_started = False
     writers_drained = False
+    output_staged = False
 
     def finish(code=None, *, failure=None, failure_detail=None):
-        nonlocal scratch
+        nonlocal scratch, output_staged
         if scratch is not None:
             if process_started and not writers_drained:
                 detail = "gate scratch retained because descendant drainage is unverified"
@@ -760,6 +848,16 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 terminal.fail_retirement(detail)
                 return no_verdict("cleanup", detail)
             scratch = None
+        if not output_staged:
+            output_staged = True
+            output_result = NO_VERDICT if failure is not None or reason is not None or (code is not None and code < 0) else result
+            if not _emit_job_stderr(
+                stderr_capture.name, stdout_capture.name, output_result, True, stdout_cursor, deadline
+            ):
+                terminal.fail_output("required gate output staging was incomplete after process exit")
+                if failure is None and reason is None:
+                    failure = "cleanup"
+                    failure_detail = "required gate output staging was incomplete after process exit"
         if failure is not None:
             return no_verdict(failure, failure_detail or failure)
         if code is not None and code < 0:
@@ -777,6 +875,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         process_started = True
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
         while process.poll() is None:
+            _stream_stdout(stdout_capture.name, stdout_cursor, deadline=run_deadline)
             if interrupted.is_set():
                 reason, detail = "interrupted", "full gate was interrupted"
                 break
@@ -793,6 +892,20 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
             writers_drained = wait_for_owned_children(run_deadline)
             if not writers_drained:
                 reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
+
+        if writers_drained:
+            output_offset = stdout_cursor["offset"]
+            while clock_now() < deadline:
+                next_offset = _stream_stdout(stdout_capture.name, stdout_cursor, final=True, deadline=deadline)
+                try:
+                    output_size = os.stat(stdout_capture.name).st_size
+                except OSError:
+                    output_size = next_offset
+                if next_offset == output_size and stdout_cursor.get("pending_marker") is None:
+                    break
+                if next_offset == output_offset:
+                    time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
+                output_offset = next_offset
 
         try:
             after = capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
@@ -984,7 +1097,13 @@ def _read_job_state(path, owner, token, identity=None):
     return state
 
 
-def _stream_stdout(path, cursor, final=False):
+def _stream_stdout(path, cursor, final=False, deadline=None):
+    try:
+        terminal = _ACTIVE_TERMINAL_OUTPUT
+    except NameError:
+        terminal = None
+    if deadline is None and terminal is not None:
+        deadline = terminal.deadline
     offset = cursor["offset"]
     try:
         with open(path, "rb") as handle:
@@ -1037,10 +1156,18 @@ def _stream_stdout(path, cursor, final=False):
                     payload = payload[:tail_at]
     if not payload:
         return offset
-    written = _write_job_output(sys.stdout.fileno(), payload)
+    try:
+        written = _write_job_output(sys.stdout.fileno(), payload, deadline)
+    except (OSError, ValueError) as error:
+        if terminal is not None:
+            terminal.fail_output("live stdout relay failed: " + str(error))
+        return offset
     if written:
         cursor["source_line_start"] = cursor["output_line_start"] = payload[written - 1:written] == b"\n"
         cursor["offset"] += written
+    if written != len(payload):
+        if terminal is not None:
+            terminal.fail_output("live stdout relay was incomplete")
     return cursor["offset"]
 
 
@@ -1051,12 +1178,13 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
         output = Path(path).read_bytes()
     except OSError as error:
         cursor["retain_output"] = True
-        if _ACTIVE_TERMINAL_OUTPUT is not None:
-            _ACTIVE_TERMINAL_OUTPUT.set_deadline(deadline)
-            _ACTIVE_TERMINAL_OUTPUT.fail_output("required gate stderr could not be read from " + path + ": " + str(error))
+        terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
+        if terminal is not None:
+            terminal.set_deadline(deadline)
+            terminal.fail_output("required gate stderr could not be read from " + path + ": " + str(error))
         return False
 
-    terminal = _ACTIVE_TERMINAL_OUTPUT
+    terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
     if terminal is None:
         cursor["retain_output"] = True
         return False
@@ -1107,7 +1235,7 @@ def _write_job_request(path, token, owner, identity, sequence, phase, interrupte
 
 def _wait_job_phase(path, owner, identity, token, phases, sequence, deadline, interrupted, stdout_path, cursor):
     while clock_now() < deadline and not interrupted.is_set():
-        _stream_stdout(stdout_path, cursor)
+        _stream_stdout(stdout_path, cursor, deadline=deadline)
         state = _read_job_state(path, owner, token, identity)
         if state is not None:
             observed = state["sequence"]
@@ -1164,6 +1292,7 @@ def _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path=N
 
 
 def run_darwin_supervised(root, command, environment, started, receipt, interrupted):
+    terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
     environment.pop("NODE_OPTIONS", None)
     environment[SUPERVISOR_ENVIRONMENT] = DARWIN_LAUNCHD
     environment[SUPERVISOR_RECEIPT_ENVIRONMENT] = receipt.path
@@ -1175,6 +1304,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         print(str(error), file=sys.stderr)
         return 4
     deadline = started + budget
+    if terminal is not None:
+        terminal.set_deadline(deadline)
     preflight_deadline = deadline - CLEANUP_RESERVE_SECONDS
     if preflight_deadline <= clock_now():
         return no_verdict("capacity", "caller budget leaves no time for source verification and cleanup")
@@ -1192,6 +1323,9 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return no_verdict("setup", str(error))
 
+    if terminal is None:
+        raise OSError("terminal output owner is unavailable")
+
     remaining = int(deadline - clock_now() - CLEANUP_RESERVE_SECONDS)
     if remaining - before["slowest"] < 1:
         return no_verdict("capacity", "caller budget leaves no time for admission plus execution")
@@ -1201,6 +1335,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
     sequence = 0
     output_offset = 0
     output_cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    terminal.request(None, None, stdout_cursor=output_cursor, stdout_deadline=deadline)
     retirement = {}
     after_failure = None
     owner = None
@@ -1208,16 +1343,54 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
     owned_service = False
     identity = None
     identity_verified = False
+    stdout_path = None
+    stderr_path = None
+    output_required = False
+    output_staged = None
+    result_code = NO_VERDICT
+
+    def stage_outputs():
+        nonlocal output_staged
+        if not output_required:
+            return True
+        if owned_service:
+            terminal.fail_output("required gate output remains owned at " + stdout_path + ", " + stderr_path)
+            return False
+        if output_staged is None:
+            output_staged = False
+            start = output_cursor["offset"]
+            pending = output_cursor.get("pending_marker")
+            if pending is not None:
+                start = min(start, pending)
+            try:
+                with open(stdout_path, "rb") as handle:
+                    handle.seek(start)
+                    remaining_stdout = handle.read()
+            except OSError as error:
+                terminal.fail_output("required gate stdout could not be staged from " + stdout_path + ": " + str(error))
+                return False
+            if remaining_stdout and not terminal.add_payload("stdout", remaining_stdout, replay=True):
+                return False
+            output_result = NO_VERDICT if reason is not None else result_code
+            output_staged = _emit_job_stderr(
+                stderr_path, stdout_path, output_result, True, output_cursor, deadline
+            )
+            if not output_staged:
+                terminal.fail_output("required gate output staging was incomplete")
+        return output_staged
 
     def retire_scratch():
         nonlocal scratch
         if scratch is None:
             return True
         if owned_service:
-            terminal.fail_retirement("platform-owned scratch remains under active guardian custody")
+            terminal.fail_retirement("platform-owned scratch remains under active guardian custody at " + scratch)
+            stage_outputs()
+            return False
+        if not stage_outputs():
             return False
         if output_cursor.get("retain_output"):
-            terminal.fail_retirement("platform-owned scratch retains required output evidence")
+            terminal.fail_output("platform-owned scratch retains required output evidence")
             return False
         if not clock_now() < deadline:
             terminal.fail_retirement("platform-owned scratch retirement exceeded the caller deadline")
@@ -1295,12 +1468,15 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             os.fsync(handle.fileno())
         os.chmod(plist_path, 0o600)
         owned_service = True
+        output_required = True
         result = _launchctl(launchctl, ["bootstrap", domain, plist_path], deadline)
         if result.returncode != 0:
             detail = (result.stderr + result.stdout).strip() or "launchctl bootstrap returned " + str(result.returncode)
             if _darwin_cleanup(owner, launchctl, service, None, deadline, status_path, False, token=nonce, sequence=sequence):
                 owned_service = False
-                return no_verdict("setup", "temporary launchd job did not start: " + detail)
+                reason, detail = "setup", "temporary launchd job did not start: " + detail
+                retire_scratch()
+                return no_verdict(reason, detail, stdout_cursor=output_cursor, stdout_deadline=deadline)
             custody = {
                 "service": service,
                 "state": "bootstrap-outcome-unresolved",
@@ -1310,6 +1486,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
                 os.path.join(scratch, "allocation-custody.json"),
                 json.dumps(custody, separators=(",", ":")).encode("utf-8"),
             )
+            terminal.fail_retirement("launchd bootstrap did not prove allocation drain for " + service)
+            stage_outputs()
             return no_verdict("cleanup", "launchd bootstrap did not prove allocation drain for " + service)
 
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
@@ -1342,18 +1520,17 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             raise OSError("body cleanup remains unresolved")
         result_code = int(state["body_code"])
         reason, detail = state.get("body_reason"), state.get("body_detail")
-        output_cursor["retain_output"] = True
         while not interrupted.is_set() and clock_now() < run_deadline:
-            next_offset = _stream_stdout(stdout_path, output_cursor, final=True)
+            next_offset = _stream_stdout(stdout_path, output_cursor, final=True, deadline=run_deadline)
             output_size = os.stat(stdout_path).st_size
             if next_offset == output_size and output_cursor.get("pending_marker") is None:
-                output_cursor["retain_output"] = False
                 output_offset = next_offset
                 break
             if next_offset == output_offset:
                 time.sleep(min(POLL_SECONDS, max(0, run_deadline - clock_now())))
             output_offset = next_offset
         else:
+            output_cursor["retain_output"] = True
             if reason is None:
                 reason = "interrupted" if interrupted.is_set() else "timeout"
                 detail = "final stdout relay incomplete after body exit " + str(result_code)
@@ -1396,15 +1573,21 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             terminal.fail_retirement("guardian or platform allocation remains under active custody")
         else:
             owned_service = False
-        if not _emit_job_stderr(stderr_path, stdout_path, result_code, reason is None, output_cursor, deadline):
-            reason, detail = "cleanup", "required output staging was incomplete after body exit " + str(result_code)
+        if not stage_outputs():
+            if reason is None:
+                reason, detail = "cleanup", "required output staging was incomplete after body exit " + str(result_code)
         if scratch is not None:
-            if owned_service or output_cursor.get("retain_output"):
+            if owned_service:
                 if reason is None:
                     reason, detail = "cleanup", "platform-owned scratch remains under active custody"
                 terminal.fail_retirement(detail)
+            elif output_cursor.get("retain_output"):
+                if reason is None:
+                    reason, detail = "cleanup", "platform-owned scratch retains required output evidence"
+                terminal.fail_output(detail)
             elif not retire_scratch():
-                reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
+                if reason is None:
+                    reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
         return no_verdict(reason, detail or reason, stdout_cursor=output_cursor, stdout_deadline=deadline) if reason else result_code
     except (OSError, TimeoutError, ValueError, KeyError, TypeError) as error:
         detail = detail or str(error)
@@ -1451,6 +1634,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             else:
                 reason = "cleanup"
                 detail += "; guardian/allocation custody retained"
+                terminal.fail_retirement("guardian/allocation custody retained at " + str(scratch))
+                stage_outputs()
         if retirement.get("reason") == "cleanup":
             reason = "cleanup"
             detail = str(retirement.get("detail") or "guardian reported cleanup uncertainty") + "; " + detail
@@ -1459,7 +1644,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             try:
                 output_offset = output_cursor["offset"]
                 while clock_now() < deadline:
-                    next_offset = _stream_stdout(stdout_path, output_cursor, final=True)
+                    next_offset = _stream_stdout(stdout_path, output_cursor, final=True, deadline=deadline)
                     if next_offset == os.stat(stdout_path).st_size and output_cursor.get("pending_marker") is None:
                         relay_complete = True
                         break
@@ -1468,11 +1653,16 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
                     output_offset = next_offset
             except (OSError, ValueError, TypeError):
                 pass
-            output_cursor["retain_output"] = output_cursor.get("retain_output", False) or not relay_complete
             if not relay_complete:
+                output_cursor["retain_output"] = True
                 detail += "; final stdout relay incomplete; private evidence retained"
-        if scratch is not None and not owned_service and not output_cursor.get("retain_output") and not retire_scratch():
-            reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
+        if scratch is not None and not owned_service:
+            stage_outputs()
+            if output_cursor.get("retain_output"):
+                terminal.fail_output("platform-owned scratch retains required output evidence")
+            elif not retire_scratch():
+                if reason is None:
+                    reason, detail = "cleanup", "platform-owned scratch could not be retired within the caller deadline"
         return no_verdict(reason, detail, stdout_cursor=output_cursor, stdout_deadline=deadline)
 
 
@@ -1485,6 +1675,7 @@ def _run(argv):
     interrupted = threading.Event()
     previous_handlers = {}
     receipt = None
+    terminal = _ACTIVE_TERMINAL_OUTPUT
 
     def receive_signal(_signum, _frame):
         interrupted.set()
@@ -1506,15 +1697,20 @@ def _run(argv):
         environment = os.environ.copy()
         if environment.get("NODE_OPTIONS"):
             return no_verdict("setup", "unset NODE_OPTIONS before starting the full gate")
+        if sys.platform not in ("linux", "darwin"):
+            return no_verdict("setup", "kernel-backed process ownership is unavailable on this host")
         try:
-            caller_budget(environment)
+            budget = caller_budget(environment)
+            if terminal is None:
+                raise OSError("terminal output owner is unavailable")
+            terminal.set_deadline(started + budget)
+            if not terminal.prepare_recovery():
+                return no_verdict("setup", "independent recovery custody is unavailable")
             establish_reaping_contract()
             if sys.platform == "linux":
                 enable_subreaper()
             elif sys.platform == "darwin":
                 load_darwin_owner().joined_identity(os.getpid())
-            else:
-                return no_verdict("setup", "kernel-backed process ownership is unavailable on this host")
             receipt = SupervisorReceipt()
         except (InvalidGateBudget, OSError) as error:
             return no_verdict("setup", str(error))
@@ -1531,12 +1727,13 @@ def _run(argv):
             try:
                 receipt.close()
             except OSError as error:
-                no_verdict("cleanup", "supervisor receipt removal failed: " + str(error))
+                terminal.fail_retirement("supervisor receipt removal failed: " + str(error))
         for signum, handler in previous_handlers.items():
             try:
                 signal.signal(signum, handler)
             except (OSError, ValueError) as error:
-                no_verdict("cleanup", "supervisor signal handler restoration failed: " + str(error))
+                if terminal is not None:
+                    terminal.fail_retirement("supervisor signal handler restoration failed: " + str(error))
 
 
 def run(argv):

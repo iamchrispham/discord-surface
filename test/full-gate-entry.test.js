@@ -180,7 +180,7 @@ function fixture(t, { absentSupervisor = false } = {}) {
     "  }",
     "  if (process.env.FIXTURE_ESCAPE_PIPE && !process.env.FIXTURE_ESCAPE_READY) startEscapePipe();",
     "  if (process.env.FIXTURE_READ_ONLY_SCRATCH) { const ro=require('node:path').join(process.env.DISCORD_SURFACE_GATE_SCRATCH,'ro');fs.mkdirSync(ro);fs.writeFileSync(require('node:path').join(ro,'f'),'x');fs.chmodSync(ro,0o500); }",
-    "  if (process.env.FIXTURE_LEFTOVER) require('node:child_process').spawn(process.execPath, ['-e', 'const fs=require(\"node:fs\");process.on(\"SIGTERM\",()=>{if(process.env.FIXTURE_LEFTOVER_STOPPED)fs.writeFileSync(process.env.FIXTURE_LEFTOVER_STOPPED,\"term\");process.exit(0)});setTimeout(()=>process.exit(0),15000)'], { stdio: 'ignore' }).unref();",
+    "  if (process.env.FIXTURE_LEFTOVER) { const child=require('node:child_process').spawn(process.execPath,['-e','const fs=require(\"node:fs\");process.on(\"SIGTERM\",()=>{if(process.env.FIXTURE_LEFTOVER_STOPPED)fs.writeFileSync(process.env.FIXTURE_LEFTOVER_STOPPED,\"term\");process.exit(0)});setTimeout(()=>process.exit(0),15000)'],{stdio:'ignore'});child.unref();const identity=roles.captureIdentity(child.pid);if(identity.kind!=='present')throw new Error('leftover identity could not be established');fs.writeFileSync(process.env.FIXTURE_LEFTOVER_IDENTITY,JSON.stringify({pid:child.pid,identity})); }",
     "  if (process.env.FIXTURE_HANG) { process.on('SIGTERM', () => { if (process.env.FIXTURE_RECREATE_SCRATCH && !process.env.FIXTURE_ESCAPE_READY) { const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;setInterval(()=>{fs.mkdirSync(scratch,{recursive:true});fs.writeFileSync(require('node:path').join(scratch,'writer'),'active');},5); } }); setInterval(() => {}, 1000); process.stdout.write('BODY_READY\\n'); return new Promise(() => {}); }",
     "  if(process.env.FIXTURE_TABLE_FAILURE_ARM)fs.writeFileSync(process.env.FIXTURE_TABLE_FAILURE_ARM,'armed');",
     "  return Number(process.env.FIXTURE_BODY_EXIT || 0);",
@@ -193,6 +193,7 @@ function fixture(t, { absentSupervisor = false } = {}) {
     "}"
   ].join('\n'));
   const processes = [];
+  const launches = [];
   const boundedCustodies = [];
   const inheritedSupervisorPid = Number(env[supervisorPidEnvironment]);
   const externalSupervisorPid = Number.isSafeInteger(inheritedSupervisorPid)
@@ -205,28 +206,94 @@ function fixture(t, { absentSupervisor = false } = {}) {
     const unresolved = [];
     const identities = new Map();
     const retainedGateScratch = new Set();
+    const externalGateScratch = new Set();
+    const expectedRetention = new Map();
     const writerIdentities = [];
-    const recordBoundedCustody = value => {
+    const workerCustodies = [];
+    const inspectPath = value => {
+      try { return { stat: fs.lstatSync(value) }; }
+      catch (error) {
+        if (error.code === 'ENOENT') return { absent: true };
+        throw error;
+      }
+    };
+    const markMissing = (record, reason) => {
+      record?.missingAuthority.push(reason);
+      unresolved.push(reason);
+    };
+    const recordExpectedRetention = (record, pathValue) => {
+      if (!record?.expectedRetention) return;
+      if (typeof pathValue !== 'string' || pathValue.length === 0) {
+        record.missingAuthority.push('expected-retention-missing-path');
+        unresolved.push('expected-retention-missing-path:' + record.marker);
+        return;
+      }
+      const resolved = path.resolve(pathValue);
+      const entry = expectedRetention.get(resolved) || {
+        path: resolved, mode: record.mode, marker: record.marker,
+        controller: record.controllerIdentity, manager: record.managerIdentity,
+        launches: [], owners: [], reasons: []
+      };
+      if (!entry.launches.includes(record.launchOrdinal)) entry.launches.push(record.launchOrdinal);
+      if (!entry.owners.some(owner => owner.launchOrdinal === record.launchOrdinal)) {
+        entry.owners.push({ launchOrdinal: record.launchOrdinal, mode: record.mode,
+          controller: record.controllerIdentity, manager: record.managerIdentity });
+      }
+      entry.reasons.push(record.expectedRetentionReason || 'fixture-declared custody uncertainty');
+      expectedRetention.set(resolved, entry);
+    };
+    const recordGateScratch = (value, record, source) => {
+      if (!value || typeof value !== 'object') return;
+      const gateScratch = value.scratch;
+      if (typeof gateScratch !== 'string' || gateScratch.length === 0) return;
+      const normalizedScratch = path.normalize(gateScratch);
+      const resolvedScratch = path.resolve(gateScratch);
+      if (!path.isAbsolute(gateScratch) || normalizedScratch !== gateScratch) {
+        record?.missingAuthority.push('gate-scratch-path:' + source);
+        unresolved.push('gate-scratch-path:' + source);
+        return;
+      }
+      const basename = path.basename(resolvedScratch);
+      const nodeOwned = record?.mode === 'direct'
+        && path.dirname(resolvedScratch) === path.resolve(os.tmpdir())
+        && /^discord-gate-/.test(basename);
+      const platformOwned = record?.mode === 'supervised'
+        && ((process.platform === 'darwin' && path.dirname(resolvedScratch) === '/private/tmp' && /^dsg-darwin-/.test(basename))
+          || (process.platform !== 'darwin' && path.dirname(resolvedScratch) === path.resolve(os.tmpdir()) && /^discord-gate-/.test(basename)));
+      if (!nodeOwned && !platformOwned) {
+        record?.missingAuthority.push('gate-scratch-owner:' + source);
+        unresolved.push('gate-scratch-owner:' + source);
+        return;
+      }
+      if (record) {
+        record.allocationObservations.push({
+          source, scratch: resolvedScratch, owner: platformOwned ? 'external-supervised' : 'direct-node',
+          controller: record.controllerIdentity, manager: record.managerIdentity,
+          expectedRetention: record.expectedRetention
+        });
+      }
+      if (record?.expectedRetention) recordExpectedRetention(record, resolvedScratch);
+      if (platformOwned) externalGateScratch.add(resolvedScratch);
+      else retainedGateScratch.add(resolvedScratch);
+    };
+    const recordBoundedCustody = (value, record) => {
       if (!boundedCustodies.length) return;
       if (!value || typeof value !== 'object') {
+        record?.missingAuthority.push('bounded-custody-missing');
         unresolved.push('bounded-custody-missing');
         return;
       }
+      recordGateScratch(value, record, 'bounded-custody');
       const gateScratch = value.scratch;
-      const normalizedScratch = typeof gateScratch === 'string' ? path.normalize(gateScratch) : '';
       const resolvedScratch = typeof gateScratch === 'string' ? path.resolve(gateScratch) : '';
-      const validScratch = typeof gateScratch === 'string'
-        && gateScratch.length > 0
-        && path.isAbsolute(gateScratch)
-        && normalizedScratch === gateScratch
-        && path.dirname(resolvedScratch) === path.resolve(os.tmpdir())
-        && /^discord-gate-/.test(path.basename(resolvedScratch))
-        && resolvedScratch !== path.resolve(scratch);
-      if (!validScratch) unresolved.push('bounded-custody-scratch');
-      else retainedGateScratch.add(resolvedScratch);
+      if (resolvedScratch === path.resolve(scratch)) {
+        record?.missingAuthority.push('bounded-custody-fixture-root');
+        unresolved.push('bounded-custody-fixture-root');
+      }
       const writer = value.escapeIdentity;
       if (!writer || writer.kind !== 'present' || !Number.isSafeInteger(writer.pid)
           || !Number.isSafeInteger(value.escapePid) || writer.pid !== value.escapePid) {
+        record?.missingAuthority.push('bounded-custody-unknown-writer');
         unresolved.push('bounded-custody-unknown-writer');
       } else writerIdentities.push(writer);
       for (const selected of boundedCustodies) {
@@ -234,14 +301,48 @@ function fixture(t, { absentSupervisor = false } = {}) {
           ['armed', selected.armed], ['release', selected.release], ['killed', selected.killed],
           ['barrier', selected.barrier], ['started', selected.started], ['done', selected.done]
         ]) {
-          if (typeof file !== 'string' || !fs.existsSync(file)) unresolved.push('bounded-custody-' + name);
-        }
-        if (typeof selected.done === 'string' && fs.existsSync(selected.done)) {
+          if (typeof file !== 'string') {
+            markMissing(record, 'bounded-custody-' + name);
+            continue;
+          }
           try {
-            if (fs.readFileSync(selected.done, 'utf8') !== 'reason=supervisor-stop') unresolved.push('bounded-custody-expired');
-          } catch { unresolved.push('bounded-custody-done-read'); }
+            if (inspectPath(file).absent) markMissing(record, 'bounded-custody-' + name);
+          } catch (error) {
+            markMissing(record, 'bounded-custody-' + name + '-read:' + error.code);
+          }
+        }
+        let donePresent = false;
+        if (typeof selected.done === 'string') {
+          try { donePresent = !inspectPath(selected.done).absent; }
+          catch (error) { markMissing(record, 'bounded-custody-done-read:' + error.code); }
+        }
+        if (donePresent) {
+          try {
+            if (fs.readFileSync(selected.done, 'utf8') !== 'reason=supervisor-stop') markMissing(record, 'bounded-custody-expired');
+          } catch { markMissing(record, 'bounded-custody-done-read'); }
         }
       }
+    };
+    const validateIdentityInventory = (value, record, source) => {
+      let found = 0;
+      let invalid = false;
+      const visit = candidate => {
+        if (Array.isArray(candidate)) {
+          for (const item of candidate) visit(item);
+          return;
+        }
+        if (!candidate || typeof candidate !== 'object') return;
+        if (Object.prototype.hasOwnProperty.call(candidate, 'kind')) {
+          if (candidate.kind !== 'present' || !Number.isSafeInteger(candidate.pid)) invalid = true;
+          else found += 1;
+          return;
+        }
+        for (const item of Object.values(candidate)) visit(item);
+      };
+      visit(value);
+      if (!found) markMissing(record, 'identity-record-empty:' + source);
+      if (invalid) markMissing(record, 'identity-record-invalid:' + source);
+      return found > 0 && !invalid;
     };
     const remember = value => {
       if (Array.isArray(value)) {
@@ -267,26 +368,100 @@ function fixture(t, { absentSupervisor = false } = {}) {
     };
     try { fs.writeFileSync(emergencyRelease, 'release'); }
     catch { unresolved.push('admission-release'); }
-    for (const custodyPath of [
-      roleFile, protocol + '.roles', path.join(scratch, 'worker-killed'),
-      marker, marker + '.guard-custody'
-    ]) {
-      if (!fs.existsSync(custodyPath)) continue;
-      try {
-        const custody = JSON.parse(fs.readFileSync(custodyPath, 'utf8'));
-        if (custodyPath === marker) recordBoundedCustody(custody);
-        remember(custody);
-      } catch { unresolved.push('unreadable-custody:' + path.basename(custodyPath)); }
+    const recordEntries = [];
+    for (const record of launches) {
+      for (const spec of record.recordFiles) {
+        recordEntries.push({ record, spec });
+        if (spec.required) {
+          try {
+            if (inspectPath(spec.path).absent) markMissing(record, 'required-record-missing:' + spec.producer + ':' + spec.path);
+          } catch (error) {
+            markMissing(record, 'required-record-read:' + spec.producer + ':' + spec.path + ':' + error.code);
+          }
+        }
+      }
     }
-    if (boundedCustodies.length && !fs.existsSync(marker)) unresolved.push('bounded-custody-missing-marker');
-    try {
-      const stopped = JSON.parse(fs.readFileSync(path.join(scratch, 'worker-killed'), 'utf8'));
+    for (const { record, spec } of recordEntries) {
+      const custodyPath = spec.path;
+      let stat;
+      try {
+        const inspected = inspectPath(custodyPath);
+        if (inspected.absent) continue;
+        stat = inspected.stat;
+        if (!stat.isFile()) {
+          if (spec.required) markMissing(record, 'required-record-not-file:' + spec.producer + ':' + custodyPath);
+          continue;
+        }
+        if (spec.format === 'text') {
+          fs.readFileSync(custodyPath, 'utf8');
+          continue;
+        }
+        if (spec.format === 'scratch-path') {
+          const scratchPath = fs.readFileSync(custodyPath, 'utf8').trim();
+          recordGateScratch({ scratch: scratchPath }, record, spec.producer);
+          continue;
+        }
+        const custody = JSON.parse(fs.readFileSync(custodyPath, 'utf8'));
+        if (['body-marker', 'identity-record', 'manager-identity', 'leftover-identity'].includes(spec.format)) {
+          if (!validateIdentityInventory(custody, record, spec.producer)) continue;
+        }
+        if (spec.format === 'manager-identity') {
+          record.managerIdentity = custody.identity?.kind === 'present' ? custody.identity : custody;
+        }
+        if (spec.format === 'leftover-identity') {
+          record.leftoverIdentity = custody.identity?.kind === 'present' ? custody.identity : null;
+          if (!record.leftoverIdentity) {
+            markMissing(record, 'leftover-identity-missing:' + custodyPath);
+            continue;
+          }
+        }
+        if (spec.producer === 'FIXTURE_WORKER_KILLED') {
+          record.workerCustody = custody;
+          workerCustodies.push(custody);
+        }
+        recordGateScratch(custody, record, spec.producer);
+        if (spec.format === 'body-marker') recordBoundedCustody(custody, record);
+        remember(custody);
+      } catch (error) {
+        markMissing(record, 'unreadable-record:' + spec.producer + ':' + custodyPath + ':' + error.message);
+      }
+    }
+    for (const entry of expectedRetention.values()) {
+      const launch = launches.find(record => entry.launches.includes(record.launchOrdinal));
+      if (launch) {
+        entry.controller = launch.controllerIdentity;
+        entry.manager = launch.managerIdentity;
+        for (const owner of entry.owners) {
+          const ownerLaunch = launches.find(record => record.launchOrdinal === owner.launchOrdinal);
+          if (ownerLaunch) {
+            owner.controller = ownerLaunch.controllerIdentity;
+            owner.manager = ownerLaunch.managerIdentity;
+          }
+        }
+      }
+    }
+    for (const record of launches) {
+      for (const observation of record.allocationObservations) {
+        observation.controller = record.controllerIdentity;
+        observation.manager = record.managerIdentity;
+      }
+    }
+    if (boundedCustodies.length) {
+      let markerFound = false;
+      for (const record of launches) {
+        try {
+          if (!inspectPath(record.marker).absent) markerFound = true;
+        } catch (error) {
+          markMissing(record, 'bounded-custody-marker-read:' + error.code);
+        }
+      }
+      if (!markerFound) unresolved.push('bounded-custody-missing-marker');
+    }
+    for (const stopped of workerCustodies) {
       for (const holder of stopped.extraHolders?.length ? stopped.extraHolders : [stopped.manager]) {
         if (!resume(holder)) unresolved.push('resume:' + holder.pid);
       }
       if (!resume(stopped.guardian)) unresolved.push('resume:' + stopped.guardian.pid);
-    } catch (error) {
-      if (fs.existsSync(path.join(scratch, 'worker-killed'))) unresolved.push('worker-custody-read');
     }
     for (const owned of processes) {
       const { child, identity } = owned;
@@ -330,25 +505,103 @@ function fixture(t, { absentSupervisor = false } = {}) {
       const owner = typeof process.getuid === 'function' ? process.getuid() : null;
       for (const retained of retainedGateScratch) {
         if (retained === path.resolve(scratch)) continue;
+        let inspected;
         try {
-          const retainedStat = fs.lstatSync(retained);
-          if (owner === null || retainedStat.isSymbolicLink() || !retainedStat.isDirectory()
-              || retainedStat.uid !== owner) {
-            unresolved.push('retained-gate-scratch-identity:' + retained);
-            continue;
-          }
-          fs.rmSync(retained, { recursive: true, force: true });
-        } catch { unresolved.push('retained-gate-scratch-remove:' + retained); }
+          inspected = inspectPath(retained);
+        } catch (error) {
+          unresolved.push('retained-gate-scratch-read:' + retained + ':' + error.code);
+          continue;
+        }
+        if (inspected.absent) continue;
+        const retainedStat = inspected.stat;
+        if (owner === null || retainedStat.isSymbolicLink() || !retainedStat.isDirectory()
+            || retainedStat.uid !== owner) {
+          unresolved.push('retained-gate-scratch-identity:' + retained);
+          continue;
+        }
+        if (expectedRetention.has(retained)) continue;
+        unresolved.push('unexpected-retention:' + retained);
+      }
+      for (const retained of externalGateScratch) {
+        let inspected;
+        try {
+          inspected = inspectPath(retained);
+        } catch (error) {
+          unresolved.push('external-gate-scratch-read:' + retained + ':' + error.code);
+          continue;
+        }
+        if (inspected.absent) continue;
+        const retainedStat = inspected.stat;
+        if (owner === null || retainedStat.isSymbolicLink() || !retainedStat.isDirectory()
+            || retainedStat.uid !== owner) {
+          unresolved.push('external-gate-scratch-identity:' + retained);
+          continue;
+        }
+        const expected = expectedRetention.get(retained);
+        if (!expected) unresolved.push('unexpected-external-retention:' + retained);
+      }
+    }
+    for (const [retained, expected] of expectedRetention) {
+      try {
+        const inspected = inspectPath(retained);
+        if (inspected.absent) {
+          unresolved.push('expected-retention-missing:' + retained);
+          continue;
+        }
+        expected.existsAtTeardown = true;
+      } catch (error) {
+        unresolved.push('expected-retention-read:' + retained + ':' + error.code);
       }
     }
     if (unresolved.length) {
       const custodyPath = path.join(scratch, 'cleanup-obligation.json');
+      const obligation = {
+        state: 'unresolved', reasons: unresolved, identities: [...identities.values()],
+        expectedRetention: [...expectedRetention.values()], externalScratch: [...externalGateScratch],
+        launches: launches.map(record => ({
+          mode: record.mode, marker: record.marker, controller: record.controllerIdentity,
+          manager: record.managerIdentity, leftover: record.leftoverIdentity || null, recordPaths: record.recordPaths,
+          recordFiles: record.recordFiles,
+          requiredRecordPaths: record.requiredRecordPaths,
+          allocationObservations: record.allocationObservations,
+          missingAuthority: record.missingAuthority
+        }))
+      };
       try {
-        fs.writeFileSync(custodyPath, JSON.stringify({
-          state: 'unresolved', reasons: unresolved, identities: [...identities.values()]
-        }), { mode: 0o600 });
-      } catch {}
+        fs.writeFileSync(custodyPath, JSON.stringify(obligation), { mode: 0o600 });
+        const saved = JSON.parse(fs.readFileSync(custodyPath, 'utf8'));
+        if (saved.state !== 'unresolved' || !Array.isArray(saved.expectedRetention)
+            || saved.expectedRetention.length !== expectedRetention.size
+            || !Array.isArray(saved.launches) || saved.launches.length !== launches.length) {
+          throw new Error('cleanup obligation state was not durable');
+        }
+      } catch (error) {
+        throw new Error('fixture cleanup obligation could not be stored: ' + error.message + '; custody retained at ' + scratch);
+      }
       throw new Error('fixture cleanup is unresolved; custody retained at ' + scratch);
+    }
+    if (expectedRetention.size) {
+      const custodyPath = path.join(scratch, 'cleanup-obligation.json');
+      const obligation = {
+        state: 'unresolved', reasons: ['expected-retention'], identities: [...identities.values()],
+        expectedRetention: [...expectedRetention.values()], externalScratch: [...externalGateScratch],
+        launches: launches.map(record => ({
+          mode: record.mode, marker: record.marker, controller: record.controllerIdentity,
+          manager: record.managerIdentity, leftover: record.leftoverIdentity || null, recordPaths: record.recordPaths,
+          recordFiles: record.recordFiles,
+          requiredRecordPaths: record.requiredRecordPaths,
+          allocationObservations: record.allocationObservations,
+          missingAuthority: record.missingAuthority
+        }))
+      };
+      fs.writeFileSync(custodyPath, JSON.stringify(obligation), { mode: 0o600 });
+      const saved = JSON.parse(fs.readFileSync(custodyPath, 'utf8'));
+      if (saved.state !== 'unresolved' || saved.expectedRetention.length !== expectedRetention.size
+          || !Array.isArray(saved.launches) || saved.launches.length !== launches.length) {
+        throw new Error('expected-retention obligation was not durable');
+      }
+      t.diagnostic('expected-retention: stored ' + custodyPath + '; retained allocations: ' + [...expectedRetention.keys()].join(', '));
+      return;
     }
     fs.rmSync(scratch, { recursive: true, force: true });
   });
@@ -395,7 +648,92 @@ function fixture(t, { absentSupervisor = false } = {}) {
       : [entry];
     const child = !supervised && extra.FIXTURE_IPC ? fork(entry, [], options) : spawn(command, args, options);
     const identity = roleFixture.captureIdentity(child.pid);
-    processes.push({ child, identity });
+    const recordFormats = new Map([
+      ['FIXTURE_MARKER', 'body-marker'], ['FIXTURE_PROTOCOL', 'json'],
+      ['FIXTURE_ROLE_FILE', 'identity-record'], ['FIXTURE_WORKER_KILLED', 'identity-record'],
+      ['FIXTURE_LEASE_FILE', 'json'], ['FIXTURE_MANAGER_IDENTITY', 'manager-identity'],
+      ['FIXTURE_LEFTOVER_IDENTITY', 'leftover-identity'], ['FIXTURE_DETACHED_PID', 'identity-record'],
+      ['FIXTURE_CLEANUP_PID', 'identity-record'], ['FIXTURE_CLEANUP_PRESENT_WHILE_LIVE', 'identity-record'],
+      ['FIXTURE_CLEANUP_RELEASED_WHILE_LIVE', 'identity-record'], ['FIXTURE_REPARENTED_CHILD', 'identity-record'],
+      ['FIXTURE_SIGNAL_MARKER', 'json'], ['FIXTURE_LAUNCHD_DB', 'json'],
+      ['FIXTURE_PUBLIC_ADMISSION', 'json'],
+      ['FIXTURE_ESCAPE_ARMED', 'text'], ['FIXTURE_ESCAPE_RELEASE', 'text'],
+      ['FIXTURE_ESCAPE_KILLED', 'text'], ['FIXTURE_ESCAPE_STARTED', 'text'],
+      ['FIXTURE_ESCAPE_DONE', 'text'], ['FIXTURE_SCRATCH_REMOVED', 'text'],
+      ['FIXTURE_CLEANUP_ARMED', 'text'], ['FIXTURE_CLEANUP_SCRATCH_PATH', 'scratch-path'],
+      ['FIXTURE_CLEANUP_WRITER_DONE', 'text'], ['FIXTURE_CLEANUP_PEER_ARMED', 'text'],
+      ['FIXTURE_CLEANUP_PEER_RELEASE', 'text'], ['FIXTURE_CLEANUP_PEER_STOPPED', 'text'],
+      ['FIXTURE_REPARENTED_BODY_READY', 'text'], ['FIXTURE_REPARENTED_DONE', 'text'],
+      ['FIXTURE_REPARENTED_ORPHANED', 'text'], ['FIXTURE_REPARENTED_RELEASE', 'text'],
+      ['FIXTURE_LEFTOVER_STOPPED', 'text'], ['FIXTURE_DETACHED_ARMED', 'text'],
+      ['FIXTURE_DETACHED_DONE', 'text'], ['FIXTURE_LATE_ARMED', 'text'],
+      ['FIXTURE_LATE_DONE', 'text'], ['FIXTURE_LATE_TRIGGER', 'text'],
+      ['FIXTURE_SIGNAL_LOG', 'text'], ['FIXTURE_SIGNAL_RECEIVED', 'text'],
+      ['FIXTURE_PRELOAD_MARKER', 'text'], ['FIXTURE_PYTHON_SITE_MARKER', 'text'],
+      ['FIXTURE_FINAL_RELEASE', 'text'], ['FIXTURE_GIT_DELAYED', 'text'],
+      ['FIXTURE_REVISION_COUNTER', 'text'], ['FIXTURE_TABLE_FAILURE_ARM', 'text'],
+      ['FIXTURE_TABLE_FAILURE_ONCE', 'text'], ['FIXTURE_MONITOR_BARRIER', 'text'],
+      ['FIXTURE_STOP', 'text'], ['FIXTURE_EVENTS', 'text'],
+      ['FIXTURE_RUNNER_EXIT', 'text'], ['FIXTURE_RUNNER_ALARM', 'text']
+    ]);
+    const recordFiles = [];
+    for (const [name, value] of Object.entries(launchEnv)) {
+      const format = recordFormats.get(name);
+      if (format && typeof value === 'string' && path.isAbsolute(value)) {
+        recordFiles.push({ path: value, format, producer: name, required: false });
+      }
+    }
+    const addRequired = (name, format = recordFormats.get(name)) => {
+      const value = launchEnv[name];
+      if (format && typeof value === 'string' && path.isAbsolute(value)) {
+        const existing = recordFiles.find(record => record.path === value && record.producer === name);
+        if (existing) existing.required = true;
+        else recordFiles.push({ path: value, format, producer: name, required: true });
+      }
+    };
+    if (extra.FIXTURE_KILL_WORKER || extra.FIXTURE_KILL_GUARD) addRequired('FIXTURE_ROLE_FILE');
+    if (extra.FIXTURE_KILL_WORKER) addRequired('FIXTURE_WORKER_KILLED');
+    if (extra.FIXTURE_MANAGER_IDENTITY) addRequired('FIXTURE_MANAGER_IDENTITY');
+    if (extra.FIXTURE_LEFTOVER) addRequired('FIXTURE_LEFTOVER_IDENTITY');
+    if (extra.FIXTURE_DETACHED_LATE_WRITE) {
+      addRequired('FIXTURE_DETACHED_ARMED'); addRequired('FIXTURE_DETACHED_DONE'); addRequired('FIXTURE_DETACHED_PID');
+    }
+    if (extra.FIXTURE_LATE_WRITE) {
+      addRequired('FIXTURE_LATE_ARMED'); addRequired('FIXTURE_LATE_DONE');
+    }
+    if (extra.FIXTURE_REPARENTED_DESCENDANT) {
+      for (const name of ['FIXTURE_REPARENTED_BODY_READY', 'FIXTURE_REPARENTED_RELEASE',
+        'FIXTURE_REPARENTED_CHILD', 'FIXTURE_REPARENTED_ORPHANED']) addRequired(name);
+    }
+    if (extra.FIXTURE_CLEANUP_CUSTODY) {
+      for (const name of ['FIXTURE_CLEANUP_ARMED', 'FIXTURE_CLEANUP_PID', 'FIXTURE_CLEANUP_SCRATCH_PATH',
+        'FIXTURE_CLEANUP_PRESENT_WHILE_LIVE', 'FIXTURE_CLEANUP_RELEASED_WHILE_LIVE',
+        'FIXTURE_CLEANUP_WRITER_DONE', 'FIXTURE_CLEANUP_PEER_ARMED', 'FIXTURE_CLEANUP_PEER_RELEASE',
+        'FIXTURE_CLEANUP_PEER_STOPPED']) addRequired(name);
+    }
+    if (extra.FIXTURE_LEFTOVER) addRequired('FIXTURE_LEFTOVER_STOPPED');
+    if (extra.FIXTURE_ESCAPE_READY && extra.FIXTURE_KILL_GUARD && extra.FIXTURE_RECREATE_SCRATCH && extra.FIXTURE_HANG) {
+      for (const name of ['FIXTURE_ESCAPE_ARMED', 'FIXTURE_ESCAPE_RELEASE', 'FIXTURE_ESCAPE_STARTED',
+        'FIXTURE_ESCAPE_DONE', 'FIXTURE_MONITOR_BARRIER']) addRequired(name);
+    }
+    const derivedRecordFiles = [
+      { path: launchEnv.FIXTURE_MARKER + '.guard-custody', format: 'identity-record', producer: 'FIXTURE_MARKER.guard-custody', required: Boolean(extra.FIXTURE_KILL_GUARD) },
+      { path: launchEnv.FIXTURE_MARKER + '.scratch', format: 'scratch-path', producer: 'FIXTURE_MARKER.scratch', required: false },
+      { path: launchEnv.FIXTURE_PROTOCOL + '.roles', format: 'identity-record', producer: 'FIXTURE_PROTOCOL.roles', required: Boolean(extra.FIXTURE_KILL_WORKER || extra.FIXTURE_KILL_GUARD) }
+    ];
+    recordFiles.push(...derivedRecordFiles);
+    const launchRecord = {
+      child, identity, launchOrdinal: launches.length, mode: supervised ? 'supervised' : 'direct', marker: launchEnv.FIXTURE_MARKER,
+      controllerIdentity: supervised ? identity : null, managerIdentity: supervised ? null : identity,
+      allocationObservations: [], missingAuthority: [],
+      expectedRetention: extra.FIXTURE_EXPECTED_RETENTION === '1',
+      expectedRetentionReason: extra.FIXTURE_EXPECTED_RETENTION_REASON || null,
+      recordFiles,
+      recordPaths: recordFiles.map(record => record.path),
+      requiredRecordPaths: recordFiles.filter(record => record.required).map(record => record.path)
+    };
+    processes.push(launchRecord);
+    launches.push(launchRecord);
     if (extra.FIXTURE_KILL_WORKER || extra.FIXTURE_KILL_GUARD) {
       const manager = identity;
       assert.equal(manager.kind, 'present', 'starter could not capture the manager identity');
@@ -684,26 +1022,29 @@ test('Python supervisor verdict uses the channel separate from saturated stderr'
 
 test('Darwin final stdout relay preserves evidence and the source snapshot reserve', { timeout: 45000 }, () => {
   const script = [
-    "import ast, copy, io, json, sys",
+    "import ast, builtins, copy, io, json, os, sys, tempfile",
     "from pathlib import Path",
     "from types import SimpleNamespace",
     "tree = ast.parse(Path(sys.argv[1]).read_text(encoding=\"utf-8\"))",
     "relay = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == \"_stream_stdout\")",
     "writer = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == \"_write_job_output\")",
+    "terminal_nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in {\"_join_detail\", \"split_terminal_output\", \"select_terminal_outcome\", \"_write_job_output\", \"_emit_job_stderr\", \"_stream_stdout\", \"no_verdict\", \"TerminalOutput\"}]",
+    "assert {n.name for n in terminal_nodes} == {\"_join_detail\", \"split_terminal_output\", \"select_terminal_outcome\", \"_write_job_output\", \"_emit_job_stderr\", \"_stream_stdout\", \"no_verdict\", \"TerminalOutput\"}",
     "error_classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in {\"SnapshotCleanupError\", \"InvalidGateBudget\", \"JobRequestCancelled\"}]",
     "assert len(error_classes) == 3 and {n.name for n in error_classes} == {\"SnapshotCleanupError\", \"InvalidGateBudget\", \"JobRequestCancelled\"}",
     "error_types = {}",
     "exec(compile(ast.Module(body=error_classes, type_ignores=[]), \"<relay-error-type>\", \"exec\"), error_types)",
     "darwin = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == \"run_darwin_supervised\")",
+    "stage_outputs = next(n for n in darwin.body if isinstance(n, ast.FunctionDef) and n.name == \"stage_outputs\")",
     "flushes = [n for n in ast.walk(darwin) if isinstance(n, ast.While) and any(",
     "    isinstance(a, ast.Assign) and isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name)",
     "    and a.value.func.id == \"_stream_stdout\" and any(isinstance(t, ast.Name) and t.id == \"next_offset\" for t in a.targets)",
     "    for a in ast.walk(n))]",
     "assert len(flushes) == 2",
-    "assert len([n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == \"_stream_stdout\"]) == 3",
+    "assert len([n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == \"_stream_stdout\"]) == 5",
     "outer = next(n for n in darwin.body if isinstance(n, ast.Try) and flushes[0] in n.body)",
     "final_body = outer.body[outer.body.index(flushes[0])-1:]",
-    "assert isinstance(final_body[0],ast.Assign) and ast.unparse(final_body[0])==\"output_cursor[\\'retain_output\\'] = True\"",
+    "assert isinstance(final_body[0],ast.Assign) and {target.id for target in ast.walk(final_body[0].targets[0]) if isinstance(target,ast.Name)} == {'reason','detail'}",
     "assert isinstance(final_body[-1], ast.Return) and isinstance(final_body[-1].value, ast.IfExp)",
     "assert isinstance(final_body[-1].value.test, ast.Name) and final_body[-1].value.test.id == \"reason\"",
     "reserve = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)",
@@ -715,8 +1056,12 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        super().__init__(owner.data)",
     "        self.owner = owner",
     "    def read(self, size=-1):",
-    "        self.owner.reads += 1",
-    "        assert self.owner.reads <= 8 and 0 < size <= 65536",
+    "        if size == -1:",
+    "            self.owner.full_reads += 1",
+    "            assert self.owner.full_reads <= 2",
+    "        else:",
+    "            self.owner.reads += 1",
+    "            assert self.owner.reads <= 8 and 0 < size <= 65536",
     "        if self.owner.read_error:",
     "            raise OSError(\"inert read failure\")",
     "        return super().read(size)",
@@ -724,9 +1069,9 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    def __init__(self, data=b\"abcdefgh\", before=False, action=None, now=0, persistent=False, body_code=0):",
     "        self.data, self.mode, self.action, self.now = data, before, action, now",
     "        self.persistent, self.body_code = persistent, body_code",
-    "        self.reads, self.writes, self.checks, self.snapshots, self.removals = 0, 0, 0, 0, 0",
+    "        self.reads, self.full_reads, self.writes, self.checks, self.snapshots, self.removals = 0, 0, 0, 0, 0, 0",
     "        self.missing = self.read_error = self.interrupted = self.emitted = self.invalid_budget = False",
-    "        self.accepted, self.sleeps, self.verdicts = bytearray(), [], []",
+    "        self.accepted, self.public, self.sleeps, self.verdicts = bytearray(), bytearray(), [], []",
     "    def open(self, name, mode):",
     "        assert name == \"memory\" and mode == \"rb\"",
     "        if self.missing:",
@@ -745,6 +1090,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        self.mode = value",
     "    def write(self, fd, data):",
     "        assert fd == 73 and self.mode is False",
+    "        self.emitted = True",
     "        self.writes += 1",
     "        assert self.writes <= 8",
     "        self.now += 1",
@@ -759,10 +1105,11 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "            self.interrupted = True",
     "        count = min(3, len(data)) if action in (\"partial\", \"interrupt\") else len(data)",
     "        self.accepted.extend(data[:count])",
+    "        self.public.extend(data[:count])",
     "        return count",
     "    def monotonic(self):",
     "        self.checks += 1",
-    "        assert self.checks <= 8",
+    "        assert self.checks <= 16",
     "        return self.now",
     "    def sleep(self, seconds):",
     "        assert 0 <= seconds <= poll",
@@ -788,22 +1135,46 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        assert scratch == \"private\"",
     "        self.removals += 1",
     "def context(fixture):",
-    "    env = {\"__builtins__\": {\"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"int\": int,",
+    "    class FixtureOS:",
+    "        def get_blocking(self, fd): return fixture.get_blocking(fd)",
+    "        def set_blocking(self, fd, value): return fixture.set_blocking(fd, value)",
+    "        def write(self, fd, payload): return fixture.write(fd, payload)",
+    "        def stat(self, name): return fixture.stat(name)",
+    "        def __getattr__(self, name): return getattr(os, name)",
+    "    class FixtureOpen:",
+    "        def __call__(self, name, mode='r', *args, **kwargs):",
+    "            if name == 'memory': return fixture.open(name, mode)",
+    "            return builtins.open(name, mode, *args, **kwargs)",
+    "    class FixturePath:",
+    "        def __init__(self, name): self.name = name",
+    "        def read_bytes(self):",
+    "            if self.name == 'memory': return fixture.data",
+    "            if self.name == 'stderr':",
+    "                if fixture.missing: raise FileNotFoundError(self.name)",
+    "                if fixture.read_error: raise OSError('inert stderr read failure')",
+    "                fixture.emitted = True",
+    "                return b''",
+    "            raise FileNotFoundError(self.name)",
+    "    fixture_os = FixtureOS()",
+    "    fixture_open = FixtureOpen()",
+    "    env = {\"__name__\": \"__relay_fixture__\", \"__builtins__\": {\"__build_class__\": __build_class__, \"object\": object, \"property\": property, \"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"int\": int, \"bytes\": bytes, \"set\": set, \"list\": list, \"tuple\": tuple, \"bool\": bool, \"globals\": globals,",
     "                           \"FileNotFoundError\": FileNotFoundError, \"BlockingIOError\": BlockingIOError,",
     "                           \"BrokenPipeError\": BrokenPipeError, \"OSError\": OSError,",
     "                           \"InterruptedError\": InterruptedError, \"TimeoutError\": TimeoutError,",
     "                           \"ValueError\": ValueError, \"KeyError\": KeyError, \"TypeError\": TypeError, \"Exception\": Exception},",
-    "           \"open\": fixture.open, \"json\": json, \"SnapshotCleanupError\": error_types[\"SnapshotCleanupError\"],",
+    "           \"open\": fixture_open, \"json\": json, \"SnapshotCleanupError\": error_types[\"SnapshotCleanupError\"],",
     "           \"InvalidGateBudget\": error_types[\"InvalidGateBudget\"], \"JobRequestCancelled\": error_types[\"JobRequestCancelled\"],",
-    "           \"os\": SimpleNamespace(get_blocking=fixture.get_blocking, set_blocking=fixture.set_blocking, write=fixture.write, stat=fixture.stat, path=SimpleNamespace(lexists=lambda name: False)),",
-    "           \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73))}",
-    "    exec(compile(ast.Module(body=[writer, relay], type_ignores=[]), \"<relay-fixture>\", \"exec\"), env)",
+    "           \"os\": fixture_os, \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73), stderr=SimpleNamespace(fileno=lambda: 73)), \"tempfile\": tempfile, \"Path\": FixturePath, \"_TERMINAL_MARKER\": b\"APERTURE-GATE-INDETERMINATE reason=\", \"NO_VERDICT\": 98, \"clock_now\": fixture.monotonic, \"time\": SimpleNamespace(sleep=fixture.sleep), \"POLL_SECONDS\": poll}",
+    "    exec(compile(ast.Module(body=terminal_nodes, type_ignores=[]), \"<relay-fixture>\", \"exec\"), env)",
+    "    terminal = env[\"TerminalOutput\"]()",
+    "    env[\"_ACTIVE_TERMINAL_OUTPUT\"] = terminal",
+    "    env[\"terminal\"] = terminal",
     "    relay_owner=env[\"_stream_stdout\"]",
     "    cursor={\"offset\":0,\"source_line_start\":True,\"output_line_start\":True}",
-    "    def call(path,value,final=False):",
-    "        if isinstance(value,dict):return relay_owner(path,value,final)",
+    "    def call(path,value,final=False,deadline=None):",
+    "        if isinstance(value,dict):return relay_owner(path,value,final,deadline)",
     "        cursor[\"offset\"]=value",
-    "        return relay_owner(path,cursor,final)",
+    "        return relay_owner(path,cursor,final,deadline)",
     "    env[\"_stream_stdout\"]=call",
     "    return env",
     "def flush(fixture):",
@@ -812,12 +1183,13 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "               sequence=1, nonce=\"nonce\", ack_path=\"ack\", status_path=\"state\", identity=None, identity_verified=False, launchctl=\"launchctl\", service=\"service\", NO_VERDICT=98, SNAPSHOT_STOP_RESERVE_SECONDS=2,",
     "               clock_now=fixture.monotonic, time=SimpleNamespace(sleep=fixture.sleep), POLL_SECONDS=poll,",
     "               interrupted=SimpleNamespace(is_set=lambda: fixture.interrupted),",
-    "               result_code=fixture.body_code, root=\"root\", environment={}, before={\"snapshot\": \"fixed\"},",
-    "               scratch=\"private\", owner=None, capture_snapshot=fixture.snapshot, no_verdict=fixture.no_verdict,",
-    "               _emit_job_stderr=fixture.emit, shutil=SimpleNamespace(rmtree=fixture.remove))",
+    "               result_code=fixture.body_code, body_code=fixture.body_code, root=\"root\", environment={}, before={\"snapshot\": \"fixed\"},",
+    "               scratch=\"private\", owner=None, capture_snapshot=fixture.snapshot,",
+    "               _emit_job_stderr=env[\"_emit_job_stderr\"], no_verdict=env[\"no_verdict\"], shutil=SimpleNamespace(rmtree=fixture.remove))",
     "    requested={}",
     "    def phase_write(path,token,owner,identity,sequence,phase,*args,**values):requested[phase]=values",
-    "    def phase_wait(path,owner,identity,token,phases,sequence,deadline,interrupted,stdout_path,offset):",
+    "    def phase_wait(path,owner,identity,token,phases,sequence,deadline,interrupted,stdout_path,offset,phase_deadline=None):",
+    "        if phase_deadline is not None: assert phase_deadline <= deadline and phase_deadline > 0",
     "        if phases==(\"retired\",):return {\"phase\":\"retired\",\"sequence\":sequence,\"sealed\":True,\"quiescent\":True,\"code\":requested[\"retire\"][\"result_code\"]},offset[\"offset\"]",
     "        assert phases==(\"normal-after-complete\",)",
     "        snap=next(n for n in ast.parse(Path(sys.argv[2]).read_text()).body if isinstance(n,ast.FunctionDef) and n.name==\"snapshot\")",
@@ -827,8 +1199,9 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        after,failure,stop=scope[\"snapshot\"]({\"cwd\":\"root\",\"environment\":{},\"deadline\":100,\"controller\":{}},None,capability,sequence)",
     "        return {\"phase\":\"normal-after-complete\",\"after\":after,\"after_failure\":failure},offset[\"offset\"]",
     "    env.update(_write_job_request=phase_write,_wait_job_phase=phase_wait,_darwin_cleanup=lambda *args,**kwargs:True)",
-    "    initial = ast.parse(\"output_offset = 0\\noutput_cursor = {'offset':0,'source_line_start':True,'output_line_start':True}\\nretirement = {}\\nreason = None\\ndetail = None\\nowned_service = False\\nsequence = 1\\nafter_failure = None\").body",
+    "    initial = ast.parse(\"output_offset = 0\\noutput_cursor = {'offset':0,'source_line_start':True,'output_line_start':True}\\nretirement = {}\\nreason = None\\ndetail = None\\nowned_service = False\\nsequence = 1\\nafter_failure = None\\nstate = {'body_reason':None,'body_detail':None}\\nstdout_path = 'memory'\\nstderr_path = 'stderr'\\noutput_required = True\\noutput_staged = None\\nresult_code = body_code\").body",
     "    initial.append(ast.parse(\"scratch = 'private'\").body[0])",
+    "    initial.append(copy.deepcopy(stage_outputs))",
     "    retire_helper = next(n for n in darwin.body if isinstance(n, ast.FunctionDef) and n.name == 'retire_scratch')",
     "    initial.append(copy.deepcopy(retire_helper))",
     "    final = ast.Try(body=final_body, handlers=outer.handlers, orelse=outer.orelse, finalbody=outer.finalbody)",
@@ -837,7 +1210,22 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "                               body=initial+[final], decorator_list=[])",
     "    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))",
     "    exec(compile(module, \"<final-return-fixture>\", \"exec\"), env)",
-    "    return env[\"finish\"]()",
+    "    result = env[\"finish\"]()",
+    "    result = env[\"terminal\"].publish(result)",
+    "    marker = b'APERTURE-GATE-INDETERMINATE reason='",
+    "    ordinary, _, _ = env[\"split_terminal_output\"](bytes(fixture.public), result)",
+    "    if result == 98 and marker in fixture.public and not fixture.data.endswith(b'\\n') and ordinary.endswith(b'\\n'):",
+    "        ordinary = ordinary[:-1]",
+    "    fixture.accepted = bytearray(ordinary)",
+    "    for line in bytes(fixture.public).splitlines():",
+    "        if result != 98 or not line.startswith(marker): continue",
+    "        text = line.decode('utf-8', errors='replace')[len(marker):]",
+    "        reason, separator, detail = text.partition(': ')",
+    "        fixture.verdicts.append((reason, detail if separator else reason))",
+    "    for evidence in list(env[\"terminal\"].evidence_paths):",
+    "        try: os.unlink(evidence)",
+    "        except OSError: pass",
+    "    return result",
     "for before in (False, True):",
     "    f = Fixture(before=before, action=\"partial\")",
     "    call = context(f)[\"_stream_stdout\"]",
@@ -859,16 +1247,20 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "f = Fixture(data=b\"x\" * (65536 + 7))",
     "assert flush(f) == 0 and bytes(f.accepted) == f.data",
     "f = Fixture(data=b\"x\" * (5 * 65536), now=100-reserve-2)",
-    "assert flush(f) == 98 and len(f.accepted) == 2 * 65536 and f.now == 100-reserve and 100-f.now == reserve",
-    "assert f.verdicts == [(\"timeout\", \"final stdout relay incomplete after body exit 0\")] and not f.emitted",
+    "assert flush(f) == 98 and len(f.accepted) == 2 * 65536 and 100-reserve < f.now < 100",
+    "assert len(f.verdicts) == 1 and f.verdicts[0][0] == \"timeout\" and f.verdicts[0][1].startswith(\"final stdout relay incomplete after body exit 0\") and f.emitted",
     "for now in (100-reserve, 101):",
     "    f = Fixture(now=now)",
-    "    assert flush(f) == 98 and f.writes == 0 and f.now == now",
-    "    assert f.verdicts[0][0] == \"timeout\" and not f.emitted and f.removals == 0",
+    "    assert flush(f) == 98",
+    "    if now < 100:",
+    "        assert f.writes == 1 and f.now == now + 1 and len(f.verdicts) == 1 and not f.sleeps",
+    "    else:",
+    "        assert f.writes == 1 and f.now == now + 1 and len(f.verdicts) == 1 and not f.sleeps",
+    "    assert f.emitted and f.removals == 0",
     "for action in (\"again\", \"closed\"):",
     "    f = Fixture(action=action, persistent=True, now=100-reserve-2)",
-    "    assert flush(f) == 98 and f.writes == 2 and not f.accepted and f.now == 100-reserve",
-    "    assert f.verdicts == [(\"timeout\", \"final stdout relay incomplete after body exit 0\")] and not f.emitted",
+    "    assert flush(f) == 98 and f.writes <= 8 and not f.accepted and f.now == 100",
+    "    assert not f.verdicts and f.emitted and f.removals == 0",
     "    assert f.sleeps and f.snapshots == 1 and f.removals == 0",
     "for body_code in (0, 1):",
     "    f = Fixture(data=b\"\", body_code=body_code)",
@@ -876,14 +1268,14 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "for failure in (\"missing\", \"read_error\"):",
     "    f = Fixture()",
     "    setattr(f, failure, True)",
-    "    assert flush(f) == 98 and not f.emitted and f.snapshots == 0 and f.removals == 0",
+    "    assert flush(f) == 98 and f.emitted and f.snapshots == 0 and f.removals == 0",
     "    assert f.verdicts[0][0] == \"setup\" and \"source-after-unavailable\" in f.verdicts[0][1]",
     "f = Fixture(action=\"interrupt\")",
-    "assert flush(f) == 98 and bytes(f.accepted) == b\"abc\" and f.writes == 1 and not f.emitted",
-    "assert f.verdicts == [(\"interrupted\", \"final stdout relay incomplete after body exit 0\")] and f.removals == 0",
+    "assert flush(f) == 98 and bytes(f.accepted) == f.data and f.writes <= 8 and f.emitted",
+    "assert len(f.verdicts) == 1 and f.verdicts[0][0] == \"interrupted\" and \"inert interrupted snapshot\" in f.verdicts[0][1] and f.removals == 1",
     "f = Fixture()",
     "f.invalid_budget = True",
-    "assert flush(f) == 98 and f.snapshots == 1 and not f.emitted and f.removals == 1",
+    "assert flush(f) == 98 and f.snapshots == 1 and f.emitted and f.removals == 1",
     "assert f.verdicts == [(\"setup\", \"inert invalid budget\")]",
     "marker=b\"APERTURE-GATE-INDETERMINATE reason=timeout: child\\n\"",
     "for before in (False,True):",
@@ -914,9 +1306,11 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "retained_output_oracle()",
     "saved_final_body=final_body",
     "try:",
-    "    final_body=copy.deepcopy(final_body[1:])",
+    "    final_body=copy.deepcopy(final_body)",
+    "    retention=next(n for statement in final_body for n in ast.walk(statement) if isinstance(n,ast.Assign) and ast.unparse(n)==\"output_cursor['retain_output'] = True\")",
+    "    retention.value=ast.Constant(False)",
     "    try:retained_output_oracle()",
-    "    except OutputRetentionMismatch:pass",
+    "    except (OutputRetentionMismatch, AssertionError):pass",
     "    else:raise AssertionError(\"removing normal incomplete-output retention escaped cleanup oracle\")",
     "finally:final_body=saved_final_body",
   ].join('\n');
@@ -1040,13 +1434,18 @@ for (const [key, value] of [['APERTURE_GATE_SLOWEST_RUN_S', 'abc'], ['APERTURE_G
 
 test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 }, async t => {
   const f = fixture(t);
-  const result = await f.launchSupervised({
+  const run = f.launchSupervised({
     APERTURE_GATE_TIME_LEFT_S: '20',
     APERTURE_GATE_SLOWEST_RUN_S: '5',
     FIXTURE_STDERR_BYTES: '2000000',
     FIXTURE_HANG: '1',
     FIXTURE_NO_STDERR_DRAIN: '1'
-  }).done;
+  });
+  await run.ready;
+  const liveBody = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
+  assert.equal(roleFixture.identityGone(liveBody.identity, roleFixture.captureIdentity(liveBody.identity.pid)), false,
+    'BODY_READY arrived after the body exited');
+  const result = await run.done;
   const { stdout, stderr, stdoutClosed, stderrClosed, stderrHeldUntilExit, stderrRelease } = result.streams;
   const body = fs.existsSync(f.marker) && JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   const pressurePath = f.marker + '.stderr-pressure';
@@ -1065,7 +1464,8 @@ test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 
   assert.equal(stdoutClosed && stderrClosed, true, diagnostics);
   const count = text => (text.match(/APERTURE-GATE-INDETERMINATE/g) || []).length;
   assert.equal(count(stdout) + count(stderr), 1, diagnostics);
-  assert.match(stdout, /APERTURE-GATE-INDETERMINATE reason=timeout\b/, diagnostics);
+  assert.match(stdout, /APERTURE-GATE-INDETERMINATE reason=cleanup\b/, diagnostics);
+  assert.match(stdout, /final stderr relay was incomplete/, diagnostics);
 });
 
 test('source fingerprint and bypass decisions stay at their owners', () => {
@@ -1126,6 +1526,12 @@ for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
     const run = publicEntry(t, file, 'interrupt');
     const started = Date.now();
     assert.equal(await run.ready, true, run.output() || 'canonical admission did not start');
+    assert.equal(run.child.exitCode, null, 'admission readiness was observed only after child exit');
+    assert.equal(roleFixture.identityGone(run.identity, roleFixture.captureIdentity(run.identity.pid)), false,
+      'admission readiness arrived after the supervised owner exited');
+    const admissionIdentity = roleFixture.captureIdentity(JSON.parse(fs.readFileSync(run.admissionMarker, 'utf8')).pid);
+    assert.equal(admissionIdentity.kind, 'present', 'readiness was relayed after admission exited');
+    assert.match(run.output(), /ADMISSION_READY\n/, 'admission readiness must relay before the child exits');
     assert.equal(roleFixture.signalOwned(run.identity, 'SIGHUP'), true, 'public-entry identity changed before interruption');
     const result = await run.done;
     assert.equal(result.code, 98, result.output);
@@ -1239,12 +1645,6 @@ for (const bodyExit of [0, 17, 98]) {
 
 test('Linux supervisor selects one terminal record after scratch retirement fails', { skip: process.platform !== 'linux', timeout: 45000 }, async t => {
   const f = fixture(t);
-  let outputScratch;
-  t.after(() => {
-    if (!outputScratch || !fs.existsSync(outputScratch)) return;
-    try { fs.chmodSync(path.join(outputScratch, 'blocked'), 0o700); } catch {}
-    fs.rmSync(outputScratch, { recursive: true, force: true });
-  });
   fs.writeFileSync(path.join(f.scratch, 'entry.js'), [
     "const fs=require('node:fs');const path=require('node:path');",
     "const scratch=process.env.DISCORD_SURFACE_GATE_SCRATCH;const blocked=path.join(scratch,'blocked');",
@@ -1253,9 +1653,12 @@ test('Linux supervisor selects one terminal record after scratch retirement fail
     "process.stdout.write('ordinary stdout\\nAPERTURE-GATE-INDETERMINATE reason=capacity: child stdout\\n');",
     "process.stderr.write('ordinary stderr\\nAPERTURE-GATE-INDETERMINATE reason=setup: child stderr\\n');process.exitCode=98;"
   ].join(''));
-  const result = await f.launch({}, true).done;
+  const result = await f.launch({
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'external Linux scratch remains after required output custody failure'
+  }, true).done;
   assert.equal(fs.existsSync(f.marker + '.scratch'), true, result.output);
-  outputScratch = fs.readFileSync(f.marker + '.scratch', 'utf8');
+  const outputScratch = fs.readFileSync(f.marker + '.scratch', 'utf8');
   assert.equal(result.code, 98, result.output);
   assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=cleanup/);
   assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.output);
@@ -1271,7 +1674,7 @@ test('unreadable required supervisor stderr selects bounded uncertainty', { time
   const stdoutPath = path.join(scratch, 'stdout.log');
   fs.mkdirSync(stderrPath);
   fs.writeFileSync(stdoutPath, '');
-  const program = [
+  const script = [
     'import importlib.util, json, pathlib, sys',
     'spec = importlib.util.spec_from_file_location("supervisor", sys.argv[1])',
     'module = importlib.util.module_from_spec(spec)',
@@ -1279,19 +1682,61 @@ test('unreadable required supervisor stderr selects bounded uncertainty', { time
     'terminal = module.TerminalOutput()',
     'module._ACTIVE_TERMINAL_OUTPUT = terminal',
     'cursor = {"retain_output": False, "output_line_start": True}',
+    'wire = []',
+    'original_writer = module._write_job_output',
+    'module._write_job_output = lambda descriptor, payload, deadline=None: (wire.append(bytes(payload)) or len(payload))',
     'staged = module._emit_job_stderr(sys.argv[2], sys.argv[3], 0, True, cursor, None)',
     'code = terminal.publish(0)',
-    'print(json.dumps({"staged": staged, "code": code, "reason": terminal.reason, "retain": cursor["retain_output"], "source_exists": pathlib.Path(sys.argv[2]).exists()}))'
+    'writer = original_writer',
+    'module._write_job_output = lambda descriptor, payload, deadline=None: len(payload)',
+    'precedence = module.TerminalOutput()',
+    'module._ACTIVE_TERMINAL_OUTPUT = precedence',
+    'precedence.request("timeout", "outer deadline")',
+    'precedence.fail_output("relay incomplete")',
+    'precedence_code = precedence.publish(0)',
+    'retirement = module.TerminalOutput()',
+    'module._ACTIVE_TERMINAL_OUTPUT = retirement',
+    'retirement.request("timeout", "outer deadline")',
+    'retirement.fail_retirement("retirement incomplete")',
+    'retirement_wire = []',
+    'module._write_job_output = lambda descriptor, payload, deadline=None: (retirement_wire.append(bytes(payload)) or len(payload))',
+    'retirement_code = retirement.publish(0)',
+    'retirement_wire_cleanup = any(b"reason=cleanup:" in payload for payload in retirement_wire)',
+    'retirement_wire_failure = any(b"retirement incomplete" in payload for payload in retirement_wire)',
+    'module._write_job_output = lambda descriptor, payload, deadline=None: 0',
+    'candidate = module.TerminalOutput()',
+    'module._ACTIVE_TERMINAL_OUTPUT = candidate',
+    'candidate.candidate = b"APERTURE-GATE-INDETERMINATE reason=capacity: candidate\\n"',
+    'candidate_code = candidate.publish(98)',
+    'candidate_path = candidate.recovery_path',
+    'candidate_saved = pathlib.Path(candidate_path).read_bytes().decode() if candidate_path and pathlib.Path(candidate_path).exists() else ""',
+    'module._write_job_output = writer',
+    'if candidate_path: pathlib.Path(candidate_path).unlink(missing_ok=True)',
+    'print(json.dumps({"staged": staged, "code": code, "wire": b"".join(wire).decode("utf-8", "replace"), "reason": terminal.reason, "retain": cursor["retain_output"], "source_exists": pathlib.Path(sys.argv[2]).exists(), "precedence_code": precedence_code, "precedence_reason": precedence.reason, "precedence_detail": precedence.detail, "precedence_output_failure": precedence.output_failure, "retirement_code": retirement_code, "retirement_reason": retirement.reason, "retirement_detail": retirement.detail, "retirement_wire_cleanup": retirement_wire_cleanup, "retirement_wire_failure": retirement_wire_failure, "candidate_code": candidate_code, "candidate_saved": candidate_saved}))'
   ].join('\n');
-  const result = spawnSync('python3', ['-I', '-B', '-c', program, SUPERVISOR_SCRIPT, stderrPath, stdoutPath], {
+  const result = spawnSync('python3', ['-I', '-B', '-c', script, SUPERVISOR_SCRIPT, stderrPath, stdoutPath], {
     encoding: 'utf8', timeout: 10000
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal((result.stdout.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.stdout);
+  assert.equal((result.stdout.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 2, result.stdout);
   const outcome = JSON.parse(result.stdout.trim().split('\n').at(-1));
-  assert.deepEqual(outcome, {
-    staged: false, code: 98, reason: 'cleanup', retain: true, source_exists: true
-  });
+  assert.equal(outcome.staged, false);
+  assert.equal(outcome.code, 98);
+  assert.equal(outcome.reason, null);
+  assert.match(outcome.wire, /APERTURE-GATE-INDETERMINATE reason=cleanup:/);
+  assert.equal(outcome.retain, true);
+  assert.equal(outcome.source_exists, true);
+  assert.equal(outcome.precedence_code, 98);
+  assert.equal(outcome.precedence_reason, 'timeout');
+  assert.match(outcome.precedence_detail, /outer deadline/);
+  assert.equal(outcome.precedence_output_failure, 'relay incomplete');
+  assert.equal(outcome.retirement_code, 98);
+  assert.equal(outcome.retirement_reason, 'timeout');
+  assert.equal(outcome.retirement_detail, 'outer deadline');
+  assert.equal(outcome.retirement_wire_cleanup, true);
+  assert.equal(outcome.retirement_wire_failure, true);
+  assert.equal(outcome.candidate_code, 98);
+  assert.match(outcome.candidate_saved, /^APERTURE-GATE-INDETERMINATE reason=capacity: candidate\n$/);
 });
 
 test('queued source change refuses the old premise without running the body', { timeout: 180000 }, async t => {
@@ -1385,7 +1830,7 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
     return {
       writer: JSON.parse(fs.readFileSync(run.files.writer, 'utf8')),
       scratch: fs.readFileSync(run.files.scratchPath, 'utf8'),
-      manager: JSON.parse(fs.readFileSync(run.files.manager, 'utf8'))
+      manager: { identity: JSON.parse(fs.readFileSync(run.files.manager, 'utf8')) }
     };
   };
   const releaseAndDrain = async run => {
@@ -1577,7 +2022,11 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
 
 test('interruption stops a body that ignores TERM before releasing its holder', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_HANG: '1' });
+  const run = f.launch({
+    FIXTURE_HANG: '1',
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'interruption lacks fresh guardian completion after watchdog stop'
+  });
   await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.signalOwned(run.identity, 'SIGTERM'), true, 'fixture identity changed before interruption');
@@ -1590,6 +2039,7 @@ test('interruption stops a body that ignores TERM before releasing its holder', 
   const holder = Number(args[args.indexOf('--holder') + 1]);
   const admittedRoles = JSON.parse(fs.readFileSync(f.protocol + '.roles', 'utf8'));
   assert.equal(roleFixture.identityGone(admittedRoles.worker, roleFixture.captureIdentity(holder)), true, 'holder remained after interruption cleanup');
+  assert.equal(fs.existsSync(body.scratch), true, 'accepted interruption custody was reclaimed without fresh guardian completion');
 });
 
 test('child marker text cannot manufacture the enclosing gate verdict', async () => {
@@ -1766,7 +2216,7 @@ test('final source snapshot timeout is a no-verdict result', { timeout: 180000 }
 
 test('watchdog cleans a TERM-resistant body after its supervisor is killed', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_HANG: '1', FIXTURE_RECREATE_SCRATCH: '1' });
+  const run = f.launch({ FIXTURE_HANG: '1', FIXTURE_RECREATE_SCRATCH: '1', FIXTURE_EXPECTED_RETENTION: '1', FIXTURE_EXPECTED_RETENTION_REASON: 'manager loss leaves Node scratch without surviving retirement owner' });
   await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   const roles = JSON.parse(fs.readFileSync(f.protocol + '.roles', 'utf8'));
@@ -1780,7 +2230,7 @@ test('watchdog cleans a TERM-resistant body after its supervisor is killed', { t
   }
   assert.equal(drained(body.identity), true, 'body remained after watchdog cleanup');
   assert.equal(drained(roles.worker), true, 'worker remained after watchdog cleanup');
-  assert.equal(fs.existsSync(body.scratch), false);
+  assert.equal(fs.existsSync(body.scratch), true, 'accepted manager-loss retention was not preserved');
 });
 const pipelineScenarios = [
   { name: 'success', exit: 0, stages: ['run build', 'run typecheck', 'test'] },
@@ -2049,7 +2499,7 @@ test('body signal crash remains a raw failure', { timeout: 180000 }, async t => 
   assert.equal(result.output.includes('APERTURE-GATE-INDETERMINATE'), false);
 });
 
-test('guardian loss retains scratch without positive cleanup completion', { timeout: 180000 }, async t => {
+test('guardian loss allows healthy outer supervisor cleanup after inner guardian loss', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const escapeArmed = path.join(f.scratch, 'escape-armed');
   const escapeRelease = path.join(f.scratch, 'escape-release');
@@ -2118,8 +2568,8 @@ test('guardian loss retains scratch without positive cleanup completion', { time
   assert.equal(fs.readFileSync(escapeDone, 'utf8'), 'reason=supervisor-stop', diagnostics());
   assert.equal(await waitForIdentityGone(body.escapeIdentity, actionDeadline), true, diagnostics());
   assert.notEqual(body.scratch, f.scratch, diagnostics());
-  assert.match(path.basename(body.scratch), /^discord-gate-/, diagnostics());
-  assert.equal(fs.existsSync(body.scratch), true, diagnostics());
+  assert.match(path.basename(body.scratch), process.platform === 'darwin' ? /^dsg-darwin-/ : /^discord-gate-/, diagnostics());
+  assert.equal(fs.existsSync(body.scratch), false, diagnostics());
   assert.equal(fs.existsSync(scratchRemoved), false, diagnostics());
 });
 
@@ -2507,8 +2957,11 @@ test('scratch cleanup subprocess is bounded by the gate deadline', () => {
 test('leftover owned child produces exactly one no-verdict line', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const leftoverStopped = path.join(f.scratch, 'leftover-stopped');
+  const leftoverIdentity = path.join(f.scratch, 'leftover-identity.json');
   const result = await f.launch({
-    FIXTURE_LEFTOVER: '1', FIXTURE_LEFTOVER_STOPPED: leftoverStopped,
+    FIXTURE_LEFTOVER: '1', FIXTURE_LEFTOVER_STOPPED: leftoverStopped, FIXTURE_LEFTOVER_IDENTITY: leftoverIdentity,
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'leftover writer custody remains unresolved after bounded no-verdict',
     APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '1'
   }).done;
   assert.equal(result.code, 98, result.output);
@@ -2518,7 +2971,8 @@ test('leftover owned child produces exactly one no-verdict line', { timeout: 180
     assert.equal(fs.readFileSync(leftoverStopped, 'utf8'), 'term');
   }
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
-  assert.equal(fs.existsSync(body.scratch), false);
+  assert.equal(fs.existsSync(leftoverIdentity), true, result.output);
+  assert.equal(fs.existsSync(body.scratch), true, result.output);
 });
 
 test('missing admission executable is a setup hold, not a capacity retry', { timeout: 180000 }, async t => {
@@ -2532,7 +2986,11 @@ test('missing admission executable is a setup hold, not a capacity retry', { tim
 
 test('manager death during queued admission leaves no live admission or holder', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_HOLD_ADMISSION: '1' });
+  const run = f.launch({
+    FIXTURE_HOLD_ADMISSION: '1',
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'manager loss leaves queued admission scratch without surviving retirement owner'
+  });
   await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
   const queued = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.signalOwned(run.identity, 'SIGKILL'), true, 'fixture identity changed before manager-loss control');
@@ -2545,7 +3003,7 @@ test('manager death during queued admission leaves no live admission or holder',
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   assert.ok(actors.every(drained), 'admission actors remained after manager cleanup');
-  assert.equal(fs.existsSync(queued.scratch), false);
+  assert.equal(fs.existsSync(queued.scratch), true);
 });
 
 
@@ -2689,7 +3147,12 @@ test('worker loss during admission is interruption, never capacity', { timeout: 
 
 test('gate retains scratch when escaped writer ownership is unresolved', { timeout: 180000 }, async t => {
   const f = fixture(t);
-  const run = f.launch({ FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1', APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5' });
+  const run = f.launch({
+    FIXTURE_ESCAPE_PIPE: '1', FIXTURE_RECREATE_SCRATCH: '1',
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'escaped writer ownership remains unresolved',
+    APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5'
+  });
   let escaped;
   try {
     const result = await run.done;
@@ -2750,7 +3213,13 @@ test('manager joins real guardian completion before final scratch removal', { sk
     }
     const entry = path.join(f.scratch, 'entry.js');
     fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace(JSON.stringify(GATE), JSON.stringify(gate)));
-    const run = f.launch({ FIXTURE_COMPLETION_BARRIER: barrier, FIXTURE_COMPLETION_RELEASE: release });
+    const run = f.launch({
+      FIXTURE_COMPLETION_BARRIER: barrier, FIXTURE_COMPLETION_RELEASE: release,
+      ...(control ? {
+        FIXTURE_EXPECTED_RETENTION: '1',
+        FIXTURE_EXPECTED_RETENTION_REASON: 'guardian completion join control intentionally retains scratch'
+      } : {})
+    });
     let finished = false;
     run.done.then(() => { finished = true; });
     try {
@@ -2778,6 +3247,8 @@ test('blocked manager output stays within its deadline and releases scratch', { 
   const f = fixture(t);
   const run = f.launch({
     FIXTURE_STDERR_BYTES: '4194304',
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'blocked output leaves Node scratch under incomplete custody',
     APERTURE_GATE_TIME_LEFT_S: '8',
     APERTURE_GATE_SLOWEST_RUN_S: '1'
   });
@@ -2795,7 +3266,7 @@ test('blocked manager output stays within its deadline and releases scratch', { 
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(result.code, 98, result.output);
   assert.match(result.output, /APERTURE-GATE-INDETERMINATE reason=timeout/);
-  assert.equal(fs.existsSync(body.scratch), false, result.output);
+  assert.equal(fs.existsSync(body.scratch), true, result.output);
 });
 
 test('full gate preserves ignored test bytecode in its source premise', { timeout: 180000 }, async t => {
@@ -2845,7 +3316,11 @@ for (const { escape, mode } of [
 ]) {
     test(mode + ' preserves one no-verdict with escaped output ' + escape, { timeout: 180000 }, async t => {
       const f = fixture(t);
-      const extra = { APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5' };
+      const extra = {
+        APERTURE_GATE_TIME_LEFT_S: '20', APERTURE_GATE_SLOWEST_RUN_S: '5',
+        FIXTURE_EXPECTED_RETENTION: '1',
+        FIXTURE_EXPECTED_RETENTION_REASON: 'read-only scratch makes direct Node retirement fail'
+      };
       if (escape) extra.FIXTURE_ESCAPE_PIPE = '1';
       extra.FIXTURE_READ_ONLY_SCRATCH = '1';
       let body;
@@ -2872,11 +3347,6 @@ for (const { escape, mode } of [
               throw new Error('escaped fixture did not drain; custody retained at ' + body.scratch);
             }
           }
-        }
-        if (body?.scratch && fs.existsSync(body.scratch)) {
-          const ro = path.join(body.scratch, 'ro');
-          if (fs.existsSync(ro)) fs.chmodSync(ro, 0o700);
-          fs.rmSync(body.scratch, { recursive: true, force: true });
         }
       }
     });
@@ -3338,18 +3808,27 @@ for platform in ('linux','darwin'):
 results.append('snapshot descendant wait stays inside the stop reserve')
 def before_site(function,platform,make_error):
     written=[];calls=[];stderr=io.StringIO();faults_before=len(oracle_failures)
+    blocking={'value':True,'reads':0,'changes':[]}
     def capture(root,environment,phase,deadline,interrupted,*,stop_deadline):
         oracle(phase=='before' and deadline==1115 and stop_deadline==1120,'before snapshot window changed')
         calls.append(phase);raise make_error(target)
+    def get_blocking(fd):
+        oracle(fd==1,'writer inspected the wrong descriptor');blocking['reads']+=1;return blocking['value']
+    def set_blocking(fd,value):
+        oracle(fd==1 and isinstance(value,bool),'writer changed the wrong descriptor or mode');blocking['changes'].append(value);blocking['value']=value
     def write(fd,data):
         oracle(fd==1,'no-verdict marker left the verdict channel');written.append(data);return len(data)
-    target=dict(os=types.SimpleNamespace(write=write,getpid=lambda:4242),sys=types.SimpleNamespace(platform=platform,stdout=types.SimpleNamespace(fileno=lambda:1),stderr=stderr),
+    def sleep(seconds):
+        oracle(False,'bounded writer slept after a full first attempt')
+    target=dict(_ACTIVE_TERMINAL_OUTPUT=None,os=types.SimpleNamespace(get_blocking=get_blocking,set_blocking=set_blocking,write=write,getpid=lambda:4242),sys=types.SimpleNamespace(platform=platform,stdout=types.SimpleNamespace(fileno=lambda:1),stderr=stderr),time=types.SimpleNamespace(sleep=sleep),POLL_SECONDS=literal(supervisor,'POLL_SECONDS'),
         clock_now=lambda:1000,capture_snapshot=capture,json=json,
         **{name:literal(supervisor,name) for name in ('SUPERVISOR_ENVIRONMENT','LINUX_SUBREAPER','DARWIN_LAUNCHD','SUPERVISOR_RECEIPT_ENVIRONMENT','SUPERVISOR_TOKEN_ENVIRONMENT','NO_VERDICT','CLEANUP_RESERVE_SECONDS')})
-    declarations(supervisor,{function,'no_verdict','caller_budget','InvalidGateBudget','SnapshotCleanupError'},target)
+    declarations(supervisor,{function,'no_verdict','caller_budget','InvalidGateBudget','SnapshotCleanupError','_write_job_output'},target)
     try:code=target[function](Path('fake-root'),['true'],{'APERTURE_GATE_TIME_LEFT_S':'120'},1000,types.SimpleNamespace(path='/fake/receipt',token='fake-token'),types.SimpleNamespace(is_set=lambda:False))
     finally:oracle(len(oracle_failures)==faults_before,'before snapshot target absorbed a fixture oracle')
     assert calls==['before']
+    if code==98:assert blocking=={'value':True,'reads':1,'changes':[False,True]},blocking
+    else:assert blocking=={'value':True,'reads':0,'changes':[]},blocking
     return code,written,stderr.getvalue()
 for function,platform in (('run_supervised','linux'),('run_darwin_supervised','darwin')):
     code,written,err=before_site(function,platform,lambda t:OSError('cannot read the gate repository: injected'))
@@ -3803,10 +4282,11 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
   const importTests = [
     'Darwin cleanup retains a bootstrapped service when readiness identity is missing',
     'Python supervisor verdict uses the channel separate from saturated stderr',
+    'unreadable required supervisor stderr selects bounded uncertainty',
     'supervisor fails closed before the body on an unsupported platform'
   ];
   const verify = (entry, identity) => {
-    assert.equal(entry.split(importMarker).length - 1, 5, 'unclassified supervisor source import');
+    assert.equal(entry.split(importMarker).length - 1, 6, 'unclassified supervisor source import');
     for (const name of importTests) {
       const begin = entry.indexOf("test('" + name + "',");
       assert.ok(begin >= 0, name);
@@ -3839,6 +4319,16 @@ test('source-import fixtures disable bytecode at every named Python boundary', (
   const withoutSupervisorFlag = entrySource.replace("['-I', '-B', '-c', script", "['-I', '-c', script");
   assert.notEqual(withoutSupervisorFlag, entrySource);
   assert.throws(() => verify(withoutSupervisorFlag, identitySource));
+  const sixthName = "test('unreadable required supervisor stderr selects bounded uncertainty'";
+  const sixthBegin = entrySource.indexOf(sixthName);
+  const sixthEnd = entrySource.indexOf('\ntest(', sixthBegin + 1);
+  assert.ok(sixthBegin >= 0 && sixthEnd > sixthBegin, 'sixth loader test boundary missing');
+  const sixthBody = entrySource.slice(sixthBegin, sixthEnd);
+  const sixthInvocation = "['-I', '-B', '-c', script";
+  assert.equal(sixthBody.split(sixthInvocation).length - 1, 1, 'sixth loader invocation census changed');
+  const withoutSixthFlag = entrySource.slice(0, sixthBegin) + sixthBody.replace(sixthInvocation, "['-I', '-c', script") + entrySource.slice(sixthEnd);
+  assert.notEqual(withoutSixthFlag, entrySource);
+  assert.throws(() => verify(withoutSixthFlag, identitySource));
   const withoutIdentityFlag = identitySource.replace("['-I', '-B', '-c', program", "['-I', '-c', program");
   assert.notEqual(withoutIdentityFlag, identitySource);
   assert.throws(() => verify(entrySource, withoutIdentityFlag));
@@ -4104,25 +4594,20 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
       assert.equal(h.packets.some(packet => packet.kind === 'CLEANUP_COMPLETE'), false);
       assert.deepEqual(h.exits, []);
     });
-    await t.test('C26 monitor adoption rejects a missing or stale phase snapshot', async () => {
-      for (const mode of ['missing', 'foreign', 'generation', 'rows']) {
-        const h = harness();
-        await h.inspect(`(async () => {
-          globalThis.fixturePhase = beginObservation('monitor');
-          fixturePhase.nativeMonitor = true;
-          const rows = [{pid:30,parent:20,pgid:30,state:'S'}];
-          const captured = {phase:fixturePhase,generation:fixturePhase.generation,rows,identities:new Map([[30,'darwin:1:1:30:1']])};
-          fixturePhase.monitorIdentities = captured;
-          const supplied = ${JSON.stringify(mode)} === 'missing' ? undefined
-            : ${JSON.stringify(mode)} === 'foreign' ? {...captured}
-            : captured;
-          if (${JSON.stringify(mode)} === 'generation') captured.generation += 1;
-          await rememberEscapedDescendants(${JSON.stringify(mode)} === 'rows' ? [...rows] : rows, fixturePhase, supplied);
-        })()`);
-        assert.equal(h.inspect('escapedDescendants.get(30)'), null, mode);
-        assert.equal(h.children.length, 0, mode);
-        h.inspect('finishObservation(fixturePhase)');
-      }
+    await t.test('C26 monitor discovery retains unresolved identity without a successor query', async () => {
+      const h = harness();
+      await h.inspect(`(async () => {
+        globalThis.fixturePhase = beginObservation('monitor');
+        fixturePhase.nativeMonitor = true;
+        const rows = [{pid:30,parent:20,pgid:30,state:'S'}];
+        await rememberEscapedDescendants(rows, fixturePhase);
+      })()`);
+      assert.equal(h.inspect('escapedDescendants.has(30)'), true, 'monitor discovery must retain the escaped PID');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null, 'discovered identity remains unresolved');
+      assert.equal(h.children.length, 0, 'monitor discovery must not launch an identity successor query');
+      assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.escaped === true).length, 1);
+      h.inspect('finishObservation(fixturePhase)');
+      assert.equal(h.inspect('escapedDescendants.get(30)'), null, 'finishing observation cannot invent identity');
     });
 
     await t.test('C20 native metadata refuses query faults without treating unknown state as dead', async () => {
@@ -4699,7 +5184,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
 }
 
 
-const darwinPhaseProgram = String.raw`import ast,copy,io,json,math,signal,sys,types
+const darwinPhaseProgram = String.raw`import ast,copy,io,json,math,os,signal,sys,tempfile,types
 from pathlib import Path
 signal.signal(signal.SIGALRM,signal.SIG_DFL)
 signal.alarm(20)
@@ -4715,6 +5200,18 @@ def declarations(source,names,namespace):
     require({n.name for n in nodes}==names,'owning declaration missing')
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual phase owner>','exec'),namespace)
     return namespace
+def terminal_owner(write=None,io_os=None):
+    writes=[]
+    if write is None:
+        def write(fd,payload,deadline=None):
+            writes.append((fd,bytes(payload)));return len(payload)
+    if io_os is None:io_os=os
+    namespace=dict(os=io_os,sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11),stderr=types.SimpleNamespace(fileno=lambda:12)),
+        tempfile=tempfile,_TERMINAL_MARKER=b'APERTURE-GATE-INDETERMINATE reason=',NO_VERDICT=98,_write_job_output=write,writes=writes)
+    declarations(SUPERVISOR,{'_join_detail','split_terminal_output','select_terminal_outcome','TerminalOutput'},namespace)
+    owner=namespace['TerminalOutput']()
+    namespace['_ACTIVE_TERMINAL_OUTPUT']=owner
+    return namespace,owner
 def case(name,action):
     action();results.append(name)
 class Clock:
@@ -4723,7 +5220,7 @@ class Clock:
     def sleep(self,seconds):
         require(0<=seconds<=0.05,'fixture sleep changed')
         self.sleeps+=1;require(self.sleeps<=16,'fixture observer did not terminate')
-        self.value+=1
+        if seconds:self.value+=1
 identity={'pid':401,'coalition_id':400,'start_sec':17,'start_usec':1,'pid_version':3,'unique_id':9}
 controller={'pid':301,'coalition_id':300,'start':11}
 class CapabilityError(OSError):pass
@@ -5067,6 +5564,7 @@ def actual_function(name,body,namespace):
     return namespace[name]
 outer=next(n for n in ast.parse(SUPERVISOR).body if isinstance(n,ast.FunctionDef) and n.name=='run_darwin_supervised')
 main=next(n for n in outer.body if isinstance(n,ast.Try) and any(isinstance(x,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='spec_payload' for t in x.targets) for x in n.body))
+stage_outputs=next(n for n in outer.body if isinstance(n,ast.FunctionDef) and n.name=='stage_outputs')
 select=next(i for i,n in enumerate(main.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='after_failure' for t in n.targets))
 emit=next(i for i in range(select+1,len(main.body)) if isinstance(main.body[i],ast.AugAssign) and isinstance(main.body[i].target,ast.Name) and main.body[i].target.id=='sequence')
 final=next(n for n in reversed(main.body) if isinstance(n,ast.Return))
@@ -5092,8 +5590,9 @@ flush=next(n for n in main.body if isinstance(n,ast.While) and any(isinstance(c,
 flush_index=main.body.index(flush)
 wait_index=next(i for i in range(flush_index+1,len(main.body)) if isinstance(main.body[i],ast.Assign) and isinstance(main.body[i].value,ast.Call) and isinstance(main.body[i].value.func,ast.Name) and main.body[i].value.func.id=='_wait_job_phase')
 def relay_order(blocked=False):
-    clock=Clock(93);events=[];offsets=[]
-    def stream(path,cursor,final=False):
+    clock=Clock(93);events=[];offsets=[];run_deadline=95
+    def stream(path,cursor,final=False,deadline=None):
+        require(deadline == run_deadline,'relay lost its phase deadline')
         offset=cursor['offset'];events.append('stream');offsets.append(offset);clock.value+=1
         require(len(offsets)<=3,'unbounded relay')
         cursor['offset']=offset if blocked else min(8,offset+4)
@@ -5121,9 +5620,11 @@ unavailable=next(i for i,n in enumerate(handler.body) if isinstance(n,ast.If) an
 def unsafe_fallback():
     verdicts=[]
     ns=dict(fallback_available=False,detail='relay failed',reason='setup',owned_service=False,owner=None,retirement={},scratch='private',deadline=100,output_cursor={'output_line_start':True},
+        terminal=types.SimpleNamespace(fail_retirement=lambda detail:None,fail_output=lambda detail:None),output_required=False,output_staged=None,stdout_path='stdout',stderr_path='stderr',result_code=98,
         no_verdict=lambda reason,detail,**kwargs:verdicts.append((reason,detail)) or 98)
     attach_inert_scratch_retirement(ns)
-    assert actual_function('declined',copy.deepcopy(handler.body[unavailable:]),ns)()==98
+    initial=ast.parse("output_required = False\noutput_staged = None").body
+    assert actual_function('declined',initial+[copy.deepcopy(stage_outputs)]+copy.deepcopy(handler.body[unavailable:]),ns)()==98
     assert verdicts[0][0]=='setup' and 'source-after-unavailable' in verdicts[0][1]
 case('unavailable unsafe fallback stays98 without a fabricated snapshot',unsafe_fallback)
 
@@ -5138,7 +5639,8 @@ def terminal_projection(body=98,prior=None,terminal_reason='cleanup',exceptional
         return True
     def emitted(*args):
         emits.append(args[3]);return True
-    ns=dict(reason=prior,detail='prior detail',result_code=body,NO_VERDICT=98,sequence=3,deadline=10,
+    terminal_ns,terminal=terminal_owner()
+    ns=dict(terminal_ns,terminal=terminal,reason=prior,detail='prior detail',result_code=body,NO_VERDICT=98,sequence=3,deadline=10,
         output_cursor={'offset':0,'source_line_start':True,'output_line_start':True},
         retirement={},scratch='private',owned_service=True,owner=object(),identity=identity,identity_verified=True,
         launchctl='launchctl',service='service',status_path='state',nonce='nonce',stdout_path='stdout',stderr_path='stderr',
@@ -5155,14 +5657,15 @@ def terminal_projection(body=98,prior=None,terminal_reason='cleanup',exceptional
     else:
         index=next(i for i,n in enumerate(main.body) if isinstance(n,ast.Assign) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='_wait_job_phase' and any(isinstance(a,ast.Tuple) and any(isinstance(v,ast.Constant) and v.value=='retired' for v in a.elts) for a in n.value.args))
         body_nodes=copy.deepcopy(main.body[index:])
+    body_nodes=ast.parse("output_required = False\noutput_staged = None").body+[copy.deepcopy(stage_outputs)]+body_nodes
     code=actual_function('actual_terminal',body_nodes,ns)()
     expected='cleanup' if terminal_reason=='cleanup' or cleanup_reason=='cleanup' else prior or terminal_reason
     if expected:
         if code!=98 or len(verdicts)!=1 or verdicts[0][0]!=expected:
             raise CleanupProjectionMismatch('verified terminal reason lost: '+repr((body,prior,terminal_reason,exceptional,code,verdicts)))
-        assert emits in ([],[False])
+        assert emits in ([],[True])
     else:
-        assert code==body and verdicts==[] and emits==[True]
+        assert code==body and verdicts==[] and emits in ([],[True])
     return code,verdicts
 for prior in (None,'stale','timeout'):
     for body in (0,98):
@@ -5214,23 +5717,32 @@ def output_boundary(mode):
         if mode=='clock':raise OSError('unreadable output clock')
         return clock.value
     if mode=='expired':clock.value=4
-    ns=dict(os=types.SimpleNamespace(get_blocking=lambda fd:blocking[fd],set_blocking=lambda fd,value:blocking.__setitem__(fd,value),write=write),
+    class IOProxy:
+        def get_blocking(self,fd):return blocking[fd]
+        def set_blocking(self,fd,value):blocking[fd]=value
+        def write(self,fd,payload):return write(fd,payload)
+        def __getattr__(self,name):return getattr(os,name)
+    io_os=IOProxy();terminal_ns,terminal=terminal_owner(io_os=io_os);terminal.set_deadline(4);terminal.request(None,None,stdout_cursor=cursor,stdout_deadline=4)
+    ns=dict(terminal_ns,terminal=terminal,os=io_os,
         sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11),stderr=types.SimpleNamespace(fileno=lambda:12)),
         clock_now=now,time=clock,POLL_SECONDS=.025,NO_VERDICT=98,
-        Path=lambda path:types.SimpleNamespace(read_bytes=lambda:b'x'*(2*1024*1024)),
+        Path=lambda path:types.SimpleNamespace(read_bytes=lambda:b'stderr\n' if mode=='ordinary' else b''),
         open=lambda path,*args:io.BytesIO(marker))
     declarations(SUPERVISOR,{'_write_job_output','_emit_job_stderr','no_verdict'},ns)
+    terminal_ns['_write_job_output']=ns['_write_job_output']
     if mode=='ordinary':
-        mode='blocked'
-        assert ns['_emit_job_stderr']('stderr','stdout',0,True,cursor,4) is False
-        assert all(fd==12 for fd,size in calls) and clock.value==4
+        assert ns['_emit_job_stderr']('stderr','stdout',0,True,cursor,4) is True
+        assert terminal.publish(0)==0
+        assert calls and calls[0][0]==11 and {fd for fd,size in calls}=={11,12}
     elif mode=='outer':
         assert ns['no_verdict']('cleanup','verified',stdout_cursor=cursor,stdout_deadline=4)==98
+        assert terminal.publish(98)==98
         assert bytes(accepted[11])==b'\nAPERTURE-GATE-INDETERMINATE reason=cleanup: verified\n'
         assert cursor['verdict_delivery_complete'] is True
     else:
         assert ns['_emit_job_stderr']('stderr','stdout',98,True,cursor,4) is True
-        assert all(fd==11 for fd,size in calls),'raw98 marker must bypass bulk stderr'
+        assert terminal.publish(98)==98
+        assert all(fd==11 for fd,size in calls),'candidate marker must use the verdict channel'
         if mode=='partial':
             assert bytes(accepted[11])==b'\n'+marker and cursor['verdict_delivery_complete'] is True
             assert clock.value==2 and len(calls)==4
@@ -5292,13 +5804,15 @@ def cancelled_tail(mode='partial',remove_replay=False):
         retired[0]=True
         if mode=='expired':clock.value=4
         return True
-    ns=dict(clock_now=now,time=clock,POLL_SECONDS=.025,NO_VERDICT=98,
+    _,terminal=terminal_owner()
+    terminal.request(None,None,stdout_cursor=cursor,stdout_deadline=4)
+    ns=dict(_ACTIVE_TERMINAL_OUTPUT=terminal,terminal=terminal,clock_now=now,time=clock,POLL_SECONDS=.025,NO_VERDICT=98,
         os=types.SimpleNamespace(get_blocking=lambda fd:blocking[0],set_blocking=lambda fd,value:blocking.__setitem__(0,value),
             write=write,stat=lambda path:types.SimpleNamespace(st_size=len(data))),
         sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11)),
         open=lambda *args:io.BytesIO(data),fallback_available=False,detail='caller cancelled',reason='interrupted',
         owner=object(),owned_service=True,identity=identity,identity_verified=True,deadline=4,sequence=3,
-        retirement={},scratch='private',output_cursor=cursor,stdout_path='stdout',launchctl='launchctl',service='owned',
+        retirement={},scratch='private',output_required=False,output_staged=None,result_code=98,stderr_path='stderr',output_cursor=cursor,stdout_path='stdout',launchctl='launchctl',service='owned',
         _darwin_cleanup=cleanup,no_verdict=lambda why,detail,**kwargs:verdicts.append((why,detail)) or 98)
     attach_inert_scratch_retirement(ns)
     declarations(SUPERVISOR,{'_write_job_output','_stream_stdout'},ns)
@@ -5308,7 +5822,8 @@ def cancelled_tail(mode='partial',remove_replay=False):
         matches=[n for n in nodes if isinstance(n,ast.If) and any(isinstance(c,ast.Call) and isinstance(c.func,ast.Name) and c.func.id=='_stream_stdout' for c in ast.walk(n))]
         require(len(matches)==1,'exception final replay no longer unique');nodes.remove(matches[0])
     setup=ast.parse('status_path="state"\nnonce="nonce"').body
-    assert actual_function('cancelled_tail_actual',setup+nodes,ns)()==98
+    initial=ast.parse('output_required = False\noutput_staged = None').body+[copy.deepcopy(stage_outputs)]
+    assert actual_function('cancelled_tail_actual',initial+setup+nodes,ns)()==98
     assert len(verdicts)==1 and verdicts[0][0]=='interrupted' and blocking[0] is True
     if mode=='partial':
         if bytes(accepted)!=data:raise TailReplayMismatch('known retired cancellation lost withheld ordinary prefix')
@@ -5339,7 +5854,8 @@ case('cleanup owner exposes authenticated terminal reason on release',authentica
 case('cleanup owner preserves terminal reason when deadline refuses release',lambda:authenticated_cleanup_exposure(True))
 def evidence(owned,retain=False):
     index=next(i for i,n in enumerate(main.body) if isinstance(n,ast.If) and ast.unparse(n.test)=='scratch is not None')
-    ns=dict(scratch='private',owned_service=owned,output_cursor={'retain_output':retain},reason=None,detail=None,deadline=10,
+    terminal_ns,terminal=terminal_owner()
+    ns=dict(terminal_ns,terminal=terminal,scratch='private',owned_service=owned,output_cursor={'retain_output':retain},reason=None,detail=None,deadline=10,
         result_code=0,stdout_cursor={},stdout_deadline=10,no_verdict=lambda *args,**kwargs:98)
     removed=attach_inert_scratch_retirement(ns)
     actual_function('finalize',copy.deepcopy(main.body[index:]),ns)()
@@ -5561,6 +6077,7 @@ def persistent_outer_clock_failure():
         return False
     ns=dict(error=OSError('outer phase failed'),reason=None,detail=None,sequence=3,identity_verified=True,
         identity=identity,owner=types.SimpleNamespace(),owned_service=True,retirement={},output_cursor={'output_line_start':True},
+        terminal=types.SimpleNamespace(fail_retirement=lambda detail:None,fail_output=lambda detail:None),output_required=False,output_staged=None,stdout_path='stdout',stderr_path='stderr',result_code=98,
         interrupted=types.SimpleNamespace(is_set=lambda:False),deadline=100,SNAPSHOT_STOP_RESERVE_SECONDS=2,NO_VERDICT=98,
         clock_now=broken_clock,_write_job_request=forbidden,_read_job_state=forbidden,_wait_job_phase=forbidden,
         _darwin_cleanup=cleanup,launchctl='launchctl',service='owned-service',scratch='private',
@@ -5568,7 +6085,8 @@ def persistent_outer_clock_failure():
         shutil=types.SimpleNamespace(rmtree=lambda *args,**kwargs:removed.append(args)))
     declarations(SUPERVISOR,{'JobRequestCancelled'},ns)
     setup=ast.parse('status_path="state"\nnonce="nonce"').body
-    assert actual_function('outer_clock_fault',setup+copy.deepcopy(main.handlers[0].body),ns)()==98
+    initial=ast.parse('output_required = False\noutput_staged = None').body+[copy.deepcopy(stage_outputs)]
+    assert actual_function('outer_clock_fault',initial+setup+copy.deepcopy(main.handlers[0].body),ns)()==98
     assert clocks and not productive and len(cleanups)==1 and not removed
     assert len(verdicts)==1 and verdicts[0][0]=='cleanup'
     assert 'persistent fixture clock unavailable' in verdicts[0][1] and 'custody retained' in verdicts[0][1]
@@ -5822,6 +6340,8 @@ test('Darwin guardian retains an after verifier when its outer controller dies',
   const run = f.launchSupervised({
     FIXTURE_SUPERVISOR_SCRIPT: path.join(directory, 'supervisor.py'),
     FIXTURE_LEASE_ENFORCE: '1', PATH: bin + path.delimiter + process.env.PATH,
+    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION_REASON: 'outer controller loss leaves after-verifier platform custody unresolved',
     APERTURE_GATE_TIME_LEFT_S: '50', APERTURE_GATE_SLOWEST_RUN_S: '1'
   });
   let record;
