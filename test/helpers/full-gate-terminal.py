@@ -1,4 +1,5 @@
 import os
+import hashlib
 import sys
 import tempfile
 import threading
@@ -19,10 +20,11 @@ def require(value, message):
 def namespace():
     scope = {"__file__": str(source_path), "__name__": "terminal_owner_test"}
     exec(compile(source, str(source_path), "exec"), scope)
+    scope["_source_write_job_output"] = scope["_write_job_output"]
     accepted = {11: bytearray(), 12: bytearray()}
     calls = []
 
-    def write(fd, payload, deadline=None):
+    def write(fd, payload, deadline=None, logical_state=None):
         calls.append((fd, bytes(payload)))
         accepted[fd].extend(payload)
         return len(payload)
@@ -37,6 +39,26 @@ def namespace():
     owner = scope["TerminalOutput"]()
     scope["_ACTIVE_TERMINAL_OUTPUT"] = owner
     return scope, owner, accepted, calls
+
+
+def bounded_namespace():
+    scope, owner, accepted, calls = namespace()
+    sizes = {11: 0, 12: 0}
+    digests = {11: hashlib.sha256(), 12: hashlib.sha256()}
+    markers = {11: 0, 12: 0}
+    tails = {11: b"", 12: b""}
+
+    def write(fd, payload, deadline=None, logical_state=None):
+        observed = tails[fd] + bytes(payload)
+        markers[fd] += observed.count(b"APERTURE-GATE-INDETERMINATE reason=")
+        tails[fd] = observed[-len(b"APERTURE-GATE-INDETERMINATE reason=") + 1:]
+        sizes[fd] += len(payload)
+        digests[fd].update(payload)
+        return len(payload)
+
+    scope["_write_job_output"] = write
+    scope["_bounded_marker_counts"] = markers
+    return scope, owner, sizes, digests
 
 
 def reason_order():
@@ -114,11 +136,7 @@ def blocked_delivery():
         scope["sys"].stdout = types.SimpleNamespace(fileno=lambda: writer)
         scope["clock_now"] = lambda: 10
         scope["time"] = types.SimpleNamespace(sleep=lambda seconds: require(False, "expired writer slept"))
-        actual = {"__file__": str(source_path), "__name__": "writer_source"}
-        exec(compile(source, str(source_path), "exec"), actual)
-        scope["_write_job_output"] = types.FunctionType(
-            actual["_write_job_output"].__code__, scope
-        )
+        scope["_write_job_output"] = scope["_source_write_job_output"]
         require(owner.publish(98) == 98, "blocked delivery passed")
         require(owner.marker_attempted and owner.recovery_staged, "blocked record not independently staged")
         require(b"reason=timeout:" in Path(owner.recovery_path).read_bytes(), "wrong record retained")
@@ -130,8 +148,6 @@ def blocked_delivery():
 
 def phase_reserve():
     scope, owner, accepted, calls = namespace()
-    actual = {"__file__": str(source_path), "__name__": "phase_source"}
-    exec(compile(source, str(source_path), "exec"), actual)
     clock = [0.0]
     sleeps = [0]
 
@@ -143,7 +159,7 @@ def phase_reserve():
     scope["clock_now"] = lambda: clock[0]
     scope["time"] = types.SimpleNamespace(sleep=sleep)
     scope["_read_job_state"] = lambda *args: None
-    scope["_write_job_output"] = types.FunctionType(actual["_write_job_output"].__code__, scope)
+    scope["_write_job_output"] = scope["_source_write_job_output"]
     owner.set_deadline(10)
     reader, writer = os.pipe()
     try:
@@ -287,8 +303,111 @@ def linux_output(raw, marked=False):
     require(bytes(accepted[11]) == expected, "stdout/candidate progress duplicated or lost")
 
 
-def darwin_output(mode):
+def large_publish_memory():
+    if sys.platform != "linux":
+        return
+    try:
+        import resource
+    except ImportError as error:
+        raise AssertionError("Linux memory scenario lacks resource limits") from error
+    if not hasattr(resource, "RLIMIT_AS"):
+        raise AssertionError("Linux memory scenario lacks RLIMIT_AS")
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (96 * 1024 * 1024, hard))
+    except (OSError, ValueError) as error:
+        raise AssertionError("Linux memory scenario could not set RLIMIT_AS") from error
     scope, owner, accepted, calls = namespace()
+    capture = owner.add_capture("stdout", replay=False)
+    chunk = b"x" * 65536
+    for _ in range(2048):
+        capture.write(chunk)
+    capture_path = capture.name
+    owner.close_captures()
+    require(owner.publish(0) == 0, "large replay-false capture was not published")
+    require(not Path(capture_path).exists(), "large replay-false capture was not retired")
+
+
+def large_required_files():
+    marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: bounded\n"
+    stderr_payload = b"e" * (2 * 65536 + 17)
+    for result in (0, 17, 98):
+        scope, owner, sizes, digests = bounded_namespace()
+        stdout_path = Path(tempfile.gettempdir()) / ("terminal-large-stdout-" + str(result))
+        stderr_path = Path(tempfile.gettempdir()) / ("terminal-large-stderr-" + str(result))
+        stdout_path.write_bytes(marker)
+        stderr_path.write_bytes(stderr_payload)
+        cursor = {"offset": 0, "verdict": (0, len(marker)), "output_line_start": True}
+        try:
+            require(scope["_emit_job_stderr"](
+                str(stderr_path), str(stdout_path), result, True, cursor, None
+            ), "large required output did not stage")
+            require(owner.publish(result) == result, "raw result changed during large output publication")
+            require(sizes[11] == len(marker), "candidate delivery size changed")
+            require(sizes[12] == len(stderr_payload), "stderr delivery size changed")
+            require(digests[11].digest() == hashlib.sha256(marker).digest(), "candidate bytes changed")
+            require(digests[12].digest() == hashlib.sha256(stderr_payload).digest(), "stderr bytes changed")
+            require(not owner.evidence_paths or all(not Path(path).exists() for path in owner.evidence_paths),
+                    "large output evidence was not retired")
+        finally:
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
+
+
+def expired_range_delivery():
+    payload = b"ordinary output\n"
+    scope, owner, sizes, digests = bounded_namespace()
+    source = Path(tempfile.gettempdir()) / "terminal-expired-range"
+    source.write_bytes(payload)
+    try:
+        require(owner.add_file("stdout", str(source), replay=True), "ordinary range setup failed")
+        owner.set_deadline(0)
+        scope["clock_now"] = lambda: 1
+        require(owner.publish(0) == 0, "expired ordinary range changed raw result")
+        require(sizes[11] == len(payload), "expired ordinary range skipped first write")
+        require(digests[11].digest() == hashlib.sha256(payload).digest(), "expired ordinary range changed bytes")
+
+        scope, owner, sizes, digests = bounded_namespace()
+        marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: expired\n"
+        cursor = {"output_line_start": False}
+        owner.candidate = marker
+        owner.request(None, None, stdout_cursor=cursor, stdout_deadline=0)
+        scope["clock_now"] = lambda: 1
+        require(owner.publish(98) == 98, "expired candidate changed raw result")
+        expected = b"\n" + marker
+        require(sizes[11] == len(expected), "expired candidate prefix delivery changed size")
+        require(digests[11].digest() == hashlib.sha256(expected).digest(), "expired candidate prefix changed bytes")
+    finally:
+        source.unlink(missing_ok=True)
+
+
+def marker_delivery_error():
+    scope, owner, accepted, calls = namespace()
+    marker = b"APERTURE-GATE-INDETERMINATE reason=cleanup: writer\n"
+    cursor = {"output_line_start": True}
+    owner.candidate = marker
+    owner.request(None, None, stdout_cursor=cursor)
+
+    def failed_writer(*args, **kwargs):
+        raise ValueError("controlled writer failure")
+
+    scope["_write_job_output"] = failed_writer
+    require(owner.publish(98) == 98, "writer ValueError escaped owner boundary")
+    require(owner.marker_attempted and owner.output_complete is False, "writer failure was not sticky")
+    require(cursor["verdict_delivery_complete"] is False and cursor["retain_output"] is True,
+            "writer failure lost delivery custody flags")
+    require(owner.accepted_offsets["verdict"] == 0, "writer failure lost accepted offset")
+    require(owner.recovery_path is not None and Path(owner.recovery_path).exists(),
+            "writer failure discarded recovery evidence")
+
+
+def darwin_output(mode):
+    large = mode == "large"
+    if large:
+        scope, owner, sizes, digests = bounded_namespace()
+        accepted = None
+    else:
+        scope, owner, accepted, calls = namespace()
     scope["clock_now"] = lambda: 0
     scope["capture_snapshot"] = lambda *args, **kwargs: {"snapshot": "same", "budget": 20, "slowest": 1}
     scope["load_darwin_owner"] = lambda: types.SimpleNamespace(
@@ -308,11 +427,39 @@ def darwin_output(mode):
     scope["tempfile"] = Storage()
     import shutil
 
+    large_marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
+    large_stdout = b"b" * (2 * 65536 + 17) + b"\n" + large_marker + b"TAIL\n"
+    large_stderr = b"s" * (2 * 65536 + 23)
+
+    def digest_file(path):
+        digest = hashlib.sha256()
+        size = 0
+        with open(path, "rb") as handle:
+            while True:
+                payload = handle.read(65536)
+                if not payload:
+                    break
+                size += len(payload)
+                digest.update(payload)
+        return size, digest.digest()
+
     class Cleanup:
         def which(self, name):
             return "fake-launchctl"
 
         def rmtree(self, path):
+            if large:
+                stderr = next(row for row in owner.outputs if row["name"] == "stderr")
+                stdout = next(row for row in owner.outputs if row["name"] == "stdout")
+                live_prefix = owner.cursor.get("offset", 0)
+                require(live_prefix <= len(large_stdout), "large Darwin live cursor exceeded source")
+                expected_suffix = large_stdout[live_prefix:]
+                require(digest_file(stderr["path"]) == (len(large_stderr), hashlib.sha256(large_stderr).digest()),
+                        "large Darwin stderr was not staged before retirement")
+                require(digest_file(stdout["path"]) == (len(expected_suffix), hashlib.sha256(expected_suffix).digest()),
+                        "large Darwin stdout suffix was not staged before retirement")
+                shutil.rmtree(path)
+                return
             staged = [Path(row["path"]).read_bytes() for row in owner.outputs if row["name"] == "stderr"]
             require(b"ERR_ONCE\n" in staged, "retirement preceded required stderr custody")
             stdout = bytes(accepted[11]) + b"".join(
@@ -326,9 +473,9 @@ def darwin_output(mode):
     scope["_service_state"] = lambda *args: {"present": False}
 
     def bootstrap(*args):
-        Path(allocations[-1], "stderr.log").write_bytes(b"ERR_ONCE\n")
+        Path(allocations[-1], "stderr.log").write_bytes(large_stderr if large else b"ERR_ONCE\n")
         Path(allocations[-1], "stdout.log").write_bytes(
-            b"BOOT_OUT\nAPERTURE-GATE-INDETERMINATE reason=capacity: child\nTAIL\n"
+            large_stdout if large else b"BOOT_OUT\nAPERTURE-GATE-INDETERMINATE reason=capacity: child\nTAIL\n"
         )
         return types.SimpleNamespace(returncode=1 if mode == "bootstrap" else 0, stdout="", stderr="bootstrap refused")
 
@@ -348,6 +495,19 @@ def darwin_output(mode):
     )
     owner.close_captures()
     require(owner.publish(result) == 98, "Darwin refusal passed")
+    if large:
+        ordinary_stdout = large_stdout.replace(large_marker, b"", 1)
+        outer_marker = ("APERTURE-GATE-INDETERMINATE reason=" + str(owner.reason) + ": "
+                        + str(owner.detail or owner.reason) + "\n").encode()
+        expected_stdout = ordinary_stdout + outer_marker
+        require(sizes[11] == len(expected_stdout), "large Darwin stdout size changed")
+        require(sizes[12] == len(large_stderr), "large Darwin stderr size changed")
+        require(digests[11].digest() == hashlib.sha256(expected_stdout).digest(), "large Darwin stdout changed")
+        require(digests[12].digest() == hashlib.sha256(large_stderr).digest(), "large Darwin stderr changed")
+        require(scope["_bounded_marker_counts"][11] == 1, "large Darwin output did not publish one outer marker")
+        require(all(not Path(path).exists() for path in owner.evidence_paths),
+                "large Darwin evidence was not retired")
+        return
     require(bytes(accepted[12]) == b"ERR_ONCE\n", "exception/bootstrap stderr was lost or duplicated")
     require(bytes(accepted[11]).startswith(b"BOOT_OUT\nTAIL\n"), "Darwin ordinary stdout was lost or duplicated")
     require(b"reason=capacity: child" not in accepted[11], "superseded child marker was published")
@@ -369,6 +529,14 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             blocked_delivery()
         elif scenario == "phase-reserve":
             phase_reserve()
+        elif scenario == "large-publish-memory":
+            large_publish_memory()
+        elif scenario == "large-required-files":
+            large_required_files()
+        elif scenario == "expired-range-delivery":
+            expired_range_delivery()
+        elif scenario == "marker-delivery-error":
+            marker_delivery_error()
         elif scenario.startswith("finalizer-"):
             public_finalizers(scenario.removeprefix("finalizer-"))
         elif scenario.startswith("linux-"):

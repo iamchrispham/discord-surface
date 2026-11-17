@@ -1078,10 +1078,13 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "            raise FileNotFoundError(\"inert missing output\")",
     "        return Handle(self)",
     "    def stat(self, name):",
-    "        assert name == \"memory\"",
-    "        if self.missing:",
-    "            raise FileNotFoundError(\"inert missing output\")",
-    "        return SimpleNamespace(st_size=len(self.data))",
+    "        if name == \"memory\":",
+    "            if self.missing: raise FileNotFoundError(name)",
+    "            return SimpleNamespace(st_size=len(self.data))",
+    "        if name == \"stderr\":",
+    "            if self.missing: raise FileNotFoundError(name)",
+    "            return SimpleNamespace(st_size=0)",
+    "        raise FileNotFoundError(name)",
     "    def get_blocking(self, fd):",
     "        assert fd == 73",
     "        return self.mode",
@@ -1143,7 +1146,13 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        def __getattr__(self, name): return getattr(os, name)",
     "    class FixtureOpen:",
     "        def __call__(self, name, mode='r', *args, **kwargs):",
-    "            if name == 'memory': return fixture.open(name, mode)",
+    "            if name in ('memory', 'stderr'):",
+    "                if name == 'stderr':",
+    "                    if fixture.missing: raise FileNotFoundError(name)",
+    "                    if fixture.read_error: raise OSError('inert stderr read failure')",
+    "                    fixture.emitted = True",
+    "                    return io.BytesIO()",
+    "                return fixture.open(name, mode)",
     "            return builtins.open(name, mode, *args, **kwargs)",
     "    class FixturePath:",
     "        def __init__(self, name): self.name = name",
@@ -1161,10 +1170,10 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "                           \"FileNotFoundError\": FileNotFoundError, \"BlockingIOError\": BlockingIOError,",
     "                           \"BrokenPipeError\": BrokenPipeError, \"OSError\": OSError,",
     "                           \"InterruptedError\": InterruptedError, \"TimeoutError\": TimeoutError,",
-    "                           \"ValueError\": ValueError, \"KeyError\": KeyError, \"TypeError\": TypeError, \"Exception\": Exception},",
+    "                           \"ValueError\": ValueError, \"KeyError\": KeyError, \"TypeError\": TypeError, \"Exception\": Exception, \"bytearray\": bytearray},",
     "           \"open\": fixture_open, \"json\": json, \"SnapshotCleanupError\": error_types[\"SnapshotCleanupError\"],",
     "           \"InvalidGateBudget\": error_types[\"InvalidGateBudget\"], \"JobRequestCancelled\": error_types[\"JobRequestCancelled\"],",
-    "           \"os\": fixture_os, \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73), stderr=SimpleNamespace(fileno=lambda: 73)), \"tempfile\": tempfile, \"Path\": FixturePath, \"_TERMINAL_MARKER\": b\"APERTURE-GATE-INDETERMINATE reason=\", \"NO_VERDICT\": 98, \"clock_now\": fixture.monotonic, \"time\": SimpleNamespace(sleep=fixture.sleep), \"POLL_SECONDS\": poll}",
+    "           \"os\": fixture_os, \"sys\": SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 73), stderr=SimpleNamespace(fileno=lambda: 73)), \"tempfile\": tempfile, \"Path\": FixturePath, \"_TERMINAL_MARKER\": b\"APERTURE-GATE-INDETERMINATE reason=\", \"_OUTPUT_CHUNK_SIZE\": 65536, \"NO_VERDICT\": 98, \"clock_now\": fixture.monotonic, \"time\": SimpleNamespace(sleep=fixture.sleep), \"POLL_SECONDS\": poll}",
     "    exec(compile(ast.Module(body=terminal_nodes, type_ignores=[]), \"<relay-fixture>\", \"exec\"), env)",
     "    terminal = env[\"TerminalOutput\"]()",
     "    env[\"_ACTIVE_TERMINAL_OUTPUT\"] = terminal",
@@ -1684,11 +1693,11 @@ test('unreadable required supervisor stderr selects bounded uncertainty', { time
     'cursor = {"retain_output": False, "output_line_start": True}',
     'wire = []',
     'original_writer = module._write_job_output',
-    'module._write_job_output = lambda descriptor, payload, deadline=None: (wire.append(bytes(payload)) or len(payload))',
+    'module._write_job_output = lambda descriptor, payload, deadline=None, logical_state=None: (wire.append(bytes(payload)) or len(payload))',
     'staged = module._emit_job_stderr(sys.argv[2], sys.argv[3], 0, True, cursor, None)',
     'code = terminal.publish(0)',
     'writer = original_writer',
-    'module._write_job_output = lambda descriptor, payload, deadline=None: len(payload)',
+    'module._write_job_output = lambda descriptor, payload, deadline=None, logical_state=None: len(payload)',
     'precedence = module.TerminalOutput()',
     'module._ACTIVE_TERMINAL_OUTPUT = precedence',
     'precedence.request("timeout", "outer deadline")',
@@ -1699,11 +1708,11 @@ test('unreadable required supervisor stderr selects bounded uncertainty', { time
     'retirement.request("timeout", "outer deadline")',
     'retirement.fail_retirement("retirement incomplete")',
     'retirement_wire = []',
-    'module._write_job_output = lambda descriptor, payload, deadline=None: (retirement_wire.append(bytes(payload)) or len(payload))',
+    'module._write_job_output = lambda descriptor, payload, deadline=None, logical_state=None: (retirement_wire.append(bytes(payload)) or len(payload))',
     'retirement_code = retirement.publish(0)',
     'retirement_wire_cleanup = any(b"reason=cleanup:" in payload for payload in retirement_wire)',
     'retirement_wire_failure = any(b"retirement incomplete" in payload for payload in retirement_wire)',
-    'module._write_job_output = lambda descriptor, payload, deadline=None: 0',
+    'module._write_job_output = lambda descriptor, payload, deadline=None, logical_state=None: 0',
     'candidate = module.TerminalOutput()',
     'module._ACTIVE_TERMINAL_OUTPUT = candidate',
     'candidate.candidate = b"APERTURE-GATE-INDETERMINATE reason=capacity: candidate\\n"',
@@ -5201,14 +5210,16 @@ def declarations(source,names,namespace):
     require({n.name for n in nodes}==names,'owning declaration missing')
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual phase owner>','exec'),namespace)
     return namespace
-def terminal_owner(write=None,io_os=None):
+def terminal_owner(write=None,io_os=None,open_fn=None):
     writes=[]
     if write is None:
-        def write(fd,payload,deadline=None):
+        def write(fd,payload,deadline=None,logical_state=None):
             writes.append((fd,bytes(payload)));return len(payload)
     if io_os is None:io_os=os
+    if open_fn is None:open_fn=open
     namespace=dict(os=io_os,sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11),stderr=types.SimpleNamespace(fileno=lambda:12)),
-        tempfile=tempfile,_TERMINAL_MARKER=b'APERTURE-GATE-INDETERMINATE reason=',NO_VERDICT=98,_write_job_output=write,writes=writes)
+        tempfile=tempfile,_TERMINAL_MARKER=b'APERTURE-GATE-INDETERMINATE reason=',_OUTPUT_CHUNK_SIZE=65536,NO_VERDICT=98,_write_job_output=write,writes=writes,
+        clock_now=lambda:0,open=open_fn,bytearray=bytearray)
     declarations(SUPERVISOR,{'_join_detail','split_terminal_output','select_terminal_outcome','TerminalOutput'},namespace)
     owner=namespace['TerminalOutput']()
     namespace['_ACTIVE_TERMINAL_OUTPUT']=owner
@@ -5707,7 +5718,7 @@ def output_boundary(mode):
     clock=Clock();calls=[];accepted={11:bytearray(),12:bytearray()};blocking={11:True,12:True}
     marker=b'APERTURE-GATE-INDETERMINATE reason=timeout: inner\n'
     cursor={'offset':0,'source_line_start':True,'output_line_start':False,'verdict':(0,len(marker))}
-    def write(fd,payload):
+    def write(fd,payload,deadline=None,logical_state=None):
         require(blocking[fd] is False,'public write used blocking descriptor')
         calls.append((fd,len(payload)));require(len(calls)<=12,'public write exceeded bounded attempts')
         if mode=='partial' and len(calls)<=2:raise BlockingIOError('temporary full')
@@ -5722,13 +5733,19 @@ def output_boundary(mode):
         def get_blocking(self,fd):return blocking[fd]
         def set_blocking(self,fd,value):blocking[fd]=value
         def write(self,fd,payload):return write(fd,payload)
+        def stat(self,path):
+            if path in ('stdout','stderr'):return types.SimpleNamespace(st_size=len(marker))
+            return os.stat(path)
         def __getattr__(self,name):return getattr(os,name)
-    io_os=IOProxy();terminal_ns,terminal=terminal_owner(io_os=io_os);terminal.set_deadline(4);terminal.request(None,None,stdout_cursor=cursor,stdout_deadline=4)
+    def opened(path,*args,**kwargs):
+        if path in ('stdout','stderr'):return io.BytesIO(marker)
+        return open(path,*args,**kwargs)
+    io_os=IOProxy();terminal_ns,terminal=terminal_owner(io_os=io_os,open_fn=opened);terminal.set_deadline(4);terminal.request(None,None,stdout_cursor=cursor,stdout_deadline=4)
     ns=dict(terminal_ns,terminal=terminal,os=io_os,
         sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11),stderr=types.SimpleNamespace(fileno=lambda:12)),
         clock_now=now,time=clock,POLL_SECONDS=.025,NO_VERDICT=98,
         Path=lambda path:types.SimpleNamespace(read_bytes=lambda:b'stderr\n' if mode=='ordinary' else b''),
-        open=lambda path,*args:io.BytesIO(marker))
+        open=opened)
     declarations(SUPERVISOR,{'_write_job_output','_emit_job_stderr','no_verdict'},ns)
     terminal_ns['_write_job_output']=ns['_write_job_output']
     if mode=='ordinary':
@@ -5789,7 +5806,7 @@ case('standalone two-argument API preserves external-bound contract only',standa
 class TailReplayMismatch(AssertionError):pass
 def cancelled_tail(mode='partial',remove_replay=False):
     clock=Clock();data=b'APERTURE-';accepted=bytearray();writes=[];blocking=[True];cursor={'offset':0,'source_line_start':True,'output_line_start':True};verdicts=[]
-    def write(fd,payload):
+    def write(fd,payload,deadline=None,logical_state=None):
         require(fd==11 and blocking[0] is False,'tail relay used blocking or foreign output')
         writes.append(len(payload));require(len(writes)<=8,'tail relay exceeded fixed attempts')
         if mode=='blocked':raise BlockingIOError('consumer full')

@@ -9,10 +9,14 @@ const { pythonTestEnvironment } = require('../scripts/test-gate');
 const root = path.resolve(__dirname, '..');
 for (const scenario of [
   'reason-order', 'required-hold', 'replacement-failure', 'blocked-delivery', 'phase-reserve',
+  'large-publish-memory', 'large-required-files', 'expired-range-delivery', 'marker-delivery-error',
   'finalizer-receipt', 'finalizer-handler', 'finalizer-creation', 'finalizer-clock',
-  'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'darwin-bootstrap', 'darwin-exception'
+  'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'darwin-bootstrap', 'darwin-exception', 'darwin-large'
 ]) {
-  test('terminal output owner: ' + scenario, { timeout: 30000 }, () => {
+  test('terminal output owner: ' + scenario, {
+    timeout: 30000,
+    skip: scenario === 'large-publish-memory' && process.platform !== 'linux'
+  }, () => {
     const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', [
       '-I', '-B', path.join(__dirname, 'helpers/full-gate-terminal.py'),
       path.join(root, 'scripts/full-gate/supervisor.py'), scenario

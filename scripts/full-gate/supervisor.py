@@ -166,17 +166,19 @@ def establish_reaping_contract():
     _REAPING_OWNER = owner
 
 
-def _write_job_output(descriptor, payload, deadline=None):
+def _write_job_output(descriptor, payload, deadline=None, logical_state=None):
     offset = 0
-    attempted = False
+    state = logical_state if logical_state is not None else {}
+    attempted = bool(state.get("attempted"))
     while offset < len(payload):
-        if attempted:
+        if attempted and deadline is not None:
             try:
                 if not clock_now() < deadline:
                     break
             except OSError:
                 break
         attempted = True
+        state["attempted"] = True
         written = 0
         was_blocking = None
         try:
@@ -206,6 +208,7 @@ def _write_job_output(descriptor, payload, deadline=None):
 
 
 _TERMINAL_MARKER = b"APERTURE-GATE-INDETERMINATE reason="
+_OUTPUT_CHUNK_SIZE = 64 * 1024
 _ACTIVE_TERMINAL_OUTPUT = None
 
 
@@ -277,7 +280,12 @@ class TerminalOutput:
 
     @property
     def evidence_paths(self):
-        paths = [output["path"] for output in self.outputs]
+        paths = []
+        for output in self.outputs:
+            paths.append(output["path"])
+            render_path = output.get("render_path")
+            if render_path is not None:
+                paths.append(render_path)
         if self.recovery_path is not None:
             paths.append(self.recovery_path)
         return paths
@@ -400,6 +408,265 @@ class TerminalOutput:
             self.fail_output("gate output could not be staged: " + str(error))
             return False
 
+    def _deadline_available(self):
+        if self.deadline is None:
+            return True
+        try:
+            return clock_now() < self.deadline
+        except OSError:
+            return False
+
+    def _copy_range_to_handle(self, source, start, end, destination):
+        size = os.stat(source).st_size
+        if end is None:
+            end = size
+        if not 0 <= start <= end <= size:
+            raise OSError("gate output range was invalid")
+        remaining = end - start
+        with open(source, "rb") as handle:
+            handle.seek(start)
+            while remaining:
+                if not self._deadline_available():
+                    raise OSError("gate output range copy exceeded the caller deadline")
+                payload = handle.read(min(_OUTPUT_CHUNK_SIZE, remaining))
+                if not payload:
+                    raise OSError("gate output range copy was short")
+                written = destination.write(payload)
+                if written != len(payload):
+                    raise OSError("gate output range copy was incomplete")
+                remaining -= written
+        destination.flush()
+        os.fsync(destination.fileno())
+        return end
+
+    def add_file_range(self, name, source, start=0, end=None, *, replay, candidate=False):
+        descriptor = None
+        path = None
+        record = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="dsg-output-")
+            record = {
+                "name": name,
+                "path": path,
+                "replay": replay,
+                "candidate": candidate,
+                "source": source,
+                "source_start": start,
+                "source_end": end,
+            }
+            self.outputs.append(record)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                copied_end = self._copy_range_to_handle(source, start, end, handle)
+            record["size"] = copied_end - start
+            return True
+        except (OSError, ValueError) as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.fail_output("gate output range could not be staged: " + str(error))
+            return False
+
+    def add_file(self, name, source, *, replay, candidate=False):
+        return self.add_file_range(name, source, 0, None, replay=replay, candidate=candidate)
+
+    def _marker_range_valid(self, path, start, end):
+        try:
+            size = os.stat(path).st_size
+            if not 0 <= start < end <= size or end - start < len(_TERMINAL_MARKER) + 1:
+                raise OSError("saved gate verdict marker was incomplete")
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                if handle.read(len(_TERMINAL_MARKER)) != _TERMINAL_MARKER:
+                    raise OSError("saved gate verdict marker was incomplete")
+                handle.seek(end - 1)
+                if handle.read(1) != b"\n":
+                    raise OSError("saved gate verdict marker was incomplete")
+            return True
+        except OSError as error:
+            self.fail_output(str(error))
+            return False
+
+    def _candidate_range(self, output):
+        path = output["path"]
+        try:
+            size = os.stat(path).st_size
+        except OSError as error:
+            self.fail_output("required gate candidate could not be inspected: " + str(error))
+            return None
+        if not self._marker_range_valid(path, 0, size):
+            return None
+        return {"path": path, "start": 0, "end": size}
+
+    def _scan_record(self, output, result):
+        path = output["path"]
+        if output["candidate"]:
+            return self._candidate_range(output)
+        try:
+            size = os.stat(path).st_size
+        except OSError as error:
+            self.fail_output("required gate output could not be inspected: " + str(error))
+            return None
+        if result != NO_VERDICT:
+            output["publish_path"] = path
+            output["publish_start"] = 0
+            output["publish_end"] = size
+            return None
+
+        render_descriptor = None
+        render_path = None
+        render = None
+        if output["replay"]:
+            try:
+                render_descriptor, render_path = tempfile.mkstemp(prefix="dsg-render-")
+                render = os.fdopen(render_descriptor, "wb")
+                render_descriptor = None
+                output["render_path"] = render_path
+            except OSError as error:
+                if render_descriptor is not None:
+                    try:
+                        os.close(render_descriptor)
+                    except OSError:
+                        pass
+                self.fail_output("gate output render could not be created: " + str(error))
+                return None
+
+        ordinary = bytearray()
+        probe = bytearray()
+        candidate = None
+        in_marker = False
+        marker_start = None
+        line_start = True
+        offset = 0
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    if not self._deadline_available():
+                        raise OSError("gate output scan exceeded the caller deadline")
+                    payload = handle.read(_OUTPUT_CHUNK_SIZE)
+                    if not payload:
+                        break
+                    for value in payload:
+                        if in_marker:
+                            if value == 10:
+                                if candidate is None:
+                                    candidate = {"path": path, "start": marker_start, "end": offset + 1}
+                                in_marker = False
+                                marker_start = None
+                                line_start = True
+                            offset += 1
+                            continue
+                        if probe:
+                            if value == _TERMINAL_MARKER[len(probe)]:
+                                probe.append(value)
+                                offset += 1
+                                if len(probe) == len(_TERMINAL_MARKER):
+                                    in_marker = True
+                                    marker_start = offset - len(_TERMINAL_MARKER)
+                                    probe.clear()
+                                continue
+                            ordinary.extend(probe)
+                            probe.clear()
+                            line_start = False
+                        if line_start and value == _TERMINAL_MARKER[0]:
+                            probe.append(value)
+                        else:
+                            ordinary.append(value)
+                            line_start = value == 10
+                        offset += 1
+                        if len(ordinary) >= _OUTPUT_CHUNK_SIZE:
+                            if render is not None:
+                                written = render.write(ordinary)
+                                if written != len(ordinary):
+                                    raise OSError("gate output render was incomplete")
+                            ordinary.clear()
+                if in_marker:
+                    raise OSError("required gate output ended inside a verdict marker")
+                if probe:
+                    ordinary.extend(probe)
+                if ordinary and render is not None:
+                    written = render.write(ordinary)
+                    if written != len(ordinary):
+                        raise OSError("gate output render was incomplete")
+            if render is not None:
+                render.flush()
+                os.fsync(render.fileno())
+                render.close()
+                render = None
+                output["publish_path"] = render_path
+                output["publish_start"] = 0
+                output["publish_end"] = os.stat(render_path).st_size
+            else:
+                output["publish_path"] = None
+            return candidate
+        except (OSError, ValueError) as error:
+            if render is not None:
+                try:
+                    render.close()
+                except OSError:
+                    pass
+            self.fail_output(str(error))
+            return None
+
+    def _relay_range(self, descriptor, source, start, end, prefix=b""):
+        state = {"attempted": False}
+        written_total = 0
+        first = True
+        last = None
+        try:
+            with open(source, "rb") as handle:
+                handle.seek(start)
+                remaining = end - start
+                while remaining:
+                    if state["attempted"] and not self._deadline_available():
+                        return written_total, False, last
+                    chunk_limit = _OUTPUT_CHUNK_SIZE - (len(prefix) if first else 0)
+                    payload = handle.read(min(chunk_limit, remaining))
+                    if not payload:
+                        return written_total, False, last
+                    wire = prefix + payload if first and prefix else payload
+                    written = _write_job_output(descriptor, wire, self.deadline, state)
+                    state["attempted"] = True
+                    written_total += written
+                    if written:
+                        last = wire[written - 1]
+                    if written != len(wire):
+                        return written_total, False, last
+                    remaining -= len(payload)
+                    first = False
+            return written_total, True, last
+        except (OSError, ValueError):
+            return written_total, False, last
+
+    def stage_recovery_range(self, source, start, end):
+        self.recovery_staged = False
+        if not self.prepare_recovery():
+            return False
+        descriptor = None
+        path = None
+        record = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="dsg-recovery-", dir=os.path.dirname(self.recovery_path))
+            record = {"name": "recovery", "path": path, "replay": False, "candidate": False}
+            self.outputs.append(record)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                self._copy_range_to_handle(source, start, end, handle)
+            os.replace(path, self.recovery_path)
+            self.outputs.remove(record)
+            self.recovery_staged = True
+            return True
+        except (OSError, ValueError) as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.fail_output("gate recovery range could not be staged: " + str(error))
+            return False
+
     def _failure_detail(self, detail):
         detail = detail or "gate output custody is incomplete"
         if self.evidence_paths:
@@ -410,54 +677,34 @@ class TerminalOutput:
         self.prepare_recovery()
         if self.cursor is not None and self.cursor.get("retain_output"):
             self.fail_output("required gate output remains under retained custody")
-        stream_payloads = []
-        candidates = []
+        candidate = None
         if self.output_complete:
-            loaded = []
             for output in self.outputs:
-                try:
-                    with open(output["path"], "rb") as handle:
-                        payload = handle.read()
-                except OSError as error:
-                    self.fail_output("required gate output could not be read: " + str(error))
+                found = self._scan_record(output, result)
+                if candidate is None and found is not None:
+                    candidate = found
+                if not self.output_complete:
                     break
-                loaded.append((output, payload))
-            if self.output_complete:
-                for output, payload in loaded:
-                    if output["candidate"]:
-                        if not payload.startswith(_TERMINAL_MARKER) or not payload.endswith(b"\n"):
-                            self.fail_output("saved gate verdict marker was incomplete")
-                            break
-                        candidates.append(payload)
-                        continue
-                    ordinary, candidate, complete = split_terminal_output(payload, result)
-                    if not complete:
-                        self.fail_output("required gate output ended inside a verdict marker")
-                        break
-                    if candidate is not None:
-                        candidates.append(candidate)
-                    if output["replay"]:
-                        stream_payloads.append((output["name"], ordinary))
 
         output_line_start = self.cursor.get("output_line_start", True) if self.cursor is not None else True
         if self.output_complete:
-            for name, payload in stream_payloads:
-                if not payload:
+            for output in self.outputs:
+                path = output.get("publish_path")
+                if not output["replay"] or path is None:
                     continue
+                name = output["name"]
                 descriptor = sys.stderr.fileno() if name == "stderr" else sys.stdout.fileno()
-                try:
-                    written = _write_job_output(descriptor, payload, self.deadline)
-                except (OSError, ValueError) as error:
-                    self.fail_output("final " + name + " relay failed: " + str(error))
-                    break
+                written, delivered, last = self._relay_range(
+                    descriptor, path, output["publish_start"], output["publish_end"]
+                )
                 self.accepted_offsets[name] = written
-                if name == "stdout" and written:
-                    output_line_start = payload[written - 1:written] == b"\n"
-                if written != len(payload):
+                if name == "stdout" and last is not None:
+                    output_line_start = last == 10
+                if not delivered:
                     self.fail_output("final " + name + " relay was incomplete")
                     break
 
-        candidate = self.candidate or (candidates[0] if candidates else None)
+        candidate = self.candidate or candidate
         def selected_record():
             code, reason, detail, selected_candidate = select_terminal_outcome(
                 result, self.reason, self.detail, self.output_complete, self.retirement_complete, candidate,
@@ -473,19 +720,28 @@ class TerminalOutput:
             return code, selected_candidate
 
         code, marker = selected_record()
-        if marker is not None and not self.stage_recovery(marker):
+        if isinstance(marker, dict):
+            if not self.stage_recovery_range(marker["path"], marker["start"], marker["end"]):
+                code, marker = selected_record()
+        elif marker is not None and not self.stage_recovery(marker):
             code, marker = selected_record()
         if marker is not None and not self.marker_attempted:
             self.marker_attempted = True
-            if not output_line_start:
-                marker = b"\n" + marker
-            try:
-                written = _write_job_output(sys.stdout.fileno(), marker, self.deadline)
-                self.accepted_offsets["verdict"] = written
-                delivered = written == len(marker)
-            except (OSError, ValueError):
-                self.accepted_offsets["verdict"] = 0
-                delivered = False
+            prefix = b"" if output_line_start else b"\n"
+            if isinstance(marker, dict):
+                written, delivered, _ = self._relay_range(
+                    sys.stdout.fileno(), marker["path"], marker["start"], marker["end"], prefix=prefix
+                )
+            else:
+                wire = prefix + marker if prefix else marker
+                state = {"attempted": False}
+                try:
+                    written = _write_job_output(sys.stdout.fileno(), wire, self.deadline, state)
+                    delivered = written == len(wire)
+                except (OSError, ValueError):
+                    written = 0
+                    delivered = False
+            self.accepted_offsets["verdict"] = written
             if self.cursor is not None:
                 self.cursor["verdict_delivery_complete"] = delivered
             if not delivered:
@@ -1174,16 +1430,6 @@ def _stream_stdout(path, cursor, final=False, deadline=None):
 def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
     if not emit:
         return True
-    try:
-        output = Path(path).read_bytes()
-    except OSError as error:
-        cursor["retain_output"] = True
-        terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
-        if terminal is not None:
-            terminal.set_deadline(deadline)
-            terminal.fail_output("required gate stderr could not be read from " + path + ": " + str(error))
-        return False
-
     terminal = globals().get("_ACTIVE_TERMINAL_OUTPUT")
     if terminal is None:
         cursor["retain_output"] = True
@@ -1191,17 +1437,8 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
     terminal.set_deadline(deadline)
     saved = cursor.get("verdict")
     if saved is not None:
-        try:
-            with open(stdout_path, "rb") as handle:
-                handle.seek(saved[0])
-                verdict = handle.read(saved[1] - saved[0])
-        except OSError as error:
+        if not terminal._marker_range_valid(stdout_path, saved[0], saved[1]):
             cursor["retain_output"] = True
-            terminal.fail_output("saved gate verdict marker could not be read from " + stdout_path + ": " + str(error))
-            return False
-        if len(verdict) != saved[1] - saved[0] or not verdict.startswith(_TERMINAL_MARKER) or not verdict.endswith(b"\n"):
-            cursor["retain_output"] = True
-            terminal.fail_output("saved gate verdict marker was short or incomplete in " + stdout_path)
             return False
         if result == NO_VERDICT:
             replay, candidate = False, True
@@ -1209,10 +1446,12 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
         else:
             replay, candidate = True, False
             name = "stdout"
-        if not terminal.add_payload(name, verdict, replay=replay, candidate=candidate):
+        if not terminal.add_file_range(
+            name, stdout_path, saved[0], saved[1], replay=replay, candidate=candidate
+        ):
             cursor["retain_output"] = True
             return False
-    if not terminal.add_payload("stderr", output, replay=True):
+    if not terminal.add_file("stderr", path, replay=True):
         cursor["retain_output"] = True
         return False
     return True
@@ -1362,14 +1601,7 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             pending = output_cursor.get("pending_marker")
             if pending is not None:
                 start = min(start, pending)
-            try:
-                with open(stdout_path, "rb") as handle:
-                    handle.seek(start)
-                    remaining_stdout = handle.read()
-            except OSError as error:
-                terminal.fail_output("required gate stdout could not be staged from " + stdout_path + ": " + str(error))
-                return False
-            if remaining_stdout and not terminal.add_payload("stdout", remaining_stdout, replay=True):
+            if not terminal.add_file_range("stdout", stdout_path, start, None, replay=True):
                 return False
             output_result = NO_VERDICT if reason is not None else result_code
             output_staged = _emit_job_stderr(
