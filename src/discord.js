@@ -535,7 +535,7 @@ class DiscordGateway {
         throw new Error('decision projection authorization is no longer valid');
       }
     }
-    return message.edit({ content: answer, components: [] });
+    return message.edit({ embeds: [{ description: answer }], components: [] });
   }
 
   async sendInteractionRejection(interaction, reason, signal) {
