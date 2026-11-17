@@ -3310,6 +3310,15 @@ def snapshot_callers():
         for prior in (None,'interrupted','timeout','stale'):
             error=OSError('owned verifier cleanup unknown')
             namespace=dict(error=error,snapshot_error=error,reason=prior,detail='prior',no_verdict=lambda reason,detail:(98,reason,detail))
+            def finish(code=None,*,failure=None,detail=None,failure_detail=None):
+                if failure is not None:
+                    return namespace['no_verdict'](failure,detail or failure_detail or failure)
+                if code is not None:
+                    return code
+                if reason is not None:
+                    return namespace['no_verdict'](reason,detail or failure_detail or namespace['detail'])
+                return code
+            namespace['finish']=finish
             body=copy.deepcopy(handler.body)
             returns=any(isinstance(n,ast.Return) for stmt in body for n in ast.walk(stmt))
             if not returns:body.append(ast.Return(value=ast.Tuple(elts=[ast.Name(id='reason',ctx=ast.Load()),ast.Name(id='detail',ctx=ast.Load())],ctx=ast.Load())))
@@ -4986,6 +4995,12 @@ main=next(n for n in outer.body if isinstance(n,ast.Try) and any(isinstance(x,as
 select=next(i for i,n in enumerate(main.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='after_failure' for t in n.targets))
 emit=next(i for i in range(select+1,len(main.body)) if isinstance(main.body[i],ast.AugAssign) and isinstance(main.body[i].target,ast.Name) and main.body[i].target.id=='sequence')
 final=next(n for n in reversed(main.body) if isinstance(n,ast.Return))
+def attach_inert_scratch_retirement(namespace):
+    scratch=namespace['scratch']
+    retired=[]
+    def retire_scratch():retired.append(scratch);return True
+    namespace['retire_scratch']=retire_scratch
+    return retired
 def comparison(state,prior=None):
     verdicts=[]
     ns=dict(state=state,before={'snapshot':'old'},reason=prior,detail='prior',result_code=0,deadline=100,output_cursor={'output_line_start':True},
@@ -5030,8 +5045,9 @@ handler=main.handlers[0]
 unavailable=next(i for i,n in enumerate(handler.body) if isinstance(n,ast.If) and isinstance(n.test,ast.UnaryOp) and isinstance(n.test.operand,ast.Name) and n.test.operand.id=='fallback_available')
 def unsafe_fallback():
     verdicts=[]
-    ns=dict(fallback_available=False,detail='relay failed',reason='setup',owned_service=False,owner=None,retirement={},deadline=100,output_cursor={'output_line_start':True},
+    ns=dict(fallback_available=False,detail='relay failed',reason='setup',owned_service=False,owner=None,retirement={},scratch='private',deadline=100,output_cursor={'output_line_start':True},
         no_verdict=lambda reason,detail,**kwargs:verdicts.append((reason,detail)) or 98)
+    attach_inert_scratch_retirement(ns)
     assert actual_function('declined',copy.deepcopy(handler.body[unavailable:]),ns)()==98
     assert verdicts[0][0]=='setup' and 'source-after-unavailable' in verdicts[0][1]
 case('unavailable unsafe fallback stays98 without a fabricated snapshot',unsafe_fallback)
@@ -5049,13 +5065,14 @@ def terminal_projection(body=98,prior=None,terminal_reason='cleanup',exceptional
         emits.append(args[3]);return True
     ns=dict(reason=prior,detail='prior detail',result_code=body,NO_VERDICT=98,sequence=3,deadline=10,
         output_cursor={'offset':0,'source_line_start':True,'output_line_start':True},
-        retirement={},owned_service=True,owner=object(),identity=identity,identity_verified=True,
+        retirement={},scratch='private',owned_service=True,owner=object(),identity=identity,identity_verified=True,
         launchctl='launchctl',service='service',status_path='state',nonce='nonce',stdout_path='stdout',stderr_path='stderr',
         interrupted=types.SimpleNamespace(is_set=lambda:False),fallback_available=False,
         _wait_job_phase=lambda *args:(retired,0),_darwin_cleanup=cleaned,_emit_job_stderr=emitted,
         clock_now=lambda:0,_stream_stdout=lambda path,cursor,**kwargs:cursor['offset'],
         os=types.SimpleNamespace(stat=lambda path:types.SimpleNamespace(st_size=0)),time=Clock(),POLL_SECONDS=.025,
         no_verdict=lambda why,detail,**kwargs:verdicts.append((why,detail)) or 98)
+    attach_inert_scratch_retirement(ns)
     if exceptional:
         handler=main.handlers[0]
         index=next(i for i,n in enumerate(handler.body) if isinstance(n,ast.If) and isinstance(n.test,ast.UnaryOp) and isinstance(n.test.operand,ast.Name) and n.test.operand.id=='fallback_available')
@@ -5206,8 +5223,9 @@ def cancelled_tail(mode='partial',remove_replay=False):
         sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11)),
         open=lambda *args:io.BytesIO(data),fallback_available=False,detail='caller cancelled',reason='interrupted',
         owner=object(),owned_service=True,identity=identity,identity_verified=True,deadline=4,sequence=3,
-        retirement={},output_cursor=cursor,stdout_path='stdout',launchctl='launchctl',service='owned',
+        retirement={},scratch='private',output_cursor=cursor,stdout_path='stdout',launchctl='launchctl',service='owned',
         _darwin_cleanup=cleanup,no_verdict=lambda why,detail,**kwargs:verdicts.append((why,detail)) or 98)
+    attach_inert_scratch_retirement(ns)
     declarations(SUPERVISOR,{'_write_job_output','_stream_stdout'},ns)
     assert ns['_stream_stdout']('stdout',cursor)==0 and accepted==b''
     nodes=copy.deepcopy(handler.body[unavailable:])
@@ -5245,8 +5263,11 @@ def authenticated_cleanup_exposure(expired=False):
 case('cleanup owner exposes authenticated terminal reason on release',authenticated_cleanup_exposure)
 case('cleanup owner preserves terminal reason when deadline refuses release',lambda:authenticated_cleanup_exposure(True))
 def evidence(owned,retain=False):
-    removed=[];ns=dict(scratch='private',owned_service=owned,output_cursor={'retain_output':retain},shutil=types.SimpleNamespace(rmtree=lambda *a,**k:removed.append(a)))
-    actual_function('finalize',copy.deepcopy(main.finalbody),ns)()
+    index=next(i for i,n in enumerate(main.body) if isinstance(n,ast.If) and ast.unparse(n.test)=='scratch is not None')
+    ns=dict(scratch='private',owned_service=owned,output_cursor={'retain_output':retain},reason=None,detail=None,deadline=10,
+        result_code=0,stdout_cursor={},stdout_deadline=10,no_verdict=lambda *args,**kwargs:98)
+    removed=attach_inert_scratch_retirement(ns)
+    actual_function('finalize',copy.deepcopy(main.body[index:]),ns)()
     assert bool(removed) is (not owned and not retain)
 case('live owned allocation retains private evidence',lambda:evidence(True))
 case('released allocation can remove private evidence',lambda:evidence(False))
@@ -5472,8 +5493,7 @@ def persistent_outer_clock_failure():
         shutil=types.SimpleNamespace(rmtree=lambda *args,**kwargs:removed.append(args)))
     declarations(SUPERVISOR,{'JobRequestCancelled'},ns)
     setup=ast.parse('status_path="state"\nnonce="nonce"').body
-    guarded=ast.Try(body=copy.deepcopy(main.handlers[0].body),handlers=[],orelse=[],finalbody=copy.deepcopy(main.finalbody))
-    assert actual_function('outer_clock_fault',setup+[guarded],ns)()==98
+    assert actual_function('outer_clock_fault',setup+copy.deepcopy(main.handlers[0].body),ns)()==98
     assert clocks and not productive and len(cleanups)==1 and not removed
     assert len(verdicts)==1 and verdicts[0][0]=='cleanup'
     assert 'persistent fixture clock unavailable' in verdicts[0][1] and 'custody retained' in verdicts[0][1]

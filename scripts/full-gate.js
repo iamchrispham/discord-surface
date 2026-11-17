@@ -599,6 +599,12 @@ async function runFullGate(root, label, entry, args) {
         const event = message.observation?.event;
         const escapedWriterDetected = process.platform === 'linux' && event === WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES;
         if (!stopped && (escapedWriterDetected || event === WATCHDOG_STOP_EVENTS.DRAIN_PEERS || WATCHDOG_OBSERVATION_FAILURE_EVENTS.has(event))) {
+          if (escapedWriterDetected && supervisorKind === SUPERVISOR.LINUX_SUBREAPER) {
+            const supervisorPid = Number(process.env[SUPERVISOR_PID_ENVIRONMENT]);
+            if (Number.isSafeInteger(supervisorPid) && supervisorPid > 1) {
+              try { process.kill(supervisorPid, 'SIGUSR1'); } catch {}
+            }
+          }
           stop(escapedWriterDetected ? REASONS.CLEANUP : REASONS.INTERRUPTED, 'watchdog-stop');
         }
       }

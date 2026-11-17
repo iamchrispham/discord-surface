@@ -281,8 +281,10 @@ def signal_owned_child(pid, signal_number):
         os.close(descriptor)
 
 
-def wait_for_owned_children(deadline):
+def wait_for_owned_children(deadline, *, cleanup_requested=None):
     while True:
+        if cleanup_requested is not None and cleanup_requested():
+            return False
         if not live_owned_children():
             return True
         remaining = deadline - clock_now()
@@ -475,7 +477,7 @@ def emit_child_stderr(capture, result):
         os.write(sys.stderr.fileno(), output)
 
 
-def run_supervised(root, command, environment, started, receipt, interrupted):
+def run_supervised(root, command, environment, started, receipt, interrupted, *, cleanup_requested=None):
     environment.pop("NODE_OPTIONS", None)
     environment[SUPERVISOR_ENVIRONMENT] = LINUX_SUBREAPER
     environment[SUPERVISOR_RECEIPT_ENVIRONMENT] = receipt.path
@@ -550,6 +552,9 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         process_started = True
         run_deadline = deadline - CLEANUP_RESERVE_SECONDS
         while process.poll() is None:
+            if cleanup_requested is not None and cleanup_requested():
+                reason, detail = "cleanup", "gate reported an escaped descendant"
+                break
             if interrupted.is_set():
                 reason, detail = "interrupted", "full gate was interrupted"
                 break
@@ -563,8 +568,11 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 reason, detail = "cleanup", "supervised process tree did not stop before the caller deadline"
         else:
             result = process.wait()
-            writers_drained = wait_for_owned_children(run_deadline)
-            if not writers_drained:
+            writers_drained = wait_for_owned_children(run_deadline, cleanup_requested=cleanup_requested)
+            if cleanup_requested is not None and cleanup_requested():
+                reason, detail = "cleanup", "gate reported an escaped descendant"
+                writers_drained = stop_owned_processes(process, deadline)
+            elif not writers_drained:
                 reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
 
         try:
@@ -922,6 +930,21 @@ def _darwin_cleanup(owner, launchctl, service, identity, deadline, status_path=N
         return False
 
 
+def run_supervised_with_cleanup_request(root, command, environment, started, receipt, interrupted):
+    requested = False
+
+    def request_cleanup(_signum, _frame):
+        nonlocal requested
+        requested = True
+
+    previous = signal.signal(signal.SIGUSR1, request_cleanup)
+    try:
+        return run_supervised(root, command, environment, started, receipt, interrupted,
+            cleanup_requested=lambda: requested)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
 def run_darwin_supervised(root, command, environment, started, receipt, interrupted):
     environment.pop("NODE_OPTIONS", None)
     environment[SUPERVISOR_ENVIRONMENT] = DARWIN_LAUNCHD
@@ -1272,7 +1295,7 @@ def run(argv):
             return no_verdict("interrupted", "full gate was interrupted before launch")
         root = Path.cwd().resolve()
         if sys.platform == "linux":
-            return run_supervised(root, command, environment, started, receipt, interrupted)
+            return run_supervised_with_cleanup_request(root, command, environment, started, receipt, interrupted)
         return run_darwin_supervised(root, command, environment, started, receipt, interrupted)
     except OSError as error:
         return no_verdict("setup", str(error))
