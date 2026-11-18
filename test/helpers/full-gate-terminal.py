@@ -290,21 +290,26 @@ def public_finalizers(mode):
         require(b"primary timeout" in marker and mode.encode() in marker, "finalizer diagnostic lost")
 
 
-def linux_output(raw, marked=False, multiple_markers=False):
+def linux_output(raw, marked=False, multiple_markers=False, marker_payload_override=None,
+                 expected_output=None, expected_no_verdict=None, late_newline=False):
     scope, owner, accepted, calls = namespace()
     scope["clock_now"] = lambda: 0
     scope["capture_snapshot"] = lambda *args, **kwargs: {"snapshot": "same", "budget": 20, "slowest": 1}
-    scope["wait_for_owned_children"] = lambda deadline: True
     marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
-    if multiple_markers:
+    if marker_payload_override is not None:
+        marker_payload = marker_payload_override
+    elif multiple_markers:
         marker_payload = marker + b"BETWEEN\n" + marker + b"TAIL\n"
     elif marked:
-        marker_payload = marker + b"TAIL\n"
+        marker_payload = marker[:-1] + (b"" if late_newline else b"\nTAIL\n")
     else:
         marker_payload = b""
+    stdout_capture = None
 
     class Process:
         def __init__(self, *args, **kwargs):
+            nonlocal stdout_capture
+            stdout_capture = kwargs["stdout"]
             kwargs["stdout"].write(b"OUT\n" + marker_payload)
             kwargs["stdout"].flush()
             kwargs["stderr"].write(b"ERR_ONCE\n")
@@ -317,6 +322,17 @@ def linux_output(raw, marked=False, multiple_markers=False):
             return raw
 
     scope["subprocess"] = types.SimpleNamespace(Popen=Process)
+    suffix_appended = False
+
+    def wait_for_owned_children(deadline):
+        nonlocal suffix_appended
+        if late_newline and not suffix_appended:
+            stdout_capture.write(b"\nTAIL\n")
+            stdout_capture.flush()
+            suffix_appended = True
+        return True
+
+    scope["wait_for_owned_children"] = wait_for_owned_children
     receipt = types.SimpleNamespace(path="private-receipt", token="private-token")
     result = scope["run_supervised"](
         Path.cwd(), ["not-executed"], {"APERTURE_GATE_TIME_LEFT_S": "20"}, 0, receipt, threading.Event()
@@ -324,7 +340,9 @@ def linux_output(raw, marked=False, multiple_markers=False):
     owner.close_captures()
     require(owner.publish(result) == raw, "coordinator changed raw result")
     require(bytes(accepted[12]) == b"ERR_ONCE\n", "ordinary stderr replayed more than once")
-    if multiple_markers and raw == 98:
+    if expected_output is not None:
+        expected = expected_no_verdict if raw == 98 and expected_no_verdict is not None else expected_output
+    elif multiple_markers and raw == 98:
         expected = b"OUT\nBETWEEN\nTAIL\n" + marker
     elif multiple_markers:
         expected = b"OUT\nBETWEEN\nTAIL\n" + marker + marker
@@ -332,11 +350,160 @@ def linux_output(raw, marked=False, multiple_markers=False):
         expected = b"OUT\nTAIL\n" + marker if marked else b"OUT\n"
     actual = bytes(accepted[11])
     require(actual == expected, f"stdout/candidate progress changed for result {raw}: {actual!r} != {expected!r}")
+    return owner
 
 
 def linux_multiple_markers():
     for result in (0, 17, 98):
         linux_output(result, multiple_markers=True)
+    marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
+    for count in (1, 8, 32):
+        payload = marker * count
+        owner = linux_output(
+            17,
+            marker_payload_override=payload,
+            expected_output=b"OUT\n" + payload,
+            expected_no_verdict=b"OUT\n" + marker,
+        )
+        staged = [row for row in owner.outputs if "range_count" in row]
+        require(len(staged) == 1 and staged[0]["range_count"] == count,
+                "marker replay staging grew with the marker count")
+    owner = linux_output(
+        98,
+        marker_payload_override=marker * 32,
+        expected_output=b"OUT\n" + marker * 32,
+        expected_no_verdict=b"OUT\n" + marker,
+    )
+    require(sum(row["name"] == "candidate" for row in owner.outputs) == 1,
+            "no-verdict candidate selection grew with the marker count")
+    owner = linux_output(17, marker_payload_override=b"", expected_output=b"OUT\n")
+    require(not any("range_count" in row for row in owner.outputs),
+            "marker-free output created an extra stage")
+
+    chunk_prefix_size = 65536 - 4 - len(marker) // 2
+    chunk_prefix = b"x" * (chunk_prefix_size - 1) + b"\n"
+    linux_output(
+        17,
+        marker_payload_override=chunk_prefix + marker + b"TAIL\n",
+        expected_output=b"OUT\n" + chunk_prefix + b"TAIL\n" + marker,
+    )
+    long_marker = b"APERTURE-GATE-INDETERMINATE reason=" + b"x" * (2 * 65536) + b"\n"
+    linux_output(
+        17,
+        marker_payload_override=long_marker + b"TAIL\n",
+        expected_output=b"OUT\nTAIL\n" + long_marker,
+    )
+
+    def replay_history(split_marker):
+        scope, owner, accepted, calls = namespace()
+        scope["clock_now"] = lambda: 0
+        scope["_ACTIVE_TERMINAL_OUTPUT"] = owner
+        stdout = owner.add_capture("stdout", replay=False)
+        stderr = owner.add_capture("stderr", replay=False)
+        stderr.write(b"ERR_ONCE\n")
+        stdout.write(b"PREFIX\n")
+        if split_marker:
+            stdout.write(marker[:-1])
+            stdout.flush()
+            cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+            scope["_stream_stdout"](stdout.name, cursor)
+            scope["_stream_stdout"](stdout.name, cursor)
+            stdout.write(b"\nTAIL\n")
+        else:
+            stdout.write(marker + b"TAIL\n")
+            cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+        stdout.flush()
+        for _ in range(5):
+            previous = cursor["offset"]
+            scope["_stream_stdout"](stdout.name, cursor, final=True)
+            if cursor["offset"] == previous and cursor["offset"] == Path(stdout.name).stat().st_size:
+                break
+        stderr.flush()
+        require(scope["_emit_job_stderr"](
+            stderr.name, stdout.name, 17, True, cursor, None
+        ), "diverging-prefix output did not stage")
+        require(owner.publish(17) == 17, "diverging-prefix result changed")
+        return bytes(accepted[11]), cursor
+
+    complete_history, complete_cursor = replay_history(False)
+    late_history, late_cursor = replay_history(True)
+    expected_history = b"PREFIX\nTAIL\n" + marker
+    require(complete_history == expected_history and late_history == expected_history,
+            "diverging prefixes duplicated or skipped accepted output")
+    require((complete_cursor["offset"], complete_cursor["source_line_start"],
+             complete_cursor["output_line_start"], complete_cursor["verdict"])
+            == (late_cursor["offset"], late_cursor["source_line_start"],
+                late_cursor["output_line_start"], late_cursor["verdict"]),
+            "late newline did not converge on the same accepted cursor")
+    linux_output(17, marked=True, late_newline=True,
+                 expected_output=b"OUT\nTAIL\n" + marker)
+    darwin_output("late-newline")
+
+    scope, owner, accepted, calls = namespace()
+    capture = owner.add_capture("stdout")
+    capture.write(marker)
+    capture.flush()
+    scope["_ACTIVE_TERMINAL_OUTPUT"] = owner
+    cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    original_os = scope["os"]
+    append_attempts = [0]
+
+    class ShortJournalWrite:
+        def __getattr__(self, name):
+            return getattr(original_os, name)
+
+        def write(self, descriptor, payload):
+            if len(payload) == 16:
+                append_attempts[0] += 1
+                return original_os.write(descriptor, payload[:8])
+            return original_os.write(descriptor, payload)
+
+    scope["os"] = ShortJournalWrite()
+    scope["_stream_stdout"](capture.name, cursor, final=True)
+    require(cursor["offset"] == 0 and cursor["retain_output"],
+            "partial journal append advanced the stdout cursor")
+    require(owner.output_complete is False and owner.verdict_range_count == 0,
+            "partial journal append was accepted")
+    journal_path = owner.verdict_journal_path
+    require(journal_path is not None and Path(journal_path).stat().st_size == 8,
+            "partial journal evidence was discarded")
+    scope["_stream_stdout"](capture.name, cursor, final=True)
+    require(append_attempts[0] == 1 and cursor["offset"] == 0,
+            "ambiguous journal append was retried or skipped")
+    owner.close_captures()
+    require(Path(capture.name).exists(), "partial append discarded original capture")
+
+    scope, owner, accepted, calls = namespace()
+    stdout = owner.add_capture("stdout")
+    stdout.write(marker)
+    stdout.flush()
+    stderr = owner.add_capture("stderr")
+    stderr.write(b"ERR_ONCE\n")
+    stderr.flush()
+    require(owner.record_verdict_range(0, len(marker)), "stage-failure range setup failed")
+    scope["_ACTIVE_TERMINAL_OUTPUT"] = owner
+    cursor = {"offset": len(marker), "verdict": (0, len(marker)), "output_line_start": True}
+
+    class FailedStageSync:
+        def __getattr__(self, name):
+            return getattr(original_os, name)
+
+        def fsync(self, descriptor):
+            raise OSError("injected stage sync failure")
+
+    scope["os"] = FailedStageSync()
+    require(not scope["_emit_job_stderr"](
+        stderr.name, stdout.name, 17, True, cursor, None
+    ), "failed combined stage was accepted")
+    require(cursor["retain_output"] and owner.output_complete is False,
+            "failed combined stage did not poison output custody")
+    staged = [row for row in owner.outputs if "range_count" in row]
+    require(len(staged) == 1 and Path(staged[0]["path"]).exists(),
+            "failed combined stage evidence was discarded")
+    require(Path(stdout.name).exists() and Path(owner.verdict_journal_path).exists(),
+            "failed combined stage lost its source evidence")
+    require(bytes(accepted[11]) == b"", "failed combined stage published duplicate bytes")
+    owner.close_captures()
 
 
 def linux_post_exit_cancel():
@@ -349,6 +516,7 @@ def linux_post_exit_cancel():
 
     with tempfile.TemporaryDirectory(prefix="terminal-adopted-child-") as actor_root:
         actor_path = Path(actor_root) / "actor-exit"
+        ready_path = Path(actor_root) / "actor-ready"
 
         class Process:
             def __init__(self, *args, **kwargs):
@@ -360,18 +528,24 @@ def linux_post_exit_cancel():
                 actor_code = (
                     "import pathlib,signal,sys,time\n"
                     "target=pathlib.Path(sys.argv[1])\n"
+                    "ready=pathlib.Path(sys.argv[2])\n"
                     "def stopped(signum, frame):\n"
                     " target.write_text('terminated')\n"
                     " raise SystemExit(0)\n"
                     "signal.signal(signal.SIGTERM, stopped)\n"
+                    "ready.write_text('ready')\n"
                     "time.sleep(8)\n"
                     "target.write_text('self-destructed')\n"
                 )
                 actor = subprocess.Popen(
-                    [sys.executable, "-I", "-c", actor_code, str(actor_path)],
+                    [sys.executable, "-I", "-c", actor_code, str(actor_path), str(ready_path)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
+                ready_deadline = time.monotonic() + 10
+                while not ready_path.exists() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                require(ready_path.exists(), "adopted child handler did not become ready")
 
             def poll(self):
                 return 17
@@ -444,6 +618,7 @@ def large_required_files():
         stderr_path = Path(tempfile.gettempdir()) / ("terminal-large-stderr-" + str(result))
         stdout_path.write_bytes(marker)
         stderr_path.write_bytes(stderr_payload)
+        require(owner.record_verdict_range(0, len(marker)), "large verdict range was not journaled")
         cursor = {"offset": 0, "verdict": (0, len(marker)), "output_line_start": True}
         try:
             require(scope["_emit_job_stderr"](
@@ -510,6 +685,7 @@ def marker_delivery_error():
 
 def darwin_output(mode):
     large = mode == "large"
+    late_newline = mode == "late-newline"
     if large:
         scope, owner, sizes, digests = bounded_namespace()
         accepted = None
@@ -581,13 +757,25 @@ def darwin_output(mode):
 
     def bootstrap(*args):
         Path(allocations[-1], "stderr.log").write_bytes(large_stderr if large else b"ERR_ONCE\n")
+        ordinary_stdout = b"BOOT_OUT\nAPERTURE-GATE-INDETERMINATE reason=capacity: child"
+        if late_newline:
+            stdout_payload = ordinary_stdout
+        else:
+            stdout_payload = b"BOOT_OUT\nAPERTURE-GATE-INDETERMINATE reason=capacity: child\nTAIL\n"
         Path(allocations[-1], "stdout.log").write_bytes(
-            large_stdout if large else b"BOOT_OUT\nAPERTURE-GATE-INDETERMINATE reason=capacity: child\nTAIL\n"
+            large_stdout if large else stdout_payload
         )
         return types.SimpleNamespace(returncode=1 if mode == "bootstrap" else 0, stdout="", stderr="bootstrap refused")
 
     scope["_launchctl"] = bootstrap
-    scope["_wait_job_phase"] = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("controlled phase failure"))
+
+    def phase_failure(*args, **kwargs):
+        if late_newline:
+            with open(Path(allocations[-1], "stdout.log"), "ab") as handle:
+                handle.write(b"\nTAIL\n")
+        raise OSError("controlled phase failure")
+
+    scope["_wait_job_phase"] = phase_failure
 
     def cleaned(*args, **kwargs):
         state = kwargs.get("terminal_state")
@@ -620,6 +808,9 @@ def darwin_output(mode):
     require(b"reason=capacity: child" not in accepted[11], "superseded child marker was published")
     require(all(not Path(path).exists() for path in allocations), "known-drained allocation not retired")
     require(bytes(accepted[11]).count(b"APERTURE-GATE-INDETERMINATE") == 1, "Darwin published twice")
+    if late_newline:
+        require(bytes(accepted[11]).count(b"TAIL\n") == 1,
+                "Darwin late newline duplicated the accepted suffix")
 
 
 with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
@@ -644,10 +835,6 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             expired_range_delivery()
         elif scenario == "marker-delivery-error":
             marker_delivery_error()
-        elif scenario == "linux-multiple-markers":
-            linux_multiple_markers()
-        elif scenario == "linux-post-exit-cancel":
-            linux_post_exit_cancel()
         elif scenario == "linux-multiple-markers":
             linux_multiple_markers()
         elif scenario == "linux-post-exit-cancel":

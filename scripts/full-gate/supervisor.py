@@ -281,6 +281,9 @@ class TerminalOutput:
         self.recovery_path = None
         self.recovery_prepared = None
         self.recovery_staged = False
+        self.verdict_journal_path = None
+        self.verdict_range_count = 0
+        self.verdict_range_end = None
 
     @property
     def evidence_paths(self):
@@ -292,6 +295,8 @@ class TerminalOutput:
                 paths.append(render_path)
         if self.recovery_path is not None:
             paths.append(self.recovery_path)
+        if self.verdict_journal_path is not None:
+            paths.append(self.verdict_journal_path)
         return paths
 
     def prepare_recovery(self):
@@ -471,6 +476,113 @@ class TerminalOutput:
                 except OSError:
                     pass
             self.fail_output("gate output range could not be staged: " + str(error))
+            return False
+
+    def record_verdict_range(self, start, end):
+        if not self.output_complete:
+            return False
+        if (type(start) is not int or type(end) is not int or start < 0
+                or end <= start or end >= 1 << 64
+                or self.verdict_range_end is not None and start < self.verdict_range_end):
+            self.fail_output("gate verdict range was invalid")
+            return False
+        payload = start.to_bytes(8, "big") + end.to_bytes(8, "big")
+        descriptor = None
+        try:
+            if self.verdict_journal_path is None:
+                descriptor, self.verdict_journal_path = tempfile.mkstemp(prefix="dsg-verdict-")
+            else:
+                descriptor = os.open(self.verdict_journal_path, os.O_WRONLY | os.O_APPEND)
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("gate verdict journal append was incomplete")
+            selected = descriptor
+            descriptor = None
+            os.close(selected)
+            self.verdict_range_count += 1
+            self.verdict_range_end = end
+            return True
+        except (OSError, ValueError) as error:
+            self.fail_output("gate verdict range could not be journaled: " + str(error))
+            return False
+        finally:
+            if descriptor is not None:
+                selected = descriptor
+                descriptor = None
+                try:
+                    os.close(selected)
+                except OSError as error:
+                    self.fail_output("gate verdict journal close failed: " + str(error))
+
+    def stage_verdict_ranges(self, source):
+        if not self.output_complete:
+            return False
+        if self.verdict_journal_path is None or self.verdict_range_count == 0:
+            self.fail_output("required gate verdict ranges have no journal")
+            return False
+        descriptor = None
+        record = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="dsg-output-")
+            record = {
+                "name": "stdout",
+                "path": path,
+                "replay": True,
+                "candidate": False,
+                "range_count": self.verdict_range_count,
+            }
+            self.outputs.append(record)
+            with os.fdopen(descriptor, "wb") as destination:
+                descriptor = None
+                source_size = os.stat(source).st_size
+                previous_end = 0
+                staged_count = 0
+                with open(source, "rb") as source_handle, open(self.verdict_journal_path, "rb") as journal:
+                    while True:
+                        encoded = journal.read(16)
+                        if not encoded:
+                            break
+                        if len(encoded) != 16:
+                            raise OSError("gate verdict journal record was incomplete")
+                        start = int.from_bytes(encoded[:8], "big")
+                        end = int.from_bytes(encoded[8:], "big")
+                        if not previous_end <= start < end <= source_size:
+                            raise OSError("gate verdict journal range was invalid")
+                        source_handle.seek(start)
+                        marker = source_handle.read(len(_TERMINAL_MARKER))
+                        source_handle.seek(end - 1)
+                        newline = source_handle.read(1)
+                        if marker != _TERMINAL_MARKER or newline != b"\n":
+                            raise OSError("saved gate verdict marker was incomplete")
+                        source_handle.seek(start)
+                        remaining = end - start
+                        while remaining:
+                            if not self._deadline_available():
+                                raise OSError("gate verdict range stage exceeded the caller deadline")
+                            payload = source_handle.read(min(_OUTPUT_CHUNK_SIZE, remaining))
+                            if not payload:
+                                raise OSError("gate verdict range stage was short")
+                            written = destination.write(payload)
+                            if written != len(payload):
+                                raise OSError("gate verdict range stage was incomplete")
+                            remaining -= written
+                        previous_end = end
+                        staged_count += 1
+                if staged_count != self.verdict_range_count:
+                    raise OSError("gate verdict journal record count changed")
+                destination.flush()
+                os.fsync(destination.fileno())
+            record["size"] = os.stat(path).st_size
+            return True
+        except (OSError, ValueError) as error:
+            if descriptor is not None:
+                selected = descriptor
+                descriptor = None
+                try:
+                    os.close(selected)
+                except OSError:
+                    pass
+            self.fail_output("gate verdict ranges could not be staged: " + str(error))
             return False
 
     def add_file(self, name, source, *, replay, candidate=False):
@@ -1358,14 +1470,13 @@ def _read_job_state(path, owner, token, identity=None):
     return state
 
 
-def _record_verdict_range(cursor, start, end):
-    saved = cursor.get("verdict")
-    if saved is None:
-        cursor["verdict"] = [(start, end)]
-    elif isinstance(saved, list):
-        saved.append((start, end))
-    else:
-        cursor["verdict"] = [saved, (start, end)]
+def _record_verdict_range(cursor, start, end, terminal):
+    if terminal is None or not terminal.record_verdict_range(start, end):
+        cursor["retain_output"] = True
+        return False
+    if cursor.get("verdict") is None:
+        cursor["verdict"] = (start, end)
+    return True
 
 
 def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
@@ -1388,7 +1499,8 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
         newline = payload.find(b"\n")
         if newline >= 0:
             end = offset + newline + 1
-            _record_verdict_range(cursor, pending, end)
+            if not _record_verdict_range(cursor, pending, end, terminal):
+                return offset
             cursor.update(offset=end, pending_marker=None, source_line_start=True)
             return end
         if final and len(payload) < 64 * 1024:
@@ -1409,7 +1521,8 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
             newline = payload.find(b"\n")
             if newline >= 0:
                 end = offset + newline + 1
-                _record_verdict_range(cursor, offset, end)
+                if not _record_verdict_range(cursor, offset, end, terminal):
+                    return offset
                 cursor.update(offset=end, source_line_start=True)
                 return end
             if not final or len(payload) == 64 * 1024:
@@ -1453,15 +1566,10 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
     terminal.set_deadline(deadline)
     saved = cursor.get("verdict")
     if saved is not None:
-        ranges = saved if isinstance(saved, list) else [saved]
         if result == NO_VERDICT:
-            ranges = ranges[:1]
             replay, candidate = False, True
             name = "candidate"
-        else:
-            replay, candidate = True, False
-            name = "stdout"
-        for start, end in ranges:
+            start, end = saved
             if not terminal._marker_range_valid(stdout_path, start, end):
                 cursor["retain_output"] = True
                 return False
@@ -1470,6 +1578,9 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
             ):
                 cursor["retain_output"] = True
                 return False
+        elif not terminal.stage_verdict_ranges(stdout_path):
+            cursor["retain_output"] = True
+            return False
     if not terminal.add_file("stderr", path, replay=True):
         cursor["retain_output"] = True
         return False
