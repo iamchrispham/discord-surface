@@ -165,9 +165,16 @@ in [INSTALL.md](INSTALL.md#build-and-inspect-the-package). The test entry builds
 and runs the explicitly registered files serially. New suites must be added to `scripts.test` in
 `package.json`.
 
-Exit 98 with `APERTURE-GATE-INDETERMINATE` means no verdict. It is neither a pass nor a test
-failure. Follow the reported reason before rescheduling. Packaging checks use an isolated
-installation and do not start the Gateway.
+Exit 98 with `APERTURE-GATE-INDETERMINATE` means no verdict. A raw body exit 98
+without the marker is the command result.
+
+- `setup` or `queue-missing`: repair admission before retrying.
+- `capacity`: reschedule with the same ticket to keep your place in the queue.
+- `cleanup`: inspect and clean the gate's owned process group or scratch directory
+  before retrying.
+- `interrupted`, `stale` or `timeout`: fix the reported cause before rescheduling.
+
+Packaging checks use an isolated installation and do not start the Gateway.
 
 Documentation-only changes need command, path, link, and diff checks. Runtime tests use
 disposable databases and simulated transport. Keep live credentials, native sessions, and the
