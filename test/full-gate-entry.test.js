@@ -2591,12 +2591,13 @@ test('guardian loss allows healthy outer supervisor cleanup after inner guardian
 test('watchdog holds admission through cleanup after worker loss', { skip: process.platform === 'win32', timeout: 180000 }, async t => {
   const f = fixture(t);
   const workerKilled = path.join(f.scratch, 'worker-killed');
+  const retainsAllocation = process.platform === 'linux';
   const env = {
     FIXTURE_LEASE_ENFORCE: '1',
     FIXTURE_KILL_WORKER: '1',
     FIXTURE_HANG: '1',
     FIXTURE_WORKER_KILLED: workerKilled,
-    FIXTURE_EXPECTED_RETENTION: '1',
+    FIXTURE_EXPECTED_RETENTION: retainsAllocation ? '1' : '',
     FIXTURE_EXPECTED_RETENTION_REASON: 'worker-loss cleanup could not verify descendant drainage'
   };
   const first = f.launchSupervised(env);
@@ -2655,8 +2656,8 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   const markers = firstResult.output.match(/^APERTURE-GATE-INDETERMINATE reason=.*$/gm) || [];
   assert.equal(markers.length, 1, firstResult.output);
   const [marker] = markers;
-  const retained = marker.startsWith('APERTURE-GATE-INDETERMINATE reason=cleanup:');
-  if (retained) {
+  if (retainsAllocation) {
+    assert.match(marker, /^APERTURE-GATE-INDETERMINATE reason=cleanup:/);
     assert.match(marker, /unverified|unknown|cannot|could not|not verified|not proven|did not prove/i);
     assert.match(marker, /descendant|drain/i);
     assert.match(marker, /retained/i);
@@ -2665,7 +2666,7 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   }
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.identityGone(stopped.body, roleFixture.captureIdentity(body.pid)), true, 'body process remained after guardian cleanup');
-  assert.equal(fs.existsSync(body.scratch), retained, firstResult.output);
+  assert.equal(fs.existsSync(body.scratch), retainsAllocation, firstResult.output);
 
   const resumedMarker = path.join(f.scratch, 'resumed-body.json');
   const resumed = await f.launchSupervised({ FIXTURE_LEASE_ENFORCE: '1', FIXTURE_MARKER: resumedMarker }).done;
