@@ -1,8 +1,10 @@
 import os
 import hashlib
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -181,6 +183,23 @@ def phase_reserve():
         )
         require(state is None and offset == 0 and clock[0] == 5, "phase consumed cleanup reserve")
         require(owner.deadline == 10, "operation bound replaced terminal bound")
+
+        clock[0] = 0
+        sleeps[0] = 0
+        cancel_event = threading.Event()
+
+        def cancel_during_write(fd, payload, deadline=None, logical_state=None, interrupted=None):
+            cancel_event.set()
+            return scope["_source_write_job_output"](
+                fd, payload, deadline, logical_state, interrupted=interrupted
+            )
+
+        scope["_write_job_output"] = cancel_during_write
+        state, offset = scope["_wait_job_phase"](
+            "unused", None, None, "private", ("ready",), 0, 5, cancel_event, str(path), cursor
+        )
+        require(state is None and offset == 0, "cancelled phase published a stale state")
+        require(cancel_event.is_set() and clock[0] < 0.1, "blocked output delayed phase cancellation")
     finally:
         os.close(writer)
         os.close(reader)
@@ -271,16 +290,22 @@ def public_finalizers(mode):
         require(b"primary timeout" in marker and mode.encode() in marker, "finalizer diagnostic lost")
 
 
-def linux_output(raw, marked=False):
+def linux_output(raw, marked=False, multiple_markers=False):
     scope, owner, accepted, calls = namespace()
     scope["clock_now"] = lambda: 0
     scope["capture_snapshot"] = lambda *args, **kwargs: {"snapshot": "same", "budget": 20, "slowest": 1}
     scope["wait_for_owned_children"] = lambda deadline: True
     marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
+    if multiple_markers:
+        marker_payload = marker + b"BETWEEN\n" + marker + b"TAIL\n"
+    elif marked:
+        marker_payload = marker + b"TAIL\n"
+    else:
+        marker_payload = b""
 
     class Process:
         def __init__(self, *args, **kwargs):
-            kwargs["stdout"].write(b"OUT\n" + (marker + b"TAIL\n" if marked else b""))
+            kwargs["stdout"].write(b"OUT\n" + marker_payload)
             kwargs["stdout"].flush()
             kwargs["stderr"].write(b"ERR_ONCE\n")
             kwargs["stderr"].flush()
@@ -299,8 +324,90 @@ def linux_output(raw, marked=False):
     owner.close_captures()
     require(owner.publish(result) == raw, "coordinator changed raw result")
     require(bytes(accepted[12]) == b"ERR_ONCE\n", "ordinary stderr replayed more than once")
-    expected = b"OUT\nTAIL\n" + marker if marked else b"OUT\n"
-    require(bytes(accepted[11]) == expected, "stdout/candidate progress duplicated or lost")
+    if multiple_markers and raw == 98:
+        expected = b"OUT\nBETWEEN\nTAIL\n" + marker
+    elif multiple_markers:
+        expected = b"OUT\nBETWEEN\nTAIL\n" + marker + marker
+    else:
+        expected = b"OUT\nTAIL\n" + marker if marked else b"OUT\n"
+    actual = bytes(accepted[11])
+    require(actual == expected, f"stdout/candidate progress changed for result {raw}: {actual!r} != {expected!r}")
+
+
+def linux_multiple_markers():
+    for result in (0, 17, 98):
+        linux_output(result, multiple_markers=True)
+
+
+def linux_post_exit_cancel():
+    if sys.platform != "linux":
+        return
+    scope, owner, accepted, calls = namespace()
+    phases = []
+    interrupted = threading.Event()
+    actor = None
+
+    with tempfile.TemporaryDirectory(prefix="terminal-adopted-child-") as actor_root:
+        actor_path = Path(actor_root) / "actor-exit"
+
+        class Process:
+            def __init__(self, *args, **kwargs):
+                nonlocal actor
+                kwargs["stdout"].write(b"OUT\n")
+                kwargs["stdout"].flush()
+                kwargs["stderr"].write(b"ERR_ONCE\n")
+                kwargs["stderr"].flush()
+                actor_code = (
+                    "import pathlib,signal,sys,time\n"
+                    "target=pathlib.Path(sys.argv[1])\n"
+                    "def stopped(signum, frame):\n"
+                    " target.write_text('terminated')\n"
+                    " raise SystemExit(0)\n"
+                    "signal.signal(signal.SIGTERM, stopped)\n"
+                    "time.sleep(8)\n"
+                    "target.write_text('self-destructed')\n"
+                )
+                actor = subprocess.Popen(
+                    [sys.executable, "-I", "-c", actor_code, str(actor_path)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+
+            def poll(self):
+                return 17
+
+            def wait(self):
+                return 17
+
+        def expire_drain(deadline):
+            interrupted.set()
+            return False
+
+        def snapshot_after_cancel(root, environment, phase, deadline, cancel, *, stop_deadline):
+            phases.append(phase)
+            if phase == "after" and cancel.is_set():
+                raise InterruptedError("fixture verifier cancelled before launch")
+            return {"snapshot": "same", "budget": 20, "slowest": 1}
+
+        scope["clock_now"] = time.monotonic
+        scope["capture_snapshot"] = snapshot_after_cancel
+        scope["wait_for_owned_children"] = expire_drain
+        scope["subprocess"] = types.SimpleNamespace(Popen=Process, PIPE=-1, TimeoutExpired=TimeoutError)
+        receipt = types.SimpleNamespace(path="private-receipt", token="private-token")
+        try:
+            result = scope["run_supervised"](
+                Path.cwd(), ["not-executed"], {"APERTURE_GATE_TIME_LEFT_S": "20"},
+                time.monotonic(), receipt, interrupted
+            )
+            owner.close_captures()
+            require(result == 98, "interrupted post-exit drain changed terminal result")
+            require(phases == ["before", "after"], "source verification did not take the interrupted path")
+            require(actor is not None, "bounded adopted-child actor did not start")
+            actor.wait(timeout=10)
+            require(actor_path.read_text() == "terminated", "adopted child survived supervisor cleanup")
+        finally:
+            if actor is not None and actor.poll() is None:
+                actor.wait(timeout=10)
 
 
 def large_publish_memory():
@@ -537,6 +644,14 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             expired_range_delivery()
         elif scenario == "marker-delivery-error":
             marker_delivery_error()
+        elif scenario == "linux-multiple-markers":
+            linux_multiple_markers()
+        elif scenario == "linux-post-exit-cancel":
+            linux_post_exit_cancel()
+        elif scenario == "linux-multiple-markers":
+            linux_multiple_markers()
+        elif scenario == "linux-post-exit-cancel":
+            linux_post_exit_cancel()
         elif scenario.startswith("finalizer-"):
             public_finalizers(scenario.removeprefix("finalizer-"))
         elif scenario.startswith("linux-"):

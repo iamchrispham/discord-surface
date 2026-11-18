@@ -1151,6 +1151,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
             result = process.wait()
             writers_drained = wait_for_owned_children(run_deadline)
             if not writers_drained:
+                writers_drained = stop_owned_processes(None, deadline)
                 reason, detail = "timeout", "full gate exceeded the caller deadline while descendants remained"
 
         if writers_drained:
@@ -1357,6 +1358,16 @@ def _read_job_state(path, owner, token, identity=None):
     return state
 
 
+def _record_verdict_range(cursor, start, end):
+    saved = cursor.get("verdict")
+    if saved is None:
+        cursor["verdict"] = [(start, end)]
+    elif isinstance(saved, list):
+        saved.append((start, end))
+    else:
+        cursor["verdict"] = [saved, (start, end)]
+
+
 def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
     try:
         terminal = _ACTIVE_TERMINAL_OUTPUT
@@ -1377,8 +1388,7 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
         newline = payload.find(b"\n")
         if newline >= 0:
             end = offset + newline + 1
-            if cursor.get("verdict") is None:
-                cursor["verdict"] = (pending, end)
+            _record_verdict_range(cursor, pending, end)
             cursor.update(offset=end, pending_marker=None, source_line_start=True)
             return end
         if final and len(payload) < 64 * 1024:
@@ -1399,8 +1409,7 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
             newline = payload.find(b"\n")
             if newline >= 0:
                 end = offset + newline + 1
-                if cursor.get("verdict") is None:
-                    cursor["verdict"] = (offset, end)
+                _record_verdict_range(cursor, offset, end)
                 cursor.update(offset=end, source_line_start=True)
                 return end
             if not final or len(payload) == 64 * 1024:
@@ -1444,20 +1453,23 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
     terminal.set_deadline(deadline)
     saved = cursor.get("verdict")
     if saved is not None:
-        if not terminal._marker_range_valid(stdout_path, saved[0], saved[1]):
-            cursor["retain_output"] = True
-            return False
+        ranges = saved if isinstance(saved, list) else [saved]
         if result == NO_VERDICT:
+            ranges = ranges[:1]
             replay, candidate = False, True
             name = "candidate"
         else:
             replay, candidate = True, False
             name = "stdout"
-        if not terminal.add_file_range(
-            name, stdout_path, saved[0], saved[1], replay=replay, candidate=candidate
-        ):
-            cursor["retain_output"] = True
-            return False
+        for start, end in ranges:
+            if not terminal._marker_range_valid(stdout_path, start, end):
+                cursor["retain_output"] = True
+                return False
+            if not terminal.add_file_range(
+                name, stdout_path, start, end, replay=replay, candidate=candidate
+            ):
+                cursor["retain_output"] = True
+                return False
     if not terminal.add_file("stderr", path, replay=True):
         cursor["retain_output"] = True
         return False
@@ -1481,7 +1493,7 @@ def _write_job_request(path, token, owner, identity, sequence, phase, interrupte
 
 def _wait_job_phase(path, owner, identity, token, phases, sequence, deadline, interrupted, stdout_path, cursor):
     while clock_now() < deadline and not interrupted.is_set():
-        _stream_stdout(stdout_path, cursor, deadline=deadline)
+        _stream_stdout(stdout_path, cursor, deadline=deadline, interrupted=interrupted)
         state = _read_job_state(path, owner, token, identity)
         if state is not None:
             observed = state["sequence"]
