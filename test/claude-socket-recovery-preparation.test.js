@@ -294,15 +294,22 @@ test('socket probe timeout preserves custody after late refusal', { timeout: 800
 test('stop during orphan probe prevents subsequent listener startup', { timeout: 8000 }, async t => {
   const socket = socketPath(t);
   await orphan(socket);
-  const { EventEmitter } = require('node:events');
   const probes = [];
-  const originalCreateConnection = net.createConnection;
-  t.mock.method(net, 'createConnection', (...args) => {
-    if (probes.length >= 2) return originalCreateConnection.apply(net, args);
-    const probe = new EventEmitter();
-    probe.destroy = () => {};
-    probes.push(probe);
-    return probe;
+  let holdProbe = true;
+  const originalPrepareSocket = socketOwnership.prepareSocket;
+  t.mock.method(socketOwnership, 'prepareSocket', async (candidate, signal) => {
+    probes.push(candidate);
+    if (holdProbe) {
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(new Error('Claude channel stopped during socket preparation'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
+    }
+    return originalPrepareSocket(candidate, signal);
   });
   const { dir, state } = fixture();
   t.after(() => state.close());
@@ -310,12 +317,12 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   const starting = channel.start();
   const rejected = assert.rejects(starting, /stopped during socket preparation/);
+  await waitForCondition(() => probes.length === 1, 'startup must enter the ordinary stale-socket probe');
   await channel.stop();
-  probes[0].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
   await rejected;
   assert.equal(channel.ready, false);
+  holdProbe = false;
   const restarting = channel.start();
-  probes[1].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
   await restarting;
   assert.equal(channel.ready, true);
   await channel.stop();

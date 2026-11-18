@@ -51,6 +51,10 @@ export function lockPathForSocket(socketPath: string): string {
   return path.join(lockNamespacePath(identityPath), `${key}.lock`);
 }
 
+export function readSocketLockOwnerSnapshotAt(lockPath: string): OwnerMarkerSnapshot {
+  return readSocketLockOwnerSnapshot(ownerPathForLock(lockPath));
+}
+
 function ownerPathForLock(lockPath: string): string {
   return path.join(lockPath, 'owner');
 }

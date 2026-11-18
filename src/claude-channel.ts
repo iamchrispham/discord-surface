@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import * as socketOwnership from './claude/socket-ownership';
+import { pinIncumbent, waitForIncumbentVacancy } from './claude/startup-recovery';
 import type {
   MessageState
 } from './acknowledgment';
@@ -53,6 +54,7 @@ interface ClaudeBodyRequest {
 export const CLAUDE_STARTUP_PHASES = {
   SOCKET_PREPARATION: 'socket preparation',
   MCP_CONNECTION: 'MCP connection',
+  INCUMBENT_WAIT: 'incumbent wait',
   LISTENER_STARTUP: 'listener startup'
 } as const;
 
@@ -70,6 +72,12 @@ interface ClaudeBindingIdentity {
 
 function errorMessage(error: unknown): string {
   return String((error as { message?: unknown }).message);
+}
+
+function bindingMatchesIdentity(binding: ClaudeBinding | null | undefined, identity: ClaudeBindingIdentity): boolean {
+  return Boolean(binding && binding.active && binding.channelId === identity.channelId && binding.guildId === identity.guildId &&
+    binding.provider === identity.provider && binding.nativeId === identity.nativeId && binding.workspace === identity.workspace &&
+    binding.endpoint === identity.endpoint && binding.generation === identity.generation);
 }
 
 function closeServer(server: { listening: boolean; close(callback: (error?: Error) => void): void } | null | undefined): Promise<void> {
@@ -155,9 +163,13 @@ export class ClaudeChannel<
   declare beforeTransportClose: (() => void | Promise<void>) | null;
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
+  declare startupScheduler: {
+    setTimeout: (callback: () => void, delayMs: number) => unknown;
+    clearTimeout: (handle: unknown) => void;
+  } | undefined;
 
   constructor(options: ClaudeChannelOptions<TProvidedMcp, TState>) {
-    const { state, nativeId, socketPath, mcp, beforeTransportClose, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
+    const { state, nativeId, socketPath, mcp, beforeTransportClose, onTransportClose, logger = () => {}, startupScheduler } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -195,6 +207,7 @@ export class ClaudeChannel<
     this.beforeTransportClose = typeof beforeTransportClose === 'function' ? beforeTransportClose : null;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
     this.logger = logger;
+    this.startupScheduler = startupScheduler;
     const handleTransportClose = () => {
       this.transportClosed = true;
       if (!this.started) this.startupAbort?.();
@@ -279,38 +292,23 @@ export class ClaudeChannel<
       startupController.abort();
       rejectStartup?.(new Error(`Claude channel stopped during ${startupPhase}`));
     };
-    let releaseSocketLock: (() => void);
-    try {
-      const retainedRelease = this.socketLockRelease;
-      if (retainedRelease) {
-        retainedRelease();
-        if (this.socketLockRelease === retainedRelease) this.socketLockRelease = null;
+    const closeStartupTransport = async (): Promise<void> => {
+      try {
+        await (this.mcp as unknown as ClaudeRuntimeMcp).close?.();
+      } catch (error) {
+        this.startupCleanupPending = true;
+        throw error;
+      } finally {
+        if (this.startupAbort === abortStartup) this.startupAbort = null;
       }
-      releaseSocketLock = socketOwnership.acquireSocketLock(this.socketPath);
-    } catch (error) {
-      if (errorMessage(error) === 'Claude channel socket preparation is already in progress') {
-        let socketExists = false;
-        try {
-          socketExists = fs.lstatSync(this.socketPath).isSocket();
-        } catch (pathError) {
-          if ((pathError as NodeJS.ErrnoException).code !== 'ENOENT') {
-            this.startupPhase = null;
-            throw pathError;
-          }
-        }
-        if (socketExists) {
-          this.startupPhase = null;
-          throw new Error('Claude channel socket already exists; stop its owner first');
-        }
-      }
-      this.startupPhase = null;
-      throw error;
-    }
-    this.socketLockRelease = releaseSocketLock;
+    };
     this.startupAbort = abortStartup;
+    const retainedRelease = this.socketLockRelease;
+    if (retainedRelease) {
+      retainedRelease();
+      if (this.socketLockRelease === retainedRelease) this.socketLockRelease = null;
+    }
     try {
-      await socketOwnership.prepareSocket(this.socketPath, startupController.signal);
-      if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
       if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') {
         startupPhase = CLAUDE_STARTUP_PHASES.MCP_CONNECTION;
         this.startupPhase = startupPhase;
@@ -322,11 +320,76 @@ export class ClaudeChannel<
         } catch (error) {
           if (startupCancelled) {
             try { await connection; } catch {}
-            try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
           }
           throw error;
         }
         if (this.transportClosed) throw new Error('Claude channel stopped during MCP connection');
+      }
+      startupPhase = CLAUDE_STARTUP_PHASES.INCUMBENT_WAIT;
+      this.startupPhase = startupPhase;
+      const startupBinding: ClaudeBinding = {
+        ...this.bindingIdentity,
+        active: true
+      };
+      const incumbent = await pinIncumbent({
+        socketPath: this.socketPath,
+        binding: startupBinding,
+        readBinding: () => this.state.getBinding(this.bindingIdentity.channelId),
+        signal: startupController.signal,
+        startupCancellation,
+        scheduler: this.startupScheduler
+      });
+      if (incumbent) {
+        await waitForIncumbentVacancy({
+          socketPath: this.socketPath,
+          binding: startupBinding,
+          readBinding: () => this.state.getBinding(this.bindingIdentity.channelId),
+          signal: startupController.signal,
+          startupCancellation,
+          scheduler: this.startupScheduler
+        }, incumbent);
+      }
+    } catch (error) {
+      let startupError: unknown = error;
+      try { await closeStartupTransport(); } catch (cleanupError) {
+        startupError = new AggregateError([error, cleanupError], 'Claude channel startup cleanup failed');
+      }
+      if (this.startupPhase === startupPhase) this.startupPhase = null;
+      throw startupError;
+    }
+    startupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
+    this.startupPhase = startupPhase;
+    let releaseSocketLock: (() => void);
+    try {
+      releaseSocketLock = socketOwnership.acquireSocketLock(this.socketPath);
+    } catch (error) {
+      let acquisitionError: unknown = error;
+      if (errorMessage(error) === 'Claude channel socket preparation is already in progress') {
+        let socketExists = false;
+        try {
+          socketExists = fs.lstatSync(this.socketPath).isSocket();
+        } catch (pathError) {
+          if ((pathError as NodeJS.ErrnoException).code !== 'ENOENT') {
+            acquisitionError = pathError;
+          }
+        }
+        if (socketExists) acquisitionError = new Error('Claude channel socket already exists; stop its owner first');
+      }
+      this.startupPhase = null;
+      try { await closeStartupTransport(); } catch (cleanupError) {
+        acquisitionError = new AggregateError([acquisitionError, cleanupError], 'Claude channel startup cleanup failed');
+      }
+      throw acquisitionError;
+    }
+    this.socketLockRelease = releaseSocketLock;
+    try {
+      if (!bindingMatchesIdentity(this.state.getBinding(this.bindingIdentity.channelId), this.bindingIdentity)) {
+        throw new Error('Claude channel binding changed during startup recovery');
+      }
+      await socketOwnership.prepareSocket(this.socketPath, startupController.signal);
+      if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
+      if (!bindingMatchesIdentity(this.state.getBinding(this.bindingIdentity.channelId), this.bindingIdentity)) {
+        throw new Error('Claude channel binding changed during startup recovery');
       }
       startupPhase = CLAUDE_STARTUP_PHASES.LISTENER_STARTUP;
       this.startupPhase = startupPhase;
@@ -452,6 +515,9 @@ export class ClaudeChannel<
         });
       await Promise.race([listenerStartup, startupCancellation]);
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
+      if (!bindingMatchesIdentity(this.state.getBinding(this.bindingIdentity.channelId), this.bindingIdentity)) {
+        throw new Error('Claude channel binding changed during startup recovery');
+      }
       listenerStartup = null;
       this.listenerInstanceId = randomUUID();
       this.ready = true;
@@ -459,12 +525,15 @@ export class ClaudeChannel<
     } catch (error) {
       this.ready = false;
       this.listenerInstanceId = null;
+      let startupError: unknown = error;
       if (listenerStartup) {
         try { await listenerStartup; } catch {}
         listenerStartup = null;
       }
       if (!this.stopping) {
-        try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+        try { await closeStartupTransport(); } catch (cleanupError) {
+          startupError = new AggregateError([error, cleanupError], 'Claude channel startup cleanup failed');
+        }
       }
       if (!this.startupCleanupPending) {
         try { await closeServer(this.server); } catch {}
@@ -475,7 +544,7 @@ export class ClaudeChannel<
           this.socketIdentity = null;
         }
       }
-      throw error;
+      throw startupError;
     } finally {
       if (this.startupAbort === abortStartup) this.startupAbort = null;
       if (this.startupPhase === startupPhase) this.startupPhase = null;

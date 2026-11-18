@@ -124,10 +124,11 @@ export function probeUnixSocket(socketPath: string, { timeoutMs = 1000 }: { time
   });
 }
 
+
 export function probeClaudeChannel(
   socketPath: string,
   expected: ClaudeBindingExpectation,
-  { timeoutMs = 1000, maxBytes = 16384 }: { timeoutMs?: number; maxBytes?: number } = {}
+  { timeoutMs = 1000, maxBytes = 16384, signal }: { timeoutMs?: number; maxBytes?: number; signal?: AbortSignal } = {}
 ): Promise<ClaudeChannelIdentity> {
   if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) throw new Error('Claude channel endpoint must be absolute');
   if (!expected || typeof expected !== 'object' || typeof expected.nativeId !== 'string' ||
@@ -137,6 +138,9 @@ export function probeClaudeChannel(
   }
   return new Promise<ClaudeChannelIdentity>((resolve, reject) => {
     let settled = false;
+    let abortRequested = false;
+    let requestClosed = false;
+    let cancellationError: Error | undefined;
     let request: http.ClientRequest | undefined;
     const deadlineMs = Math.max(1, Number(timeoutMs));
     let deadlineTimer: NodeJS.Timeout;
@@ -144,14 +148,36 @@ export function probeClaudeChannel(
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
+      signal?.removeEventListener('abort', onAbort);
       if (error) reject(error);
       else if (proof) resolve(proof);
+    };
+    const onRequestClose = (): void => {
+      requestClosed = true;
+      if (abortRequested && cancellationError) finish(cancellationError);
+    };
+    const onAbort = (): void => {
+      abortRequested = true;
+      const error = new Error('Claude channel identity probe was cancelled');
+      cancellationError = error;
+      clearTimeout(deadlineTimer);
+      signal?.removeEventListener('abort', onAbort);
+      if (!request || requestClosed) {
+        finish(error);
+        return;
+      }
+      request.destroy(error);
     };
     deadlineTimer = setTimeout(() => {
       const error = new Error('Claude channel identity probe timed out');
       request?.destroy(error);
       finish(error);
     }, deadlineMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
     try {
       request = http.request({ agent: false, socketPath, path: '/identity', method: 'GET',
         headers: { accept: 'application/json' } }, response => {
@@ -163,7 +189,7 @@ export function probeClaudeChannel(
             request?.destroy(new Error('Claude channel identity response is too large'));
           }
         });
-        response.on('error', (error: Error) => finish(error));
+        response.on('error', (error: Error) => { if (!abortRequested) finish(error); });
         response.on('end', () => {
           if (response.statusCode !== 200) {
             finish(new Error(`Claude channel identity endpoint returned HTTP ${response.statusCode}`));
@@ -206,11 +232,11 @@ export function probeClaudeChannel(
           finish(null, proof);
         });
       });
-      request.once('error', (error: Error) => finish(error));
+      request.once('close', onRequestClose);
+      request.once('error', (error: Error) => { if (!abortRequested) finish(error); });
       request.end();
     } catch (error) {
       finish(asNativeError(error));
     }
   });
 }
-

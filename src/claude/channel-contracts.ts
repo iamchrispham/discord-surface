@@ -157,6 +157,10 @@ export interface ClaudeChannelOptionsBase {
   beforeTransportClose?: (() => void | Promise<void>) | null;
   onTransportClose?: (() => void) | null;
   logger?: (message: string) => void;
+  startupScheduler?: {
+    setTimeout: (callback: () => void, delayMs: number) => unknown;
+    clearTimeout: (handle: unknown) => void;
+  };
 }
 
 export type ClaudeMcpInput<TProvidedMcp> =
