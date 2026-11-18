@@ -1,6 +1,7 @@
 import { THREAD_STATES, type ThreadEnrollment } from '../state/thread-enrollment';
 
 const RETRYABLE_FETCH_PREFIX = 'Discord HTTP 503 during recovery: ';
+export const RECOVERY_DNS_MARKER_PREFIX = 'Discord DNS failure during recovery: ';
 const LEGACY_DEADLINE_DETAIL_SUFFIX = ' recovery exceeded 30000ms';
 const LEGACY_DEADLINE_DETAILS = {
   THREAD: 'Discord recovery deadline exceeded',
@@ -43,6 +44,7 @@ export function classifyRecoveryFailure(error: unknown): { state: 'unavailable';
 export function isRetryableFetchBoundary(state: string, detail: string | null | undefined): boolean {
   return state === 'unavailable' && (
     isRetryableHttp503Boundary(state, detail) ||
+    detail?.startsWith(RECOVERY_DNS_MARKER_PREFIX) === true ||
     detail?.startsWith(RECOVERY_DEADLINE_MARKER_PREFIX) === true
   );
 }
@@ -95,7 +97,8 @@ export function isLegacyPreBaselineDeadlineBoundary(boundary: IntakeBoundaryLike
 export function retryPendingBoundaryDetail(reason: string, boundary: RetryBoundaryLike): string {
   if (typeof boundary.detail === 'string' && boundary.detail.startsWith(RECOVERY_RETRY_PENDING_PREFIX)) return boundary.detail;
   let source = 'HTTP 503';
-  if (boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail)) source = 'legacy recovery timeout';
+  if (boundary.detail?.startsWith(RECOVERY_DNS_MARKER_PREFIX)) source = 'DNS failure';
+  else if (boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail)) source = 'legacy recovery timeout';
   else if (boundary.detail?.startsWith(RECOVERY_DEADLINE_MARKER_PREFIX)) source = 'recovery deadline';
   return `${RECOVERY_RETRY_PENDING_PREFIX}${reason} after ${source}`;
 }
@@ -142,9 +145,45 @@ export async function recoveryFetch<T>(fetch: () => Promise<T>): Promise<T> {
   try {
     return await fetch();
   } catch (error) {
-    if (error && typeof error === 'object' && 'status' in error && error.status === 503) {
+    if (!hasRecoveryControlMetadata(error) && error && typeof error === 'object' && 'status' in error && error.status === 503) {
       throw new Error(`${RETRYABLE_FETCH_PREFIX}${error instanceof Error ? error.message : 'Service Unavailable'}`, { cause: error });
+    }
+    const dnsCause = supportedDnsCause(error);
+    if (dnsCause) {
+      const detail = typeof dnsCause.message === 'string' && dnsCause.message
+        ? dnsCause.message
+        : `${dnsCause.syscall} ${dnsCause.code} ${dnsCause.hostname}`;
+      throw new Error(`${RECOVERY_DNS_MARKER_PREFIX}${detail}`, { cause: error });
     }
     throw error;
   }
+}
+
+interface StructuredDnsError extends Error {
+  code: 'ENOTFOUND';
+  syscall: 'getaddrinfo';
+  hostname: 'discord.com';
+}
+
+function hasTransportControlMetadata(error: unknown): boolean {
+  return hasRecoveryControlMetadata(error) || error instanceof Error && ('status' in error || 'statusCode' in error);
+}
+
+function hasRecoveryControlMetadata(error: unknown): boolean {
+  return error instanceof Error && 'recoveryKind' in error;
+}
+
+function isStructuredDnsError(error: unknown): error is StructuredDnsError {
+  if (!(error instanceof Error) || hasTransportControlMetadata(error)) return false;
+  const candidate = error as Partial<StructuredDnsError>;
+  return candidate.code === 'ENOTFOUND' && candidate.syscall === 'getaddrinfo' && candidate.hostname === 'discord.com';
+}
+
+function supportedDnsCause(error: unknown): StructuredDnsError | null {
+  if (hasTransportControlMetadata(error)) return null;
+  if (isStructuredDnsError(error)) return error;
+  if (error instanceof TypeError && error.message === 'fetch failed' && isStructuredDnsError(error.cause)) {
+    return error.cause;
+  }
+  return null;
 }

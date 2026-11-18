@@ -47,6 +47,7 @@ function fixture(t, { adoptThread = true } = {}) {
   const check = (kind, id, after) => {
     calls.push({ kind, id, after });
     if (fault?.kind === kind && fault.id === id && (!fault.after || fault.after === after)) {
+      if (fault.error) throw fault.error;
       throw Object.assign(new Error('fetch failed'), { status: fault.status });
     }
   };
