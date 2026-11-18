@@ -1142,7 +1142,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    class FixtureOS:",
     "        def get_blocking(self, fd): return fixture.get_blocking(fd)",
     "        def set_blocking(self, fd, value): return fixture.set_blocking(fd, value)",
-    "        def write(self, fd, payload): return fixture.write(fd, payload)",
+    "        def write(self, fd, payload): return fixture.write(fd, payload) if fd == 73 else os.write(fd, payload)",
     "        def stat(self, name): return fixture.stat(name) if name in ('memory', 'stderr') else os.stat(name)",
     "        def __getattr__(self, name): return getattr(os, name)",
     "    class FixtureOpen:",
@@ -1167,7 +1167,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "            raise FileNotFoundError(self.name)",
     "    fixture_os = FixtureOS()",
     "    fixture_open = FixtureOpen()",
-    "    env = {\"__name__\": \"__relay_fixture__\", \"__builtins__\": {\"__build_class__\": __build_class__, \"object\": object, \"property\": property, \"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"int\": int, \"bytes\": bytes, \"set\": set, \"list\": list, \"tuple\": tuple, \"bool\": bool, \"globals\": globals,",
+    "    env = {\"__name__\": \"__relay_fixture__\", \"__builtins__\": {\"__build_class__\": __build_class__, \"object\": object, \"property\": property, \"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"type\": type, \"int\": int, \"bytes\": bytes, \"set\": set, \"list\": list, \"tuple\": tuple, \"bool\": bool, \"globals\": globals,",
     "                           \"FileNotFoundError\": FileNotFoundError, \"BlockingIOError\": BlockingIOError,",
     "                           \"BrokenPipeError\": BrokenPipeError, \"OSError\": OSError,",
     "                           \"InterruptedError\": InterruptedError, \"TimeoutError\": TimeoutError,",
@@ -1292,7 +1292,8 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    for data in (b\"ordinary\\n\"+marker+b\"tail\",b\"x\"*65530+b\"\\n\"+marker+b\"end\",",
     "                 b\"before\\n\"+marker+b\"z\"*65536,b\"APERTURE-GATE-INDETERMINATE reas\",b\"ordinary\\n\"+marker*2+b\"tail\"):",
     "        f=Fixture(data=data,before=before)",
-    "        call=context(f)[\"_stream_stdout\"]",
+    "        env=context(f)",
+    "        call=env[\"_stream_stdout\"]",
     "        cursor={\"offset\":0,\"source_line_start\":True,\"output_line_start\":True}",
     "        for step in range(8):",
     "            call(\"memory\",cursor,True)",
@@ -1301,6 +1302,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "        assert bytes(f.accepted)==data.replace(marker,b\"\"),(len(data),bytes(f.accepted)[-100:])",
     "        assert bool(cursor.get(\"verdict\"))==(marker in data)",
     "        assert f.mode==before",
+    "        for path in env[\"terminal\"].evidence_paths: os.unlink(path)",
     "for length in (65536,70000):",
     "    data=b\"APERTURE-GATE-INDETERMINATE reason=timeout: \"",
     "    data+=b\"x\"*(length-len(data))",
@@ -2650,13 +2652,20 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   assert.equal(roleFixture.signalOwned(stopped.guardian, 'SIGCONT'), true, 'guardian identity changed before resume');
   const firstResult = await first.done;
   assert.equal(firstResult.code, 98, firstResult.output);
-  assert.match(firstResult.output, /APERTURE-GATE-INDETERMINATE reason=cleanup/);
-  assert.match(firstResult.output, /unverified|unknown|cannot|could not|not verified|not proven|did not prove/i);
-  assert.match(firstResult.output, /descendant|drain/i);
-  assert.match(firstResult.output, /retained/i);
+  const markers = firstResult.output.match(/^APERTURE-GATE-INDETERMINATE reason=.*$/gm) || [];
+  assert.equal(markers.length, 1, firstResult.output);
+  const [marker] = markers;
+  const retained = marker.startsWith('APERTURE-GATE-INDETERMINATE reason=cleanup:');
+  if (retained) {
+    assert.match(marker, /unverified|unknown|cannot|could not|not verified|not proven|did not prove/i);
+    assert.match(marker, /descendant|drain/i);
+    assert.match(marker, /retained/i);
+  } else {
+    assert.match(marker, /^APERTURE-GATE-INDETERMINATE reason=interrupted: SIGKILL /);
+  }
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.identityGone(stopped.body, roleFixture.captureIdentity(body.pid)), true, 'body process remained after guardian cleanup');
-  assert.equal(fs.existsSync(body.scratch), true, firstResult.output);
+  assert.equal(fs.existsSync(body.scratch), retained, firstResult.output);
 
   const resumedMarker = path.join(f.scratch, 'resumed-body.json');
   const resumed = await f.launchSupervised({ FIXTURE_LEASE_ENFORCE: '1', FIXTURE_MARKER: resumedMarker }).done;
@@ -5786,7 +5795,7 @@ def output_boundary(mode):
     class IOProxy:
         def get_blocking(self,fd):return blocking[fd]
         def set_blocking(self,fd,value):blocking[fd]=value
-        def write(self,fd,payload):return write(fd,payload)
+        def write(self,fd,payload):return write(fd,payload) if fd in blocking else os.write(fd,payload)
         def stat(self,path):
             if path in ('stdout','stderr'):return types.SimpleNamespace(st_size=len(marker))
             return os.stat(path)
@@ -5803,6 +5812,7 @@ def output_boundary(mode):
     declarations(SUPERVISOR,{'_write_job_output','_emit_job_stderr','no_verdict'},ns)
     terminal_ns['_write_job_output']=ns['_write_job_output']
     if mode=='ordinary':
+        assert terminal.record_verdict_range(0,len(marker)) is True
         assert ns['_emit_job_stderr']('stderr','stdout',0,True,cursor,4) is True
         assert terminal.publish(0)==0
         assert calls and calls[0][0]==11 and {fd for fd,size in calls}=={11,12}

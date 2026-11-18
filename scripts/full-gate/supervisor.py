@@ -1270,6 +1270,8 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
             output_offset = stdout_cursor["offset"]
             while clock_now() < deadline:
                 next_offset = _stream_stdout(stdout_capture.name, stdout_cursor, final=True, deadline=deadline)
+                if next_offset is None:
+                    break
                 try:
                     output_size = os.stat(stdout_capture.name).st_size
                 except OSError:
@@ -1472,7 +1474,7 @@ def _read_job_state(path, owner, token, identity=None):
 
 def _record_verdict_range(cursor, start, end, terminal):
     if terminal is None or not terminal.record_verdict_range(start, end):
-        cursor["retain_output"] = True
+        cursor.update(offset=start, retain_output=True, verdict_append_failed=True)
         return False
     if cursor.get("verdict") is None:
         cursor["verdict"] = (start, end)
@@ -1480,6 +1482,8 @@ def _record_verdict_range(cursor, start, end, terminal):
 
 
 def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
+    if cursor.get("verdict_append_failed"):
+        return None
     try:
         terminal = _ACTIVE_TERMINAL_OUTPUT
     except NameError:
@@ -1500,7 +1504,7 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
         if newline >= 0:
             end = offset + newline + 1
             if not _record_verdict_range(cursor, pending, end, terminal):
-                return offset
+                return None
             cursor.update(offset=end, pending_marker=None, source_line_start=True)
             return end
         if final and len(payload) < 64 * 1024:
@@ -1522,7 +1526,7 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
             if newline >= 0:
                 end = offset + newline + 1
                 if not _record_verdict_range(cursor, offset, end, terminal):
-                    return offset
+                    return None
                 cursor.update(offset=end, source_line_start=True)
                 return end
             if not final or len(payload) == 64 * 1024:
@@ -1884,6 +1888,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         reason, detail = state.get("body_reason"), state.get("body_detail")
         while not interrupted.is_set() and clock_now() < run_deadline:
             next_offset = _stream_stdout(stdout_path, output_cursor, final=True, deadline=run_deadline)
+            if next_offset is None:
+                break
             output_size = os.stat(stdout_path).st_size
             if next_offset == output_size and output_cursor.get("pending_marker") is None:
                 output_offset = next_offset
@@ -2007,6 +2013,8 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
                 output_offset = output_cursor["offset"]
                 while clock_now() < deadline:
                     next_offset = _stream_stdout(stdout_path, output_cursor, final=True, deadline=deadline)
+                    if next_offset is None:
+                        break
                     if next_offset == os.stat(stdout_path).st_size and output_cursor.get("pending_marker") is None:
                         relay_complete = True
                         break

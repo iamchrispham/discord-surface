@@ -506,6 +506,76 @@ def linux_multiple_markers():
     owner.close_captures()
 
 
+def linux_journal_short_write():
+    scope, owner, _, _ = namespace()
+    now = 0
+    phases = []
+    polls = []
+    appends = 0
+    marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: "
+    original_os = scope["os"]
+    stream = scope["_stream_stdout"]
+
+    class ShortJournalWrite:
+        def __getattr__(self, name):
+            return getattr(original_os, name)
+
+        def write(self, descriptor, payload):
+            nonlocal appends
+            if len(payload) == 16:
+                appends += 1
+                return original_os.write(descriptor, payload[:8])
+            return original_os.write(descriptor, payload)
+
+    class ExitedBody:
+        def __init__(self, *args, **kwargs):
+            self.__class__.scratch = Path(kwargs["env"]["DISCORD_SURFACE_GATE_SCRATCH"])
+            capture = kwargs["stdout"]
+            self.__class__.capture = Path(capture.name)
+            capture.write(b"OUT\n" + marker + b"x" * 65536 + b"\n")
+            capture.flush()
+
+        def poll(self):
+            return 17
+
+        def wait(self):
+            return 17
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    def snapshot(root, environment, phase, deadline, *args, **kwargs):
+        phases.append((phase, now))
+        if now >= deadline:
+            raise TimeoutError("source verification reserve exhausted")
+        return {"snapshot": "same", "budget": 20, "slowest": 1}
+
+    def observe_stream(path, cursor, *args, **kwargs):
+        polls.append((cursor["offset"], not owner.output_complete))
+        return stream(path, cursor, *args, **kwargs)
+
+    scope.update(os=ShortJournalWrite(), subprocess=types.SimpleNamespace(Popen=ExitedBody),
+                 clock_now=lambda: now, time=types.SimpleNamespace(sleep=sleep), POLL_SECONDS=1,
+                 capture_snapshot=snapshot, wait_for_owned_children=lambda deadline: True,
+                 _stream_stdout=observe_stream)
+    try:
+        result = scope["run_supervised"](
+            Path.cwd(), ["not-executed"], {"APERTURE_GATE_TIME_LEFT_S": "20"}, 0,
+            types.SimpleNamespace(path="private-receipt", token="private-token"), threading.Event()
+        )
+    finally:
+        owner.close_captures()
+    require(owner.publish(result) == 98 and appends == 1 and owner.verdict_range_count == 0,
+            "short append was accepted or retried")
+    require(phases == [("before", 0), ("after", 0)] and not any(poisoned for _, poisoned in polls),
+            f"short append consumed cleanup time or retried a poisoned cursor: {phases}, {len(polls)} polls")
+    require(owner.cursor["offset"] == len(b"OUT\n"), "split marker lost its accepted boundary")
+    require(not ExitedBody.scratch.exists(), "drained Linux allocation was retained")
+    require(ExitedBody.capture.exists() and Path(owner.verdict_journal_path).stat().st_size == 8,
+            "short append lost the original capture or partial journal")
+
+
 def linux_post_exit_cancel():
     if sys.platform != "linux":
         return
@@ -837,6 +907,8 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             marker_delivery_error()
         elif scenario == "linux-multiple-markers":
             linux_multiple_markers()
+        elif scenario == "linux-journal-short-write":
+            linux_journal_short_write()
         elif scenario == "linux-post-exit-cancel":
             linux_post_exit_cancel()
         elif scenario.startswith("finalizer-"):
