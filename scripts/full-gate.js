@@ -414,6 +414,7 @@ async function runFullGate(root, label, entry, args) {
   let sentinelSecret;
   let declined = false;
   const observed = { stage: 'setup', firstStop: null, workerError: false, workerErrorCode: null, workerExit: null, bodyExit: null, watchdogStop: null, workerStop: null, initialGroupProbe: null, finalGroupProbe: null, upstreamOrigin: 'UNKNOWN' };
+  let deferredCapacity;
   const decline = (reason, detail) => {
     if (!declined) {
       declined = true;
@@ -640,11 +641,17 @@ async function runFullGate(root, label, entry, args) {
     observed.stage = 'admission';
     const admitted = await runAdmission(guardian.pid);
     if (stopped) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped + ' before admission; nothing ran');
-    if (admitted.capacity) return decline(REASONS.CAPACITY, 'caller budget leaves no time for admission plus execution');
+    if (admitted.capacity) {
+      deferredCapacity = 'caller budget leaves no time for admission plus execution';
+      return NO_VERDICT;
+    }
     if (admitted.interrupted) return decline(REASONS.INTERRUPTED, 'worker exited during admission; nothing ran');
     if (admitted.code === 4) return 4;
     if (admitted.error) return decline(REASONS.SETUP, admitted.error + '; nothing ran');
-    if (admitted.code === 3) return decline(REASONS.CAPACITY, 'not admitted; nothing ran');
+    if (admitted.code === 3) {
+      deferredCapacity = 'not admitted; nothing ran';
+      return NO_VERDICT;
+    }
     if (admitted.code !== 0) {
       const reason = admitted.code == null ? REASONS.INTERRUPTED : REASONS.ADMISSION;
       const outcome = admitted.code == null ? 'signal' : 'exit ' + admitted.code;
@@ -766,6 +773,11 @@ async function runFullGate(root, label, entry, args) {
     if (!finalSnapshotRequired) {
       clearTimeout(timer);
       removeInterruptHandlers();
+    }
+    if (deferredCapacity) {
+      const reason = deferredCapacity;
+      deferredCapacity = undefined;
+      return decline(REASONS.CAPACITY, reason);
     }
   }
   if (finalSnapshotRequired) {
