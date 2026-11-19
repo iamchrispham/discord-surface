@@ -287,6 +287,8 @@ async function exercise(fixture, config) {
       fixtureRootExists,
       obligationExists,
       obligationState,
+      allocation,
+      controllerPid: run.identity.pid,
       diagnostics
     };
     assert.deepEqual(forbiddenActions, [], 'forbidden process action observed');
@@ -313,6 +315,10 @@ test('expected retained allocation passes after drain and durable obligation', {
   });
   assert.equal(result.observedDecision, 'pass');
   assert.equal(result.obligationState.state, 'unresolved');
+  const retained = result.obligationState.expectedRetention;
+  assert.deepEqual(retained.map(entry => entry.path), [result.allocation], 'retention obligation lost its allocation path');
+  assert.deepEqual(result.obligationState.externalScratch, [result.allocation]);
+  assert.deepEqual(retained[0].owners.map(owner => [owner.launchOrdinal, owner.controller.pid]), [[0, result.controllerPid]]);
 });
 
 test('unexpected retained allocation fails', { timeout: 30000 }, async () => {

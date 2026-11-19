@@ -986,6 +986,26 @@ def expired_range_delivery():
         expected = b"\n" + marker
         require(sizes[11] == len(expected), "expired candidate prefix delivery changed size")
         require(digests[11].digest() == hashlib.sha256(expected).digest(), "expired candidate prefix changed bytes")
+
+        writer = scope["_source_write_job_output"]
+        scope["time"] = types.SimpleNamespace(sleep=lambda _: require(False, "expired writer retried after waiting"))
+        for expired in (payload, expected):
+            for blocked in (False, True):
+                attempts = []
+
+                def write(_, data):
+                    attempts.append(bytes(data))
+                    if blocked:
+                        raise BlockingIOError()
+                    return len(data)
+
+                scope["os"] = types.SimpleNamespace(get_blocking=lambda _: True, set_blocking=lambda *_: None, write=write)
+                state = {}
+                written = writer(11, expired, deadline=0, logical_state=state)
+                require(attempts == [expired], "expired writer skipped first attempt")
+                require(written == (0 if blocked else len(expired)), "expired writer lost accepted byte count")
+                require(writer(11, expired, deadline=0, logical_state=state) == 0 and attempts == [expired],
+                        "expired writer retried an attempted range")
     finally:
         source.unlink(missing_ok=True)
 
