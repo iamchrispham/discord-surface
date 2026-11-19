@@ -1024,6 +1024,53 @@ test('Python supervisor verdict uses the channel separate from saturated stderr'
   assert.match(output, /APERTURE-GATE-INDETERMINATE reason=timeout: bounded fixture/);
 });
 
+test('Darwin state publication retries a short write without replacing owned files', { timeout: 10000 }, () => {
+  const program = String.raw`import ast, json, os, sys, tempfile, types
+from pathlib import Path
+tree=ast.parse(Path(sys.argv[1]).read_text(encoding='utf-8'))
+writer=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='write_state')
+scope={'json':json,'os':os,'DARWIN':types.SimpleNamespace(CLOCK_CONTRACT='clock')}
+exec(compile(ast.Module(body=[writer],type_ignores=[]),'<Darwin state writer>','exec'),scope)
+with tempfile.TemporaryDirectory(prefix='darwin-state-retry-') as temporary:
+    state=Path(temporary)/'state.json'
+    state.write_text('previous state',encoding='utf-8')
+    temp_path=Path(str(state)+'.tmp-'+str(os.getpid()))
+    unrelated=Path(str(state)+'.tmp-unrelated')
+    unrelated.write_text('unrelated',encoding='utf-8')
+    spec={'state_path':str(state),'launch_token':'token'}
+    temp_path.write_text('owned by an earlier attempt',encoding='utf-8')
+    try:scope['write_state'](spec,{'phase':'blocked'})
+    except FileExistsError:pass
+    else:raise AssertionError('an existing temporary file was replaced')
+    assert temp_path.read_text(encoding='utf-8')=='owned by an earlier attempt'
+    assert state.read_text(encoding='utf-8')=='previous state'
+    temp_path.unlink()
+    class ShortWriteOS:
+        attempts=0
+        def __getattr__(self,name):return getattr(os,name)
+        def write(self,descriptor,payload):
+            if self.attempts==0:
+                self.attempts+=1
+                return os.write(descriptor,payload[:8])
+            return os.write(descriptor,payload)
+    scope['os']=ShortWriteOS()
+    try:scope['write_state'](spec,{'phase':'partial'})
+    except OSError:pass
+    else:raise AssertionError('short state write was accepted')
+    assert not temp_path.exists(),'failed attempt left its exclusive temporary file behind'
+    assert state.read_text(encoding='utf-8')=='previous state','failed attempt replaced prior state'
+    assert unrelated.read_text(encoding='utf-8')=='unrelated','cleanup removed an unrelated file'
+    scope['write_state'](spec,{'phase':'retry'})
+    saved=json.loads(state.read_text(encoding='utf-8'))
+    assert saved=={'launch_token':'token','clock_contract':'clock','quiescent':False,'body_quiescent':False,'phase':'retry'}
+    assert not temp_path.exists() and unrelated.read_text(encoding='utf-8')=='unrelated'
+`;
+  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', [
+    '-I', '-B', '-c', program, path.join(PROJECT, 'scripts/full-gate/darwin-runner.py')
+  ], { encoding: 'utf8', timeout: 5000 });
+  assert.equal(result.status, 0, result.error?.message || result.stdout + '\n' + result.stderr);
+});
+
 test('Darwin final stdout relay preserves evidence and the source snapshot reserve', { timeout: 45000 }, () => {
   const script = [
     "import ast, builtins, copy, io, json, os, sys, tempfile",
@@ -1184,10 +1231,10 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    env[\"terminal\"] = terminal",
     "    relay_owner=env[\"_stream_stdout\"]",
     "    cursor={\"offset\":0,\"source_line_start\":True,\"output_line_start\":True}",
-    "    def call(path,value,final=False,deadline=None):",
-    "        if isinstance(value,dict):return relay_owner(path,value,final,deadline)",
+    "    def call(path,value,final=False,deadline=None,interrupted=None):",
+    "        if isinstance(value,dict):return relay_owner(path,value,final,deadline,interrupted=interrupted)",
     "        cursor[\"offset\"]=value",
-    "        return relay_owner(path,cursor,final,deadline)",
+    "        return relay_owner(path,cursor,final,deadline,interrupted=interrupted)",
     "    env[\"_stream_stdout\"]=call",
     "    return env",
     "def flush(fixture):",
@@ -1284,8 +1331,8 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "    assert flush(f) == 98 and f.emitted and f.snapshots == 0 and f.removals == 0",
     "    assert f.verdicts[0][0] == \"setup\" and \"source-after-unavailable\" in f.verdicts[0][1]",
     "f = Fixture(action=\"interrupt\")",
-    "assert flush(f) == 98 and bytes(f.accepted) == f.data and f.writes <= 8 and f.emitted",
-    "assert len(f.verdicts) == 1 and f.verdicts[0][0] == \"interrupted\" and \"inert interrupted snapshot\" in f.verdicts[0][1] and f.removals == 1",
+    "assert flush(f) == 98 and bytes(f.accepted) == f.data[:3] and f.writes==2 and f.emitted and not f.sleeps",
+    "assert len(f.verdicts) == 1 and f.verdicts[0][0] == \"interrupted\" and \"final stdout relay incomplete\" in f.verdicts[0][1] and f.removals==0 and f.snapshots==1",
     "f = Fixture()",
     "f.invalid_budget = True",
     "assert flush(f) == 98 and f.snapshots == 1 and f.emitted and f.removals == 1",
@@ -2677,7 +2724,7 @@ test('watchdog holds admission through cleanup after worker loss', { skip: proce
   assert.equal(fs.existsSync(resumedMarker), true, 'admission did not resume after cleanup finished');
 });
 
-test('live stdout relay yields to supervisor cancellation', { timeout: 10000 }, () => {
+test('live and final stdout relay yield to supervisor cancellation', { timeout: 10000 }, () => {
   const program = String.raw`import ast, io, sys, threading, types
 from pathlib import Path
 source=Path(sys.argv[1]).read_text()
@@ -2687,8 +2734,9 @@ assert set(functions)=={'_write_job_output','_stream_stdout','run_supervised'}
 calls=[node for node in ast.walk(functions['run_supervised']) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='_stream_stdout']
 live=[node for node in calls if not any(keyword.arg=='final' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords)]
 final=[node for node in calls if any(keyword.arg=='final' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords)]
-assert len(live)==1 and any(keyword.arg=='interrupted' and isinstance(keyword.value,ast.Name) and keyword.value.id=='interrupted' for keyword in live[0].keywords)
-assert len(final)==1 and not any(keyword.arg=='interrupted' for keyword in final[0].keywords)
+assert len(live)==len(final)==1
+for call in live+final:
+    assert any(keyword.arg=='interrupted' and isinstance(keyword.value,ast.Name) and keyword.value.id=='interrupted' for keyword in call.keywords), 'relay call must pass supervisor cancellation'
 interrupted=threading.Event(); clock=[0.0]; writes=[]; sleeps=[]; failures=[]; accepted=bytearray(); ready=[False]; blocking=[True]; data=b'waiting on stdout\n'
 def write(fd,payload):
     assert fd==11 and blocking[0] is False
@@ -2706,13 +2754,15 @@ namespace=dict(os=types.SimpleNamespace(get_blocking=lambda fd:blocking[0],set_b
     sys=types.SimpleNamespace(stdout=types.SimpleNamespace(fileno=lambda:11)),open=lambda *args:io.BytesIO(data),
     _ACTIVE_TERMINAL_OUTPUT=terminal)
 exec(compile(ast.Module(body=[functions['_write_job_output'],functions['_stream_stdout']],type_ignores=[]),'<supervisor relay>','exec'),namespace)
-cursor={'offset':0,'source_line_start':True,'output_line_start':True}
-assert namespace['_stream_stdout']('stdout',cursor,deadline=1,interrupted=interrupted)==0
-assert len(writes)==1, 'live stdout relay retried after cancellation'
-assert sleeps==[], 'live stdout relay waited after cancellation'
-assert failures==[] and blocking[0] is True
+for final_phase in (False, True):
+    cursor={'offset':0,'source_line_start':True,'output_line_start':True}
+    interrupted.clear();writes.clear()
+    assert namespace['_stream_stdout']('stdout',cursor,final=final_phase,deadline=1,interrupted=interrupted)==0
+    assert len(writes)==1, 'stdout relay retried after cancellation'
+    assert sleeps==[], 'stdout relay waited after cancellation'
+    assert failures==[] and blocking[0] is True
 interrupted.clear();ready[0]=True
-assert namespace['_stream_stdout']('stdout',cursor,final=True,deadline=2)==len(data)
+assert namespace['_stream_stdout']('stdout',cursor,final=True,deadline=2,interrupted=interrupted)==len(data)
 assert bytes(accepted)==data and failures==[] and blocking[0] is True
 `;
   const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-I', '-B', '-c', program, SUPERVISOR_SCRIPT], {
@@ -5670,8 +5720,10 @@ flush_index=main.body.index(flush)
 wait_index=next(i for i in range(flush_index+1,len(main.body)) if isinstance(main.body[i],ast.Assign) and isinstance(main.body[i].value,ast.Call) and isinstance(main.body[i].value.func,ast.Name) and main.body[i].value.func.id=='_wait_job_phase')
 def relay_order(blocked=False):
     clock=Clock(93);events=[];offsets=[];run_deadline=95
-    def stream(path,cursor,final=False,deadline=None):
+    cancellation=types.SimpleNamespace(is_set=lambda:False)
+    def stream(path,cursor,final=False,deadline=None,*,interrupted=None):
         require(deadline == run_deadline,'relay lost its phase deadline')
+        require(interrupted is cancellation,'relay lost its cancellation signal')
         offset=cursor['offset'];events.append('stream');offsets.append(offset);clock.value+=1
         require(len(offsets)<=3,'unbounded relay')
         cursor['offset']=offset if blocked else min(8,offset+4)
@@ -5680,7 +5732,7 @@ def relay_order(blocked=False):
         events.append('after-ack')
         if not blocked:require(offsets==[0,4],'after authorized before relay finished')
     def waited(*args):events.append('after-start');return {},8
-    ns=dict(interrupted=types.SimpleNamespace(is_set=lambda:False),clock_now=clock.now,run_deadline=95,deadline=100,
+    ns=dict(interrupted=cancellation,clock_now=clock.now,run_deadline=95,deadline=100,
         stdout_path='stdout',output_offset=0,output_cursor={'offset':0},_stream_stdout=stream,os=types.SimpleNamespace(stat=lambda p:types.SimpleNamespace(st_size=8)),
         time=clock,POLL_SECONDS=0.025,reason=None,detail=None,result_code=0,sequence=1,
         ack_path='ack',nonce='nonce',owner=None,identity=identity,_write_job_request=ack_write,

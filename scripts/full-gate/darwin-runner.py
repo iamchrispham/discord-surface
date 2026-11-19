@@ -33,13 +33,20 @@ def write_state(spec, value):
     temporary = path + ".tmp-" + str(os.getpid())
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        payload = (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
-        if os.write(descriptor, payload) != len(payload):
-            raise OSError("guardian state write was incomplete")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
+        try:
+            payload = (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+            if os.write(descriptor, payload) != len(payload):
+                raise OSError("guardian state write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def controller_alive(identity):

@@ -794,13 +794,26 @@ class TerminalOutput:
         if self.cursor is not None and self.cursor.get("retain_output"):
             self.fail_output("required gate output remains under retained custody")
         candidate = None
+        pending = None
         if self.output_complete:
             for output in self.outputs:
+                if output.get("pending_marker"):
+                    pending = output
+                    continue
+                if not output["replay"] and not output["candidate"]:
+                    continue
                 found = self._scan_record(output, result)
                 if candidate is None and found is not None:
                     candidate = found
                 if not self.output_complete:
                     break
+        candidate = self.candidate or candidate
+        retained = None
+        if pending is not None:
+            if self.reason is not None:
+                retained = pending["path"]
+            elif self.output_complete and self.retirement_complete and (result != NO_VERDICT or candidate is None):
+                pending.update(replay=True, publish_path=pending["path"], publish_start=0, publish_end=pending["size"])
 
         output_line_start = self.cursor.get("output_line_start", True) if self.cursor is not None else True
         if self.output_complete:
@@ -816,11 +829,19 @@ class TerminalOutput:
                 self.accepted_offsets[name] = written
                 if name == "stdout" and last is not None:
                     output_line_start = last == 10
+                if output.get("pending_marker") and self.cursor is not None:
+                    self.cursor["offset"] = output["source_start"] + written
+                    if last is not None:
+                        self.cursor["source_line_start"] = self.cursor["output_line_start"] = last == 10
+                    if delivered:
+                        self.cursor["pending_marker"] = None
+                        self.cursor.pop("pending_marker_end", None)
+                    else:
+                        self.cursor["retain_output"] = True
                 if not delivered:
                     self.fail_output("final " + name + " relay was incomplete")
                     break
 
-        candidate = self.candidate or candidate
         def selected_record():
             code, reason, detail, selected_candidate = select_terminal_outcome(
                 result, self.reason, self.detail, self.output_complete, self.retirement_complete, candidate,
@@ -829,6 +850,8 @@ class TerminalOutput:
             if reason is not None:
                 if not self.output_complete or not self.retirement_complete:
                     detail = self._failure_detail(detail)
+                elif retained is not None:
+                    detail = _join_detail(detail, "incomplete gate marker retained at " + retained)
                 marker = ("APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + str(detail or reason) + "\n").encode(
                     "utf-8", errors="replace"
                 )
@@ -874,6 +897,8 @@ class TerminalOutput:
             self.cursor["retain_output"] = self.cursor.get("retain_output", False) or not complete
         if complete:
             for path in self.evidence_paths:
+                if path == retained:
+                    continue
                 try:
                     os.unlink(path)
                 except OSError:
@@ -931,19 +956,39 @@ def direct_children():
     return [int(value) for value in child_list().read_text(encoding="ascii").split()]
 
 
-def live_owned_children(excluded=()):
+def live_owned_children(excluded=(), deadline=None):
     excluded = set(excluded)
-    live = []
-    for pid in direct_children():
-        if pid in excluded:
-            continue
-        try:
-            waited, _ = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            continue
-        if waited == 0:
-            live.append(pid)
-    return live
+    while True:
+        if deadline is not None and clock_now() >= deadline:
+            return None
+        if not excluded:
+            try:
+                waited, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return []
+            if waited:
+                continue
+            children = direct_children()
+            return children if children else None
+
+        live = []
+        reaped = False
+        for pid in direct_children():
+            if pid in excluded:
+                continue
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                reaped = True
+                continue
+            if waited == 0:
+                live.append(pid)
+            else:
+                reaped = True
+        if live:
+            return live
+        if not reaped:
+            return []
 
 
 def signal_owned_child(pid, signal_number):
@@ -964,7 +1009,10 @@ def signal_owned_child(pid, signal_number):
 
 def wait_for_owned_children(deadline):
     while True:
-        if not live_owned_children():
+        children = live_owned_children(deadline=deadline)
+        if children is None:
+            return False
+        if not children:
             return True
         remaining = deadline - clock_now()
         if remaining <= 0:
@@ -1026,7 +1074,9 @@ def stop_owned_processes(process, deadline):
     while clock_now() < term_deadline:
         process_live = process is not None and process.poll() is None
         excluded = {process.pid} if process_live else set()
-        children = live_owned_children(excluded)
+        children = live_owned_children(excluded, term_deadline)
+        if children is None:
+            break
         for pid in children:
             signal_owned_child(pid, signal.SIGTERM)
         if not process_live and not children:
@@ -1038,13 +1088,16 @@ def stop_owned_processes(process, deadline):
     while clock_now() < deadline:
         process_live = process is not None and process.poll() is None
         excluded = {process.pid} if process_live else set()
-        children = live_owned_children(excluded)
+        children = live_owned_children(excluded, deadline)
+        if children is None:
+            return False
         for pid in children:
             signal_owned_child(pid, signal.SIGKILL)
         if not process_live and not children:
             return True
         time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
-    return not (process is not None and process.poll() is None) and not live_owned_children()
+    children = live_owned_children(deadline=deadline)
+    return not (process is not None and process.poll() is None) and children == []
 
 
 def capture_snapshot(root, environment, phase, deadline, interrupted, *, stop_deadline):
@@ -1268,9 +1321,12 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
 
         if writers_drained:
             output_offset = stdout_cursor["offset"]
-            while clock_now() < deadline:
-                next_offset = _stream_stdout(stdout_capture.name, stdout_cursor, final=True, deadline=deadline)
-                if next_offset is None:
+            while clock_now() < run_deadline and not interrupted.is_set():
+                next_offset = _stream_stdout(
+                    stdout_capture.name, stdout_cursor, final=True,
+                    deadline=run_deadline, interrupted=interrupted,
+                )
+                if next_offset is None or interrupted.is_set():
                     break
                 try:
                     output_size = os.stat(stdout_capture.name).st_size
@@ -1279,8 +1335,16 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 if next_offset == output_size and stdout_cursor.get("pending_marker") is None:
                     break
                 if next_offset == output_offset:
-                    time.sleep(min(POLL_SECONDS, max(0, deadline - clock_now())))
+                    time.sleep(min(POLL_SECONDS, max(0, run_deadline - clock_now())))
                 output_offset = next_offset
+            if stdout_cursor.get("pending_marker") is None:
+                try:
+                    stdout_size = os.stat(stdout_capture.name).st_size
+                except OSError:
+                    stdout_cursor["retain_output"] = True
+                else:
+                    if stdout_cursor["offset"] < stdout_size:
+                        stdout_cursor["retain_output"] = True
 
         try:
             after = capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
@@ -1482,7 +1546,7 @@ def _record_verdict_range(cursor, start, end, terminal):
 
 
 def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
-    if cursor.get("verdict_append_failed"):
+    if cursor.get("verdict_append_failed") or cursor.get("pending_marker_end") is not None:
         return None
     try:
         terminal = _ACTIVE_TERMINAL_OUTPUT
@@ -1505,41 +1569,40 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
             end = offset + newline + 1
             if not _record_verdict_range(cursor, pending, end, terminal):
                 return None
-            cursor.update(offset=end, pending_marker=None, source_line_start=True)
+            cursor.update(offset=end, pending_marker=None, pending_marker_end=None, source_line_start=True)
             return end
         if final and len(payload) < 64 * 1024:
-            cursor.update(offset=pending, pending_marker=None, ordinary_until=offset + len(payload))
-            return pending
+            cursor.update(offset=pending, pending_marker_end=offset + len(payload))
+            return None
         cursor["offset"] += len(payload)
         return cursor["offset"]
     if not payload:
         return offset
-    ordinary_until = cursor.get("ordinary_until", 0)
-    if offset < ordinary_until:
-        payload = payload[:ordinary_until - offset]
-    else:
-        at = 0 if cursor["source_line_start"] and payload.startswith(marker) else payload.find(b"\n" + marker) + 1
-        if at == 0 and not (cursor["source_line_start"] and payload.startswith(marker)):
-            at = -1
-        if at == 0:
-            newline = payload.find(b"\n")
-            if newline >= 0:
-                end = offset + newline + 1
-                if not _record_verdict_range(cursor, offset, end, terminal):
-                    return None
-                cursor.update(offset=end, source_line_start=True)
-                return end
-            if not final or len(payload) == 64 * 1024:
-                cursor.update(offset=offset + len(payload), pending_marker=offset)
-                return cursor["offset"]
-        elif at > 0:
-            payload = payload[:at]
-        if at < 0 and (not final or len(payload) == 64 * 1024):
-            tail_at = payload.rfind(b"\n") + 1
-            if tail_at or cursor["source_line_start"]:
-                tail = payload[tail_at:]
-                if tail and marker.startswith(tail):
-                    payload = payload[:tail_at]
+    starts_marker = cursor["source_line_start"] and payload.startswith(marker)
+    at = 0 if starts_marker else payload.find(b"\n" + marker) + 1
+    if at == 0 and not starts_marker:
+        at = -1
+    if at == 0:
+        newline = payload.find(b"\n")
+        if newline >= 0:
+            end = offset + newline + 1
+            if not _record_verdict_range(cursor, offset, end, terminal):
+                return None
+            cursor.update(offset=end, source_line_start=True)
+            return end
+        if not final or len(payload) == 64 * 1024:
+            cursor.update(offset=offset + len(payload), pending_marker=offset)
+            return cursor["offset"]
+        cursor.update(pending_marker=offset, pending_marker_end=offset + len(payload))
+        return None
+    if at > 0:
+        payload = payload[:at]
+    elif not final or len(payload) == 64 * 1024:
+        tail_at = payload.rfind(b"\n") + 1
+        if tail_at or cursor["source_line_start"]:
+            tail = payload[tail_at:]
+            if tail and marker.startswith(tail):
+                payload = payload[:tail_at]
     if not payload:
         return offset
     try:
@@ -1585,6 +1648,12 @@ def _emit_job_stderr(path, stdout_path, result, emit, cursor, deadline):
         elif not terminal.stage_verdict_ranges(stdout_path):
             cursor["retain_output"] = True
             return False
+    pending = cursor.get("pending_marker")
+    if pending is not None:
+        if not terminal.add_file_range("stdout", stdout_path, pending, cursor.get("pending_marker_end"), replay=False):
+            cursor["retain_output"] = True
+            return False
+        terminal.outputs[-1]["pending_marker"] = True
     if not terminal.add_file("stderr", path, replay=True):
         cursor["retain_output"] = True
         return False
@@ -1731,12 +1800,9 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             return False
         if output_staged is None:
             output_staged = False
-            start = output_cursor["offset"]
-            pending = output_cursor.get("pending_marker")
-            if pending is not None:
-                start = min(start, pending)
-            if not terminal.add_file_range("stdout", stdout_path, start, None, replay=True):
-                return False
+            if output_cursor.get("pending_marker") is None:
+                if not terminal.add_file_range("stdout", stdout_path, output_cursor["offset"], None, replay=True):
+                    return False
             output_result = NO_VERDICT if reason is not None else result_code
             output_staged = _emit_job_stderr(
                 stderr_path, stdout_path, output_result, True, output_cursor, deadline
@@ -1887,7 +1953,9 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
         result_code = int(state["body_code"])
         reason, detail = state.get("body_reason"), state.get("body_detail")
         while not interrupted.is_set() and clock_now() < run_deadline:
-            next_offset = _stream_stdout(stdout_path, output_cursor, final=True, deadline=run_deadline)
+            next_offset = _stream_stdout(
+                stdout_path, output_cursor, final=True, deadline=run_deadline, interrupted=interrupted
+            )
             if next_offset is None:
                 break
             output_size = os.stat(stdout_path).st_size

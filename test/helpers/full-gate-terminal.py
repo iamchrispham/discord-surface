@@ -26,7 +26,9 @@ def namespace():
     accepted = {11: bytearray(), 12: bytearray()}
     calls = []
 
-    def write(fd, payload, deadline=None, logical_state=None):
+    def write(fd, payload, deadline=None, logical_state=None, *, interrupted=None):
+        if interrupted is not None and interrupted.is_set():
+            return 0
         calls.append((fd, bytes(payload)))
         accepted[fd].extend(payload)
         return len(payload)
@@ -50,7 +52,9 @@ def bounded_namespace():
     markers = {11: 0, 12: 0}
     tails = {11: b"", 12: b""}
 
-    def write(fd, payload, deadline=None, logical_state=None):
+    def write(fd, payload, deadline=None, logical_state=None, *, interrupted=None):
+        if interrupted is not None and interrupted.is_set():
+            return 0
         observed = tails[fd] + bytes(payload)
         markers[fd] += observed.count(b"APERTURE-GATE-INDETERMINATE reason=")
         tails[fd] = observed[-len(b"APERTURE-GATE-INDETERMINATE reason=") + 1:]
@@ -576,6 +580,259 @@ def linux_journal_short_write():
             "short append lost the original capture or partial journal")
 
 
+def linux_adopted_child_drain():
+    def setup():
+        scope, _, _, _ = namespace()
+        state = {"adopted": False}
+        now = [0]
+
+        class ReapingOS:
+            WNOHANG = os.WNOHANG
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def waitpid(self, pid, options):
+                require(options == os.WNOHANG, "child drain used a blocking wait")
+                if pid == -1:
+                    if not state["adopted"]:
+                        state["adopted"] = True
+                        return 101, 0
+                    return 0, 0
+                if pid == 101:
+                    state["adopted"] = True
+                    return 101, 0
+                if pid == 202:
+                    return 0, 0
+                raise ChildProcessError
+
+        scope.update(
+            os=ReapingOS(),
+            direct_children=lambda: [202] if state["adopted"] else [101],
+            clock_now=lambda: now[0],
+            time=types.SimpleNamespace(sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)),
+            POLL_SECONDS=1,
+        )
+        return scope, state, now
+
+    scope, _, _ = setup()
+    require(scope["live_owned_children"]() == [202],
+            "drain accepted the first reap without seeing its adopted writer")
+
+    scope, _, now = setup()
+    require(scope["wait_for_owned_children"](1) is False,
+            "wait reported drain while the adopted writer was live")
+    require(now[0] == 1, "adopted writer wait exceeded its caller deadline")
+
+    empty, _, _, _ = namespace()
+
+    class NoChildrenOS:
+        WNOHANG = os.WNOHANG
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def waitpid(self, _pid, _options):
+            raise ChildProcessError
+
+    empty.update(os=NoChildrenOS(), direct_children=lambda: [], clock_now=lambda: 0,
+                 time=types.SimpleNamespace(sleep=lambda _seconds: None), POLL_SECONDS=1)
+    require(empty["live_owned_children"]() == [], "an empty child tree did not drain")
+    require(empty["wait_for_owned_children"](1) is True, "an empty child tree lost its clean result")
+
+    unavailable, _, _, _ = namespace()
+
+    class ChildStillExistsOS:
+        WNOHANG = os.WNOHANG
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def waitpid(self, _pid, _options):
+            return 0, 0
+
+    def unreadable_children():
+        raise OSError("injected child ownership read failure")
+
+    unavailable.update(os=ChildStillExistsOS(), direct_children=unreadable_children,
+                       clock_now=lambda: 0, time=types.SimpleNamespace(sleep=lambda _seconds: None),
+                       POLL_SECONDS=1)
+    try:
+        unavailable["wait_for_owned_children"](1)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("unknown child ownership was accepted as drained")
+
+
+def linux_final_relay_reserve():
+    scope, owner, _, _ = namespace()
+    now = [0]
+    phases = []
+    pipe_output = bytearray()
+    write_times = []
+    stdout_data = b"OUT\nTAIL\n"
+    original_os = os
+
+    class BackpressuredOS:
+        blocking = True
+
+        def __getattr__(self, name):
+            return getattr(original_os, name)
+
+        def get_blocking(self, descriptor):
+            require(descriptor == 11, "final relay inspected the wrong descriptor")
+            return self.blocking
+
+        def set_blocking(self, descriptor, value):
+            require(descriptor == 11, "final relay changed the wrong descriptor")
+            self.blocking = value
+
+        def write(self, descriptor, payload):
+            require(descriptor == 11, "final relay wrote to the wrong descriptor")
+            write_times.append(now[0])
+            if now[0] < 19:
+                raise BlockingIOError("stdout becomes writable after the verification reserve")
+            pipe_output.extend(payload)
+            return len(payload)
+
+    class ExitedBody:
+        def __init__(self, *args, **kwargs):
+            self.scratch = Path(kwargs["env"]["DISCORD_SURFACE_GATE_SCRATCH"])
+            self.capture = Path(kwargs["stdout"].name)
+            kwargs["stdout"].write(stdout_data)
+            kwargs["stdout"].flush()
+            kwargs["stderr"].write(b"")
+            kwargs["stderr"].flush()
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def snapshot(_root, _environment, phase, deadline, _interrupted, *, stop_deadline):
+        phases.append((phase, now[0]))
+        if phase == "after" and now[0] >= stop_deadline - scope["SNAPSHOT_STOP_RESERVE_SECONDS"]:
+            raise TimeoutError("source verification reserve exhausted")
+        return {"snapshot": "same", "budget": 20, "slowest": 1}
+
+    scope.update(os=BackpressuredOS(), _write_job_output=scope["_source_write_job_output"],
+                 subprocess=types.SimpleNamespace(Popen=ExitedBody),
+                 clock_now=lambda: now[0], time=types.SimpleNamespace(sleep=sleep), POLL_SECONDS=1,
+                 capture_snapshot=snapshot, wait_for_owned_children=lambda _deadline: True)
+    try:
+        result = scope["run_supervised"](
+            Path.cwd(), ["not-executed"], {"APERTURE_GATE_TIME_LEFT_S": "20"}, 0,
+            types.SimpleNamespace(path="private-receipt", token="private-token"), threading.Event()
+        )
+    finally:
+        owner.close_captures()
+
+    cutoff = scope["CLEANUP_RESERVE_SECONDS"]
+    reserve = scope["SNAPSHOT_STOP_RESERVE_SECONDS"]
+    require(phases == [("before", 0), ("after", now[0])], "source snapshots did not bracket the run")
+    require(now[0] < 20 - reserve, "final stdout relay consumed the source verification reserve")
+    require(not any(value >= 20 - cutoff for value in write_times),
+            "final stdout relay attempted delivery past its verification cutoff")
+    require(result == 0 and not pipe_output, "late stdout delivery replaced the completed body result")
+    require(owner.cursor["offset"] == 0 and owner.output_complete is False,
+            "final relay did not preserve its last accepted offset")
+    capture = next(output["path"] for output in owner.outputs if output["name"] == "stdout")
+    require(Path(capture).exists() and Path(capture).read_bytes() == stdout_data,
+            "final relay discarded the unread stdout capture")
+
+
+def linux_incomplete_marker():
+    marker = b"APERTURE-GATE-INDETERMINATE reason="
+    tail = b"timeout: child"
+
+    def split_capture():
+        scope, owner, accepted, _ = namespace()
+        scope["clock_now"] = lambda: 0
+        capture = owner.add_capture("stdout", replay=False)
+        stderr = owner.add_capture("stderr")
+        prefix = b"OUT\n"
+        partial_marker = b"APERTURE-GATE-INDETERMINATE reas"
+        capture.write(prefix + partial_marker)
+        capture.flush()
+        cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+        first = scope["_stream_stdout"](capture.name, cursor, deadline=20)
+        require(first == len(prefix) and bytes(accepted[11]) == prefix,
+                "split marker prefix changed ordinary output")
+        capture.write(b"on=" + tail)
+        capture.flush()
+        final = scope["_stream_stdout"](capture.name, cursor, final=True, deadline=20)
+        return scope, owner, accepted, capture, stderr, cursor, final, prefix + marker + tail
+
+    scope, owner, accepted, capture, stderr, cursor, final, data = split_capture()
+    require(final is None and bytes(accepted[11]) == b"OUT\n",
+            "unterminated marker was relayed as ordinary stdout")
+    owner.request("timeout", "parent timeout", stdout_cursor=cursor, stdout_deadline=20)
+    require(scope["_emit_job_stderr"](stderr.name, capture.name, 98, True, cursor, 20),
+            "timeout output could not be staged")
+    staged = next(Path(output["path"]) for output in owner.outputs if output.get("pending_marker"))
+    capture.close()
+    Path(capture.name).unlink()
+    require(owner.publish(98) == 98, "incomplete marker changed the supervisor result")
+    require(bytes(accepted[11]).count(marker) == 1, "supervisor published two terminal records")
+    require(cursor["offset"] == len(b"OUT\n"), "incomplete marker changed the accepted offset")
+    require(staged.read_bytes() == data[len(b"OUT\n"):] and os.fsencode(staged) in accepted[11],
+            "incomplete marker range was not retained and reported")
+    require(owner.verdict_range_count == 0, "incomplete marker created an unbounded journal entry")
+    owner.close_captures()
+
+    for result in (0, 98):
+        scope, owner, accepted, capture, stderr, cursor, final, data = split_capture()
+        require(final is None and bytes(accepted[11]) == b"OUT\n",
+                "normal output relayed an incomplete marker before its result was known")
+        require(scope["_stream_stdout"](capture.name, cursor, deadline=20) is None
+                and cursor["offset"] == len(b"OUT\n"), "a later phase advanced the pending marker")
+        owner.request(None, None, stdout_cursor=cursor, stdout_deadline=20)
+        require(scope["_emit_job_stderr"](stderr.name, capture.name, result, True, cursor, 20),
+                "normal output could not be staged")
+        capture.close()
+        Path(capture.name).unlink()
+        require(owner.publish(result) == result and bytes(accepted[11]) == data,
+                "normal result did not preserve raw ordinary output")
+        require(cursor["offset"] == len(data), "normal relay lost its accepted offset")
+        owner.close_captures()
+
+    raw_scope, raw_owner, raw_accepted, _ = namespace()
+    raw_scope["clock_now"] = lambda: 0
+    raw_data = b"RAW_EXIT_98\n"
+    raw_capture = raw_owner.add_capture("stdout", replay=False)
+    raw_stderr = raw_owner.add_capture("stderr")
+    raw_capture.write(raw_data)
+    raw_capture.flush()
+    raw_cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    raw_final = raw_scope["_stream_stdout"](raw_capture.name, raw_cursor, final=True, deadline=20)
+    require(raw_final == len(b"RAW_EXIT_98\n"), "literal raw exit 98 output was withheld")
+    require(raw_scope["_emit_job_stderr"](raw_stderr.name, raw_capture.name, 98, True, raw_cursor, 20),
+            "literal raw exit 98 output could not be staged")
+    require(raw_owner.publish(98) == 98 and bytes(raw_accepted[11]) == b"RAW_EXIT_98\n",
+            "literal raw exit 98 was rewritten as a terminal marker")
+    raw_owner.close_captures()
+
+    for reason in ("timeout", "cleanup"):
+        scoped, selected_owner, selected_accepted, selected_capture, selected_stderr, selected_cursor, selected_final, selected_data = split_capture()
+        require(selected_final is None, "incomplete marker was not held for " + reason)
+        selected_owner.request(reason, "parent " + reason, stdout_cursor=selected_cursor, stdout_deadline=20)
+        require(scoped["_emit_job_stderr"](
+            selected_stderr.name, selected_capture.name, 98, True, selected_cursor, 20
+        ), "failed output could not be staged for " + reason)
+        require(selected_owner.publish(98) == 98, reason + " changed the supervisor result")
+        require(bytes(selected_accepted[11]).count(marker) == 1,
+                reason + " published an incomplete child marker and a second verdict")
+        retained = next(Path(output["path"]) for output in selected_owner.outputs if output.get("pending_marker"))
+        require(retained.read_bytes() == selected_data[len(b"OUT\n"):] and os.fsencode(retained) in selected_accepted[11],
+                reason + " discarded the incomplete marker evidence")
+        selected_owner.close_captures()
+
+
 def linux_post_exit_cancel():
     if sys.platform != "linux":
         return
@@ -909,6 +1166,12 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             linux_multiple_markers()
         elif scenario == "linux-journal-short-write":
             linux_journal_short_write()
+        elif scenario == "linux-adopted-child-drain":
+            linux_adopted_child_drain()
+        elif scenario == "linux-final-relay-reserve":
+            linux_final_relay_reserve()
+        elif scenario == "linux-incomplete-marker":
+            linux_incomplete_marker()
         elif scenario == "linux-post-exit-cancel":
             linux_post_exit_cancel()
         elif scenario.startswith("finalizer-"):
