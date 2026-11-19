@@ -752,7 +752,7 @@ function fixture(t, { absentSupervisor = false } = {}) {
         const text = chunk.toString();
         output += text;
         if (streams) streams[name] += text;
-        if (output.includes('BODY_READY\n') || output.includes('ADMISSION_READY\n')) resolveReady();
+        if (output.includes('BODY_READY\n') || output.includes('ADMISSION_READY\n')) resolveReady(true);
       };
       if (streams) stream.once('close', () => { streams[name + 'Closed'] = true; });
       if (streams && name === 'stderr') {
@@ -773,19 +773,31 @@ function fixture(t, { absentSupervisor = false } = {}) {
       }
     }
     const done = new Promise((resolve, reject) => {
-      child.once('error', reject);
+      const finish = result => {
+        resolveReady(false);
+        resolve(result);
+      };
+      child.once('error', error => {
+        resolveReady(false);
+        reject(error);
+      });
       if (extra.FIXTURE_IPC) {
         child.once('exit', (code, signal) => setImmediate(() => {
           child.stdout.destroy();
           child.stderr.destroy();
-          resolve({ code, signal, output });
+          finish({ code, signal, output });
         }));
       } else child.once('close', (code, signal) => {
-        resolve({ code, signal, output, ...(streams ? { streams } : {}) });
+        finish({ code, signal, output, ...(streams ? { streams } : {}) });
       });
     });
     return {
       child, identity, ready, done,
+      async requireReady() {
+        if (await ready) return;
+        const { output } = await done;
+        assert.fail(output || 'gate exited before signaling readiness');
+      },
       confirmRetirement() { launchRecord.expectedRetention = false; }
     };
   }
@@ -1494,6 +1506,17 @@ for (const [key, value] of [['APERTURE_GATE_SLOWEST_RUN_S', 'abc'], ['APERTURE_G
   });
 }
 
+test('gate fixture reports exit before readiness', { timeout: 15000 }, async t => {
+  const f = fixture(t);
+  const run = f.launch({ APERTURE_GATE_TIME_LEFT_S: '5', APERTURE_GATE_SLOWEST_RUN_S: '5' });
+  const result = await run.done;
+  assert.equal(result.code, 98, result.output);
+  assert.equal(fs.existsSync(f.marker), false);
+  assert.match(result.output, /reason=capacity/);
+  assert.equal(await Promise.race([run.ready, Promise.resolve('unsettled')]), false);
+  await assert.rejects(run.requireReady(), /reason=capacity/);
+});
+
 test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 }, async t => {
   const f = fixture(t);
   const run = f.launchSupervised({
@@ -1503,7 +1526,7 @@ test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 
     FIXTURE_HANG: '1',
     FIXTURE_NO_STDERR_DRAIN: '1'
   });
-  await run.ready;
+  await run.requireReady();
   const liveBody = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.identityGone(liveBody.identity, roleFixture.captureIdentity(liveBody.identity.pid)), false,
     'BODY_READY arrived after the body exited');
@@ -2092,7 +2115,7 @@ test('interruption stops a body that ignores TERM before releasing its holder', 
     FIXTURE_EXPECTED_RETENTION: '1',
     FIXTURE_EXPECTED_RETENTION_REASON: 'interruption lacks fresh guardian completion after watchdog stop'
   });
-  await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
+  await run.requireReady();
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.signalOwned(run.identity, 'SIGTERM'), true, 'fixture identity changed before interruption');
   const result = await run.done;
@@ -2282,7 +2305,7 @@ test('final source snapshot timeout is a no-verdict result', { timeout: 180000 }
 test('watchdog cleans a TERM-resistant body after its supervisor is killed', { timeout: 180000 }, async t => {
   const f = fixture(t);
   const run = f.launch({ FIXTURE_HANG: '1', FIXTURE_RECREATE_SCRATCH: '1', FIXTURE_EXPECTED_RETENTION: '1', FIXTURE_EXPECTED_RETENTION_REASON: 'manager loss leaves Node scratch without surviving retirement owner' });
-  await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
+  await run.requireReady();
   const body = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   const roles = JSON.parse(fs.readFileSync(f.protocol + '.roles', 'utf8'));
   assert.equal(roleFixture.signalOwned(run.identity, 'SIGKILL'), true, 'fixture identity changed before worker-loss control');
@@ -2774,7 +2797,7 @@ assert bytes(accepted)==data and failures==[] and blocking[0] is True
 test('launchd coalition drain catches a detached grandchild after its helper exits', { skip: process.platform !== 'darwin', timeout: 30000 }, async t => {
   const unrelated = fixture(t);
   const unrelatedRun = unrelated.launchSupervised({ FIXTURE_HANG: '1' });
-  await Promise.race([unrelatedRun.ready, unrelatedRun.done.then(result => assert.fail(result.output))]);
+  await unrelatedRun.requireReady();
   const unrelatedRoles = JSON.parse(fs.readFileSync(unrelated.protocol + '.roles', 'utf8'));
   const unrelatedJob = unrelatedRoles.extraHolders[1];
   assert.ok(unrelatedJob, 'unrelated launchd job identity was not recorded');
@@ -3118,7 +3141,7 @@ test('manager death during queued admission leaves no live admission or holder',
     FIXTURE_EXPECTED_RETENTION: '1',
     FIXTURE_EXPECTED_RETENTION_REASON: 'manager loss leaves queued admission scratch without surviving retirement owner'
   });
-  await Promise.race([run.ready, run.done.then(value => assert.fail(value.output))]);
+  await run.requireReady();
   const queued = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
   assert.equal(roleFixture.signalOwned(run.identity, 'SIGKILL'), true, 'fixture identity changed before manager-loss control');
   const result = await run.done;
