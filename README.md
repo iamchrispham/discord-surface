@@ -108,6 +108,9 @@ same session's native **Monitor** tool. A session already launched with Channels
 details](docs/runtime-reference.md#ordinary-claude-session-binding)
 include the Monitor command, acknowledgment handling, and listener recovery.
 
+See [Resume a bound Claude session](docs/runtime-reference.md#resume-a-bound-claude-session)
+for automatic Channels attachment and how to verify it after resume.
+
 ## Verify delivery
 
 Send one real instruction to the bound channel. Confirm that it reaches the intended native

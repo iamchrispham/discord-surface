@@ -268,6 +268,42 @@ Monitor startup does not promote native execution readiness. Discord intake read
 execution status remain separate. A stopped or abruptly lost Monitor never causes submitted work
 to be sent again.
 
+### Resume a bound Claude session
+
+On hosts that source the local [Claude launcher][claude-discord-launcher], resume an
+existing binding by its native Claude UUID:
+
+```sh
+claude --resume "$CLAUDE_SESSION_UUID"
+```
+
+The launcher attaches the Discord Channels server when it finds an active Claude binding for
+that UUID, confirms no live Claude process holds the session, and can use the running Gateway
+to prepare its channel configuration. Add `--with-fleet` if you also use the fleet feed.
+The launcher keeps the existing UUID and uses the endpoint already recorded in the binding.
+
+The automatic path reports its result on stderr:
+
+- `claude: attached Discord for …` means the launcher prepared the Channels arguments for the
+  resume. Confirm delivery with a fresh Discord message and a visible reply from the resumed session.
+- `claude: Discord not attached, …` explains why the launcher passed through without Discord
+  Channels. Check the reason first. If the session is already open, use that session and start
+  its native Monitor only when its bound socket has no listener.
+
+Use `claude --with-discord --resume "$CLAUDE_SESSION_UUID"` to request Channels explicitly while
+looking up the bound endpoint by UUID. A named option such as `--with-discord tpm` selects a
+socket stem. Pair it with the UUID bound to that socket when resuming, since a named launch
+without a resume can start a fresh session.
+
+The launcher comes from the separate skills installation. The Discord Surface package
+supplies `claude-channel` and `claude-monitor`. On hosts without the launcher, use
+the native Channels configuration above or start the Monitor inside the running bound
+session. With the launcher loaded, prefix the resume command with
+`CLAUDE_WITH_DISCORD_DRYRUN=1` to inspect its launch arguments without starting Claude or
+writing the channel configuration.
+
+[claude-discord-launcher]: https://github.com/iamchrispham/claude-skills/blob/main/discord-bind/scripts/claude-with-discord.zsh
+
 ### Ordinary Codex session binding
 
 Run these commands from the existing Codex session's own command context after configuring the
