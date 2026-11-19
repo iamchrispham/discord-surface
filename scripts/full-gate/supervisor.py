@@ -1100,6 +1100,33 @@ def stop_owned_processes(process, deadline):
     return not (process is not None and process.poll() is None) and children == []
 
 
+def _remove_gate_scratch(scratch, deadline):
+    establish_reaping_contract()
+    # Reserve time to reap a timed-out remover.
+    finish_by = deadline - POLL_SECONDS
+    if clock_now() >= finish_by:
+        raise TimeoutError("scratch removal had no time to start at " + scratch)
+    remove = "import os, shutil, sys\nshutil.rmtree(sys.argv[1])\nsys.exit(int(os.path.lexists(sys.argv[1])))"
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-B", "-c", remove, scratch],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        status = process.wait(timeout=max(0, finish_by - clock_now()))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        try:
+            process.kill()
+            process.wait(timeout=max(0, deadline - clock_now()))
+        except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+            detail = "scratch remover pid " + str(process.pid) + " cleanup uncertain at " + scratch
+            raise OSError(detail) from cleanup_error
+        raise TimeoutError("scratch removal did not complete before the caller deadline at " + scratch) from error
+    if clock_now() >= deadline:
+        raise TimeoutError("scratch removal did not complete before the caller deadline at " + scratch)
+    if status != 0:
+        raise OSError("scratch remover exited with status " + str(status) + " at " + scratch)
+
+
 def capture_snapshot(root, environment, phase, deadline, interrupted, *, stop_deadline):
     establish_reaping_contract()
     # Leave the stop TERM grace plus time to see KILL land before stop_deadline.
@@ -1273,13 +1300,9 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
                 terminal.fail_retirement(detail)
                 return no_verdict("cleanup", detail)
             try:
-                shutil.rmtree(scratch)
+                _remove_gate_scratch(scratch, deadline)
             except OSError as error:
                 detail = "gate scratch removal failed: " + str(error)
-                terminal.fail_retirement(detail)
-                return no_verdict("cleanup", detail)
-            if not clock_now() < deadline or os.path.lexists(scratch):
-                detail = "gate scratch removal did not complete before the caller deadline"
                 terminal.fail_retirement(detail)
                 return no_verdict("cleanup", detail)
             scratch = None
@@ -1828,12 +1851,9 @@ def run_darwin_supervised(root, command, environment, started, receipt, interrup
             terminal.fail_retirement("platform-owned scratch retirement exceeded the caller deadline")
             return False
         try:
-            shutil.rmtree(scratch)
+            _remove_gate_scratch(scratch, deadline)
         except OSError as error:
             terminal.fail_retirement("platform-owned scratch removal failed: " + str(error))
-            return False
-        if not clock_now() < deadline or os.path.lexists(scratch):
-            terminal.fail_retirement("platform-owned scratch removal did not complete before the caller deadline")
             return False
         scratch = None
         return True

@@ -10,6 +10,7 @@ const root = path.resolve(__dirname, '..');
 for (const scenario of [
   'reason-order', 'required-hold', 'replacement-failure', 'blocked-delivery', 'phase-reserve',
   'large-publish-memory', 'large-required-files', 'expired-range-delivery', 'marker-delivery-error',
+  'scratch-retirement-deadline',
   'finalizer-receipt', 'finalizer-handler', 'finalizer-creation', 'finalizer-clock',
   'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'linux-multiple-markers', 'linux-journal-short-write',
   'linux-adopted-child-drain', 'linux-final-relay-reserve', 'linux-incomplete-marker', 'linux-post-exit-cancel',

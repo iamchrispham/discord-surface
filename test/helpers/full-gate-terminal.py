@@ -1010,6 +1010,66 @@ def expired_range_delivery():
         source.unlink(missing_ok=True)
 
 
+def scratch_retirement_deadline():
+    for case in ("complete", "failed", "expired", "stalled", "not-reaped"):
+        scope, _, _, _ = namespace()
+        deadline = 20
+        clock = [deadline if case == "expired" else 19.8]
+        events = []
+
+        class Remover:
+            pid = 10101
+
+            def wait(self, timeout):
+                events.append(("wait", timeout))
+                if case in ("complete", "failed"):
+                    return 0 if case == "complete" else 2
+                clock[0] += timeout
+                if not any(event[0] == "kill" for event in events) or case == "not-reaped":
+                    raise subprocess.TimeoutExpired("scratch remover", timeout)
+                return -9
+
+            def kill(self):
+                events.append(("kill", self.pid))
+
+        def launch(argv, **kwargs):
+            require(events == [("reaping", None)], "remover did not acquire child wait ownership before spawning")
+            require(argv[1:5] == ["-I", "-S", "-B", "-c"] and argv[-1] == "/private/allocation",
+                    "unverified removal command")
+            events.append(("launch", None))
+            return Remover()
+
+        scope["clock_now"] = lambda: clock[0]
+        scope["establish_reaping_contract"] = lambda: events.append(("reaping", None))
+        scope["subprocess"] = types.SimpleNamespace(Popen=launch, TimeoutExpired=subprocess.TimeoutExpired,
+                                                    DEVNULL=subprocess.DEVNULL)
+        try:
+            scope["_remove_gate_scratch"]("/private/allocation", deadline)
+        except OSError as error:
+            require(case != "complete", "completed retirement was refused")
+            if case == "expired":
+                require(events == [("reaping", None)] and "no time to start" in str(error),
+                        "retirement spawned on an expired deadline")
+            elif case == "failed":
+                require("status 2" in str(error) and len(events) == 3, "nonzero removal was claimed complete")
+            else:
+                require([event[0] for event in events] == ["reaping", "launch", "wait", "kill", "wait"],
+                        "stalled retirement did not stop and reap its owned helper")
+                require(clock[0] <= deadline, "retirement burned time after the deadline")
+                require(("cleanup uncertain" in str(error)) == (case == "not-reaped"),
+                        "retirement lost uncertain reaping state")
+        else:
+            require(case == "complete" and [event[0] for event in events] == ["reaping", "launch", "wait"],
+                    "unproved retirement returned success")
+
+    scope, _, _, _ = namespace()
+    scope["sys"] = sys
+    scratch = Path(tempfile.mkdtemp(prefix="bounded-retirement-"))
+    (scratch / "owned").write_text("scratch")
+    scope["_remove_gate_scratch"](str(scratch), scope["clock_now"]() + 5)
+    require(not scratch.exists(), "verified scratch retirement left the allocation on disk")
+
+
 def marker_delivery_error():
     scope, owner, accepted, calls = namespace()
     marker = b"APERTURE-GATE-INDETERMINATE reason=cleanup: writer\n"
@@ -1100,6 +1160,7 @@ def darwin_output(mode):
             shutil.rmtree(path)
 
     scope["shutil"] = Cleanup()
+    scope["_remove_gate_scratch"] = lambda path, deadline: scope["shutil"].rmtree(path)
     scope["_service_state"] = lambda *args: {"present": False}
 
     def bootstrap(*args):
@@ -1182,6 +1243,8 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             expired_range_delivery()
         elif scenario == "marker-delivery-error":
             marker_delivery_error()
+        elif scenario == "scratch-retirement-deadline":
+            scratch_retirement_deadline()
         elif scenario == "linux-multiple-markers":
             linux_multiple_markers()
         elif scenario == "linux-journal-short-write":

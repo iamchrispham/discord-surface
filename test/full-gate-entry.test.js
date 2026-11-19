@@ -1263,7 +1263,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "               interrupted=SimpleNamespace(is_set=lambda: fixture.interrupted),",
     "               result_code=fixture.body_code, body_code=fixture.body_code, root=\"root\", environment={}, before={\"snapshot\": \"fixed\"},",
     "               scratch=\"private\", owner=None, capture_snapshot=fixture.snapshot,",
-    "               _emit_job_stderr=env[\"_emit_job_stderr\"], no_verdict=env[\"no_verdict\"], shutil=SimpleNamespace(rmtree=fixture.remove))",
+    "               _emit_job_stderr=env[\"_emit_job_stderr\"], no_verdict=env[\"no_verdict\"], _remove_gate_scratch=lambda allocation, deadline: fixture.remove(allocation))",
     "    requested={}",
     "    def phase_write(path,token,owner,identity,sequence,phase,*args,**values):requested[phase]=values",
     "    def phase_wait(path,owner,identity,token,phases,sequence,deadline,interrupted,stdout_path,offset,phase_deadline=None):",
