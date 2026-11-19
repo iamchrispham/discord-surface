@@ -675,7 +675,8 @@ function fixture(t, { absentSupervisor = false } = {}) {
       ['FIXTURE_REVISION_COUNTER', 'text'], ['FIXTURE_TABLE_FAILURE_ARM', 'text'],
       ['FIXTURE_TABLE_FAILURE_ONCE', 'text'], ['FIXTURE_MONITOR_BARRIER', 'text'],
       ['FIXTURE_STOP', 'text'], ['FIXTURE_EVENTS', 'text'],
-      ['FIXTURE_RUNNER_EXIT', 'text'], ['FIXTURE_RUNNER_ALARM', 'text']
+      ['FIXTURE_RUNNER_EXIT', 'text'], ['FIXTURE_RUNNER_ALARM', 'text'],
+      ['FIXTURE_RUNNER_IDENTITY', 'identity-record']
     ]);
     const recordFiles = [];
     for (const [name, value] of Object.entries(launchEnv)) {
@@ -6281,6 +6282,7 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
     const runnerAlarm = path.join(f.scratch, 'runner-alarm');
     const bodyMarker = path.join(f.scratch, 'body-started.json');
     const databasePath = path.join(f.scratch, 'fake-launchd.json');
+    const runnerIdentityPath = path.join(f.scratch, 'runner-identity.json');
     const bin = path.join(f.scratch, 'fake-bin');
     fs.mkdirSync(bin);
     const ownerBoundary = [
@@ -6345,12 +6347,15 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
     fs.writeFileSync(databasePath, JSON.stringify({ services: { [unrelatedService]: unrelated } }));
     const launchctlSource = [
       '#!/usr/bin/env python3',
-      'import json, os, plistlib, subprocess, sys',
+      'import json, os, plistlib, subprocess, sys, tempfile',
       '_DATABASE = ' + JSON.stringify(databasePath),
       'def read_db():',
       '    with open(_DATABASE, encoding="utf-8") as handle: return json.load(handle)',
       'def write_db(value):',
-      '    with open(_DATABASE, "w", encoding="utf-8") as handle: json.dump(value, handle)',
+      '    with tempfile.TemporaryDirectory(dir=os.path.dirname(_DATABASE)) as staging:',
+      '        draft = os.path.join(staging, "launchd.json")',
+      '        with open(draft, "w", encoding="utf-8") as handle: json.dump(value, handle)',
+      '        os.replace(draft, _DATABASE)',
       'action = sys.argv[1]',
       'if action == "print":',
       '    service = sys.argv[2]',
@@ -6388,6 +6393,7 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
     const supervised = f.launchSupervised({
       FIXTURE_SUPERVISOR_SCRIPT: path.join(directory, 'supervisor.py'),
       FIXTURE_LAUNCHD_DB: databasePath,
+      FIXTURE_RUNNER_IDENTITY: runnerIdentityPath,
       FIXTURE_MARKER: bodyMarker,
       PATH: bin + path.delimiter + process.env.PATH,
       APERTURE_GATE_TIME_LEFT_S: '30',
@@ -6404,9 +6410,9 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
         if (!serviceRecord) await new Promise(resolve => setTimeout(resolve, 10));
       }
       assert.ok(serviceRecord, 'public supervisor did not create the disposable platform job');
-      spec = JSON.parse(fs.readFileSync(serviceRecord.spec_path, 'utf8'));
       runnerIdentity = roleFixture.captureIdentity(serviceRecord.pid);
       assert.equal(runnerIdentity.kind, 'present', 'disposable runner identity was not captured');
+      spec = JSON.parse(fs.readFileSync(serviceRecord.spec_path, 'utf8'));
       const result = await supervised.done;
       const database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
       const events = fs.existsSync(eventLog)
@@ -6431,11 +6437,14 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
       serviceRecord ||= Object.values(database.services).find(record => record.service !== unrelatedService);
       if (serviceRecord) {
         fs.writeFileSync(stopMarker, 'stop');
-        if (runnerIdentity?.kind === 'present' && !roleFixture.identityGone(runnerIdentity, roleFixture.captureIdentity(runnerIdentity.pid))) {
-          let gone = await waitForIdentityGone(runnerIdentity, Date.now() + 3000);
-          if (!gone && roleFixture.sameProcessIdentity(runnerIdentity, roleFixture.captureIdentity(runnerIdentity.pid))) {
-            assert.equal(roleFixture.signalOwned(runnerIdentity, 'SIGTERM'), true, 'test owner could not stop its disposable runner');
-            gone = await waitForIdentityGone(runnerIdentity, Date.now() + 5000);
+        const identity = runnerIdentity ?? { kind: 'unknown', pid: serviceRecord.pid };
+        fs.writeFileSync(runnerIdentityPath, JSON.stringify(identity), { mode: 0o600 });
+        assert.equal(identity.kind, 'present', 'disposable runner identity is unproved; custody retained at ' + serviceRecord.scratch);
+        if (!roleFixture.identityGone(identity, roleFixture.captureIdentity(identity.pid))) {
+          let gone = await waitForIdentityGone(identity, Date.now() + 3000);
+          if (!gone && roleFixture.sameProcessIdentity(identity, roleFixture.captureIdentity(identity.pid))) {
+            assert.equal(roleFixture.signalOwned(identity, 'SIGTERM'), true, 'test owner could not stop its disposable runner');
+            gone = await waitForIdentityGone(identity, Date.now() + 5000);
           }
           assert.equal(gone, true, 'disposable runner remained after bounded cleanup');
         }
