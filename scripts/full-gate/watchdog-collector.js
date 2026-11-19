@@ -34,6 +34,9 @@ function createWatchdogCollector({ spawn, now = Date.now, monotonicNow = () => p
     clearTimer(phase.timer);
     phase.pending?.(failure(phase, code, origin));
     signal('SIGTERM');
+    // A descendant can keep the pipes open after the scanner has exited.
+    phase.child?.stdout.destroy();
+    phase.child?.stderr.destroy();
     release(phase);
   }
   function begin(end) {

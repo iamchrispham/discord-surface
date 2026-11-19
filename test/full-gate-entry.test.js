@@ -4495,8 +4495,8 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
         constructor() {
           super();
           this.pid = ++childId;
-          this.stdout = new EventEmitter();
-          this.stderr = new EventEmitter();
+          this.stdout = new PassThrough();
+          this.stderr = new PassThrough();
           this.connected = true;
           this.closed = false;
           this.sent = [];
