@@ -202,7 +202,10 @@ function fixture(t, { absentSupervisor = false } = {}) {
     ? inheritedSupervisorPid
     : null;
   const effectiveExternalSupervisorPid = externalSupervisorPid ?? process.pid;
-  const externalSupervisorIdentity = roleFixture.captureIdentity(effectiveExternalSupervisorPid);
+  let externalSupervisorIdentity = roleFixture.captureIdentity(effectiveExternalSupervisorPid);
+  if (externalSupervisorIdentity.kind === 'unknown') {
+    externalSupervisorIdentity = roleFixture.captureIdentity(effectiveExternalSupervisorPid);
+  }
   t.after(async () => {
     const unresolved = [];
     const identities = new Map();
@@ -911,6 +914,7 @@ test('identity inspection errors cannot prove actor absence', () => {
     const observed = roleFixture.captureIdentity(process.pid, () => reply);
     assert.equal(observed.kind, 'unknown');
     assert.equal(roleFixture.identityGone(live, observed), false);
+    assert.equal(roleFixture.sameProcessIdentity(live, observed), false);
   }
   const absentForOtherPid = roleFixture.captureIdentity(process.pid + 1, () => ({
     status: 0, stdout: JSON.stringify({ kind: 'absent' })
@@ -920,6 +924,7 @@ test('identity inspection errors cannot prove actor absence', () => {
   if (changed.platform === 'darwin') changed.unique_id += 1;
   else changed.start = (BigInt(changed.start) + 1n).toString();
   assert.equal(roleFixture.identityGone(live, changed), true);
+  assert.equal(roleFixture.sameProcessIdentity(live, changed), false);
 });
 
 test('real process absence is known and a reused pid is never signaled', { timeout: 20000 }, async () => {
@@ -1532,7 +1537,7 @@ test('outer no-verdict survives a full child stderr log pipe', { timeout: 30000 
   });
   await run.requireReady();
   const liveBody = JSON.parse(fs.readFileSync(f.marker, 'utf8'));
-  assert.equal(roleFixture.identityGone(liveBody.identity, roleFixture.captureIdentity(liveBody.identity.pid)), false,
+  assert.equal(roleFixture.sameProcessIdentity(liveBody.identity, roleFixture.captureIdentity(liveBody.identity.pid)), true,
     'BODY_READY arrived after the body exited');
   const result = await run.done;
   const { stdout, stderr, stdoutClosed, stderrClosed, stderrHeldUntilExit, stderrRelease } = result.streams;
@@ -1616,7 +1621,7 @@ for (const file of ['scripts/test-gate.js', 'scripts/package-smoke.js']) {
     const started = Date.now();
     assert.equal(await run.ready, true, run.output() || 'canonical admission did not start');
     assert.equal(run.child.exitCode, null, 'admission readiness was observed only after child exit');
-    assert.equal(roleFixture.identityGone(run.identity, roleFixture.captureIdentity(run.identity.pid)), false,
+    assert.equal(roleFixture.sameProcessIdentity(run.identity, roleFixture.captureIdentity(run.identity.pid)), true,
       'admission readiness arrived after the supervised owner exited');
     const admissionIdentity = roleFixture.captureIdentity(JSON.parse(fs.readFileSync(run.admissionMarker, 'utf8')).pid);
     assert.equal(admissionIdentity.kind, 'present', 'readiness was relayed after admission exited');
@@ -1910,7 +1915,7 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
     run.done = launched.done.then(value => { run.outcome = value; return value; });
     return run;
   };
-  const isLive = actor => !roleFixture.identityGone(actor.identity, roleFixture.captureIdentity(actor.pid));
+  const isLive = actor => roleFixture.sameProcessIdentity(actor.identity, roleFixture.captureIdentity(actor.pid));
   const waitForStart = async run => {
     const ready = await waitFor(() => ['armed', 'writer', 'scratchPath', 'presentWhileLive', 'peerArmed', 'manager'].every(name => fs.existsSync(run.files[name])) || run.outcome, 8000);
     assert.equal(ready, true, run.outcome?.output || 'fixture actors did not become ready');
@@ -1989,7 +1994,7 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
     assert.equal(await waitFor(() => fs.existsSync(bypassed.files.releasedWhileLive), 20000), true, 'guard bypass did not expose scratch release during live writer custody');
     const releaseEvidence = JSON.parse(fs.readFileSync(bypassed.files.releasedWhileLive, 'utf8'));
     assert.ok(roleFixture.sameProcessIdentity(releaseEvidence.identity, bypassActors.writer.identity), 'absence receipt came from a different actor');
-    assert.equal(roleFixture.identityGone(releaseEvidence.identity, roleFixture.captureIdentity(releaseEvidence.identity.pid)), false);
+    assert.equal(roleFixture.sameProcessIdentity(releaseEvidence.identity, roleFixture.captureIdentity(releaseEvidence.identity.pid)), true);
     assert.equal(isLive(bypassActors.writer), true, 'writer exited before the bypass release was observed');
     assert.equal(fs.existsSync(bypassActors.scratch), false, 'guard bypass did not release scratch while the writer was live');
   } finally {
@@ -2089,7 +2094,7 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
     assert.equal(result.code, 0, result.output);
     assert.equal(fs.existsSync(marker), true, 'public command did not reach its body');
     assert.equal(fs.existsSync(signalLog), false, 'stale ancestry reached the native signal boundary');
-    assert.equal(roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid)), false, 'the stale ancestry actor was signaled');
+    assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'the stale ancestry actor was signaled');
 
     const bypassLog = path.join(bypassed.scratch, 'signals.log');
     const bypassResult = await bypassed.launchSupervised({
@@ -2102,7 +2107,7 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
     }).done;
     assert.equal(bypassResult.code, 98, bypassResult.output);
     assert.ok(fs.readFileSync(bypassLog, 'utf8').split(',').includes(String(actor.pid)), 'bypassed ownership did not reach the intercepted signal boundary');
-    assert.equal(roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid)), false, 'the intercepted signal reached the disposable actor');
+    assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'the intercepted signal reached the disposable actor');
   } finally {
     if (!roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid))) {
       assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'disposable actor identity changed before cleanup');
@@ -3314,7 +3319,7 @@ test('gate retains scratch when escaped writer ownership is unresolved', { timeo
     assert.equal(result.code, 98, result.output);
     assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1);
     assert.match(result.output, /reason=(?:interrupted|cleanup)/);
-    assert.equal(roleFixture.identityGone(escaped.escapeIdentity, roleFixture.captureIdentity(escaped.escapePid)), false, 'unproved escaped ownership is not signalled');
+    assert.equal(roleFixture.sameProcessIdentity(escaped.escapeIdentity, roleFixture.captureIdentity(escaped.escapePid)), true, 'unproved escaped ownership is not signalled');
     assert.equal(fs.existsSync(f.marker + '.escape-signalled'), false);
     assert.equal(fs.existsSync(escaped.scratch), true, 'unknown escaped ownership keeps scratch in custody');
   } finally {
@@ -6533,7 +6538,7 @@ test('Darwin guardian retains an after verifier when its outer controller dies',
     assert.equal(result.signal, 'SIGKILL');
     const stopDeadline = Date.now() + 55000;
     while (!roleFixture.identityGone(record.verifier, roleFixture.captureIdentity(record.verifier.pid)) && Date.now() < stopDeadline) {
-      assert.equal(roleFixture.identityGone(record.guardian, roleFixture.captureIdentity(record.guardian.pid)), false, 'guardian retired while verifier still lived');
+      assert.equal(roleFixture.sameProcessIdentity(record.guardian, roleFixture.captureIdentity(record.guardian.pid)), true, 'guardian retired while verifier still lived');
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     assert.equal(roleFixture.identityGone(record.verifier, roleFixture.captureIdentity(record.verifier.pid)), true);

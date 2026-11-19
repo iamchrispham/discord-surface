@@ -20,6 +20,7 @@ const forbiddenActions = [];
 let nextPid = 76000;
 let fakeNow = 1700000000000;
 let storageFailure = false;
+let missEnclosingLookup = false;
 let timerCallbacks = 0;
 
 function presentIdentity(pid, state = 'gone') {
@@ -48,7 +49,13 @@ function markGone(pid) {
 }
 
 const roles = {
-  captureIdentity(pid) { return currentIdentity(pid); },
+  captureIdentity(pid) {
+    if (pid === safeProcess.pid && missEnclosingLookup) {
+      missEnclosingLookup = false;
+      return { kind: 'unknown', pid };
+    }
+    return currentIdentity(pid);
+  },
   sameProcessIdentity: realRoles.sameProcessIdentity,
   identityGone: realRoles.identityGone,
   signalOwned(identity) {
@@ -224,6 +231,8 @@ function writeJson(file, value) {
 async function exercise(fixture, config) {
   const directoriesBefore = new Set(ownedDirectories);
   storageFailure = config.storageFailure === true;
+  const enclosing = config.missEnclosingLookup ? presentIdentity(safeProcess.pid, 'live') : null;
+  missEnclosingLookup = Boolean(enclosing);
   timerCallbacks = 0;
   fakeNow += 100000;
   const diagnostics = [];
@@ -252,7 +261,7 @@ async function exercise(fixture, config) {
     const bodyIdentity = config.kind === 'unknown'
       ? { kind: 'unknown', pid: bodyPid }
       : presentIdentity(bodyPid, config.kind === 'live' ? 'live' : 'gone');
-    writeJson(f.marker, { pid: bodyPid, identity: bodyIdentity, scratch: allocation });
+    writeJson(f.marker, { pid: bodyPid, identity: bodyIdentity, scratch: allocation, enclosing });
     if (config.mode === 'direct') writeJson(extra.FIXTURE_MANAGER_IDENTITY, { identity: run.identity });
     if (config.kind === 'unknown') {
       writeJson(extra.FIXTURE_LEFTOVER_IDENTITY, { identity: { kind: 'unknown', pid: nextPid++ } });
@@ -302,6 +311,8 @@ async function exercise(fixture, config) {
       if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
       ownedDirectories.delete(directory);
     }
+    if (enclosing) markGone(enclosing.pid);
+    missEnclosingLookup = false;
     storageFailure = false;
   }
 }
@@ -319,6 +330,15 @@ test('expected retained allocation passes after drain and durable obligation', {
   assert.deepEqual(retained.map(entry => entry.path), [result.allocation], 'retention obligation lost its allocation path');
   assert.deepEqual(result.obligationState.externalScratch, [result.allocation]);
   assert.deepEqual(retained[0].owners.map(owner => [owner.launchOrdinal, owner.controller.pid]), [[0, result.controllerPid]]);
+});
+
+test('a transient enclosing supervisor inspection failure does not block fixture cleanup', { timeout: 30000 }, async () => {
+  const result = await exercise(fixture, {
+    name: 'enclosing-observation-retry', kind: 'expected', mode: 'supervised',
+    expectedRetention: true, missEnclosingLookup: true
+  });
+  assert.equal(result.observedDecision, 'pass');
+  assert.ok(result.obligationState.identities.every(identity => identity.pid !== safeProcess.pid));
 });
 
 test('unexpected retained allocation fails', { timeout: 30000 }, async () => {
