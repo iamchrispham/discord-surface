@@ -4691,12 +4691,12 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
       await h.respond(monitor, h.table(monitor));
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 1);
     });
-    await t.test('C19 missing native rows keep unresolved custody held', async () => {
+    await t.test('C19 missing native rows keep discovered custody held', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const monitor = h.pending(); await h.respond(monitor, h.table(monitor, '21 20 20 S\n30 21 30 S darwin:1:1:30:1\n'));
       await h.advance(1000);
       const partial = h.pending(); await h.respond(partial, h.table(partial));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
       assert.deepEqual(h.exits, []);
     });
@@ -4719,6 +4719,32 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
     });
 
 
+
+    await t.test('drain rejects PID reuse only when the previously captured identity can be disproved', async () => {
+      for (const scenario of ['unrelated', 'same', 'unknown', 'malformed', 'fresh-child', 'pid-only']) {
+        const h = harness(); await h.start(); await h.advance(1000);
+        const initial = h.pending();
+        const identity = scenario === 'pid-only' ? '' : ' darwin:1:1:30:1';
+        await h.respond(initial, h.table(initial, '30 20 30 S' + identity + '\n'));
+        assert.equal(h.inspect('escapedDescendants.get(30)'), identity.trim() || null, scenario);
+        h.proc.emit('message', { kind: 'BODY_EXIT' });
+        h.proc.emit('message', { kind: 'DRAIN' }); await flush();
+        const drain = h.pending();
+        assert.equal(drain.command, 'ps');
+        const parent = scenario === 'fresh-child' ? 20 : 1;
+        await h.respond(drain, h.table(drain, `30 ${parent} 30 S\n`));
+        if (scenario === 'fresh-child' || scenario === 'pid-only') {
+          assert.equal(h.pending(), undefined, scenario);
+        } else {
+          const verify = h.pending();
+          assert.equal(verify.command, 'python3');
+          const observation = { unrelated: '1:1:31:1', same: '1:1:30:1', unknown: undefined, malformed: 'invalid' }[scenario];
+          await h.respond(verify, JSON.stringify({ 30: observation }));
+        }
+        assert.deepEqual(h.exits, scenario === 'unrelated' ? [0] : [], scenario);
+        assert.deepEqual(h.signals, [], scenario);
+      }
+    });
 
     await t.test('C25 missing and malformed native identities stay unresolved without another process', async () => {
       for (const value of ['', ' darwin:0:1:30:1', ' darwin:1:1000000:30:1', ' invalid']) {
@@ -4982,7 +5008,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       const scan = h.pending(); await h.respond(scan, h.table(scan));
       assert.deepEqual(h.exits, [0]);
     });
-    await t.test('C2 bounded output keeps escaped identities unresolved', async () => {
+    await t.test('C2 native table captures the escaped writer identity', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const scan = h.pending();
       assert.equal(scan.command, 'python3');
@@ -4992,7 +5018,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
       await h.respond(scan, h.table(scan, '21 20 20 S\n30 21 30 S darwin:1:1:30:1\n'));
       assert.equal(h.pending(), undefined, 'native identity is captured in the table invocation');
       assert.equal(h.children.length, 1);
-      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
       assert.equal(h.inspect('collector.owned()'), false);
       assert.equal(stopCount(h), 0);
       assert.equal(scan.stdout.listenerCount('data'), 0);
@@ -5098,7 +5124,7 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
     await t.test('C13 guardian ancestry remains covered after manager reparenting', async () => {
       const h = harness(); await h.start(); await h.advance(1000);
       const scan = h.pending(); await h.respond(scan, h.table(scan, '30 10 30 S darwin:1:1:30:1\n'));
-      assert.equal(h.inspect('escapedDescendants.get(30)'), null);
+      assert.equal(h.inspect('escapedDescendants.get(30)'), 'darwin:1:1:30:1');
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.escaped).length, 1);
       assert.equal(h.packets.filter(packet => packet.kind === 'CUSTODY' && packet.state === 'CLEAR').length, 0);
     });
@@ -5298,7 +5324,9 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         }
         assert.doesNotMatch(inventory.sources[watchdog], /process\.kill\s*\(/);
         assert.doesNotMatch(inventory.sources[watchdog], /signalEscapedDescendants/);
-        assert.match(inventory.sources[watchdog], /escapedDescendants\.set\(row\.pid, null\)/);
+        const escapeWrites = [...inventory.sources[watchdog].matchAll(/escapedDescendants\.set\(([^\n]+)\);/g)];
+        assert.deepEqual(escapeWrites.map(match => match[1]), ['row.pid, identities?.get(row.pid) ?? null'],
+          'escaped identities may come only from their discovery sample');
         assert.doesNotMatch(inventory.sources[watchdog], /spawnSync/);
         assert.match(inventory.sources[worker], /admission = spawn\(message\.command, message\.args, \{ stdio: 'inherit' \}\)/);
         assert.match(inventory.sources[watchdog], /const \{ spawn \} = require\('node:child_process'\)/);
@@ -5320,9 +5348,10 @@ print(json.dumps({'faults': len(faults), 'identityFaults': len(identity_faults),
         append(body, '\nprocess.kill(pid, signal);\n'),
         append(collector, '\nspawn("ps", []);\n'),
         append(collector, '\nrequire("../future-evidence");\n'),
+        append(watchdog, '\nescapedDescendants.set(pid, subsequentIdentity);\n'),
         { files: [...inventory.files, sibling], sources: { ...inventory.sources, [sibling]: 'process.kill(pid, signal);\nspawn("ps", []);\n' } }
       ];
-      assert.equal(mutants.length, 5);
+      assert.equal(mutants.length, 6);
       for (const mutant of mutants) assert.throws(() => assertEvidenceOwners(mutant), assert.AssertionError);
     });
   });

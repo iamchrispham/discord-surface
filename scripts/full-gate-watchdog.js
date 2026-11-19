@@ -17,6 +17,7 @@ const OBSERVATION_PHASE_BOUNDS = Object.freeze({
   orphan: 'cleanup'
 });
 const DARWIN_PROCESS_IDENTITY_FLAGS = Object.freeze(['-I', '-S', '-B']);
+const DARWIN_IDENTITY = /^darwin:[1-9]\d*:\d{1,6}:[1-9]\d*:[1-9]\d*$/;
 const DARWIN_PROCESS_IDENTITY_SCRIPT = `
 import sys
 if sys.argv[1:2] == ['--table']:
@@ -262,7 +263,9 @@ async function readProcessIdentities(pids, phase) {
   try {
     for (const [rawPid, identity] of Object.entries(JSON.parse(result.stdout))) {
       const pid = Number(rawPid);
-      if (uniquePids.includes(pid) && typeof identity === 'string' && identity) identities.set(pid, 'darwin:' + identity);
+      if (uniquePids.includes(pid) && typeof identity === 'string' && DARWIN_IDENTITY.test('darwin:' + identity)) {
+        identities.set(pid, 'darwin:' + identity);
+      }
     }
   } catch { if (identityObservation) identityObservation.outcome = 'parse-failed'; }
   return identities;
@@ -296,7 +299,7 @@ async function readProcessTable(phase) {
     const row = { pid: Number(match[1]), parent: Number(match[2]), pgid: Number(match[3]), state: match[4] };
     const rememberedUnresolved = unresolvedScope.has(row.pid) && escapedDescendants.get(row.pid) === null;
     if (nativeMonitor && row.pid !== process.pid && row.pid !== result.pid && (row.pgid !== group || rememberedUnresolved) && !row.state.startsWith('Z')
-        && /^darwin:[1-9]\d*:\d{1,6}:[1-9]\d*:[1-9]\d*$/.test(match[5] || '')) identities.set(row.pid, match[5]);
+        && DARWIN_IDENTITY.test(match[5] || '')) identities.set(row.pid, match[5]);
     return row;
   }).filter(Boolean).filter(row => row.pid !== result.pid);
   if (!rows.some(row => row.pid === process.pid)) {
@@ -310,6 +313,11 @@ async function readProcessTable(phase) {
   return { rows, scannerPid: result.pid, monitorIdentities };
 }
 async function rememberEscapedDescendants(rows, phase) {
+  const freshEscapes = new Set();
+  if (!currentObservation(phase)) return freshEscapes;
+  const sample = phase.monitorIdentities;
+  const identities = sample?.phase === phase && sample.generation === phase.generation && sample.rows === rows
+    ? sample.identities : null;
   const descendants = new Set([group, process.pid]);
   let changed = true;
   while (changed) {
@@ -318,28 +326,31 @@ async function rememberEscapedDescendants(rows, phase) {
       if (descendants.has(row.parent) && !descendants.has(row.pid) && !row.state.startsWith('Z')) {
         descendants.add(row.pid);
         changed = true;
-        if (row.pid !== process.pid && row.pgid !== group && !escapedDescendants.has(row.pid)) {
-          escapedDescendants.set(row.pid, null);
+        if (row.pgid === group) continue;
+        freshEscapes.add(row.pid);
+        if (!escapedDescendants.has(row.pid)) {
+          // Only the discovery sample can bind an identity to this ancestry.
+          escapedDescendants.set(row.pid, identities?.get(row.pid) ?? null);
           try { if (process.connected) process.send({ kind: MESSAGES.CUSTODY, phase: phase.custody, escaped: true }, () => {}); } catch {}
         }
       }
     }
   }
-  if (!currentObservation(phase)) return;
+  return freshEscapes;
 }
-async function hasLiveEscapedDescendants(rows, phase) {
-  const byPid = new Map(rows.map(row => [row.pid, row]));
-  const candidates = [...escapedDescendants].filter(([pid]) => byPid.has(pid));
+async function hasLiveEscapedDescendants(rows, phase, freshEscapes) {
   if (!currentObservation(phase)) return true;
-  return candidates.some(([pid]) => {
-    const row = byPid.get(pid);
-    return row && !row.state.startsWith('Z');
-  });
-}
-async function hasOwnedProcesses(table, phase) {
-  if (!table) return true;
-  const peers = table.rows.some(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
-  return peers || await hasLiveEscapedDescendants(table.rows, phase);
+  const livePids = new Set(rows.filter(row => !row.state.startsWith('Z')).map(row => row.pid));
+  const candidates = [...escapedDescendants].filter(([pid]) => livePids.has(pid));
+  if (candidates.some(([pid, identity]) => identity === null || freshEscapes.has(pid))) return true;
+  if (candidates.length === 0) return false;
+  const observed = await readProcessIdentities(candidates.map(([pid]) => pid), phase);
+  if (!currentObservation(phase)) return true;
+  for (const [pid, expected] of candidates) {
+    if (!observed.has(pid) || sameProcessIdentity(expected, observed.get(pid))) return true;
+    escapedDescendants.delete(pid);
+  }
+  return false;
 }
 async function monitorDescendants() {
   if (!body || stopping || boundaryPending || collector.owned()) return;
@@ -349,7 +360,7 @@ async function monitorDescendants() {
     const snapshot = await readProcessTable(phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!snapshot) return stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
-      await rememberEscapedDescendants(snapshot.rows, phase);
+    await rememberEscapedDescendants(snapshot.rows, phase);
     if (!stopping && phase.generation === observationGeneration && !currentObservation(phase)) stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE);
   } catch (error) { stop(WATCHDOG_STOP_EVENTS.MONITOR_TABLE, error); }
   finally { finishObservation(phase); }
@@ -392,10 +403,10 @@ async function finishStop() {
     let complete = false;
     try {
       const table = phase ? await readProcessTable(phase) : null;
-      if (table) await rememberEscapedDescendants(table.rows, phase);
+      const freshEscapes = table ? await rememberEscapedDescendants(table.rows, phase) : null;
       const groupHasLiveProcesses = !table || table.rows.some(row =>
         row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
-      const escapedWriterIsLive = table ? await hasLiveEscapedDescendants(table.rows, phase) : false;
+      const escapedWriterIsLive = table ? await hasLiveEscapedDescendants(table.rows, phase, freshEscapes) : false;
       const observationIsCurrent = currentObservation(phase);
       complete = observationIsCurrent && !groupHasLiveProcesses && !escapedWriterIsLive;
     } catch {}
@@ -473,13 +484,13 @@ async function check() {
     const table = await readProcessTable(phase);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!table) return stop(WATCHDOG_STOP_EVENTS.DRAIN_TABLE);
-    await rememberEscapedDescendants(table.rows, phase);
+    const freshEscapes = await rememberEscapedDescendants(table.rows, phase);
     const peers = table.rows.filter(row => row.pgid === group && ![process.pid, group, table.scannerPid].includes(row.pid) && !row.state.startsWith('Z'));
     if (peers.length) {
       drainRecheckRequested = true;
       return;
     }
-    const liveEscapes = await hasLiveEscapedDescendants(table.rows, phase);
+    const liveEscapes = await hasLiveEscapedDescendants(table.rows, phase, freshEscapes);
     if (stopping || phase.generation !== observationGeneration) return;
     if (!currentObservation(phase)) return stop(WATCHDOG_STOP_EVENTS.DRAIN_ESCAPES);
     if (liveEscapes) {
