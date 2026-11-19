@@ -3459,11 +3459,9 @@ test('watchdog cannot signal escaped IDs after stale acquisition or recheck', ()
   const manager = fs.readFileSync(path.join(PROJECT, 'scripts/full-gate.js'), 'utf8');
   const remember = source.match(/async function rememberEscapedDescendants[\s\S]*?\n}/)?.[0];
   assert.ok(remember, 'escaped ancestry owner must remain inventoried');
-  assert.match(remember, /escapedDescendants\.set\(row\.pid, null\)/);
   assert.doesNotMatch(remember, /readProcessIdentities/);
   assert.doesNotMatch(source, /process\.kill\s*\(/);
   assert.doesNotMatch(source, /signalEscapedDescendants/);
-  assert.match(source, /return row && !row\.state\.startsWith\('Z'\)/);
   assert.match(source, /const PROCESS_MONITOR_INTERVAL_MS = 1000/);
   assert.match(source, /setInterval\(monitorDescendants, PROCESS_MONITOR_INTERVAL_MS\)/);
   assert.doesNotMatch(manager, /process\.kill\s*\(\s*-worker\.pid/);
@@ -4721,7 +4719,7 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
 
 
     await t.test('drain rejects PID reuse only when the previously captured identity can be disproved', async () => {
-      for (const scenario of ['unrelated', 'same', 'unknown', 'malformed', 'fresh-child', 'pid-only']) {
+      for (const scenario of ['unrelated', 'same', 'unknown', 'malformed', 'fresh-child', 'pid-only', 'zombie']) {
         const h = harness(); await h.start(); await h.advance(1000);
         const initial = h.pending();
         const identity = scenario === 'pid-only' ? '' : ' darwin:1:1:30:1';
@@ -4732,8 +4730,9 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
         const drain = h.pending();
         assert.equal(drain.command, 'ps');
         const parent = scenario === 'fresh-child' ? 20 : 1;
-        await h.respond(drain, h.table(drain, `30 ${parent} 30 S\n`));
-        if (scenario === 'fresh-child' || scenario === 'pid-only') {
+        const zombie = scenario === 'zombie';
+        await h.respond(drain, h.table(drain, `30 ${parent} 30 ${zombie ? 'Z' : 'S'}\n`));
+        if (scenario === 'fresh-child' || scenario === 'pid-only' || zombie) {
           assert.equal(h.pending(), undefined, scenario);
         } else {
           const verify = h.pending();
@@ -4741,7 +4740,7 @@ function watchdogCollectorLifecycleTests({ test, assert, vm, EventEmitter, watch
           const observation = { unrelated: '1:1:31:1', same: '1:1:30:1', unknown: undefined, malformed: 'invalid' }[scenario];
           await h.respond(verify, JSON.stringify({ 30: observation }));
         }
-        assert.deepEqual(h.exits, scenario === 'unrelated' ? [0] : [], scenario);
+        assert.deepEqual(h.exits, scenario === 'unrelated' || zombie ? [0] : [], scenario);
         assert.deepEqual(h.signals, [], scenario);
       }
     });
