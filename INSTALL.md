@@ -76,6 +76,8 @@ Codex uses `ordinary-bind --state-dir <state> --channel-id <existing-channel>`. 
 
 Claude uses `ordinary-claude-bind` with the exact current transcript and a short owner-only socket path, followed by `claude-monitor` in that session's native Monitor tool. Ordinary Claude binding also depends on the local caller-identity integration at `~/.claude/hooks/session-chat-binding.mjs`, which this package does not install. If absent, obtain the supported integration from its owner instead of fabricating caller identity. Channels are an alternative only for a session already launched with the native opt-in.
 
+For a previously bound session, see [Resume a bound Claude session](docs/runtime-reference.md#resume-a-bound-claude-session) for launcher requirements, explicit attachment, and a delivery check.
+
 After the Gateway owner authorizes this host to consume the intended guild, use the public `start --state-dir <state>` entrypoint and inspect `status --state-dir <state>`. Do not start a second consumer as a workaround. Keep all Gateway-aware CLI paths on the same installed release.
 
 The peer MCP requires native caller identity on every invocation. A generic `codex mcp add` only saves server configuration; it does not prove that an already-running session loads the tools or passes its session identity to the MCP process. Do not add a static session UUID to that configuration. Use the installed `mcp --provider codex|claude --state-dir <state>` command only through a native integration that supplies the current caller identity and reloads the tools into that same session. If either capability is unavailable, leave peer MCP unregistered on that host.
