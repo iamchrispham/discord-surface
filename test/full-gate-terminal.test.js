@@ -14,6 +14,7 @@ for (const scenario of [
   'finalizer-receipt', 'finalizer-handler', 'finalizer-creation', 'finalizer-clock',
   'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'linux-multiple-markers', 'linux-journal-short-write',
   'linux-adopted-child-drain', 'linux-final-relay-reserve', 'linux-incomplete-marker', 'linux-post-exit-cancel',
+  'linux-permanent-relay-failure', 'linux-verifier-cleanup', 'linux-setup-verifier-cleanup',
   'darwin-bootstrap', 'darwin-exception', 'darwin-large'
 ]) {
   test('terminal output owner: ' + scenario, {

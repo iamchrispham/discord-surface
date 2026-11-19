@@ -187,8 +187,11 @@ def _write_job_output(descriptor, payload, deadline=None, logical_state=None, in
             was_blocking = os.get_blocking(descriptor)
             os.set_blocking(descriptor, False)
             written = os.write(descriptor, payload[offset:offset + 64 * 1024])
-        except (BlockingIOError, BrokenPipeError, OSError):
+        except (BlockingIOError, InterruptedError):
             pass
+        except OSError:
+            state["destination_failed"] = True
+            break
         finally:
             if was_blocking is not None:
                 try:
@@ -1275,10 +1278,16 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
     scratch = None
     process_started = False
     writers_drained = False
+    verifier_cleanup_failed = False
     output_staged = False
 
     def finish(code=None, *, failure=None, failure_detail=None):
         nonlocal scratch, output_staged
+        if scratch is not None and verifier_cleanup_failed:
+            detail = failure_detail or "source verifier cleanup is uncertain"
+            terminal.fail_retirement(detail)
+            terminal.fail_output("gate output retained because source verifier cleanup is uncertain")
+            return no_verdict("cleanup", detail)
         if scratch is not None and process_started and not writers_drained:
             detail = "gate scratch retained because descendant drainage is unverified"
             terminal.fail_retirement(detail)
@@ -1372,6 +1381,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         try:
             after = capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
         except SnapshotCleanupError as error:
+            verifier_cleanup_failed = True
             reason, detail = "cleanup", str(error)
         except InterruptedError as error:
             if reason is None:
@@ -1403,6 +1413,7 @@ def run_supervised(root, command, environment, started, receipt, interrupted):
         try:
             capture_snapshot(root, environment, "after", deadline, interrupted, stop_deadline=deadline)
         except SnapshotCleanupError as snapshot_error:
+            verifier_cleanup_failed = True
             return finish(failure="cleanup", failure_detail=str(snapshot_error))
         except Exception:
             return finish(failure="stale", failure_detail="unable to verify source after setup failure")
@@ -1569,7 +1580,8 @@ def _record_verdict_range(cursor, start, end, terminal):
 
 
 def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
-    if cursor.get("verdict_append_failed") or cursor.get("pending_marker_end") is not None:
+    if (cursor.get("verdict_append_failed") or cursor.get("stdout_relay_failed") or
+            cursor.get("pending_marker_end") is not None):
         return None
     try:
         terminal = _ACTIVE_TERMINAL_OUTPUT
@@ -1628,18 +1640,22 @@ def _stream_stdout(path, cursor, final=False, deadline=None, interrupted=None):
                 payload = payload[:tail_at]
     if not payload:
         return offset
+    write_state = {}
     try:
-        if interrupted is None:
-            written = _write_job_output(sys.stdout.fileno(), payload, deadline)
-        else:
-            written = _write_job_output(sys.stdout.fileno(), payload, deadline, interrupted=interrupted)
+        written = _write_job_output(sys.stdout.fileno(), payload, deadline, write_state, interrupted=interrupted)
     except (OSError, ValueError) as error:
         if terminal is not None:
             terminal.fail_output("live stdout relay failed: " + str(error))
-        return offset
+        cursor.update(stdout_relay_failed=True, retain_output=True)
+        return None
     if written:
         cursor["source_line_start"] = cursor["output_line_start"] = payload[written - 1:written] == b"\n"
         cursor["offset"] += written
+    if write_state.get("destination_failed"):
+        if terminal is not None:
+            terminal.fail_output("live stdout relay destination failed")
+        cursor.update(stdout_relay_failed=True, retain_output=True)
+        return None
     if written != len(payload) and (interrupted is None or not interrupted.is_set()):
         if terminal is not None:
             terminal.fail_output("live stdout relay was incomplete")

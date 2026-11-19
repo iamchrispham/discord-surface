@@ -1,3 +1,4 @@
+import errno
 import os
 import hashlib
 import shutil
@@ -672,7 +673,7 @@ def linux_adopted_child_drain():
         raise AssertionError("unknown child ownership was accepted as drained")
 
 
-def linux_final_relay_reserve():
+def linux_final_relay_reserve(*, permanent=False):
     scope, owner, _, _ = namespace()
     scope["_remove_gate_scratch"] = retire_fixture_allocation
     now = [0]
@@ -699,6 +700,11 @@ def linux_final_relay_reserve():
         def write(self, descriptor, payload):
             require(descriptor == 11, "final relay wrote to the wrong descriptor")
             write_times.append(now[0])
+            if permanent:
+                if len(write_times) == 1:
+                    pipe_output.extend(payload[:4])
+                    return 4
+                raise BrokenPipeError(errno.EPIPE, "stdout closed after accepting a prefix")
             if now[0] < 19:
                 raise BlockingIOError("stdout becomes writable after the verification reserve")
             pipe_output.extend(payload)
@@ -746,12 +752,49 @@ def linux_final_relay_reserve():
     require(now[0] < 20 - reserve, "final stdout relay consumed the source verification reserve")
     require(not any(value >= 20 - cutoff for value in write_times),
             "final stdout relay attempted delivery past its verification cutoff")
-    require(result == 0 and not pipe_output, "late stdout delivery replaced the completed body result")
-    require(owner.cursor["offset"] == 0 and owner.output_complete is False,
+    expected_output = stdout_data[:4] if permanent else b""
+    if permanent:
+        require(phases[-1] == ("after", 0) and write_times == [0, 0],
+                "permanent stdout failure delayed source verification or retried the closed pipe")
+    require(result == 0 and pipe_output == expected_output, "stdout relay lost the accepted prefix or changed the body result")
+    require(owner.cursor["offset"] == len(expected_output) and owner.output_complete is False,
             "final relay did not preserve its last accepted offset")
     capture = next(output["path"] for output in owner.outputs if output["name"] == "stdout")
     require(Path(capture).exists() and Path(capture).read_bytes() == stdout_data,
             "final relay discarded the unread stdout capture")
+
+
+def linux_verifier_cleanup(*, setup_error=False):
+    scope, owner, _, _ = namespace()
+    allocations = []
+
+    class ExitedBody:
+        def __init__(self, *args, **kwargs):
+            allocations.append(Path(kwargs["env"]["DISCORD_SURFACE_GATE_SCRATCH"]))
+            if setup_error:
+                raise OSError("body spawn failed")
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    def snapshot(_root, _environment, phase, *_args, **_kwargs):
+        if phase == "after":
+            raise scope["SnapshotCleanupError"]("after verifier cleanup remains uncertain")
+        return {"snapshot": "same", "budget": 20, "slowest": 1}
+
+    scope.update(subprocess=types.SimpleNamespace(Popen=ExitedBody),
+                 capture_snapshot=snapshot, clock_now=lambda: 0,
+                 wait_for_owned_children=lambda _deadline: True,
+                 _remove_gate_scratch=retire_fixture_allocation)
+    result = scope["run_supervised"](
+        Path.cwd(), ["not-executed"], {"APERTURE_GATE_TIME_LEFT_S": "20"}, 0,
+        types.SimpleNamespace(path="private-receipt", token="private-token"), threading.Event()
+    )
+    require(result == 98 and owner.retirement_complete is False, "uncertain verifier cleanup did not decline retirement")
+    require(len(allocations) == 1 and allocations[0].is_dir(), "uncertain verifier cleanup retired its scratch")
 
 
 def linux_incomplete_marker():
@@ -1261,6 +1304,10 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             linux_adopted_child_drain()
         elif scenario == "linux-final-relay-reserve":
             linux_final_relay_reserve()
+        elif scenario == "linux-permanent-relay-failure":
+            linux_final_relay_reserve(permanent=True)
+        elif scenario in ("linux-verifier-cleanup", "linux-setup-verifier-cleanup"):
+            linux_verifier_cleanup(setup_error=scenario == "linux-setup-verifier-cleanup")
         elif scenario == "linux-incomplete-marker":
             linux_incomplete_marker()
         elif scenario == "linux-post-exit-cancel":
