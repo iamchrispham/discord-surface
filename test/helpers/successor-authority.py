@@ -152,6 +152,7 @@ import runpy
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.environ['DISCORD_SURFACE_FIXTURE_SRC'])
 import conductor_worker_proof as proof  # noqa: E402
 
