@@ -1,5 +1,6 @@
 import os
 import hashlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -294,9 +295,14 @@ def public_finalizers(mode):
         require(b"primary timeout" in marker and mode.encode() in marker, "finalizer diagnostic lost")
 
 
+def retire_fixture_allocation(path, _deadline):
+    shutil.rmtree(path)
+
+
 def linux_output(raw, marked=False, multiple_markers=False, marker_payload_override=None,
                  expected_output=None, expected_no_verdict=None, late_newline=False):
     scope, owner, accepted, calls = namespace()
+    scope["_remove_gate_scratch"] = retire_fixture_allocation
     scope["clock_now"] = lambda: 0
     scope["capture_snapshot"] = lambda *args, **kwargs: {"snapshot": "same", "budget": 20, "slowest": 1}
     marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
@@ -512,6 +518,7 @@ def linux_multiple_markers():
 
 def linux_journal_short_write():
     scope, owner, _, _ = namespace()
+    scope["_remove_gate_scratch"] = retire_fixture_allocation
     now = 0
     phases = []
     polls = []
@@ -667,6 +674,7 @@ def linux_adopted_child_drain():
 
 def linux_final_relay_reserve():
     scope, owner, _, _ = namespace()
+    scope["_remove_gate_scratch"] = retire_fixture_allocation
     now = [0]
     phases = []
     pipe_output = bytearray()
@@ -837,6 +845,7 @@ def linux_post_exit_cancel():
     if sys.platform != "linux":
         return
     scope, owner, accepted, calls = namespace()
+    scope["_remove_gate_scratch"] = retire_fixture_allocation
     phases = []
     interrupted = threading.Event()
     actor = None
@@ -1115,7 +1124,6 @@ def darwin_output(mode):
             return path
 
     scope["tempfile"] = Storage()
-    import shutil
 
     large_marker = b"APERTURE-GATE-INDETERMINATE reason=capacity: child\n"
     large_stdout = b"b" * (2 * 65536 + 17) + b"\n" + large_marker + b"TAIL\n"
