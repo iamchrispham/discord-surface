@@ -3036,7 +3036,7 @@ test('worker keeps body and admission in its group and excludes body control for
     }
   }, { timeout: 1000 });
   workerProcess.emit('message', { kind: MESSAGES.ADMIT, command: 'admit', args: [] });
-  admission.emit('exit', 0);
+  admission.emit('close', 0);
   workerProcess.emit('message', { kind: MESSAGES.START });
   assert.equal(admissionOptions.detached, undefined);
   assert.equal(bodyOptions.detached, undefined);

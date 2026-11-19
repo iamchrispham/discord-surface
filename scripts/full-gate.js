@@ -474,6 +474,7 @@ async function runFullGate(root, label, entry, args) {
   let ticket;
   let premise;
   let bodyResult;
+  let bodyLaunchError;
   let finalSnapshotRequired = false;
   const stop = (signal, event) => {
     observed.firstStop ||= { event, stage: observed.stage, reason: signal };
@@ -663,6 +664,7 @@ async function runFullGate(root, label, entry, args) {
     const result = await Promise.race([finished, workerExit.then(value => ({ workerExited: true, signal: value.signal })), guardianExit.then(value => ({ workerExited: true, signal: value.signal }))]);
     if (stopped || result.workerExited) return decline(stopped === REASONS.TIMEOUT ? REASONS.TIMEOUT : REASONS.INTERRUPTED, stopped || result.signal || 'worker exited before reporting the body result');
     bodyResult = result.code;
+    bodyLaunchError = result.error;
     finalSnapshotRequired = true;
   } catch (error) {
     if (error.code === 'ETIMEDOUT' || Date.now() >= deadline) return decline(REASONS.TIMEOUT, 'gate work exceeded the caller deadline');
@@ -787,6 +789,7 @@ async function runFullGate(root, label, entry, args) {
       removeInterruptHandlers();
     }
   }
+  if (bodyLaunchError) return decline(REASONS.ADMISSION, 'gate body could not start: ' + bodyLaunchError);
   return bodyResult;
 }
 

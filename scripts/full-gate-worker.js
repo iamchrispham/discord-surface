@@ -41,11 +41,14 @@ function report(message) {
 process.on('message', message => {
   if (message.kind === MESSAGES.ADMIT && !admission && !stopping) {
     admission = spawn(message.command, message.args, { stdio: 'inherit' });
-    admission.once('error', error => report({ kind: MESSAGES.ADMISSION_EXIT, error: error.message }));
-    admission.once('exit', code => {
+    let admissionError;
+    admission.once('error', error => { admissionError = error.message; });
+    admission.once('close', code => {
       admissionExited = true;
-      admissionSucceeded = code === 0;
-      report({ kind: MESSAGES.ADMISSION_EXIT, code });
+      admissionSucceeded = !admissionError && code === 0;
+      report(admissionError
+        ? { kind: MESSAGES.ADMISSION_EXIT, error: admissionError }
+        : { kind: MESSAGES.ADMISSION_EXIT, code });
     });
   }
   if (message.kind === MESSAGES.START && !body && !stopping) {
@@ -62,15 +65,17 @@ process.on('message', message => {
       bodyScanRequested = true;
       report({ kind: MESSAGES.BODY_COMPLETE });
     });
-    let bodyResultSent = false;
-    const reportBodyExit = code => {
-      if (bodyResultSent) return;
-      bodyResultSent = true;
+    let bodyLaunchError;
+    body.once('error', error => {
+      if (body.pid !== undefined) return stop();
+      bodyLaunchError = error.message;
+    });
+    body.once('close', (code, signal) => {
       bodyExited = true;
-      report({ kind: MESSAGES.BODY_EXIT, code });
-    };
-    body.once('error', () => reportBodyExit(1));
-    body.once('close', (code, signal) => reportBodyExit(signal ? 128 + os.constants.signals[signal] : code));
+      report(bodyLaunchError
+        ? { kind: MESSAGES.BODY_EXIT, error: bodyLaunchError }
+        : { kind: MESSAGES.BODY_EXIT, code: signal ? 128 + os.constants.signals[signal] : code });
+    });
   }
   if (message.kind === MESSAGES.BODY_SCAN_COMPLETE && bodyScanRequested && body?.connected && !stopping) {
     try { body.send({ kind: MESSAGES.BODY_SCAN_COMPLETE }, error => { if (error) stop(); }); } catch { stop(); }
