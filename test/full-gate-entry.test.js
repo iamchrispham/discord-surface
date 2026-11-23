@@ -6412,8 +6412,10 @@ test('Darwin phase ownership keeps relay, retirement and failed verdicts ordered
 
 
 test('public supervisor refuses a shared controller coalition before dispatch', { skip: process.platform !== 'darwin', timeout: 90000 }, async t => {
-  async function runCase(bypassGuard) {
+  async function runCase(bypassGuard, refuseBootout = false) {
     const f = fixture(t);
+    const refuseMarker = path.join(f.scratch, 'refuse-bootout');
+    if (refuseBootout) fs.writeFileSync(refuseMarker, 'refuse');
     const directory = path.join(f.scratch, 'private-owner', 'scripts', 'full-gate');
     fs.mkdirSync(directory, { recursive: true });
     const stopMarker = path.join(f.scratch, 'fixture-stop');
@@ -6435,7 +6437,9 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
       'def joined_identity(pid):',
       '    role = _fixture_os.path.basename(_fixture_sys.argv[0])',
       '    if role == "darwin-runner.py" and _fixture_os.path.exists(_FIXTURE_STOP): raise SystemExit(0)',
-      '    coalition = 400 if role == "darwin-runner.py" and int(pid) == _fixture_os.getpid() else 300',
+      refuseBootout
+        ? '    coalition = 300 if role == "supervisor.py" and int(pid) == _fixture_os.getpid() else 400'
+        : '    coalition = 400 if role == "darwin-runner.py" and int(pid) == _fixture_os.getpid() else 300',
       '    identity = {"pid":int(pid),"unique_id":int(pid),"pid_version":1,"start_sec":1,"start_usec":1,"coalition_id":coalition}',
       '    if role == "supervisor.py" and int(pid) != _fixture_os.getpid(): _fixture_log("identity", int(pid), coalition)',
       '    return identity',
@@ -6521,6 +6525,9 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
       '    write_db(database)',
       '    raise SystemExit(0)',
       'if action == "bootout":',
+      '    if os.path.exists(' + JSON.stringify(refuseMarker) + '):',
+      '        print("Boot-out failed: 5: Input/output error", file=sys.stderr)',
+      '        raise SystemExit(5)',
       '    service = sys.argv[-1]',
       '    database = read_db()',
       '    if service in database["services"]: database["services"][service]["active"] = False',
@@ -6542,6 +6549,7 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
     let serviceRecord;
     let runnerIdentity;
     let spec;
+    let recovery;
     try {
       const launchDeadline = Date.now() + 10000;
       while (!serviceRecord && Date.now() < launchDeadline) {
@@ -6558,9 +6566,21 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
       const events = fs.existsSync(eventLog)
         ? fs.readFileSync(eventLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
         : [];
-      assert.ok(events.some(event => event.kind === 'identity' && event.role === 'supervisor.py' && event.pid === serviceRecord.pid && event.coalition === 300), 'same-coalition observation did not reach the public supervisor guard');
+      if (!refuseBootout) assert.ok(events.some(event => event.kind === 'identity' && event.role === 'supervisor.py' && event.pid === serviceRecord.pid && event.coalition === 300), 'same-coalition observation did not reach the public supervisor guard');
       assert.deepEqual(database.services[unrelatedService], unrelated, 'public cleanup changed the unrelated job');
-      if (!bypassGuard) {
+      if (refuseBootout) {
+        recovery = /output evidence retained at (\S+)/.exec(result.output)?.[1];
+        assert.equal(result.code, 98, result.output);
+        assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.output);
+        assert.match(result.output, /^APERTURE-GATE-INDETERMINATE reason=cleanup:/m);
+        assert.equal(fs.existsSync(bodyMarker), true, 'body did not run before cleanup');
+        assert.ok(events.some(event => event.kind === 'drain' && event.role === 'supervisor.py'), 'supervisor did not reach cleanup after retirement');
+        assert.equal(database.services[serviceRecord.service].active, true, 'refused bootout released the platform job');
+        assert.equal(fs.existsSync(serviceRecord.scratch), true, 'refused bootout retired the job scratch');
+        for (const evidence of [path.join(serviceRecord.scratch, 'stdout.log'), recovery]) {
+          assert.ok(evidence && fs.existsSync(evidence) && result.output.includes(evidence), 'retained evidence was not named: ' + evidence);
+        }
+      } else if (!bypassGuard) {
         assert.equal(result.code, 98, result.output);
         assert.equal((result.output.match(/APERTURE-GATE-INDETERMINATE/g) || []).length, 1, result.output);
         assert.equal(fs.existsSync(bodyMarker), false, 'shared coalition reached command dispatch');
@@ -6588,16 +6608,19 @@ test('public supervisor refuses a shared controller coalition before dispatch', 
           }
           assert.equal(gone, true, 'disposable runner remained after bounded cleanup');
         }
+        fs.rmSync(refuseMarker, { force: true });
         const bootout = spawnSync('python3', [launchctl, 'bootout', serviceRecord.service], { encoding: 'utf8', timeout: 5000 });
         assert.equal(bootout.status, 0, bootout.stderr);
         fs.rmSync(serviceRecord.scratch, { recursive: true, force: true });
       }
+      if (recovery) fs.rmSync(recovery, { force: true });
       database = JSON.parse(fs.readFileSync(databasePath, 'utf8'));
       assert.deepEqual(database.services[unrelatedService], unrelated, 'test cleanup changed the unrelated job');
     }
   }
   await runCase(false);
   await runCase(true);
+  await t.test('public supervisor refuses an unconfirmed normal cleanup and keeps the allocation', () => runCase(false, true));
 });
 
 test('Darwin guardian retains an after verifier when its outer controller dies', { skip: process.platform !== 'darwin', timeout: 120000 }, async t => {
