@@ -2061,13 +2061,16 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
     '    descriptor = os.pidfd_open(pid)'
   ].join('\n');
   const bypassedOwnershipGuard = '    descriptor = os.pidfd_open(pid)';
-  const liveChildGuard = '        except ChildProcessError:\n            continue\n        if waited == 0:';
-  const bypassedLiveChildGuard = '        except ChildProcessError:\n            waited = 0\n        if waited == 0:';
+  const liveChildGuard = '            except ChildProcessError:\n                reaped = True\n                continue\n            if waited == 0:';
+  const bypassedLiveChildGuard = '            except ChildProcessError:\n                waited = 0\n            if waited == 0:';
+  const noChildGuard = '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                return []';
+  const bypassedNoChildGuard = '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                waited = 0';
   const supervisorSource = fs.readFileSync(SUPERVISOR_SCRIPT, 'utf8');
   assert.ok(supervisorSource.includes(directChildrenLine));
   assert.ok(supervisorSource.includes(signalLine));
   assert.ok(supervisorSource.includes(ownershipGuard));
   assert.ok(supervisorSource.includes(liveChildGuard));
+  assert.ok(supervisorSource.includes(noChildGuard));
   const instrument = source => source
     .replace(directChildrenLine, injectedChildrenLine)
     .replace(signalLine, interceptedSignal);
@@ -2082,7 +2085,8 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
   const normalSupervisor = writeSupervisor(normal, 'supervisor', instrument(supervisorSource));
   let bypassSource = instrument(supervisorSource)
     .replace(ownershipGuard, bypassedOwnershipGuard)
-    .replace(liveChildGuard, bypassedLiveChildGuard);
+    .replace(liveChildGuard, bypassedLiveChildGuard)
+    .replace(noChildGuard, bypassedNoChildGuard);
   assert.notEqual(bypassSource, instrument(supervisorSource), 'counterfactual did not bypass child-handle ownership');
   const bypassSupervisor = writeSupervisor(bypassed, 'supervisor', bypassSource);
   const marker = path.join(normal.scratch, 'body.json');
