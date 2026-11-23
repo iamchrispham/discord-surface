@@ -5933,6 +5933,40 @@ for prior in (None,'stale','timeout'):
         case('actual normal terminal cleanup overrides '+repr((body,prior)),lambda body=body,prior=prior:terminal_projection(body,prior))
 case('raw98 without authenticated reason remains marker-free',lambda:terminal_projection(98,None,None))
 case('authenticated interrupted98 cannot restore body0',lambda:terminal_projection(0,None,'interrupted'))
+def unconfirmed_normal_cleanup(body):
+    retired={'phase':'retired','sequence':3,'sealed':True,'quiescent':True,'code':body}
+    verdicts=[]
+    terminal_ns,terminal=terminal_owner()
+    def declared(why,detail,**kwargs):
+        verdicts.append((why,detail));terminal.request(why,detail);return 98
+    ns=dict(terminal_ns,terminal=terminal,reason=None,detail=None,result_code=body,NO_VERDICT=98,sequence=3,deadline=10,
+        output_cursor={'offset':0,'source_line_start':True,'output_line_start':True},
+        retirement={},scratch='private',owned_service=True,owner=object(),identity=identity,identity_verified=True,
+        launchctl='launchctl',service='service',status_path='state',nonce='nonce',stdout_path='stdout',stderr_path='stderr',
+        interrupted=types.SimpleNamespace(is_set=lambda:False),fallback_available=False,
+        _wait_job_phase=lambda *args:(retired,0),_darwin_cleanup=lambda *args,**kwargs:False,_emit_job_stderr=lambda *args:True,
+        clock_now=lambda:0,_stream_stdout=lambda path,cursor,**kwargs:cursor['offset'],
+        os=types.SimpleNamespace(stat=lambda path:types.SimpleNamespace(st_size=0)),time=Clock(),POLL_SECONDS=.025,
+        no_verdict=declared)
+    released=attach_inert_scratch_retirement(ns)
+    index=next(i for i,n in enumerate(main.body) if isinstance(n,ast.Assign) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='_wait_job_phase' and any(isinstance(a,ast.Tuple) and any(isinstance(v,ast.Constant) and v.value=='retired' for v in a.elts) for a in n.value.args))
+    body_nodes=ast.parse("output_required = False\noutput_staged = None").body+[copy.deepcopy(stage_outputs)]+copy.deepcopy(main.body[index:])
+    code=actual_function('unconfirmed_cleanup',body_nodes,ns)()
+    try:
+        require(code==98 and [why for why,detail in verdicts]==['cleanup'],'unconfirmed normal cleanup returned '+repr((body,code,verdicts)))
+        require(released==[],'unconfirmed normal cleanup released the allocation')
+        require(terminal.publish(body)==98,'unconfirmed normal cleanup published a result')
+        record=b''.join(payload for fd,payload in terminal_ns['writes'] if fd==11)
+        require(record.count(b'APERTURE-GATE-INDETERMINATE')==1 and record.startswith(b'APERTURE-GATE-INDETERMINATE reason=cleanup:'),
+            'unconfirmed normal cleanup record changed: '+repr(record))
+        require(terminal.evidence_paths and all(os.path.exists(path) and path.encode() in record for path in terminal.evidence_paths),
+            'unconfirmed normal cleanup evidence unnamed')
+    finally:
+        for path in terminal.evidence_paths:
+            try:os.unlink(path)
+            except OSError:pass
+for body in (0,17):
+    case('unconfirmed normal cleanup refuses body '+str(body)+' and keeps the allocation',lambda body=body:unconfirmed_normal_cleanup(body))
 case('exception cleanup owner exposes verified terminal refusal',lambda:terminal_projection(98,'setup',None,True,cleanup_reason='cleanup'))
 def old_terminal_control():
     guard='state.get("code") == NO_VERDICT and state.get("reason") and (state["reason"] == "cleanup" or reason is None)'
