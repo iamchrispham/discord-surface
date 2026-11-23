@@ -884,6 +884,137 @@ def linux_incomplete_marker():
         selected_owner.close_captures()
 
 
+_CHILD_MARKER = b"APERTURE-GATE-INDETERMINATE reason="
+
+
+def complete_records(stdout):
+    return [line for line in bytes(stdout).split(b"\n")[:-1] if line.startswith(_CHILD_MARKER)]
+
+
+def staged_child_output(child_output, result, fail_stderr=False):
+    scope, owner, accepted, _ = namespace()
+    scope["clock_now"] = lambda: 0
+    relayed = scope["_write_job_output"]
+
+    def write(fd, payload, deadline=None, logical_state=None, *, interrupted=None):
+        if fail_stderr and fd == 12:
+            raise OSError(errno.EPIPE, "stderr reader closed")
+        return relayed(fd, payload, deadline, logical_state, interrupted=interrupted)
+
+    scope["_write_job_output"] = write
+    capture = owner.add_capture("stdout", replay=False)
+    stderr = owner.add_capture("stderr", replay=False)
+    capture.write(child_output)
+    capture.flush()
+    stderr.write(b"ERR\n")
+    stderr.flush()
+    cursor = {"offset": 0, "source_line_start": True, "output_line_start": True}
+    while scope["_stream_stdout"](capture.name, cursor, final=True, deadline=20) not in (None, len(child_output)):
+        pass
+    owner.request(None, None, stdout_cursor=cursor, stdout_deadline=20)
+    require(scope["_emit_job_stderr"](stderr.name, capture.name, result, True, cursor, 20),
+            "child output could not be staged")
+    owner.close_captures()
+    return owner, accepted, cursor
+
+
+def staged_raw_markers(owner):
+    rows = [row for row in owner.outputs if "range_count" in row]
+    require(len(rows) == 1, "raw child markers were not staged once")
+    return rows[0]["path"]
+
+
+def linux_child_marker_stderr_failure():
+    child_marker = _CHILD_MARKER + b"timeout: child\n"
+    for label, child_output in (
+        ("pending", b"OUT\n" + child_marker[:-1]),
+        ("one raw", b"OUT\n" + child_marker),
+        ("three raw", b"OUT\n" + child_marker * 3),
+    ):
+        owner, accepted, _ = staged_child_output(child_output, 17, fail_stderr=True)
+        require(owner.publish(17) == 98, label + " stderr failure kept the raw result")
+        records = complete_records(accepted[11])
+        require(len(records) == 1 and b"reason=cleanup:" in records[0],
+                label + " child marker and stderr failure left " + str(len(records))
+                + " terminal records: " + repr(bytes(accepted[11])))
+
+
+def linux_raw_marker_retirement_failure():
+    raw = (_CHILD_MARKER + b"capacity: child\n") * 3
+    for result in (0, 17):
+        owner, accepted, _ = staged_child_output(b"OUT\n" + raw, result)
+        withheld = staged_raw_markers(owner)
+        owner.fail_retirement("supervisor receipt removal failed: injected")
+        require(owner.publish(result) == 98, "retirement failure kept raw result " + str(result))
+        records = complete_records(accepted[11])
+        require(len(records) == 1 and b"reason=cleanup:" in records[0],
+                "retirement failure after raw markers left " + str(len(records)) + " terminal records")
+        require(Path(withheld).exists() and Path(withheld).read_bytes() == raw and withheld.encode() in records[0],
+                "withheld raw markers were not retained exactly and named")
+
+
+def linux_raw_marker_reason_withheld():
+    raw = (_CHILD_MARKER + b"capacity: child\n") * 3
+    for result in (17, 98):
+        owner, accepted, cursor = staged_child_output(b"OUT\n" + raw, 17)
+        withheld = staged_raw_markers(owner)
+        owner.request("timeout", "primary timeout")
+        require(owner.output_complete and owner.retirement_complete, "reason case lost its complete flags")
+        require(owner.publish(result) == 98, "reason kept raw result " + str(result))
+        records = complete_records(accepted[11])
+        require(len(records) == 1 and b"reason=timeout:" in records[0],
+                "reason with raw markers left " + str(len(records)) + " terminal records")
+        require(Path(withheld).exists() and Path(withheld).read_bytes() == raw and withheld.encode() in records[0],
+                "withheld raw markers were not retained exactly and named")
+        require(cursor["retain_output"], "withheld raw markers left output custody released")
+
+
+def blocked_stderr_stdout_recoverable():
+    scope, owner, accepted, _ = namespace()
+    clock = [0.0]
+    diagnostics = b"DIAG\n" + _CHILD_MARKER + b"capacity: child\n"
+    reader, writer = os.pipe()
+    try:
+        os.set_blocking(writer, False)
+        full = False
+        for _ in range(128):
+            try:
+                os.write(writer, b"x" * 65536)
+            except BlockingIOError:
+                full = True
+                break
+        require(full, "bounded pipe fill did not reach pressure")
+        os.set_blocking(writer, True)
+        relayed = scope["_write_job_output"]
+
+        def write(fd, payload, deadline=None, logical_state=None, *, interrupted=None):
+            if fd == writer:
+                return scope["_source_write_job_output"](fd, payload, deadline, logical_state, interrupted=interrupted)
+            return relayed(fd, payload, deadline, logical_state, interrupted=interrupted)
+
+        scope["_write_job_output"] = write
+        scope["sys"].stderr = types.SimpleNamespace(fileno=lambda: writer)
+        scope["clock_now"] = lambda: clock[0]
+        scope["time"] = types.SimpleNamespace(sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+        stdout = owner.add_capture("stdout")
+        stderr = owner.add_capture("stderr")
+        stdout.write(diagnostics)
+        stderr.write(b"ERR\n")
+        owner.close_captures()
+        owner.request(None, None, stdout_deadline=1)
+        require(owner.publish(17) == 98, "blocked stderr kept the raw result")
+        require(clock[0] >= 1, "blocked stderr did not use up the deadline")
+        records = complete_records(accepted[11])
+        require(len(records) == 1 and b"reason=cleanup:" in records[0],
+                "blocked stderr left " + str(len(records)) + " terminal records")
+        require(Path(stdout.name).exists() and Path(stdout.name).read_bytes() == diagnostics and stdout.name.encode() in records[0],
+                "stdout diagnostics were not retained exactly and named")
+        require(b"reason=cleanup:" in Path(owner.recovery_path).read_bytes(), "terminal record not staged")
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
 def linux_post_exit_cancel():
     if sys.platform != "linux":
         return
@@ -1310,6 +1441,14 @@ with tempfile.TemporaryDirectory(prefix="gate-terminal-unit-") as root:
             linux_verifier_cleanup(setup_error=scenario == "linux-setup-verifier-cleanup")
         elif scenario == "linux-incomplete-marker":
             linux_incomplete_marker()
+        elif scenario == "linux-child-marker-stderr-failure":
+            linux_child_marker_stderr_failure()
+        elif scenario == "linux-raw-marker-retirement-failure":
+            linux_raw_marker_retirement_failure()
+        elif scenario == "linux-raw-marker-reason-withheld":
+            linux_raw_marker_reason_withheld()
+        elif scenario == "blocked-stderr-stdout-recoverable":
+            blocked_stderr_stdout_recoverable()
         elif scenario == "linux-post-exit-cancel":
             linux_post_exit_cancel()
         elif scenario.startswith("finalizer-"):

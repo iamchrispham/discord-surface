@@ -818,11 +818,17 @@ class TerminalOutput:
             elif self.output_complete and self.retirement_complete and (result != NO_VERDICT or candidate is None):
                 pending.update(replay=True, publish_path=pending["path"], publish_start=0, publish_end=pending["size"])
 
+        replay_raw_markers = self.reason is None and self.output_complete and self.retirement_complete
+        withheld = []
         output_line_start = self.cursor.get("output_line_start", True) if self.cursor is not None else True
         if self.output_complete:
-            for output in self.outputs:
+            # stderr goes first so its failure stops publication before raw marker bytes reach stdout.
+            for output in sorted(self.outputs, key=lambda output: output["name"] != "stderr"):
                 path = output.get("publish_path")
                 if not output["replay"] or path is None:
+                    continue
+                if "range_count" in output and not replay_raw_markers:
+                    withheld.append(output["path"])
                     continue
                 name = output["name"]
                 descriptor = sys.stderr.fileno() if name == "stderr" else sys.stdout.fileno()
@@ -853,8 +859,11 @@ class TerminalOutput:
             if reason is not None:
                 if not self.output_complete or not self.retirement_complete:
                     detail = self._failure_detail(detail)
-                elif retained is not None:
-                    detail = _join_detail(detail, "incomplete gate marker retained at " + retained)
+                else:
+                    if retained is not None:
+                        detail = _join_detail(detail, "incomplete gate marker retained at " + retained)
+                    if withheld:
+                        detail = _join_detail(detail, "withheld gate output retained at " + ", ".join(withheld))
                 marker = ("APERTURE-GATE-INDETERMINATE reason=" + reason + ": " + str(detail or reason) + "\n").encode(
                     "utf-8", errors="replace"
                 )
@@ -897,10 +906,10 @@ class TerminalOutput:
 
         complete = self.output_complete and self.retirement_complete
         if self.cursor is not None:
-            self.cursor["retain_output"] = self.cursor.get("retain_output", False) or not complete
+            self.cursor["retain_output"] = self.cursor.get("retain_output", False) or not complete or bool(withheld)
         if complete:
             for path in self.evidence_paths:
-                if path == retained:
+                if path == retained or path in withheld:
                     continue
                 try:
                     os.unlink(path)

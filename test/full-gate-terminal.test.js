@@ -15,6 +15,8 @@ for (const scenario of [
   'linux-0', 'linux-17', 'linux-98', 'linux-marked', 'linux-multiple-markers', 'linux-journal-short-write',
   'linux-adopted-child-drain', 'linux-final-relay-reserve', 'linux-incomplete-marker', 'linux-post-exit-cancel',
   'linux-permanent-relay-failure', 'linux-verifier-cleanup', 'linux-setup-verifier-cleanup',
+  'linux-child-marker-stderr-failure', 'linux-raw-marker-retirement-failure', 'linux-raw-marker-reason-withheld',
+  'blocked-stderr-stdout-recoverable',
   'darwin-bootstrap', 'darwin-exception', 'darwin-large'
 ]) {
   test('terminal output owner: ' + scenario, {
