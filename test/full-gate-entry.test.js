@@ -1282,7 +1282,7 @@ test('Darwin final stdout relay preserves evidence and the source snapshot reser
     "            raise FileNotFoundError(self.name)",
     "    fixture_os = FixtureOS()",
     "    fixture_open = FixtureOpen()",
-    "    env = {\"__name__\": \"__relay_fixture__\", \"__builtins__\": {\"__build_class__\": __build_class__, \"object\": object, \"property\": property, \"len\": len, \"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"type\": type, \"int\": int, \"bytes\": bytes, \"set\": set, \"list\": list, \"tuple\": tuple, \"bool\": bool, \"globals\": globals,",
+    "    env = {\"__name__\": \"__relay_fixture__\", \"__builtins__\": {\"__build_class__\": __build_class__, \"object\": object, \"property\": property, \"len\": len, \"sorted\": sorted,\"str\": str, \"min\": min, \"max\": max, \"isinstance\": isinstance, \"dict\": dict, \"type\": type, \"int\": int, \"bytes\": bytes, \"set\": set, \"list\": list, \"tuple\": tuple, \"bool\": bool, \"globals\": globals,",
     "                           \"FileNotFoundError\": FileNotFoundError, \"BlockingIOError\": BlockingIOError,",
     "                           \"BrokenPipeError\": BrokenPipeError, \"OSError\": OSError,",
     "                           \"InterruptedError\": InterruptedError, \"TimeoutError\": TimeoutError,",
@@ -6001,7 +6001,7 @@ def output_boundary(mode):
         assert terminal.record_verdict_range(0,len(marker)) is True
         assert ns['_emit_job_stderr']('stderr','stdout',0,True,cursor,4) is True
         assert terminal.publish(0)==0
-        assert calls and calls[0][0]==11 and {fd for fd,size in calls}=={11,12}
+        assert calls and calls[0][0]==12 and {fd for fd,size in calls}=={11,12}
     elif mode=='outer':
         assert ns['no_verdict']('cleanup','verified',stdout_cursor=cursor,stdout_deadline=4)==98
         assert terminal.publish(98)==98
