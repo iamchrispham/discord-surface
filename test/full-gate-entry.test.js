@@ -19,6 +19,51 @@ const SUPERVISOR_SCRIPT = path.join(PROJECT, 'scripts/full-gate/supervisor.py');
 const ROLE_FIXTURE = path.join(PROJECT, 'test/successor-authority/process-identity.js');
 const SUPERVISOR_PID_ENVIRONMENT = 'DISCORD_SURFACE_GATE_SUPERVISOR_PID';
 const PLATFORM_SCRATCH_ENVIRONMENT = 'DISCORD_SURFACE_GATE_SCRATCH';
+const WATCHDOG_SCRIPT = path.join(PROJECT, 'scripts/full-gate-watchdog.js');
+// Linux-only tests rewrite these exact source lines; the pin below checks them on every platform.
+const SUPERVISOR_PROBE = Object.freeze({
+  directChildren: '    return [int(value) for value in child_list().read_text(encoding="ascii").split()]',
+  signal: '        signal.pidfd_send_signal(descriptor, signal_number)',
+  ownershipGuard: [
+    '    try:',
+    '        waited, _ = os.waitpid(pid, os.WNOHANG)',
+    '    except ChildProcessError:',
+    '        return',
+    '    if waited == pid:',
+    '        return',
+    '    descriptor = os.pidfd_open(pid)'
+  ].join('\n'),
+  liveChildGuard: '            except ChildProcessError:\n                reaped = True\n                continue\n            if waited == 0:',
+  noChildGuard: '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                return []'
+});
+const SUPERVISOR_PROBE_BYPASS = Object.freeze({
+  ownershipGuard: '    descriptor = os.pidfd_open(pid)',
+  liveChildGuard: '            except ChildProcessError:\n                waited = 0\n            if waited == 0:',
+  noChildGuard: '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                waited = 0'
+});
+const MANAGER_RETIREMENT_GUARD = 'scratchIsPlatformOwned = Boolean(platformScratch);';
+const WATCHDOG_LIVE_WRITER_GUARD = "if (liveEscapes) {\n      drainRecheckRequested = true;\n      return;\n    }";
+
+function instrumentSupervisor(source) {
+  return source
+    .replace(SUPERVISOR_PROBE.directChildren, SUPERVISOR_PROBE.directChildren + ' + [int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"])]')
+    .replace(SUPERVISOR_PROBE.signal, [
+      '        if pid == int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"]):',
+      '            with open(os.environ["FIXTURE_SIGNAL_LOG"], "a", encoding="ascii") as handle:',
+      '                handle.write(str(pid) + ",")',
+      '        else:',
+      '            signal.pidfd_send_signal(descriptor, signal_number)'
+    ].join('\n'));
+}
+
+function writeProbeSupervisor(directory, source) {
+  const scripts = path.join(directory, 'scripts');
+  fs.mkdirSync(path.join(scripts, 'full-gate'), { recursive: true });
+  fs.symlinkSync(GATE, path.join(scripts, 'full-gate.js'));
+  const file = path.join(scripts, 'full-gate', 'supervisor.py');
+  fs.writeFileSync(file, source, { mode: 0o600 });
+  return file;
+}
 
 function fakeSupervisionEnvironment(source, overrides = {}, { absentSupervisor = false } = {}) {
   const env = { ...source };
@@ -1977,14 +2022,12 @@ test('cleanup keeps scratch until an escaped writer and guardian are done', { sk
   fs.cpSync(path.join(PROJECT, 'scripts', 'full-gate'), path.join(bypassScripts, 'full-gate'), { recursive: true });
   const bypassManager = path.join(bypassScripts, 'full-gate.js');
   const managerSource = fs.readFileSync(bypassManager, 'utf8');
-  const retirementGuard = 'scratchIsPlatformOwned = Boolean(platformScratch);';
-  assert.equal(managerSource.split(retirementGuard).length - 1, 1, 'disposable control must target the Node scratch-retirement boundary');
-  fs.writeFileSync(bypassManager, managerSource.replace(retirementGuard, 'scratchIsPlatformOwned = false;'));
+  assert.equal(managerSource.split(MANAGER_RETIREMENT_GUARD).length - 1, 1, 'disposable control must target the Node scratch-retirement boundary');
+  fs.writeFileSync(bypassManager, managerSource.replace(MANAGER_RETIREMENT_GUARD, 'scratchIsPlatformOwned = false;'));
   const bypassWatchdog = path.join(bypassScripts, 'full-gate-watchdog.js');
   const fixedWatchdog = fs.readFileSync(bypassWatchdog, 'utf8');
-  const liveWriterGuard = "if (liveEscapes) {\n      drainRecheckRequested = true;\n      return;\n    }";
-  assert.equal(fixedWatchdog.split(liveWriterGuard).length - 1, 1, 'disposable control must bypass the live escaped-writer drain guard');
-  fs.writeFileSync(bypassWatchdog, fixedWatchdog.replace(liveWriterGuard, ''));
+  assert.equal(fixedWatchdog.split(WATCHDOG_LIVE_WRITER_GUARD).length - 1, 1, 'disposable control must bypass the live escaped-writer drain guard');
+  fs.writeFileSync(bypassWatchdog, fixedWatchdog.replace(WATCHDOG_LIVE_WRITER_GUARD, ''));
 
   const bypassed = start('bypassed', path.join(bypassScripts, 'full-gate.js'));
   let bypassActors;
@@ -2035,60 +2078,34 @@ test('watchdog table failure interrupts the worker through the manager', { skip:
   assert.match(result.output, /workerStop[^\n]*parent-stop/);
 });
 
+test('Linux-only source probes still match the sources they rewrite', () => {
+  const probes = [
+    [SUPERVISOR_SCRIPT, Object.values(SUPERVISOR_PROBE)],
+    [GATE, [MANAGER_RETIREMENT_GUARD]],
+    [WATCHDOG_SCRIPT, [WATCHDOG_LIVE_WRITER_GUARD]]
+  ];
+  for (const [file, fragments] of probes) {
+    const source = fs.readFileSync(file, 'utf8');
+    for (const fragment of fragments) {
+      assert.equal(source.split(fragment).length - 1, 1, path.basename(file) + ' must hold exactly one ' + JSON.stringify(fragment));
+    }
+  }
+});
+
 test('stale numeric ancestry cannot grant Linux signal ownership', { skip: process.platform !== 'linux', timeout: 90000 }, async t => {
   const normal = fixture(t);
   const bypassed = fixture(t);
   const actor = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 60000); setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   const actorIdentity = roleFixture.captureIdentity(actor.pid);
   assert.equal(actorIdentity.kind, 'present', 'disposable ancestry actor was not captured');
-  const directChildrenLine = '    return [int(value) for value in child_list().read_text(encoding="ascii").split()]';
-  const injectedChildrenLine = '    return [int(value) for value in child_list().read_text(encoding="ascii").split()] + [int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"])]';
-  const signalLine = '        signal.pidfd_send_signal(descriptor, signal_number)';
-  const interceptedSignal = [
-    '        if pid == int(os.environ["FIXTURE_REUSED_ROOT_CHILD_PID"]):',
-    '            with open(os.environ["FIXTURE_SIGNAL_LOG"], "a", encoding="ascii") as handle:',
-    '                handle.write(str(pid) + ",")',
-    '        else:',
-    '            signal.pidfd_send_signal(descriptor, signal_number)'
-  ].join('\n');
-  const ownershipGuard = [
-    '    try:',
-    '        waited, _ = os.waitpid(pid, os.WNOHANG)',
-    '    except ChildProcessError:',
-    '        return',
-    '    if waited == pid:',
-    '        return',
-    '    descriptor = os.pidfd_open(pid)'
-  ].join('\n');
-  const bypassedOwnershipGuard = '    descriptor = os.pidfd_open(pid)';
-  const liveChildGuard = '            except ChildProcessError:\n                reaped = True\n                continue\n            if waited == 0:';
-  const bypassedLiveChildGuard = '            except ChildProcessError:\n                waited = 0\n            if waited == 0:';
-  const noChildGuard = '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                return []';
-  const bypassedNoChildGuard = '                waited, _ = os.waitpid(-1, os.WNOHANG)\n            except ChildProcessError:\n                waited = 0';
   const supervisorSource = fs.readFileSync(SUPERVISOR_SCRIPT, 'utf8');
-  assert.ok(supervisorSource.includes(directChildrenLine));
-  assert.ok(supervisorSource.includes(signalLine));
-  assert.ok(supervisorSource.includes(ownershipGuard));
-  assert.ok(supervisorSource.includes(liveChildGuard));
-  assert.ok(supervisorSource.includes(noChildGuard));
-  const instrument = source => source
-    .replace(directChildrenLine, injectedChildrenLine)
-    .replace(signalLine, interceptedSignal);
-  const writeSupervisor = (root, name, source) => {
-    const directory = path.join(root.scratch, 'private-owner', 'scripts', 'full-gate');
-    fs.mkdirSync(directory, { recursive: true });
-    fs.symlinkSync(GATE, path.join(directory, '..', 'full-gate.js'));
-    const file = path.join(directory, name + '.py');
-    fs.writeFileSync(file, source, { mode: 0o600 });
-    return file;
-  };
-  const normalSupervisor = writeSupervisor(normal, 'supervisor', instrument(supervisorSource));
-  let bypassSource = instrument(supervisorSource)
-    .replace(ownershipGuard, bypassedOwnershipGuard)
-    .replace(liveChildGuard, bypassedLiveChildGuard)
-    .replace(noChildGuard, bypassedNoChildGuard);
-  assert.notEqual(bypassSource, instrument(supervisorSource), 'counterfactual did not bypass child-handle ownership');
-  const bypassSupervisor = writeSupervisor(bypassed, 'supervisor', bypassSource);
+  const normalSupervisor = writeProbeSupervisor(path.join(normal.scratch, 'private-owner'), instrumentSupervisor(supervisorSource));
+  const bypassSource = instrumentSupervisor(supervisorSource)
+    .replace(SUPERVISOR_PROBE.ownershipGuard, SUPERVISOR_PROBE_BYPASS.ownershipGuard)
+    .replace(SUPERVISOR_PROBE.liveChildGuard, SUPERVISOR_PROBE_BYPASS.liveChildGuard)
+    .replace(SUPERVISOR_PROBE.noChildGuard, SUPERVISOR_PROBE_BYPASS.noChildGuard);
+  assert.notEqual(bypassSource, instrumentSupervisor(supervisorSource), 'counterfactual did not bypass child-handle ownership');
+  const bypassSupervisor = writeProbeSupervisor(path.join(bypassed.scratch, 'private-owner'), bypassSource);
   const marker = path.join(normal.scratch, 'body.json');
   const signalLog = path.join(normal.scratch, 'signals.log');
   try {
@@ -2116,6 +2133,50 @@ test('stale numeric ancestry cannot grant Linux signal ownership', { skip: proce
     }).done;
     assert.equal(bypassResult.code, 98, bypassResult.output);
     assert.ok(fs.readFileSync(bypassLog, 'utf8').split(',').includes(String(actor.pid)), 'bypassed ownership did not reach the intercepted signal boundary');
+    assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'the intercepted signal reached the disposable actor');
+  } finally {
+    if (!roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid))) {
+      assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'disposable actor identity changed before cleanup');
+      assert.equal(roleFixture.signalOwned(actorIdentity, 'SIGTERM'), true, 'disposable actor could not be stopped by its test owner');
+      assert.equal(await waitForIdentityGone(actorIdentity, Date.now() + 5000), true, 'disposable actor remained after bounded cleanup');
+    }
+  }
+});
+
+test('drain timeout signals only owned children when a stale PID is listed', { skip: process.platform !== 'linux', timeout: 90000 }, async t => {
+  const f = fixture(t);
+  const actor = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 60000); setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const actorIdentity = roleFixture.captureIdentity(actor.pid);
+  assert.equal(actorIdentity.kind, 'present', 'disposable ancestry actor was not captured');
+  const supervisorSource = fs.readFileSync(SUPERVISOR_SCRIPT, 'utf8');
+  const descendant = "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>process.exit(0),30000)'],{detached:true,stdio:'ignore'}).unref();";
+  const runSupervisor = (label, source) => {
+    const signalLog = path.join(f.scratch, label + '-signals.log');
+    const result = spawnSync('python3', [
+      '-I', writeProbeSupervisor(path.join(f.scratch, label), source), '--', process.execPath, '-e', descendant
+    ], {
+      cwd: f.root, encoding: 'utf8', timeout: 30000,
+      env: {
+        ...process.env, NODE_OPTIONS: '', FIXTURE_REUSED_ROOT_CHILD_PID: String(actor.pid), FIXTURE_SIGNAL_LOG: signalLog,
+        APERTURE_GATE_TIME_LEFT_S: '12', APERTURE_GATE_SLOWEST_RUN_S: '1'
+      }
+    });
+    const signals = fs.existsSync(signalLog) ? fs.readFileSync(signalLog, 'utf8').split(',').filter(Boolean) : [];
+    return { result, signals };
+  };
+  try {
+    const normal = runSupervisor('normal', instrumentSupervisor(supervisorSource));
+    assert.equal(normal.result.status, 98, normal.result.stderr + normal.result.stdout);
+    assert.match(normal.result.stdout, /reason=timeout:[^\n]*descendants remained/);
+    assert.deepEqual(normal.signals, [], 'stale listed PID reached the native signal boundary');
+
+    const bypassSource = instrumentSupervisor(supervisorSource)
+      .replace(SUPERVISOR_PROBE.ownershipGuard, SUPERVISOR_PROBE_BYPASS.ownershipGuard);
+    assert.notEqual(bypassSource, instrumentSupervisor(supervisorSource), 'counterfactual did not bypass the ownership guard');
+    const bypassed = runSupervisor('bypassed', bypassSource);
+    assert.equal(bypassed.result.status, 98, bypassed.result.stderr + bypassed.result.stdout);
+    assert.match(bypassed.result.stdout, /reason=timeout:[^\n]*descendants remained/);
+    assert.ok(bypassed.signals.includes(String(actor.pid)), 'bypassed ownership guard did not reach the intercepted signal boundary');
     assert.equal(roleFixture.sameProcessIdentity(actorIdentity, roleFixture.captureIdentity(actor.pid)), true, 'the intercepted signal reached the disposable actor');
   } finally {
     if (!roleFixture.identityGone(actorIdentity, roleFixture.captureIdentity(actor.pid))) {
